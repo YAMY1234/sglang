@@ -459,10 +459,53 @@ struct TopKCandidatesParams {
   uint32_t static_cluster_floor;  // cluster variant only: longer rows split across a cluster
   int32_t cand_page_bits;
   int32_t* overflow_rows;  // cluster variant only, nullable: counts rows redone past the tie buffer
+  // Push variant only (DSA DCP decode merge, dsa/dcp_topk_merge.cuh): the row's
+  // entries go straight to its candidate block on every rank, not to `candidates`.
+  uint64_t* push_mc = nullptr;                 // multicast address of the merge buffer
+  const int64_t* push_counters = nullptr;      // [push_max_rows] merge calls per row slot
+  int64_t push_slot = 0;                       // entries per row slot
+  int32_t push_max_rows = 0;
 
   SGL_DEVICE int32_t global_position(int32_t local) const {
     const auto b = cand_page_bits;
     return (((local >> b) * cand_world + cand_rank) << b) | (local & ((1 << b) - 1));
+  }
+};
+
+/// Where a candidate goes: the [rows, topk, 2] tensor, or (kPush) this rank's
+/// candidate block of the row in every rank's merge buffer, as the merge's
+/// tagged 64-bit entry (score bits << 32 | 24-bit position << 8 | call tag).
+template <bool kPush>
+struct CandidateSink {
+  int2* out;
+  uint64_t* push;
+  uint64_t tag;
+
+  SGL_DEVICE static CandidateSink make(const TopKCandidatesParams& params, const uint32_t bx) {
+    if constexpr (kPush) {
+      // the merge kernel of the previous call has finished with this row slot
+      const int64_t c = params.push_counters[bx];
+      const int64_t row_slot = (c & 1) * params.push_max_rows + bx;
+      return {nullptr,
+              params.push_mc + row_slot * params.push_slot + static_cast<int64_t>(params.cand_rank) * params.topk,
+              static_cast<uint64_t>(c % 255) + 1};
+    } else {
+      return {reinterpret_cast<int2*>(params.candidates) + bx * static_cast<int64_t>(params.topk), nullptr, 0};
+    }
+  }
+
+  SGL_DEVICE void put(uint32_t slot, int32_t score_bits, int32_t pos) const {
+    if constexpr (kPush) {
+      const uint64_t p = pos >= 0 ? static_cast<uint32_t>(pos) : 0xFFFFFFu;
+      const uint64_t e = (static_cast<uint64_t>(static_cast<uint32_t>(score_bits)) << 32) | (p << 8) | tag;
+#if SGL_ARCH_HOPPER_OR_GREATER
+      asm volatile("multimem.st.relaxed.sys.global.b64 [%0], %1;" ::"l"(push + slot), "l"(e) : "memory");
+#else
+      __trap();
+#endif
+    } else {
+      out[slot] = make_int2(score_bits, pos);
+    }
   }
 };
 
@@ -474,38 +517,38 @@ struct TopKCandidatesParams {
  * staged in shared memory; the epilogue then reads each selected score and
  * writes (score bits, global position), `(0, -1)` padded.
  */
-template <bool kPDL>
+template <bool kPDL, bool kPush = false>
 SGL_DEVICE void
 candidates_one_block(const TopKCandidatesParams& params, const uint32_t bx, RaggedSmem* smem, int32_t* s_topk_indices) {
   const auto seq_len = static_cast<uint32_t>(params.seq_lens[bx]);
   const auto row_start = params.row_starts == nullptr ? 0u : params.row_starts[bx];
   const auto topk = params.topk;
-  const auto out = reinterpret_cast<int2*>(params.candidates) + bx * static_cast<int64_t>(topk);
   const auto score = params.scores + bx * params.score_stride;
-  const auto emit = [&](uint32_t tx, int32_t idx) {
-    out[tx] = idx >= 0 ? make_int2(__float_as_int(score[row_start + idx]), params.global_position(idx))
-                       : make_int2(0, -1);
+  const auto emit = [&](const CandidateSink<kPush>& sink, uint32_t tx, int32_t idx) {
+    sink.put(tx, idx >= 0 ? __float_as_int(score[row_start + idx]) : 0, idx >= 0 ? params.global_position(idx) : -1);
   };
 
   if (seq_len <= topk) {
     device::PDLWaitPrimary<kPDL>();
     device::PDLTriggerSecondary<kPDL>();
-    for_each_item(topk, [&](uint32_t tx, uint32_t) { emit(tx, tx < seq_len ? static_cast<int32_t>(tx) : -1); });
+    const auto sink = CandidateSink<kPush>::make(params, bx);
+    for_each_item(topk, [&](uint32_t tx, uint32_t) { emit(sink, tx, tx < seq_len ? static_cast<int32_t>(tx) : -1); });
     return;
   }
 
   ragged_window_topk<kPDL>(score, row_start, seq_len, topk, s_topk_indices, 0, smem);
   device::PDLTriggerSecondary<kPDL>();
   __syncthreads();
-  for_each_item(topk, [&](uint32_t tx, uint32_t) { emit(tx, s_topk_indices[tx]); });
+  const auto sink = CandidateSink<kPush>::make(params, bx);
+  for_each_item(topk, [&](uint32_t tx, uint32_t) { emit(sink, tx, s_topk_indices[tx]); });
 }
 
-template <bool kPDL>
+template <bool kPDL, bool kPush = false>
 TOPK_KERNEL void topk_candidates_kernel(const __grid_constant__ TopKCandidatesParams params) {
   device::enable_smem_spilling();
   __shared__ RaggedSmem smem;
   __shared__ int32_t s_topk_indices[kMaxTopK];
-  candidates_one_block<kPDL>(params, blockIdx.x, &smem, s_topk_indices);
+  candidates_one_block<kPDL, kPush>(params, blockIdx.x, &smem, s_topk_indices);
 }
 
 // Packed DSA extend layout.
@@ -854,7 +897,7 @@ struct TopKCandidatesCluster : impl::TopKRadixBase<12> {
   }
 };
 
-template <bool kPDL, uint32_t kClusterSize>
+template <bool kPDL, uint32_t kClusterSize, bool kPush = false>
 __global__ __launch_bounds__(kBlockSize, 1) __cluster_dims__(1, kClusterSize, 1) void topk_dcp_candidates_cluster_kernel(
     const __grid_constant__ TopKCandidatesParams params, const uint32_t cluster_floor) {
   device::enable_smem_spilling();
@@ -868,10 +911,12 @@ __global__ __launch_bounds__(kBlockSize, 1) __cluster_dims__(1, kClusterSize, 1)
   const auto topk = params.topk;
   if (seq_len <= cluster_floor || seq_len <= topk) {
     if (blockIdx.y != bx % kClusterSize) return;
-    return candidates_one_block<kPDL>(params, bx, reinterpret_cast<RaggedSmem*>(&smem), s_topk_indices);
+    return candidates_one_block<kPDL, kPush>(params, bx, reinterpret_cast<RaggedSmem*>(&smem), s_topk_indices);
   }
 
-  const auto out = reinterpret_cast<int2*>(params.candidates) + bx * static_cast<int64_t>(topk);
+  // the push sink reads the merge's row counter, so wait for the indexer first
+  if constexpr (kPush) device::PDLWaitPrimary<kPDL>();
+  const auto sink = CandidateSink<kPush>::make(params, bx);
   const auto score = params.scores + bx * params.score_stride;
   const auto world = params.cand_world;
   const auto rank = params.cand_rank;
@@ -880,14 +925,14 @@ __global__ __launch_bounds__(kBlockSize, 1) __cluster_dims__(1, kClusterSize, 1)
       problem,
       reinterpret_cast<typename Cluster::Smem*>(&smem),
       [&](uint32_t slot, float val, uint32_t idx) {
-        out[slot] = make_int2(__float_as_int(val), static_cast<int32_t>(idx) * world + rank);
+        sink.put(slot, __float_as_int(val), static_cast<int32_t>(idx) * world + rank);
       },
       &s_first_staged);
   if (blockIdx.y != 0) return;
   __syncthreads();
   for (uint32_t slot = s_first_staged + threadIdx.x; slot < topk; slot += kBlockSize) {
     const auto idx = s_topk_indices[slot];
-    out[slot] = idx >= 0 ? make_int2(__float_as_int(score[idx]), idx * world + rank) : make_int2(0, -1);
+    sink.put(slot, idx >= 0 ? __float_as_int(score[idx]) : 0, idx >= 0 ? idx * world + rank : -1);
   }
 }
 
@@ -2115,6 +2160,96 @@ struct TopKKernel {
     LaunchKernel(rows, kBlockSize, device_.unwrap())
         .config({.use_pdl = kUsePDL})
         .launch(topk_candidates_kernel<kUsePDL>, params);
+  }
+
+  /**
+   * \brief `transform_candidates_dcp` that pushes instead of writing `candidates`:
+   * row i's top-`cand_k` entries go to this rank's candidate block of row slot i in
+   * every rank's DCP merge buffer (multicast address `push_mc`; the int64 layout
+   * of dsa/dcp_topk_merge.cuh, `slot` entries per row slot, `max_rows` slots per
+   * parity), tagged with the call of `counters[i]`. The merge kernel that reads
+   * them advances the counters.
+   */
+  static void transform_candidates_dcp_push(
+      const tvm::ffi::TensorView scores,
+      const tvm::ffi::TensorView seq_lens,
+      const int64_t push_mc,
+      const tvm::ffi::TensorView counters,
+      const int64_t world,
+      const int64_t rank,
+      const int64_t cand_k,
+      const int64_t slot,
+      const int64_t cluster_size,
+      const int64_t cluster_floor) {
+    using namespace host;
+    auto B = SymbolicSize{"batch_size"};
+    auto L = SymbolicSize{"max_seq_len"};
+    auto S = SymbolicSize{"score_stride"};
+    auto M = SymbolicSize{"max_rows"};
+    auto device_ = SymbolicDevice{};
+    device_.set_options<kDLGPU>();
+
+    TensorMatcher({B, L})  // score
+        .with_strides({S, 1})
+        .with_dtype<float>()
+        .with_device(device_)
+        .verify(scores);
+    TensorMatcher({B})  // seq_lens
+        .with_dtype<int32_t>()
+        .with_device(device_)
+        .verify(seq_lens);
+    TensorMatcher({M})  // counters
+        .with_dtype<int64_t>()
+        .with_device(device_)
+        .verify(counters);
+
+    RuntimeCheck(S.unwrap() % 4 == 0, "score_stride must be a multiple of 4 (16-byte vectorized load)");
+    RuntimeCheck(cand_k > 0 && cand_k <= kMaxTopK, "cand_k must be in (0, 2048]");
+    RuntimeCheck(world >= 1 && rank >= 0 && rank < world, "invalid world/rank");
+    RuntimeCheck(push_mc != 0 && slot >= world * cand_k, "invalid push buffer");
+    RuntimeCheck(B.unwrap() <= M.unwrap(), "more rows than merge row slots");
+
+    const auto params = TopKCandidatesParams{
+        .scores = static_cast<float*>(scores.data_ptr()),
+        .seq_lens = static_cast<const int32_t*>(seq_lens.data_ptr()),
+        .row_starts = nullptr,
+        .candidates = nullptr,
+        .score_stride = S.unwrap(),
+        .topk = static_cast<uint32_t>(cand_k),
+        .cand_world = static_cast<int32_t>(world),
+        .cand_rank = static_cast<int32_t>(rank),
+        .push_mc = reinterpret_cast<uint64_t*>(push_mc),
+        .push_counters = static_cast<const int64_t*>(counters.data_ptr()),
+        .push_slot = slot,
+        .push_max_rows = static_cast<int32_t>(M.unwrap()),
+    };
+    const auto rows = static_cast<uint32_t>(B.unwrap());
+    if (rows == 0) return;
+#if SUPPORT_CLUSTER
+    if (cluster_size != 0) {
+      RuntimeCheck(cluster_floor >= 0 && cluster_floor <= UINT32_MAX, "invalid cluster_floor");
+      const auto floor = static_cast<uint32_t>(cluster_floor);
+      const auto launch = [&]<uint32_t kClusterSize>() {
+        LaunchKernel({rows, kClusterSize}, kBlockSize, device_.unwrap())
+            .config({.use_pdl = kUsePDL, .cluster_dim = dim3{1, kClusterSize}})
+            .launch(topk_dcp_candidates_cluster_kernel<kUsePDL, kClusterSize, true>, params, floor);
+      };
+      switch (cluster_size) {
+        case 2:
+          return launch.template operator()<2>();
+        case 4:
+          return launch.template operator()<4>();
+        default:
+          RuntimeCheck(false, "cluster_size must be 0, 2 or 4, got ", cluster_size);
+      }
+    }
+#else
+    RuntimeCheck(cluster_size == 0, "the cluster candidate top-k needs sm90 / sm100");
+    static_cast<void>(cluster_floor);
+#endif
+    LaunchKernel(rows, kBlockSize, device_.unwrap())
+        .config({.use_pdl = kUsePDL})
+        .launch(topk_candidates_kernel<kUsePDL, true>, params);
   }
 
   /**

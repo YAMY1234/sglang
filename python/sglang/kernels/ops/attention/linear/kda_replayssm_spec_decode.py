@@ -32,12 +32,180 @@ Linear chain only (dspark γ chain, topk<=1).
 
 from __future__ import annotations
 
+import functools
+import logging
+
+import logging
+import os
+from functools import lru_cache
+
 import torch
 import triton
 import triton.language as tl
 
+logger = logging.getLogger(__name__)
+
 # Measured on GB300 (K=V=128); any BV keeps the fold bit-identical, re-tune freely.
 KDA_FOLD_BLOCK_V = 8
+
+# SGLANG_OPT_KDA_REPLAYSSM_FAST_FOLD: value rows per work item of the CUDA row
+# fold (128 = a whole head), its cp.async pipeline depth, the tokens a stage
+# holds (longer accepted windows restage the rest in place) and the CTA width.
+# Measured on VR200 (69 layers x 12 heads, 198 requests): 128/2/8/256 is fastest.
+KDA_FAST_FOLD_ROWS = 128
+KDA_FAST_FOLD_STAGES = 2
+KDA_FAST_FOLD_MAX_TOK = 8
+KDA_FAST_FOLD_THREADS = 256
+
+_LOGGED: set = set()
+
+# aria loop/fork300-tp8 (default unset): override KDA_FOLD_BLOCK_V; radixark/sglang-k31#300
+# measured 16 on SM107. Read in os.environ for the overlay.
+_FOLD_BLOCK_V_ENV = "SGLANG_K31_KDA_FOLD_BLOCK_V"
+
+
+@lru_cache(maxsize=1)
+def _fold_block_v_override() -> int | None:
+    raw = os.environ.get(_FOLD_BLOCK_V_ENV, "").strip()
+    if not raw:
+        return None
+    bv = int(raw)
+    if bv not in (4, 8, 16, 32, 64, 128):
+        raise ValueError(f"{_FOLD_BLOCK_V_ENV}={raw} must be a power of two in [4, 128]")
+    logging.getLogger(__name__).info(
+        "KDA ReplaySSM fold BV %d (%s; default %d, aria loop/fork300-tp8)",
+        bv,
+        _FOLD_BLOCK_V_ENV,
+        KDA_FOLD_BLOCK_V,
+    )
+    return bv
+
+
+def _fold_block_v() -> int:
+    override = _fold_block_v_override()
+    return KDA_FOLD_BLOCK_V if override is None else override
+
+
+def _log_once(key: str, msg: str, *args) -> None:
+    if key not in _LOGGED:
+        _LOGGED.add(key)
+        logger.info(msg, *args)
+
+
+def _fast_fold_eligible(
+    checkpoint_state: torch.Tensor,
+    rawv_cache: torch.Tensor,
+    rawk_cache: torch.Tensor,
+    gk_cache: torch.Tensor,
+    beta_cache: torch.Tensor,
+) -> bool:
+    from sglang.srt.environ import envs
+
+    if not envs.SGLANG_OPT_KDA_REPLAYSSM_FAST_FOLD.get():
+        return False
+    if not checkpoint_state.is_cuda or torch.version.hip is not None:
+        return False
+    if torch.cuda.get_device_capability(checkpoint_state.device)[0] < 10:
+        return False  # packed f32x2 PTX
+    num_layers, num_slots, HV, V, K = checkpoint_state.shape
+    L = rawv_cache.shape[-2]
+    ok = (
+        V == 128
+        and K == 128
+        and checkpoint_state.dtype == torch.float32
+        and rawv_cache.dtype == torch.bfloat16
+        and rawk_cache.dtype == torch.bfloat16
+        and gk_cache.dtype == torch.float32
+        and beta_cache.dtype == torch.float32
+        and checkpoint_state.stride()[2:] == (V * K, K, 1)
+        and rawv_cache.stride()[2:] == (L * V, V, 1)
+        and rawk_cache.stride()[2:] == (L * K, K, 1)
+        and gk_cache.stride()[2:] == (L * K, K, 1)
+        and beta_cache.stride()[2:] == (L, 1)
+        and L % 4 == 0
+        and all(
+            t.data_ptr() % 16 == 0 and all(s % 4 == 0 for s in t.stride()[:2])
+            for t in (checkpoint_state, rawv_cache, rawk_cache, gk_cache, beta_cache)
+        )
+    )
+    if not ok:
+        _log_once(
+            "fast_fold_ineligible",
+            "KDA ReplaySSM fast fold requested but the pool layout does not fit "
+            "(state %s %s, rawv %s); keeping the Triton fold",
+            tuple(checkpoint_state.shape),
+            checkpoint_state.dtype,
+            rawv_cache.dtype,
+        )
+    return ok
+
+
+@functools.lru_cache(maxsize=None)
+def _jit_fast_fold(rows: int, stages: int, max_tok: int, threads: int, has_track: bool):
+    from sglang.kernels.jit.utils import load_jit
+
+    cls = (
+        f"sglang::kda_fold::KdaReplayFold<{rows}, {stages}, {max_tok}, {threads}, "
+        f"{str(has_track).lower()}>"
+    )
+    return load_jit(
+        "kda_replayssm_fold",
+        str(rows),
+        str(stages),
+        str(max_tok),
+        str(threads),
+        str(int(has_track)),
+        cuda_files=["mamba/kda_replayssm_fold.cuh"],
+        cuda_wrappers=[("run", f"{cls}::run")],
+    )
+
+
+def _commit_fast_fold(
+    checkpoint_state: torch.Tensor,
+    rawv_cache: torch.Tensor,
+    rawk_cache: torch.Tensor,
+    gk_cache: torch.Tensor,
+    beta_cache: torch.Tensor,
+    ssm_state_indices: torch.Tensor,
+    accept_lens: torch.Tensor,
+    mamba_track_indices: torch.Tensor | None,
+    mamba_steps_to_track: torch.Tensor | None,
+    null_block_id: int,
+) -> None:
+    has_track = mamba_track_indices is not None and mamba_steps_to_track is not None
+    device_index = checkpoint_state.device.index
+    module = _jit_fast_fold(
+        KDA_FAST_FOLD_ROWS,
+        KDA_FAST_FOLD_STAGES,
+        KDA_FAST_FOLD_MAX_TOK,
+        KDA_FAST_FOLD_THREADS,
+        has_track,
+    )
+    _log_once(
+        "fast_fold",
+        "KDA ReplaySSM commit: CUDA row fold (SGLANG_OPT_KDA_REPLAYSSM_FAST_FOLD, "
+        "%d rows x %d stages x %d threads, %d layers x %d heads, track=%s)",
+        KDA_FAST_FOLD_ROWS,
+        KDA_FAST_FOLD_STAGES,
+        KDA_FAST_FOLD_THREADS,
+        checkpoint_state.shape[0],
+        checkpoint_state.shape[2],
+        has_track,
+    )
+    module.run(
+        checkpoint_state,
+        rawv_cache,
+        rawk_cache,
+        gk_cache,
+        beta_cache,
+        ssm_state_indices,
+        accept_lens,
+        mamba_track_indices if has_track else ssm_state_indices,
+        mamba_steps_to_track if has_track else accept_lens,
+        int(null_block_id),
+        0,  # grid: every resident CTA
+        torch.cuda.current_stream(device_index).cuda_stream,
+    )
 
 
 @triton.jit
@@ -169,6 +337,291 @@ def kda_replayssm_exact_fold_kernel(
     tl.store(p_h0, b_h.to(p_h0.dtype.element_ty), mask=mask_h)
 
 
+# aria loop/d2-kda: the partner's K31HT_KDA_FOLD word (v15 package), kernels verbatim between the fences;
+# only the dispatch in commit_kda_replayssm_spec_all_layers and its engagement line are ours.
+# K31HT>>> KDA_FOLD
+# K31HT_KDA_FOLD=tp4: the stock fold body per 8-column V tile, KDA_FOLD_TP_VT consecutive tiles per one-warp program, with the
+# next tile's state load issued before the current tile's token chain (pipelines the state load under the chain). Each tile runs
+# the same op order as kda_replayssm_exact_fold_kernel, so the folded checkpoint (and the track snapshot) is bit-identical to it.
+KDA_FOLD_TP_VT = 4
+LAST_FOLD = {"form": None}
+
+
+@triton.jit
+def kda_replayssm_tp_fold_kernel(
+    h0,
+    rawv_cache,
+    rawk_cache,
+    gk_cache,
+    beta_cache,
+    ssm_state_indices,
+    accept_lens,
+    mamba_track_indices,
+    mamba_steps_to_track,
+    stride_state_slot: tl.constexpr,
+    stride_rawv_slot: tl.constexpr,
+    stride_rawk_slot: tl.constexpr,
+    stride_gk_slot: tl.constexpr,
+    stride_beta_slot: tl.constexpr,
+    stride_state_layer: tl.constexpr,
+    stride_rawv_layer: tl.constexpr,
+    stride_rawk_layer: tl.constexpr,
+    stride_gk_layer: tl.constexpr,
+    stride_beta_layer: tl.constexpr,
+    stride_indices: tl.constexpr,
+    stride_accept: tl.constexpr,
+    stride_track: tl.constexpr,
+    stride_steps: tl.constexpr,
+    H: tl.constexpr,
+    HV: tl.constexpr,
+    K: tl.constexpr,
+    V: tl.constexpr,
+    BK: tl.constexpr,
+    BV: tl.constexpr,
+    MAX_CACHE_LEN: tl.constexpr,
+    USE_QK_L2NORM_IN_KERNEL: tl.constexpr,
+    NULL_BLOCK_ID: tl.constexpr,
+    HAS_TRACK: tl.constexpr,
+    VT: tl.constexpr,
+):
+    i_vg = tl.program_id(0)
+    i_n = tl.program_id(1)
+    i_hvl = tl.program_id(2)
+    i_layer = (i_hvl // HV).to(tl.int64)
+    i_hv = i_hvl % HV
+    i_h = i_hv // (HV // H)
+    h0 = h0 + i_layer * stride_state_layer
+    rawv_cache = rawv_cache + i_layer * stride_rawv_layer
+    rawk_cache = rawk_cache + i_layer * stride_rawk_layer
+    gk_cache = gk_cache + i_layer * stride_gk_layer
+    beta_cache = beta_cache + i_layer * stride_beta_layer
+
+    state_idx = tl.load(ssm_state_indices + i_n * stride_indices).to(tl.int64)
+    if state_idx <= NULL_BLOCK_ID:
+        return
+    n_fold = tl.load(accept_lens + i_n * stride_accept).to(tl.int32)
+    if n_fold <= 0:
+        return
+    if HAS_TRACK:
+        trk_idx = tl.load(mamba_track_indices + i_n * stride_track).to(tl.int64)
+        trk_step = tl.load(mamba_steps_to_track + i_n * stride_steps).to(tl.int32)
+    else:
+        trk_idx = NULL_BLOCK_ID
+        trk_step = -1
+
+    o_k = tl.arange(0, BK)
+    mask_k = o_k < K
+    o_v = (i_vg * VT) * BV + tl.arange(0, BV)
+    mask_v = o_v < V
+    mask_h = mask_k[:, None] & mask_v[None, :]
+    p_tile = h0 + state_idx * stride_state_slot + i_hv * V * K + o_v[None, :] * K + o_k[:, None]
+    b_h = tl.load(p_tile, mask=mask_h, other=0.0).to(tl.float32)
+    for vt in tl.static_range(VT):
+        o_v = (i_vg * VT + vt) * BV + tl.arange(0, BV)
+        mask_v = o_v < V
+        mask_h = mask_k[:, None] & mask_v[None, :]
+        if vt + 1 < VT:
+            # host guarantees V % (BV * VT) == 0, so every tile is full and the current mask covers the next tile
+            pre_h = tl.load(p_tile + BV * K, mask=mask_h, other=0.0).to(tl.float32)
+        p_k = rawk_cache + state_idx * stride_rawk_slot + i_h * MAX_CACHE_LEN * K + o_k
+        p_v = rawv_cache + state_idx * stride_rawv_slot + i_hv * MAX_CACHE_LEN * V + o_v
+        p_g = gk_cache + state_idx * stride_gk_slot + i_hv * MAX_CACHE_LEN * K + o_k
+        p_b = beta_cache + state_idx * stride_beta_slot + i_hv * MAX_CACHE_LEN
+        nxt_k = tl.load(p_k, mask=mask_k, other=0.0)
+        nxt_v = tl.load(p_v, mask=mask_v, other=0.0)
+        nxt_g = tl.load(p_g, mask=mask_k, other=0.0)
+        nxt_b = tl.load(p_b)
+        for t in range(0, n_fold):
+            b_k = nxt_k.to(tl.float32)
+            b_v = nxt_v.to(tl.float32)
+            b_gk = nxt_g.to(tl.float32)
+            b_beta = nxt_b.to(tl.float32)
+            has_next = t + 1 < n_fold
+            nxt_k = tl.load(p_k + (t + 1) * K, mask=mask_k & has_next, other=0.0)
+            nxt_v = tl.load(p_v + (t + 1) * V, mask=mask_v & has_next, other=0.0)
+            nxt_g = tl.load(p_g + (t + 1) * K, mask=mask_k & has_next, other=0.0)
+            nxt_b = tl.load(p_b + (t + 1), mask=has_next, other=0.0)
+
+            # --- verbatim recurrent update, IS_KDA branch (same as kda_replayssm_exact_fold_kernel) ---
+            if USE_QK_L2NORM_IN_KERNEL:
+                b_k = b_k / (tl.sqrt(tl.sum(b_k * b_k) + 1e-6))
+            b_h *= tl.exp(b_gk[:, None])
+            b_v -= tl.sum(b_h * b_k[:, None], 0)
+            b_v *= b_beta
+            b_h += b_k[:, None] * b_v[None, :]
+
+            if HAS_TRACK:
+                if (t == trk_step) and (trk_idx > NULL_BLOCK_ID):
+                    tl.store(
+                        h0
+                        + trk_idx * stride_state_slot
+                        + i_hv * V * K
+                        + o_v[None, :] * K
+                        + o_k[:, None],
+                        b_h.to(h0.dtype.element_ty),
+                        mask=mask_h,
+                    )
+        tl.store(p_tile, b_h.to(p_tile.dtype.element_ty), mask=mask_h)
+        if vt + 1 < VT:
+            b_h = pre_h
+            p_tile = p_tile + BV * K
+
+
+# K31HT_KDA_FOLD=tp4rm: kda_replayssm_tp_fold_kernel with a request-major grid (V-groups, layer * head, request): the same
+# per-program body and op order (bit-identical result); one request's programs dispatch together, which removes most of TP4's
+# ragged-accept penalty (ckda155). Renamed so a profile shows which form ran.
+@triton.jit
+def kda_replayssm_tp_fold_rm_kernel(
+    h0,
+    rawv_cache,
+    rawk_cache,
+    gk_cache,
+    beta_cache,
+    ssm_state_indices,
+    accept_lens,
+    mamba_track_indices,
+    mamba_steps_to_track,
+    stride_state_slot: tl.constexpr,
+    stride_rawv_slot: tl.constexpr,
+    stride_rawk_slot: tl.constexpr,
+    stride_gk_slot: tl.constexpr,
+    stride_beta_slot: tl.constexpr,
+    stride_state_layer: tl.constexpr,
+    stride_rawv_layer: tl.constexpr,
+    stride_rawk_layer: tl.constexpr,
+    stride_gk_layer: tl.constexpr,
+    stride_beta_layer: tl.constexpr,
+    stride_indices: tl.constexpr,
+    stride_accept: tl.constexpr,
+    stride_track: tl.constexpr,
+    stride_steps: tl.constexpr,
+    H: tl.constexpr,
+    HV: tl.constexpr,
+    K: tl.constexpr,
+    V: tl.constexpr,
+    BK: tl.constexpr,
+    BV: tl.constexpr,
+    MAX_CACHE_LEN: tl.constexpr,
+    USE_QK_L2NORM_IN_KERNEL: tl.constexpr,
+    NULL_BLOCK_ID: tl.constexpr,
+    HAS_TRACK: tl.constexpr,
+    VT: tl.constexpr,
+):
+    i_vg = tl.program_id(0)
+    i_n = tl.program_id(2)
+    i_hvl = tl.program_id(1)
+    i_layer = (i_hvl // HV).to(tl.int64)
+    i_hv = i_hvl % HV
+    i_h = i_hv // (HV // H)
+    h0 = h0 + i_layer * stride_state_layer
+    rawv_cache = rawv_cache + i_layer * stride_rawv_layer
+    rawk_cache = rawk_cache + i_layer * stride_rawk_layer
+    gk_cache = gk_cache + i_layer * stride_gk_layer
+    beta_cache = beta_cache + i_layer * stride_beta_layer
+
+    state_idx = tl.load(ssm_state_indices + i_n * stride_indices).to(tl.int64)
+    if state_idx <= NULL_BLOCK_ID:
+        return
+    n_fold = tl.load(accept_lens + i_n * stride_accept).to(tl.int32)
+    if n_fold <= 0:
+        return
+    if HAS_TRACK:
+        trk_idx = tl.load(mamba_track_indices + i_n * stride_track).to(tl.int64)
+        trk_step = tl.load(mamba_steps_to_track + i_n * stride_steps).to(tl.int32)
+    else:
+        trk_idx = NULL_BLOCK_ID
+        trk_step = -1
+
+    o_k = tl.arange(0, BK)
+    mask_k = o_k < K
+    o_v = (i_vg * VT) * BV + tl.arange(0, BV)
+    mask_v = o_v < V
+    mask_h = mask_k[:, None] & mask_v[None, :]
+    p_tile = h0 + state_idx * stride_state_slot + i_hv * V * K + o_v[None, :] * K + o_k[:, None]
+    b_h = tl.load(p_tile, mask=mask_h, other=0.0).to(tl.float32)
+    for vt in tl.static_range(VT):
+        o_v = (i_vg * VT + vt) * BV + tl.arange(0, BV)
+        mask_v = o_v < V
+        mask_h = mask_k[:, None] & mask_v[None, :]
+        if vt + 1 < VT:
+            # host guarantees V % (BV * VT) == 0, so every tile is full and the current mask covers the next tile
+            pre_h = tl.load(p_tile + BV * K, mask=mask_h, other=0.0).to(tl.float32)
+        p_k = rawk_cache + state_idx * stride_rawk_slot + i_h * MAX_CACHE_LEN * K + o_k
+        p_v = rawv_cache + state_idx * stride_rawv_slot + i_hv * MAX_CACHE_LEN * V + o_v
+        p_g = gk_cache + state_idx * stride_gk_slot + i_hv * MAX_CACHE_LEN * K + o_k
+        p_b = beta_cache + state_idx * stride_beta_slot + i_hv * MAX_CACHE_LEN
+        nxt_k = tl.load(p_k, mask=mask_k, other=0.0)
+        nxt_v = tl.load(p_v, mask=mask_v, other=0.0)
+        nxt_g = tl.load(p_g, mask=mask_k, other=0.0)
+        nxt_b = tl.load(p_b)
+        for t in range(0, n_fold):
+            b_k = nxt_k.to(tl.float32)
+            b_v = nxt_v.to(tl.float32)
+            b_gk = nxt_g.to(tl.float32)
+            b_beta = nxt_b.to(tl.float32)
+            has_next = t + 1 < n_fold
+            nxt_k = tl.load(p_k + (t + 1) * K, mask=mask_k & has_next, other=0.0)
+            nxt_v = tl.load(p_v + (t + 1) * V, mask=mask_v & has_next, other=0.0)
+            nxt_g = tl.load(p_g + (t + 1) * K, mask=mask_k & has_next, other=0.0)
+            nxt_b = tl.load(p_b + (t + 1), mask=has_next, other=0.0)
+
+            # --- verbatim recurrent update, IS_KDA branch (same as kda_replayssm_exact_fold_kernel) ---
+            if USE_QK_L2NORM_IN_KERNEL:
+                b_k = b_k / (tl.sqrt(tl.sum(b_k * b_k) + 1e-6))
+            b_h *= tl.exp(b_gk[:, None])
+            b_v -= tl.sum(b_h * b_k[:, None], 0)
+            b_v *= b_beta
+            b_h += b_k[:, None] * b_v[None, :]
+
+            if HAS_TRACK:
+                if (t == trk_step) and (trk_idx > NULL_BLOCK_ID):
+                    tl.store(
+                        h0
+                        + trk_idx * stride_state_slot
+                        + i_hv * V * K
+                        + o_v[None, :] * K
+                        + o_k[:, None],
+                        b_h.to(h0.dtype.element_ty),
+                        mask=mask_h,
+                    )
+        tl.store(p_tile, b_h.to(p_tile.dtype.element_ty), mask=mask_h)
+        if vt + 1 < VT:
+            b_h = pre_h
+            p_tile = p_tile + BV * K
+
+
+# K31HT<<<
+
+# K31HT>>> KDA_FOLD
+_K31HT_KDA_FOLD_FORMS = ("", "0", "tp4", "tp4rm")
+_k31ht_kda_fold_logged: set = set()
+
+
+@lru_cache(maxsize=1)
+def _k31ht_kda_fold_form() -> str:
+    form = os.environ.get("K31HT_KDA_FOLD", "0").strip()
+    if form not in _K31HT_KDA_FOLD_FORMS:
+        raise ValueError(f"K31HT_KDA_FOLD: unset | 0 | tp4 | tp4rm; got {form!r}")
+    return form
+
+
+def _log_k31ht_kda_fold_engaged(form: str, bv: int, grid: tuple) -> None:
+    if form in _k31ht_kda_fold_logged:
+        return
+    _k31ht_kda_fold_logged.add(form)
+    logging.getLogger(__name__).info(
+        "KDA ReplaySSM fold: K31HT_KDA_FOLD=%s engaged (BV %d x VT %d per one-warp program, grid %s; "
+        "bitwise to the exact fold; aria loop/d2-kda)",
+        form,
+        bv,
+        KDA_FOLD_TP_VT,
+        grid,
+    )
+
+
+# K31HT<<<
+
+
 def commit_kda_replayssm_spec(
     checkpoint_state: torch.Tensor,  # [num_slots, HV, V, K] fp32, folded in place
     rawv_cache: torch.Tensor,  # [num_slots, HV, L, V]
@@ -195,7 +648,7 @@ def commit_kda_replayssm_spec(
     num_slots, HV, V, K = checkpoint_state.shape
     B = ssm_state_indices.shape[0]
     BK = triton.next_power_of_2(K)
-    BV = min(triton.next_power_of_2(V), KDA_FOLD_BLOCK_V)
+    BV = min(triton.next_power_of_2(V), _fold_block_v())
     grid = (triton.cdiv(V, BV), B, HV)
     has_track = mamba_track_indices is not None and mamba_steps_to_track is not None
     if has_track:
@@ -261,6 +714,7 @@ def commit_kda_replayssm_spec_all_layers(
     mamba_steps_to_track: torch.Tensor | None = None,
     use_qk_l2norm_in_kernel: bool = True,
     null_block_id: int = 0,
+    fold: str | None = None,  # K31HT:KDA_FOLD
 ) -> None:
     """Fold every layer's accepted window in a single launch.
 
@@ -271,10 +725,26 @@ def commit_kda_replayssm_spec_all_layers(
     the same per-slot recurrent replay. ssm_state_indices / accept_lens / track
     are per-request and shared across layers.
     """
+    if use_qk_l2norm_in_kernel and _fast_fold_eligible(
+        checkpoint_state, rawv_cache, rawk_cache, gk_cache, beta_cache
+    ):
+        _commit_fast_fold(
+            checkpoint_state,
+            rawv_cache,
+            rawk_cache,
+            gk_cache,
+            beta_cache,
+            ssm_state_indices,
+            accept_lens,
+            mamba_track_indices,
+            mamba_steps_to_track,
+            null_block_id,
+        )
+        return
     num_layers, num_slots, HV, V, K = checkpoint_state.shape
     B = ssm_state_indices.shape[0]
     BK = triton.next_power_of_2(K)
-    BV = min(triton.next_power_of_2(V), KDA_FOLD_BLOCK_V)
+    BV = min(triton.next_power_of_2(V), _fold_block_v())
     grid = (triton.cdiv(V, BV), B, HV * num_layers)
     has_track = mamba_track_indices is not None and mamba_steps_to_track is not None
     if has_track:
@@ -287,6 +757,57 @@ def commit_kda_replayssm_spec_all_layers(
         steps_t = accept_lens
         stride_track = 0
         stride_steps = 0
+    # K31HT>>> KDA_FOLD
+    fold_knob = _k31ht_kda_fold_form() if fold is None else fold
+    # The partner's tile (BV 8 x VT 4), not the SGLANG_K31_KDA_FOLD_BLOCK_V override: the D2 bench timed this form.
+    tp_bv = min(triton.next_power_of_2(V), KDA_FOLD_BLOCK_V)
+    if fold_knob in ("tp4", "tp4rm") and V % (tp_bv * KDA_FOLD_TP_VT) == 0:
+        rm = fold_knob == "tp4rm"
+        kernel = kda_replayssm_tp_fold_rm_kernel if rm else kda_replayssm_tp_fold_kernel
+        n_vg = V // (tp_bv * KDA_FOLD_TP_VT)
+        tp_grid = (n_vg, HV * num_layers, B) if rm else (n_vg, B, HV * num_layers)
+        kernel[tp_grid](
+            checkpoint_state,
+            rawv_cache,
+            rawk_cache,
+            gk_cache,
+            beta_cache,
+            ssm_state_indices,
+            accept_lens,
+            track_idx_t,
+            steps_t,
+            checkpoint_state.stride(1),
+            rawv_cache.stride(1),
+            rawk_cache.stride(1),
+            gk_cache.stride(1),
+            beta_cache.stride(1),
+            checkpoint_state.stride(0),
+            rawv_cache.stride(0),
+            rawk_cache.stride(0),
+            gk_cache.stride(0),
+            beta_cache.stride(0),
+            ssm_state_indices.stride(0),
+            accept_lens.stride(0),
+            stride_track,
+            stride_steps,
+            H=num_k_heads,
+            HV=HV,
+            K=K,
+            V=V,
+            BK=BK,
+            BV=tp_bv,
+            MAX_CACHE_LEN=max_cache_len,
+            USE_QK_L2NORM_IN_KERNEL=use_qk_l2norm_in_kernel,
+            NULL_BLOCK_ID=null_block_id,
+            HAS_TRACK=has_track,
+            VT=KDA_FOLD_TP_VT,
+            num_warps=1,
+            num_stages=3,
+        )
+        LAST_FOLD["form"] = fold_knob
+        _log_k31ht_kda_fold_engaged(fold_knob, tp_bv, tp_grid)
+        return
+    # K31HT<<<
     kda_replayssm_exact_fold_kernel[grid](
         checkpoint_state,
         rawv_cache,

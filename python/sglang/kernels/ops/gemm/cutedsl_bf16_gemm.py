@@ -27,6 +27,8 @@ Warp specialization (8 warps, 256 threads/CTA; warp 3 idle):
 from __future__ import annotations
 
 import bisect
+import logging
+import threading
 from typing import List, NamedTuple, Optional, Tuple, Type
 
 import cuda.bindings.driver as cuda
@@ -1434,6 +1436,77 @@ def _model_takes_tgv(m: int, n: int, k: int) -> bool:
 def _model_tgv_tactic(m: int, n: int, k: int) -> Optional[int]:
     m_ranges = _MODEL_TGV_M_RANGES.get((n, k))
     return None if m_ranges is None else m_ranges(m)
+
+
+# (n, k) -> the m ranges a model routes to cuBLASLt instead of cuBLAS (torch's
+# default BLAS library) where cuBLAS's heuristic lands in a slow window and
+# neither TGV nor cuBLAS is the best pick (Kimi-K3.1 SM107 NDT=5 rows). Empty
+# unless a model registers ranges; a range is a TGVMRanges with no tactic.
+_MODEL_CUBLASLT_M_RANGES: dict[tuple[int, int], TGVMRanges] = {}
+
+
+def register_cublaslt_m_ranges(
+    shapes: dict[tuple[int, int], tuple[tuple[int, int], ...]],
+) -> None:
+    """Route a model's dense-GEMM shapes ``(n, k)`` to cuBLASLt for the given
+    ``(m_lo, m_hi)`` ranges, for every caller of the shape that goes through
+    the BF16 dispatch. Overlaps raise, as for register_tgv_m_ranges."""
+    for shape, ranges in shapes.items():
+        m_ranges = _MODEL_CUBLASLT_M_RANGES.setdefault(shape, TGVMRanges())
+        for m_lo, m_hi in ranges:
+            m_ranges.append(m_lo=m_lo, m_hi=m_hi, tactic=None)
+
+
+def use_cublaslt_bf16_gemm(m: int, n: int, k: int) -> bool:
+    """Whether a model registered this (m, n, k) for cuBLASLt. One dict lookup
+    for a shape nothing registered."""
+    m_ranges = _MODEL_CUBLASLT_M_RANGES.get((n, k))
+    return m_ranges is not None and m > 0 and m in m_ranges
+
+
+_CUBLASLT_THREAD: list = [None]
+
+
+def _cublaslt_enter() -> object:
+    """Switch torch's BLAS library to cuBLASLt (a process-global setting) and return the previous
+    one. Only the forward thread may launch dispatch GEMMs while it is switched; a call from a
+    second thread logs one warning."""
+    ident = threading.get_ident()
+    if _CUBLASLT_THREAD[0] is None:
+        _CUBLASLT_THREAD[0] = ident
+    elif _CUBLASLT_THREAD[0] != ident:
+        _CUBLASLT_THREAD[0] = ident
+        logging.getLogger(__name__).warning(
+            "cuBLASLt m-range GEMM launched from a second thread; the BLAS library switch "
+            "is process-global"
+        )
+    prev = torch.backends.cuda.preferred_blas_library()
+    torch.backends.cuda.preferred_blas_library("cublaslt")
+    return prev
+
+
+def cublaslt_bf16_linear(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    """``F.linear(x, weight)`` (no bias) with torch's BLAS library set to
+    cuBLASLt for the call. The library choice is read on the host when the GEMM
+    is launched, so a CUDA graph captures the cuBLASLt kernel; the setting is
+    restored before returning."""
+    prev = _cublaslt_enter()
+    try:
+        return torch.nn.functional.linear(x, weight)
+    finally:
+        torch.backends.cuda.preferred_blas_library(prev)
+
+
+def cublaslt_bf16_mm_out(
+    x: torch.Tensor, weight: torch.Tensor, out: torch.Tensor
+) -> torch.Tensor:
+    """``torch.mm(x, weight.t(), out=out)`` under cuBLASLt, as cublaslt_bf16_linear
+    (the caller-owned-output path, UnquantizedLinearMethod.apply_into)."""
+    prev = _cublaslt_enter()
+    try:
+        return torch.mm(x, weight.t(), out=out)
+    finally:
+        torch.backends.cuda.preferred_blas_library(prev)
 
 
 # MuseSpark TP4/TP8 projections using TGV on GB300; other M use cuBLAS.

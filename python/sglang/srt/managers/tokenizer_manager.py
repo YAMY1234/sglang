@@ -209,6 +209,141 @@ _REQUEST_STATE_WAIT_TIMEOUT = envs.SGLANG_REQUEST_STATE_WAIT_TIMEOUT.get()
 
 logger = logging.getLogger(__name__)
 
+# aria-op H683 (run k31-vr200-sglang-1029; default off): cyclic GC in the process
+# that serves generate_request (the PD decode's Dynamo main process). Dynamo serves
+# through sgl.Engine, so launch_server's post-warmup freeze_gc never runs (Dynamo
+# 1.6.0 has no DYN_SGL_FREEZE_GC_AFTER_INIT: ai-dynamo/dynamo#15203, #16761,
+# v1.6.2 #17967), and every full collection walks the ~1.2M-object startup heap
+# plus each element of every live prompt list (AgentX: ~130k tokens a request).
+# SGLANG_K31_DECODE_GC_FREEZE=N (N >= 1) in this process:
+#  * untracks each request's prompt list (obj.input_ids, a list of ints; under
+#    Dynamo the same object as the request's token_ids). A list of ints cannot be
+#    part of a reference cycle (CPython untracks atomic-only tuples and dicts the
+#    same way); reference counting still frees it;
+#  * at the N-th generate_request: gc.collect(), gc.freeze() (as SGLang's
+#    freeze_gc and Dynamo's _freeze_worker_gc_after_init), then one more full
+#    collection so the full-GC 25% rule counts only unfrozen objects;
+#  * logs one gen2 summary per minute (count, max, sum, collected).
+# GC bookkeeping only: no output, sampling or token-order change.
+def _k31_decode_gc_env() -> int:
+    raw = os.environ.get("SGLANG_K31_DECODE_GC_FREEZE", "").strip()
+    if raw in ("", "0"):
+        return 0
+    try:
+        after = int(raw)
+    except ValueError:
+        after = -1
+    if after < 1:
+        logger.warning(
+            "K31 decode gc freeze: ignoring SGLANG_K31_DECODE_GC_FREEZE=%r "
+            "(need an integer >= 1); stays off",
+            raw,
+        )
+        return 0
+    return after
+
+
+_K31_DECODE_GC_FREEZE_AT = _k31_decode_gc_env()
+_k31_decode_gc = {"seen": 0, "untracked": 0, "frozen": 0, "untrack": None, "off": False}
+
+
+def _k31_decode_gc_install_summary() -> None:
+    """One gen2 summary line per minute with a full collection in it."""
+    import gc
+
+    win = {
+        "t0": time.monotonic(),
+        "start": 0.0,
+        "n": 0,
+        "sum": 0.0,
+        "max": 0.0,
+        "coll": 0,
+    }
+
+    def _gen2_summary(phase, info):
+        if info.get("generation") != 2:
+            return
+        if phase == "start":
+            win["start"] = time.perf_counter()
+            return
+        took = time.perf_counter() - win["start"]
+        win["n"] += 1
+        win["sum"] += took
+        win["max"] = max(win["max"], took)
+        win["coll"] += info.get("collected", 0)
+        now = time.monotonic()
+        if now - win["t0"] >= 60.0:
+            logger.info(
+                "K31 decode gc gen2 in %.0f s: n=%d max=%.3f s sum=%.3f s "
+                "collected=%d frozen=%d untracked_prompts=%d",
+                now - win["t0"],
+                win["n"],
+                win["max"],
+                win["sum"],
+                win["coll"],
+                _k31_decode_gc["frozen"],
+                _k31_decode_gc["untracked"],
+            )
+            win.update(t0=now, n=0, sum=0.0, max=0.0, coll=0)
+
+    gc.callbacks.append(_gen2_summary)
+
+
+def _k31_decode_gc_tick(obj, owner: str) -> None:
+    """Untrack this request's prompt list(s); freeze the heap at the N-th request."""
+    state = _k31_decode_gc
+    if state["off"]:
+        return
+    try:
+        if state["untrack"] is None:
+            import ctypes
+
+            untrack = ctypes.pythonapi.PyObject_GC_UnTrack
+            untrack.argtypes = [ctypes.py_object]
+            untrack.restype = None
+            state["untrack"] = untrack
+            _k31_decode_gc_install_summary()
+        ids = obj.input_ids
+        if type(ids) is list and ids:
+            if type(ids[0]) is int:
+                state["untrack"](ids)
+                state["untracked"] += 1
+            else:
+                for one in ids:
+                    if type(one) is list and one and type(one[0]) is int:
+                        state["untrack"](one)
+                        state["untracked"] += 1
+        if state["seen"] >= _K31_DECODE_GC_FREEZE_AT:
+            return
+        state["seen"] += 1
+        if state["seen"] < _K31_DECODE_GC_FREEZE_AT:
+            return
+        import gc
+
+        tic = time.perf_counter()
+        collected = gc.collect()
+        gc.freeze()
+        gc.collect()
+        state["frozen"] = gc.get_freeze_count()
+        logger.warning(
+            "K31 decode gc freeze on: frozen=%d objects (pid %d, %s, request %d; "
+            "collected %d first; gc threshold %s; prompt lists untracked so far %d; "
+            "took %.3f s)",
+            state["frozen"],
+            os.getpid(),
+            owner,
+            state["seen"],
+            collected,
+            gc.get_threshold(),
+            state["untracked"],
+            time.perf_counter() - tic,
+        )
+    except Exception:
+        state["off"] = True
+        logger.warning(
+            "K31 decode gc freeze failed; off, serving continues", exc_info=True
+        )
+
 
 def _validate_watermark_request(sampling_params: SamplingParams) -> None:
     watermark = sampling_params.watermark
@@ -901,6 +1036,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
         # Normalize the request
         obj.normalize_batch_and_arguments()
+        if _K31_DECODE_GC_FREEZE_AT:
+            _k31_decode_gc_tick(obj, type(self).__name__)
         self._set_default_priority(obj)
         if (
             isinstance(obj, GenerateReqInput)
