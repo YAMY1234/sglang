@@ -176,9 +176,9 @@ class TestBranchTrackSplit(unittest.TestCase):
             mamba_branching_seqlen=branching, full_untruncated_fill_ids=[1] * input_len
         )
 
-    def _split(self, adder, req, prefix_len=4096, extend_len=4000):
+    def _split(self, adder, req, prefix_len=4096, extend_len=4000, has_chunked=False):
         with get_context().override_server_args(_mamba_cache_chunk_size=CHUNK):
-            return adder._branch_split_len(req, prefix_len, extend_len)
+            return adder._branch_split_len(req, prefix_len, extend_len, has_chunked)
 
     def test_off_by_default(self):
         self.assertIsNone(self._split(self._adder(), self._req(6144)))
@@ -196,6 +196,10 @@ class TestBranchTrackSplit(unittest.TestCase):
             self.assertIsNone(self._split(self._adder(), self._req(4096 + 32)))
             # another request already holds this batch's one chunked slot
             self.assertIsNone(self._split(self._adder(object()), self._req(6144)))
+            # or the scheduler's chunked request is still unfinished
+            self.assertIsNone(
+                self._split(self._adder(), self._req(6144), has_chunked=True)
+            )
 
     def test_the_cut_forward_tracks_k_and_the_next_one_the_input_end(self):
         args = dict(tree_page=CHUNK, input_len=8096)

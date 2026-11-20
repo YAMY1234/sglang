@@ -1035,12 +1035,17 @@ class PrefillAdder:
         return trunc_len // self.mamba_chunk_grid * self.mamba_chunk_grid or trunc_len
 
     def _branch_split_len(
-        self, req: Req, prefix_len: int, extend_len: int
+        self, req: Req, prefix_len: int, extend_len: int, has_chunked_req: bool
     ) -> Optional[int]:
         """SGLANG_MAMBA_BRANCH_TRACK_SPLIT: the extend length that ends this forward at
         the branching point, when the forward would otherwise end the input (where the
-        branching point would take the input end's track); else None."""
-        if not envs.SGLANG_MAMBA_BRANCH_TRACK_SPLIT.get() or self.new_chunked_req:
+        branching point would take the input end's track); else None. The cut makes req
+        a chunked request, so none while another one is unfinished (has_chunked_req)."""
+        if (
+            not envs.SGLANG_MAMBA_BRANCH_TRACK_SPLIT.get()
+            or has_chunked_req
+            or self.new_chunked_req
+        ):
             return None
         k = req.mamba_branching_seqlen
         if k is None or prefix_len + extend_len < len(req.full_untruncated_fill_ids):
@@ -1378,7 +1383,8 @@ class PrefillAdder:
         )
         branch_split = False
         if not truncated and self.dllm_config is None:
-            split = self._branch_split_len(req, req.prefix_len, new_len)
+            # req is the scheduler's chunked request itself
+            split = self._branch_split_len(req, req.prefix_len, new_len, False)
             if split is not None:
                 new_len, truncated, branch_split = split, True, True
         request_slot_reserve = self._request_slot_reserve_for_req(
@@ -1884,7 +1890,7 @@ class PrefillAdder:
 
         branch_split = False
         if not is_chunked and self.dllm_config is None:
-            split = self._branch_split_len(req, prefix_len, extend_len)
+            split = self._branch_split_len(req, prefix_len, extend_len, has_chunked_req)
             if split is not None:
                 extend_len, is_chunked, max_new_tokens = split, True, 0
                 branch_split = True
