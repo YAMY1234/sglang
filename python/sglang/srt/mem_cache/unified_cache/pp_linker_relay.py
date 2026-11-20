@@ -475,9 +475,12 @@ class PPLinkerRelay:
             elif entry.phase == "load":
                 votes = self.store.collect(self._key(entry))
                 if getattr(w, "early", None) is not None:
-                    # A stage's early vote (landed only) stands in for its normal one.
+                    # A stage's early vote (landed only) stands in for its normal one,
+                    # except PP0's: every stage refuses a load's private slots at the same
+                    # relay position, and PP0's normal vote, cast once its load applied,
+                    # carries that refusal (an early vote does not).
                     early = self.store.collect(self._early_key(self.epoch, entry.cycle))
-                    votes = [e if e is not None else v for e, v in zip(early, votes)]
+                    votes = votes[:1] + [e if e is not None else v for e, v in zip(early[1:], votes[1:])]
                 if any(v is None for v in votes):
                     continue
                 publish = (
