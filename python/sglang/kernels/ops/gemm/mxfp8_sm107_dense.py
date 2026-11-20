@@ -1883,8 +1883,10 @@ DECODE_TABLE: dict = {
 # (40-layer CUDA-graph chains of real weights, bitwise to the served tactic).
 DECODE_TABLE_BUCKETS: dict = {
     # q_a | kv, 1792 x 5120
+    # one tactic for every M: within 5% of the per-M best (the per-M picks are ties standalone and (2, 2) lost
+    # 0.5 us per call in situ at M 544)
     (1792, 5120): {
-        288: ((256, 64), (2, 1), True, 256),
+        288: ((256, 64), (2, 4), False, 256),
         312: ((256, 64), (2, 4), False, 256),
         336: ((256, 64), (2, 4), False, 256),
         360: ((256, 64), (2, 4), False, 256),
@@ -1898,10 +1900,10 @@ DECODE_TABLE_BUCKETS: dict = {
         504: ((256, 64), (2, 4), False, 256),
         512: ((256, 64), (2, 4), False, 256),
         528: ((256, 64), (2, 4), False, 256),
-        544: ((256, 64), (2, 2), True, 256),
+        544: ((256, 64), (2, 4), False, 256),
         576: ((256, 64), (2, 4), False, 256),
         608: ((256, 64), (2, 4), False, 256),
-        640: ((256, 64), (2, 2), True, 256),
+        640: ((256, 64), (2, 4), False, 256),
         672: ((256, 64), (2, 4), False, 256),
         704: ((256, 64), (2, 4), False, 256),
     },
