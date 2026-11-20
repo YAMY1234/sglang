@@ -366,7 +366,22 @@ class TestDecodePreallocCap(CustomTestCase):
 
         self.assertEqual(queue.queue, [second])
         self.assertEqual(
-            queue.prealloc_break_counts, Counter(cap=1, kv_fit=1, metadata=1)
+            queue.prealloc_break_counts,
+            Counter(passes=3, cap=1, kv_fit=1, metadata=1),
+        )
+
+    def test_break_diag_counts_ready_entries_left_behind(self):
+        # A late long request that does not fit stops the pass (head-of-line):
+        # the ready short request behind it waits too.
+        long_, short = _waiting_decode_req("long"), _waiting_decode_req("short")
+        queue = self._queue([long_, short], reserved=[])
+        queue.prealloc_break_counts = Counter()
+        queue._prealloc_reservation_fits.return_value = False
+
+        self.assertEqual(self._pop(queue, cap=None), ([], []))
+        self.assertEqual(queue.queue, [long_, short])
+        self.assertEqual(
+            queue.prealloc_break_counts, Counter(passes=1, kv_fit=1, blocked_ready=1)
         )
 
     def test_break_diag_off_keeps_no_counts(self):

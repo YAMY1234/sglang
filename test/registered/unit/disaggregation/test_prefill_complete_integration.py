@@ -770,6 +770,7 @@ class TestAllocationIntegration(CustomTestCase):
         long_.disagg_kv_sender.mark_prefill_complete.assert_not_called()
         self.assertTrue(long_.disagg_ready_checked)
         self.assertIn("early readiness (MIN_WORK_TOKENS 64): 1 of 2 requests", logs.output[0])
+        self.assertIn("late uncached work p50 64 p90 64 max 64", logs.output[0])
 
     def test_min_work_tokens_readies_at_the_handshake(self):
         # Decode allocates while the request waits in the bootstrap and waiting
