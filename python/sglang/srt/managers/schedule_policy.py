@@ -95,7 +95,7 @@ CLIP_MAX_NEW_TOKENS = int(
     os.environ.get("SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION", "4096")
 )
 
-# Under SGLANG_SPF_FAST_MATCH, re-match an unchanged waiting queue at least this often.
+# Under SGLANG_SPF_SKIP_UNCHANGED, re-match an unchanged waiting queue at least this often.
 MAX_SKIPPED_MATCH_PASSES = 16
 
 
@@ -215,7 +215,8 @@ class SchedulePolicy:
         self._shortest_prefill_calls = 0
         self._waiting_prefix_refresh_calls = 0
         self.fast_match = envs.SGLANG_SPF_FAST_MATCH.get()
-        # The queue and cache state the last cache-aware sort saw (fast match only).
+        self.skip_unchanged = envs.SGLANG_SPF_SKIP_UNCHANGED.get()
+        # The queue and cache state the last cache-aware sort saw (skip only).
         self._matched_policy: Optional[CacheAwarePolicy] = None
         self._matched_queue: List[Req] = []
         self._matched_state = None
@@ -338,7 +339,7 @@ class SchedulePolicy:
     def _remember_matched_queue(
         self, waiting_queue: List[Req], policy: CacheAwarePolicy
     ) -> None:
-        if not self.fast_match or policy not in (
+        if not self.skip_unchanged or policy not in (
             CacheAwarePolicy.LPM,
             CacheAwarePolicy.SHORTEST_PREFILL_FIRST,
         ):

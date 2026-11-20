@@ -200,7 +200,9 @@ class TestShortestPrefillFirst(CustomTestCase):
                 pass
 
         def make_policy(fast):
-            with patch.object(envs.SGLANG_SPF_FAST_MATCH, "get", return_value=fast):
+            with patch.object(
+                envs.SGLANG_SPF_FAST_MATCH, "get", return_value=fast
+            ), patch.object(envs.SGLANG_SPF_SKIP_UNCHANGED, "get", return_value=fast):
                 return SchedulePolicy(
                     policy="shortest-prefill-first",
                     tree_cache=RadixCache.create_simulated(mock_allocator=Allocator()),

@@ -1112,10 +1112,12 @@ class Envs:
     SGLANG_LINKER_EARLY_STRICT = EnvBool(False)
     # Debug: a directory for per-rank scheduler stage-span traces ("" off; needs --enable-metrics).
     SGLANG_SCHED_STAGE_TRACE_DIR = EnvStr("")
-    # Scheduling: cheaper prefix matching for the cache-aware policies. No per-pass
-    # copy of each waiting prompt, and LPM / shortest-prefill-first skip a pass when
-    # neither the queue nor the cache's match state changed. Same matches and order.
+    # Scheduling: cache-aware prefix matching without a per-pass copy of each
+    # waiting prompt. Same matches and order.
     SGLANG_SPF_FAST_MATCH = EnvBool(False)
+    # Scheduling: LPM / shortest-prefill-first skip a pass when neither the queue
+    # nor the cache's match state changed. Same matches and order.
+    SGLANG_SPF_SKIP_UNCHANGED = EnvBool(False)
     SGLANG_LINKER_EARLY_STATES = EnvInt(32)
     SGLANG_LINKER_HELPER = EnvBool(False)
     SGLANG_LINKER_HELPER_SEGMENT_MB = EnvInt(0)
