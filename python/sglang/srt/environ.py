@@ -906,6 +906,11 @@ class Envs:
     # attention TP groups (and DCP) are wider: each prefill room takes every
     # rank of the decode group, which relays out KV as with early.
     SGLANG_PREFILL_COMPLETE_ALLOW_MULTI_ENDPOINT = EnvBool(False)
+    # prefill_complete, prefill only: a request whose uncached prompt tokens are fewer
+    # than this tells decode it is ready at its first prefill batch, so decode reserves
+    # its KV as under early; 0 (default) keeps every request's reservation until
+    # prefill completes.
+    SGLANG_PREFILL_COMPLETE_MIN_WORK_TOKENS = EnvInt(0)
 
     # ===================================================================
     # Distributed and model-parallel runtime

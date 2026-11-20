@@ -1635,6 +1635,17 @@ class SchedulerDisaggregationPrefillMixin:
             if last_batch.batch_size() < last_bs:
                 running_batch.batch_is_full = False
 
+    def maybe_send_early_readiness(self: Scheduler, req: Req) -> None:
+        """SGLANG_PREFILL_COMPLETE_MIN_WORK_TOKENS: at a request's first batch, tell decode it
+        is ready when its uncached work is below the threshold, so decode reserves its KV as
+        under early; other requests wait for prefill to complete (mark_prefill_complete)."""
+        if req.disagg_ready_checked or not req.pending_bootstrap:
+            return
+        req.disagg_ready_checked = True
+        threshold = envs.SGLANG_PREFILL_COMPLETE_MIN_WORK_TOKENS.get()
+        if threshold > 0 and len(req.origin_input_ids) - req.num_matched_prefix_tokens < threshold:
+            req.disagg_kv_sender.mark_prefill_complete()
+
     def maybe_send_cached_prefix_chunk(
         self: Scheduler, req: Req, allow_send: bool = True
     ) -> None:

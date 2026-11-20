@@ -1452,6 +1452,8 @@ class Req(ReqDllmMixin):
         # Used in overlap sequence to signal that an optimistic request should
         # abort chunking. Set in create_sender, consumed in process_batch_result.
         self.pending_bootstrap = False
+        # prefill_complete: SGLANG_PREFILL_COMPLETE_MIN_WORK_TOKENS was applied at the first batch.
+        self.disagg_ready_checked = False
         # Number of optimistic prefill forward passes started. preserved across retracts.
         self.prefill_attempt_count = 0
 

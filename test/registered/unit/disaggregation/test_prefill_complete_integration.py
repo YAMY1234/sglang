@@ -647,6 +647,38 @@ class TestAllocationIntegration(CustomTestCase):
         scheduler.disagg_prefill_bootstrap_queue.finalize_bootstrap.assert_not_called()
         scheduler.send_kv_chunk.assert_not_called()
 
+    def test_min_work_tokens_readies_short_requests_at_their_first_batch(self):
+        scheduler = SimpleNamespace()
+        scheduler.maybe_send_early_readiness = MethodType(
+            SchedulerDisaggregationPrefillMixin.maybe_send_early_readiness, scheduler
+        )
+        for threshold, uncached, ready in ((64, 36, True), (64, 64, False), (0, 1, False)):
+            with self.subTest(threshold=threshold, uncached=uncached):
+                room = 50 + uncached + threshold
+                sender, receiver = self.sender(room=room), self.receiver(room=room)
+                self.flush()
+                req = SimpleNamespace(
+                    pending_bootstrap=True,
+                    disagg_ready_checked=False,
+                    origin_input_ids=[0] * 100,
+                    num_matched_prefix_tokens=100 - uncached,
+                    disagg_kv_sender=sender,
+                )
+                with envs.SGLANG_PREFILL_COMPLETE_MIN_WORK_TOKENS.override(threshold):
+                    scheduler.maybe_send_early_readiness(req)
+                    self.flush()
+                    want = KVPoll.WaitingForInput if ready else KVPoll.Bootstrapping
+                    self.assertEqual(receiver.poll(), want)
+                    # Decided once, at the first batch; completion still readies the rest.
+                    req.num_matched_prefix_tokens = 100
+                    scheduler.maybe_send_early_readiness(req)
+                    self.flush()
+                    self.assertEqual(receiver.poll(), want)
+                sender.mark_prefill_complete()
+                self.flush()
+                self.assertEqual(receiver.poll(), KVPoll.WaitingForInput)
+                self.assertEqual(list(self.wire), [])
+
     def test_matched_tp_dcp_peer_needs_flag_and_equal_layout(self):
         # Decode attention TP8 + DCP8; one prefill rank per decode rank only
         # when the prefill uses the same attention TP and DCP.
