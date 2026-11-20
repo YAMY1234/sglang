@@ -222,8 +222,10 @@ class UnifiedRadixCache(BasePrefixCache):
     _wb_evict_batch = False
     # SGLANG_MAMBA_PATH_CAP_COUNTS_HOST, set by _init_mamba_path_cap_counts_host.
     _mamba_path_cap_counts_host = False
-    # SGLANG_MAMBA_PATH_CAP_AUDIT_EVERY, set by _init_mamba_path_cap_anchor.
+    # SGLANG_MAMBA_PATH_CAP_AUDIT_EVERY, set by _init_mamba_path_cap_audit.
     _mamba_path_cap_audit_every = 0
+    # SGLANG_MAMBA_PATH_CAP_ANCHOR in effect, set by _init_mamba_path_cap_anchor.
+    _mamba_path_cap_anchor = False
     mamba_retention_counts: Optional[dict[str, int]] = None
     # L2->L3 write-back (SGLANG_OPT_HICACHE_STORAGE_WRITE_BACK); set in init_hicache.
     _storage_write_back: Optional[StorageWriteBack] = None
@@ -892,6 +894,7 @@ class UnifiedRadixCache(BasePrefixCache):
             )
             return
         self.tree_core.set_mamba_path_cap_anchor(True)
+        self._mamba_path_cap_anchor = True
         logger.info(
             "Mamba path cap keeps a half-depth anchor state (cap %d, tree core %s)",
             cap,
@@ -913,7 +916,7 @@ class UnifiedRadixCache(BasePrefixCache):
         cap (or, with the anchor, the newest cap-1 plus the deepest older state
         at or below half the tail's depth). Locks and forks make "other" legal."""
         cap = self.components[ComponentType.MAMBA].mamba_max_states_per_path
-        anchor_on = self.tree_core.mamba_path_cap_anchor and cap >= 2
+        anchor_on = self._mamba_path_cap_anchor
         counts = self.mamba_path_cap_audit_counts
         for tail_depth, before, kept in self.tree_core.take_mamba_path_cap_audit():
             expected = set(before[: cap - 1 if anchor_on else cap])

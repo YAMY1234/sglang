@@ -218,7 +218,8 @@ class TestMambaPathStateCap(unittest.TestCase):
 
     def test_audit_counts_walks_that_follow_the_anchor_rule(self):
         before = [6, 5, 4, 3, 2, 1]
-        core = mock.Mock(mamba_path_cap_anchor=True)
+        # The Rust adapter has no mamba_path_cap_anchor attribute: spec it out.
+        core = mock.Mock(spec=["take_mamba_path_cap_audit"])
         core.take_mamba_path_cap_audit.return_value = [
             (6, before, [6, 5, 3]),
             (6, before, [6, 5, 4]),
@@ -228,6 +229,7 @@ class TestMambaPathStateCap(unittest.TestCase):
             tree_core=core,
             mamba_path_cap_audit_counts=dict(walks=0, exact=0, other=0, moved=0),
             _mamba_path_cap_audit_every=100,
+            _mamba_path_cap_anchor=True,
         )
         UnifiedRadixCache._audit_mamba_path_cap(cache)
         self.assertEqual(
