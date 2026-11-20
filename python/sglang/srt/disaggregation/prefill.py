@@ -1271,6 +1271,11 @@ class SchedulerDisaggregationPrefillMixin:
                     undone_reqs.append(req)
                     continue
 
+            if req.pending_bootstrap and pp_consensus_polls is not None:
+                # The PP release relay: as above, only
+                # pop_bootstrapped_and_resolve_parked_pp resolves a parked request.
+                undone_reqs.append(req)
+                continue
             if req.pending_bootstrap:
                 # Parked: prefill finished before bootstrap completed.
                 if self.handle_pending_bootstrap(req, poll):

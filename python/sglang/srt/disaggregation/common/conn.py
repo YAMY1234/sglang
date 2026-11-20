@@ -108,6 +108,11 @@ PREFILL_COMPLETE_REQUEST_STATE_TYPES = frozenset(
 )
 
 
+# prefill_complete: most decode endpoints one bootstrap room accepts, i.e. decode
+# attention TP over prefill attention TP (SGLANG_PREFILL_COMPLETE_ALLOW_MULTI_ENDPOINT).
+PREFILL_COMPLETE_MAX_ROOM_ENDPOINTS = 64
+
+
 def prefill_complete_unsupported_states(state_types) -> List[StateType]:
     """The state pools prefill_complete cannot defer with the KV."""
     supported = {StateType.DSA}
@@ -150,6 +155,9 @@ class PrefillServerInfo:
     enable_kv_cache_sharding: bool = False
     # Decode context-parallel width; omitted from the payload when 1.
     dcp_size: int = 1
+    # prefill_complete: decode endpoints one bootstrap room accepts; omitted
+    # from the payload when 1.
+    pc_room_endpoints: int = 1
 
     # PD true-retraction rebootstrap: the prefill's HTTP API port. The decode
     # already knows the prefill host (the bootstrap_addr host), so it can POST
@@ -171,6 +179,7 @@ class PrefillServerInfo:
         self.dp_size = int(self.dp_size)
         self.pp_size = int(self.pp_size)
         self.dcp_size = int(self.dcp_size)
+        self.pc_room_endpoints = int(self.pc_room_endpoints)
         self.page_size = int(self.page_size) if self.page_size is not None else None
         self.kv_cache_dtype = (
             str(self.kv_cache_dtype) if self.kv_cache_dtype is not None else None
@@ -468,10 +477,21 @@ class CommonKVManager(BaseKVManager):
                     "prefill_complete defers request state pools %s with the KV",
                     deferred_request_states,
                 )
-            if self.attn_tp_size > 1 or self.dcp_size > 1:
+            if (self.attn_tp_size > 1 or self.dcp_size > 1) and (
+                envs.SGLANG_PREFILL_COMPLETE_ALLOW_MATCHED_TP_DCP.get()
+            ):
                 logger.info(
                     "prefill_complete with attention TP %d and DCP %d; peers must "
                     "use the same sizes",
+                    self.attn_tp_size,
+                    self.dcp_size,
+                )
+            if envs.SGLANG_PREFILL_COMPLETE_ALLOW_MULTI_ENDPOINT.get():
+                logger.info(
+                    "prefill_complete rooms take every decode rank of a larger "
+                    "attention TP group (up to %d endpoints; this role: attention "
+                    "TP %d, DCP %d)",
+                    PREFILL_COMPLETE_MAX_ROOM_ENDPOINTS,
                     self.attn_tp_size,
                     self.dcp_size,
                 )
@@ -742,15 +762,19 @@ class CommonKVManager(BaseKVManager):
     def _notify_bootstrap(self, room: int, notification: BootstrapNotification) -> None:
         if notification is None:
             return
-        endpoint, failed = notification
-        # Use the normal status channel; readiness does not authorize writes.
-        # No room-table lock is held while sending to a potentially dead peer.
-        self.send_kv_status_message(
-            targets=[endpoint],
-            bootstrap_room=room,
-            status=KVPoll.Failed if failed else KVPoll.WaitingForInput,
-            failure_reason="Prefill bootstrap failed" if failed else None,
-        )
+        notes = notification if isinstance(notification, list) else [notification]
+        for failed in (True, False):
+            targets = [endpoint for endpoint, f in notes if f is failed]
+            if not targets:
+                continue
+            # Use the normal status channel; readiness does not authorize writes.
+            # No room-table lock is held while sending to a potentially dead peer.
+            self.send_kv_status_message(
+                targets=targets,
+                bootstrap_room=room,
+                status=KVPoll.Failed if failed else KVPoll.WaitingForInput,
+                failure_reason="Prefill bootstrap failed" if failed else None,
+            )
 
     def _handle_bootstrap_message(self, msg: List[bytes]) -> bool:
         if self.deferred_bootstrap is None or not msg:
@@ -760,12 +784,18 @@ class CommonKVManager(BaseKVManager):
         try:
             room = int(msg[1])
             endpoint = (msg[2].decode("ascii"), int(msg[3]))
+            # Decode endpoints of the room's request; only multi-endpoint
+            # receivers send it (CommonKVReceiver.init).
+            expected = int(msg[4]) if msg[0] == b"BOOTSTRAP" and len(msg) > 4 else 1
         except (IndexError, ValueError, UnicodeDecodeError):
             logger.warning("Dropping malformed bootstrap control message")
             return True
         if msg[0] == b"BOOTSTRAP":
+            if not 1 <= expected <= PREFILL_COMPLETE_MAX_ROOM_ENDPOINTS:
+                logger.warning("Dropping BOOTSTRAP for room %s: %d endpoints", room, expected)
+                return True
             self._notify_bootstrap(
-                room, self.deferred_bootstrap.register(room, endpoint)
+                room, self.deferred_bootstrap.register(room, endpoint, expected)
             )
             return True
         # Retain cancellation even if it beats source creation. Let the backend
@@ -1732,6 +1762,12 @@ class CommonKVManager(BaseKVManager):
         if self.defer_decode_allocation and self.dcp_size > 1:
             # Decode pairs prefill_complete ranks only across equal DCP sizes.
             payload["dcp_size"] = self.dcp_size
+        if (
+            self.defer_decode_allocation
+            and envs.SGLANG_PREFILL_COMPLETE_ALLOW_MULTI_ENDPOINT.get()
+        ):
+            # Rooms accept every rank of a larger decode attention TP group.
+            payload["pc_room_endpoints"] = PREFILL_COMPLETE_MAX_ROOM_ENDPOINTS
 
         if envs.SGLANG_RUST_SERVER.get() and self.attn_dp_size > 1:
             topology_rows = get_parallel().world_group.all_gather_object(payload)
@@ -2730,8 +2766,12 @@ class CommonKVReceiver(BaseKVReceiver):
             reason = (
                 "prefill_complete requires peer attention TP1/CP1, or with "
                 "SGLANG_PREFILL_COMPLETE_ALLOW_MATCHED_TP_DCP the decode's "
-                f"attention TP and DCP (peer attn_tp={info.attn_tp_size} "
-                f"attn_cp={info.attn_cp_size} dcp={info.dcp_size})"
+                "attention TP and DCP, or with "
+                "SGLANG_PREFILL_COMPLETE_ALLOW_MULTI_ENDPOINT a TP1/DCP1 peer whose "
+                "rooms take this decode's attention TP ranks "
+                f"(peer attn_tp={info.attn_tp_size} attn_cp={info.attn_cp_size} "
+                f"dcp={info.dcp_size} room_endpoints={info.pc_room_endpoints}, "
+                f"decode attn_tp={self.kv_mgr.attn_tp_size})"
             )
         if reason is not None:
             self.kv_mgr.record_failure(self.bootstrap_room, reason)
@@ -2765,6 +2805,13 @@ class CommonKVReceiver(BaseKVReceiver):
             self.kv_mgr.update_status(self.bootstrap_room, KVPoll.WaitingForInput)
             return
         self._prefill_wait_start = time.time()
+        # Every rank of this attention TP group registers in the prefill rank's
+        # room; tell it how many to expect (a one-endpoint frame stays unchanged).
+        room_endpoints = (
+            [str(self.required_dst_info_num).encode("ascii")]
+            if self.required_dst_info_num > 1
+            else []
+        )
         try:
             for info in self.bootstrap_infos:
                 sock, lock = self._connect_to_bootstrap_server(info)
@@ -2776,6 +2823,7 @@ class CommonKVReceiver(BaseKVReceiver):
                             self.kv_mgr.local_ip.encode("ascii"),
                             str(self.kv_mgr.rank_port).encode("ascii"),
                         ]
+                        + room_endpoints
                     )
         except zmq.ZMQError:
             self.abort()
@@ -2783,6 +2831,12 @@ class CommonKVReceiver(BaseKVReceiver):
     def _prefill_complete_peer_ok(self, info: PrefillServerInfo) -> bool:
         if info.attn_cp_size != 1:
             return False
+        if (
+            envs.SGLANG_PREFILL_COMPLETE_ALLOW_MULTI_ENDPOINT.get()
+            and (info.required_dst_info_num or 1) > 1
+        ):
+            # Several decode ranks share each prefill rank's room.
+            return self._prefill_complete_multi_endpoint(info)
         if not envs.SGLANG_PREFILL_COMPLETE_ALLOW_MATCHED_TP_DCP.get():
             return info.attn_tp_size == 1
         # Equal attention TP maps each decode rank to one prefill rank and equal
@@ -2792,6 +2846,17 @@ class CommonKVReceiver(BaseKVReceiver):
             and info.dcp_size == self.kv_mgr.dcp_size
             and info.required_dst_info_num == 1
             and not info.enable_kv_cache_sharding
+        )
+
+    def _prefill_complete_multi_endpoint(self, info: PrefillServerInfo) -> bool:
+        """A TP1 prefill rank whose rooms take every rank of this decode attention
+        TP group; the DCP relayout and head-sliced state are early's data plane."""
+        return (
+            info.attn_tp_size == 1
+            and info.dcp_size == 1
+            and not info.enable_kv_cache_sharding
+            and info.required_dst_info_num == self.kv_mgr.attn_tp_size
+            and info.required_dst_info_num <= info.pc_room_endpoints
         )
 
     def poll(self) -> KVPoll:
@@ -3246,6 +3311,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         self.enable_dsa_cache_layer_split: Optional[bool] = None
         self.enable_kv_cache_sharding: Optional[bool] = None
         self.dcp_size: Optional[int] = None
+        self.pc_room_endpoints: Optional[int] = None
         self.prefill_http_port: Optional[int] = None
         self.decode_allocation_policy = "early"
         self.prefill_port_table: Dict[
@@ -3373,6 +3439,8 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
 
         if self.dcp_size is None:
             self.dcp_size = int(data.get("dcp_size", 1))
+        if self.pc_room_endpoints is None:
+            self.pc_room_endpoints = int(data.get("pc_room_endpoints", 1))
 
         if system_dp_size == 1:
             dp_group = attn_dp_rank
@@ -3442,6 +3510,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
                 enable_dsa_cache_layer_split=bool(self.enable_dsa_cache_layer_split),
                 enable_kv_cache_sharding=bool(self.enable_kv_cache_sharding),
                 dcp_size=self.dcp_size or 1,
+                pc_room_endpoints=self.pc_room_endpoints or 1,
                 prefill_http_port=self.prefill_http_port,
                 decode_allocation_policy=self.decode_allocation_policy,
             )
@@ -3453,6 +3522,8 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
             if info.dcp_size == 1:
                 # Decode workers that predate the field reject unknown keys.
                 payload.pop("dcp_size")
+            if info.pc_room_endpoints == 1:
+                payload.pop("pc_room_endpoints")
             return web.json_response(payload, status=200)
 
         if not self._is_ready():

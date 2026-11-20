@@ -902,6 +902,10 @@ class Envs:
     # allows attention TP > 1 and DCP when both roles use the same sizes.
     SGLANG_PREFILL_COMPLETE_ALLOW_REQUEST_STATE_POOLS = EnvBool(False)
     SGLANG_PREFILL_COMPLETE_ALLOW_MATCHED_TP_DCP = EnvBool(False)
+    # prefill_complete with an attention TP1/DCP1 prefill and a decode whose
+    # attention TP groups (and DCP) are wider: each prefill room takes every
+    # rank of the decode group, which relays out KV as with early.
+    SGLANG_PREFILL_COMPLETE_ALLOW_MULTI_ENDPOINT = EnvBool(False)
 
     # ===================================================================
     # Distributed and model-parallel runtime
