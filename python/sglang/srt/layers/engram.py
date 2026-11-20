@@ -879,6 +879,32 @@ def _gpu_numa_node(device: int) -> int:
         return -1
 
 
+def _bind_to_numa(addr: int, nbytes: int, node: int) -> None:
+    """mbind(MPOL_BIND) an untouched mapping to one NUMA node; no-op if unknown."""
+    if node < 0:
+        return
+    nr = {"aarch64": 235, "x86_64": 237}.get(os.uname().machine)
+    if nr is None:
+        return
+    libc = ctypes.CDLL(None, use_errno=True)
+    mask = (ctypes.c_ulong * 16)()
+    mask[node // 64] = 1 << (node % 64)
+    MPOL_BIND = 2
+    rc = libc.syscall(
+        nr,
+        ctypes.c_void_p(addr),
+        ctypes.c_ulong(nbytes),
+        MPOL_BIND,
+        mask,
+        ctypes.c_ulong(16 * 64),
+        0,
+    )
+    if rc != 0:
+        logger.warning(
+            "engram host table: mbind to NUMA %d failed, errno %d", node, ctypes.get_errno()
+        )
+
+
 def _host_numa_nodes() -> list[int]:
     """NUMA nodes with CPUs, i.e. host memory; [] if unknown."""
     try:
@@ -1044,6 +1070,14 @@ class _HostTable:
         # Advisory before the first touch: pages are allocated huge at fault time.
         self.mm.madvise(mmap.MADV_HUGEPAGE)
         self.bytes = torch.frombuffer(self.mm, dtype=torch.uint8)
+        if replication == EngramReplication.PER_RANK_ANON:
+            # Each rank's private copy on its GPU's socket, so the two servers of a
+            # node do not fragment one socket's memory (huge pages need contiguity).
+            _bind_to_numa(
+                self.bytes.data_ptr(),
+                nbytes,
+                _gpu_numa_node(torch.cuda.current_device()),
+            )
         if not per_node:
             # Cached checkpoint pages, left by a previous server or by the loader,
             # make the 512 MiB huge-page faults fall back, so empty them first.
