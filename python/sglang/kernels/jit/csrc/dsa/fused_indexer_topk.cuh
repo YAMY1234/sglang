@@ -34,6 +34,10 @@
 #ifndef FSTK_SERVING
 #define FSTK_SERVING 0
 #endif
+// FSTK_VARIANTS=1 (not serving) builds only the layout-5 variants 6-9.
+#ifndef FSTK_VARIANTS
+#define FSTK_VARIANTS 0
+#endif
 #ifndef FSTK_SERVING_LAYOUT
 #define FSTK_SERVING_LAYOUT 5
 #endif
@@ -147,9 +151,15 @@ struct ScoreParams {
 //   5: four math warpgroups, warpgroup g takes row g of both 128-key halves (4 rows, N 128,
 //      256-key splits, 4 stages read by all): 32 weight registers per thread, so 4 math
 //      warps per SM sub-partition hide the TMEM load latency.
+//   6-9: layout 5 with one barrier arrive per warp instead of per thread; 7, 9: one vote per
+//      split and no window test inside a row's window; 8, 9: odd warpgroups take the split's
+//      second half first, so the warps of a sub-partition wait on different TMEM stages.
 template <int kLayout>
 struct LayoutTraits {
-  static constexpr int kBase = kLayout == 3 ? 0 : (kLayout == 4 ? 2 : kLayout);
+  static constexpr int kBase = kLayout == 3 ? 0 : (kLayout == 4 ? 2 : (kLayout >= 6 ? 5 : kLayout));
+  static constexpr bool kWarpArrive = kLayout >= 6;
+  static constexpr bool kSplitVote = kLayout == 7 or kLayout == 9;
+  static constexpr bool kStagger = kLayout == 8 or kLayout == 9;
   static constexpr bool kPairLoads = kLayout == 3 or kLayout == 4;
   static constexpr uint32_t kBlockQ = kBase == 2 ? 8 : 4;
   static constexpr uint32_t kSplitKV = kBase == 2 ? 128 : 256;
@@ -425,12 +435,13 @@ __global__ __launch_bounds__(LayoutTraits<kLayout>::kNumThreads, 1) void fstk_sc
 #pragma unroll
     for (uint32_t i = 0; i < kNumKVStagesL; ++i) {
       smem.full_kv_barriers[i].init(1);
-      smem.empty_kv_barriers[i].init(kNumMathThreads);
+      smem.empty_kv_barriers[i].init(Traits::kWarpArrive ? kNumMathThreads / 32 : kNumMathThreads);
     }
 #pragma unroll
     for (uint32_t i = 0; i < kNumTmemStages; ++i) {
       smem.full_tmem_barriers[i].init(1);
-      smem.empty_tmem_barriers[i].init(Traits::kSharedStage ? kNumMathThreads : 128);
+      smem.empty_tmem_barriers[i].init(
+          Traits::kWarpArrive ? kNumMathThreads / 32 : (Traits::kSharedStage ? kNumMathThreads : 128));
     }
     cutlass::arch::fence_barrier_init();
   }
@@ -866,53 +877,158 @@ __global__ __launch_bounds__(LayoutTraits<kLayout>::kNumThreads, 1) void fstk_sc
             weights[j] = ptx::ld_shared(smem_weights_row + j) * (j < kAluHeads ? 2.0f : 1.0f);
         }
 
-        for (uint32_t kv_split_idx = 0; kv_split_idx < num_kv_splits; ++kv_split_idx) {
-          CUTE_TIE_DECL(kv_pipeline.advance(), kv_stage_idx, kv_phase);
-          smem.full_kv_barriers[kv_stage_idx].wait(kv_phase);
-          float scale_kv[kMmaPerSplit];
-          float results[kWindowed ? kMmaPerSplit : 1];
-#pragma unroll
-          for (uint32_t h = 0; h < kMmaPerSplit; ++h)
-            scale_kv[h] = kMode != kModeNoEpi ? ptx::ld_shared(smem.smem_sf_kv[kv_stage_idx] + h * UMMA_M + lane_key) : 0.0f;
+        if constexpr (kLayout == 5) {
+          for (uint32_t kv_split_idx = 0; kv_split_idx < num_kv_splits; ++kv_split_idx) {
+            CUTE_TIE_DECL(kv_pipeline.advance(), kv_stage_idx, kv_phase);
+            smem.full_kv_barriers[kv_stage_idx].wait(kv_phase);
+            float scale_kv[kMmaPerSplit];
+            float results[kWindowed ? kMmaPerSplit : 1];
+  #pragma unroll
+            for (uint32_t h = 0; h < kMmaPerSplit; ++h)
+              scale_kv[h] = kMode != kModeNoEpi ? ptx::ld_shared(smem.smem_sf_kv[kv_stage_idx] + h * UMMA_M + lane_key) : 0.0f;
 
-#pragma unroll
-          for (uint32_t h = 0; h < kMmaPerSplit; ++h) {
-            CUTE_TIE_DECL(tmem_pipeline.advance(), tmem_stage_idx, tmem_phase);
-            smem.full_tmem_barriers[tmem_stage_idx].wait(tmem_phase);
-            ptx::tcgen05_after_thread_sync();
-            if (h == kMmaPerSplit - 1) {
-              // Every UMMA of the split has committed: the KV stage is free.
-              cutlass::arch::fence_view_async_shared();
-              smem.empty_kv_barriers[kv_stage_idx].arrive();
-            }
-            if constexpr (kMode == kModeNoEpi) {
+  #pragma unroll
+            for (uint32_t h = 0; h < kMmaPerSplit; ++h) {
+              CUTE_TIE_DECL(tmem_pipeline.advance(), tmem_stage_idx, tmem_phase);
+              smem.full_tmem_barriers[tmem_stage_idx].wait(tmem_phase);
+              ptx::tcgen05_after_thread_sync();
+              if (h == kMmaPerSplit - 1) {
+                // Every UMMA of the split has committed: the KV stage is free.
+                cutlass::arch::fence_view_async_shared();
+                smem.empty_kv_barriers[kv_stage_idx].arrive();
+              }
+              if constexpr (kMode == kModeNoEpi) {
+                ptx::tcgen05_before_thread_sync();
+                smem.empty_tmem_barriers[tmem_stage_idx].arrive();
+                continue;
+              }
+              ptx::tmem_load_32dp32b<kNumHeads>(tmem_stage_idx * UMMA_N + my_row * kNumHeads, reinterpret_cast<uint32_t*>(accum));
+              cutlass::arch::fence_view_async_tmem_load();
               ptx::tcgen05_before_thread_sync();
               smem.empty_tmem_barriers[tmem_stage_idx].arrive();
+              const float result = dg_reduce<kAluHeads>(accum, weights) * scale_kv[h];
+              if constexpr (kWindowed) {
+                results[h] = result;
+              } else {
+                handle(q_block_idx, my_row, 0, 0, 0, 0.0f, kv_base + kv_split_idx * kSplitKV + h * UMMA_M + lane_key, result);
+              }
+            }
+            // Appends after both halves are scored (see the layout-0 path).
+  #pragma unroll
+            for (uint32_t h = 0; h < kMmaPerSplit; ++h) {
+              const uint32_t kv_offset = kv_base + kv_split_idx * kSplitKV + h * UMMA_M + lane_key;
+              if constexpr (kCompact)
+                append(kv_offset, results[h]);
+              else if constexpr (kFilter)
+                append_plain(kv_offset, results[h]);
+              if constexpr (kTau) keep_sample(kv_offset, results[h]);
+            }
+          }
+
+        } else {
+          // Arrives once per thread, or once per warp after every lane is done (kWarpArrive).
+          const auto release = [&](auto& barrier) {
+            if constexpr (Traits::kWarpArrive) {
+              __syncwarp();
+              if (lane_idx == 0) barrier.arrive();
+            } else {
+              barrier.arrive();
+            }
+          };
+          // Odd warpgroups take the split's second half first (kStagger).
+          const bool reverse_halves = Traits::kStagger and (math_warpgroup_idx & 1) != 0;
+          for (uint32_t kv_split_idx = 0; kv_split_idx < num_kv_splits; ++kv_split_idx) {
+            CUTE_TIE_DECL(kv_pipeline.advance(), kv_stage_idx, kv_phase);
+            smem.full_kv_barriers[kv_stage_idx].wait(kv_phase);
+            float scale_kv[kMmaPerSplit];
+            float results[kWindowed ? kMmaPerSplit : 1];
+  #pragma unroll
+            for (uint32_t h = 0; h < kMmaPerSplit; ++h)
+              scale_kv[h] = kMode != kModeNoEpi ? ptx::ld_shared(smem.smem_sf_kv[kv_stage_idx] + h * UMMA_M + lane_key) : 0.0f;
+            uint32_t stage_of[kMmaPerSplit], phase_of[kMmaPerSplit];
+  #pragma unroll
+            for (uint32_t h = 0; h < kMmaPerSplit; ++h) {
+              CUTE_TIE_DECL(tmem_pipeline.advance(), tmem_stage_idx, tmem_phase);
+              stage_of[h] = tmem_stage_idx;
+              phase_of[h] = tmem_phase;
+            }
+            // One 128-key half: its UMMA's accumulators, reduced; nan when there is no epilogue.
+            const auto score_half = [&](const uint32_t h) -> float {
+              const uint32_t tmem_stage_idx = stage_of[h];
+              smem.full_tmem_barriers[tmem_stage_idx].wait(phase_of[h]);
+              ptx::tcgen05_after_thread_sync();
+              if (h == kMmaPerSplit - 1) {
+                // Every UMMA of the split has committed: the KV stage is free.
+                cutlass::arch::fence_view_async_shared();
+                release(smem.empty_kv_barriers[kv_stage_idx]);
+              }
+              if constexpr (kMode == kModeNoEpi) {
+                ptx::tcgen05_before_thread_sync();
+                release(smem.empty_tmem_barriers[tmem_stage_idx]);
+                return 0.0f;
+              }
+              ptx::tmem_load_32dp32b<kNumHeads>(tmem_stage_idx * UMMA_N + my_row * kNumHeads, reinterpret_cast<uint32_t*>(accum));
+              cutlass::arch::fence_view_async_tmem_load();
+              ptx::tcgen05_before_thread_sync();
+              release(smem.empty_tmem_barriers[tmem_stage_idx]);
+              return dg_reduce<kAluHeads>(accum, weights) * scale_kv[h];
+            };
+            static_assert(kMmaPerSplit == 2);
+            float r0, r1;
+            if (reverse_halves) {
+              r1 = score_half(1);
+              r0 = score_half(0);
+            } else {
+              r0 = score_half(0);
+              r1 = score_half(1);
+            }
+            if constexpr (kMode == kModeNoEpi) continue;
+            if constexpr (kWindowed) {
+              results[0] = r0;
+              results[kWindowed ? 1 : 0] = r1;
+            } else {
+              const uint32_t base = kv_base + kv_split_idx * kSplitKV + lane_key;
+              handle(q_block_idx, my_row, 0, 0, 0, 0.0f, base, r0);
+              handle(q_block_idx, my_row, 0, 0, 0, 0.0f, base + UMMA_M, r1);
+            }
+            if constexpr (kFilter and not kCompact and Traits::kSplitVote) {
+              // One vote for both halves; the window test only on splits that cross the row's window
+              // edges. Appends land in the same order and positions as append_plain's.
+              const uint32_t split_base = kv_base + kv_split_idx * kSplitKV;
+              const bool inside = split_base >= win_start and split_base - win_start + kSplitKV <= win_len;
+              bool t0 = results[0] >= row_tau, t1 = results[1] >= row_tau;
+              if (not inside) {
+                t0 = t0 and split_base + lane_key - win_start < win_len;
+                t1 = t1 and split_base + UMMA_M + lane_key - win_start < win_len;
+              }
+              if (__any_sync(0xffffffffu, t0 or t1)) {
+  #pragma unroll
+                for (uint32_t h = 0; h < kMmaPerSplit; ++h) {
+                  const bool take = h == 0 ? t0 : t1;
+                  const uint32_t rel = split_base + h * UMMA_M + lane_key - win_start;
+                  const uint32_t mask = __ballot_sync(0xffffffffu, take);
+                  const uint32_t pos = sub_n + __popc(mask & ((1u << lane_idx) - 1u));
+                  sub_n += __popc(mask);
+                  if (take and pos < params.cand_sub_cap)
+                    params.cand_key[(static_cast<uint64_t>(row) * kNumSubLists5 + sub_idx) * params.cand_sub_cap + pos] =
+                        (static_cast<uint64_t>(ordered_key(results[h])) << 32) | static_cast<uint64_t>(~rel);
+                }
+              }
               continue;
             }
-            ptx::tmem_load_32dp32b<kNumHeads>(tmem_stage_idx * UMMA_N + my_row * kNumHeads, reinterpret_cast<uint32_t*>(accum));
-            cutlass::arch::fence_view_async_tmem_load();
-            ptx::tcgen05_before_thread_sync();
-            smem.empty_tmem_barriers[tmem_stage_idx].arrive();
-            const float result = dg_reduce<kAluHeads>(accum, weights) * scale_kv[h];
-            if constexpr (kWindowed) {
-              results[h] = result;
-            } else {
-              handle(q_block_idx, my_row, 0, 0, 0, 0.0f, kv_base + kv_split_idx * kSplitKV + h * UMMA_M + lane_key, result);
+            // Appends after both halves are scored (see the layout-0 path).
+  #pragma unroll
+            for (uint32_t h = 0; h < kMmaPerSplit; ++h) {
+              const uint32_t kv_offset = kv_base + kv_split_idx * kSplitKV + h * UMMA_M + lane_key;
+              if constexpr (kCompact)
+                append(kv_offset, results[h]);
+              else if constexpr (kFilter)
+                append_plain(kv_offset, results[h]);
+              if constexpr (kTau) keep_sample(kv_offset, results[h]);
             }
           }
-          // Appends after both halves are scored (see the layout-0 path).
-#pragma unroll
-          for (uint32_t h = 0; h < kMmaPerSplit; ++h) {
-            const uint32_t kv_offset = kv_base + kv_split_idx * kSplitKV + h * UMMA_M + lane_key;
-            if constexpr (kCompact)
-              append(kv_offset, results[h]);
-            else if constexpr (kFilter)
-              append_plain(kv_offset, results[h]);
-            if constexpr (kTau) keep_sample(kv_offset, results[h]);
-          }
-        }
 
+        }
         if constexpr (kFilter) {
           if (lane_idx == 0 and row < valid_rows)
             params.cand_count[out_row * kNumSubLists5 + sub_idx] = static_cast<int32_t>(sub_n);
@@ -1596,6 +1712,24 @@ struct FusedIndexerTopK {
     sglang::host::RuntimeCheck(
         layout == FSTK_SERVING_LAYOUT and alu_heads == 0, "fstk serving: only layout ", FSTK_SERVING_LAYOUT);
     FSTK_DISPATCH(FSTK_SERVING_LAYOUT, 0);
+#elif FSTK_VARIANTS
+    // The layout-5 variants only (a build of its own).
+    sglang::host::RuntimeCheck(alu_heads == 0 or alu_heads == 16, "fstk: alu_heads must be 0 or 16");
+    sglang::host::RuntimeCheck(layout >= 6 and layout <= 9, "fstk variants: layout must be 6..9");
+    if (layout == 6) {
+      if (alu_heads) FSTK_DISPATCH(6, 16);
+      FSTK_DISPATCH(6, 0);
+    }
+    if (layout == 7) {
+      if (alu_heads) FSTK_DISPATCH(7, 16);
+      FSTK_DISPATCH(7, 0);
+    }
+    if (layout == 8) {
+      if (alu_heads) FSTK_DISPATCH(8, 16);
+      FSTK_DISPATCH(8, 0);
+    }
+    if (alu_heads) FSTK_DISPATCH(9, 16);
+    FSTK_DISPATCH(9, 0);
 #else
     sglang::host::RuntimeCheck(alu_heads == 0 or alu_heads == 16, "fstk: alu_heads must be 0 or 16");
     sglang::host::RuntimeCheck(layout >= 0 and layout <= 5, "fstk: layout must be 0..5");
