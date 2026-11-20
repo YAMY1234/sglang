@@ -1945,7 +1945,7 @@ class Engram(nn.Module):
             return x
         kv, _ = self.wkv(emb.flatten(-2))
         image_ids = input_ids if self.image_token_id is not None else None
-        from sglang.kernels.ops.layernorm.mhc_mega import locality_inplace_out
+        from sglang.kernels.ops.layernorm.mhc_mega import locality_stream_out
 
         return engram_gate(
             x,
@@ -1956,7 +1956,7 @@ class Engram(nn.Module):
             self.clamp_value,
             image_ids,
             self.image_token_id,
-            out=locality_inplace_out(x),
+            out=locality_stream_out(x),
         )
 
     def embed_rows(
