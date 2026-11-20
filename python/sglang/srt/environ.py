@@ -976,6 +976,9 @@ class Envs:
     # single objects in the middle of prefixes, rarely runs: set its
     # eviction_high_watermark_ratio above this budget's share of the store.
     SGLANG_LINKER_STORE_BUDGET_PAGES = EnvInt(0)
+    # The store budget evicts down to this share of the budget once over it: closer
+    # to 1 evicts fewer pages per pass, more often (each pass is one removal task).
+    SGLANG_LINKER_STORE_LOW_FRACTION = EnvFloat(0.95)
     # A stored KDA state counts as this many pages toward that budget (its size
     # over a page's objects; the same on every stage).
     SGLANG_LINKER_STATE_PAGE_EQUIV = EnvInt(431)

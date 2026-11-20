@@ -347,6 +347,7 @@ class _StoreTree:
         recall: int = 0,
     ):
         self.budget, self.state_units = budget, state_units
+        self.low_fraction = low_fraction
         self.low = int(budget * low_fraction)
         self.protect, self.recall = protect, recall
         self.nodes: dict[str, list] = {}
@@ -813,6 +814,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 self.store_tree = _StoreTree(
                     budget,
                     envs.SGLANG_LINKER_STATE_PAGE_EQUIV.get(),
+                    low_fraction=envs.SGLANG_LINKER_STORE_LOW_FRACTION.get(),
                     protect=envs.SGLANG_LINKER_STORE_PROTECT_TICKS.get(),
                     recall=envs.SGLANG_LINKER_STORE_RECALL_TICKS.get(),
                 )
@@ -2735,6 +2737,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             self.store_tree = _StoreTree(
                 tree.budget,
                 tree.state_units,
+                low_fraction=tree.low_fraction,
                 protect=tree.protect,
                 recall=tree.recall,
             )

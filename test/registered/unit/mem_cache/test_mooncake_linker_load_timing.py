@@ -1174,6 +1174,14 @@ class TestStoreBudgetTailFirst(CustomTestCase):
         self.assertEqual(stage0.page_remove_counts["lease_retries"], 1)
         self.assertEqual(len(stage0.page_remove_retries), 1)
 
+    def test_low_fraction_sets_the_pages_per_eviction_pass(self):
+        # SGLANG_LINKER_STORE_LOW_FRACTION: closer to 1, fewer pages per pass.
+        for low_fraction, per_pass in ((0.9, 11), (0.99, 2)):
+            tree = mooncake_direct_linker._StoreTree(100, 4, low_fraction=low_fraction)
+            for i in range(101):
+                tree.add([f"p{i}"], None, ())
+            self.assertEqual(len(tree.evict()), per_pass)
+
     def test_batch_removal_matches_one_call_per_key(self):
         # SGLANG_LINKER_BATCH_REMOVE: the same removed keys, counts and lease
         # retries as one call per key, in one store call per pass.
