@@ -90,7 +90,34 @@ class PPLinkerRelay:
         self._locked_max = (0, 0)
         # Locked tokens by wait: this stage's own put, another stage's put, the commit.
         self._split_peak, self._split_sum, self._split_n = (0, [0, 0, 0]), [0, 0, 0], 0
+        self._reset_finish_lag()
         self._stats_next = time.monotonic() + 60.0
+
+    def _reset_finish_lag(self):
+        # PP0 stats: when PP0 finished each offload index (from _own_base on), how
+        # far each stage has got, its lag behind PP0 (ms) and the steps it held the min.
+        self._own_base, self._own_at = 0, []
+        self._stage_seen = [0] * self.size
+        self._finish_lag = [[] for _ in range(self.size)]
+        self._min_steps = [0] * self.size
+
+    def _track_finish_lag(self, counts, finished):
+        now = time.monotonic()
+        own = self.offload_head + len(self.offload_results)
+        self._own_at.extend([now] * (own - self._own_base - len(self._own_at)))
+        for rank, count in enumerate(counts):
+            count = count or 0
+            for i in range(self._stage_seen[rank], count):
+                k = i - self._own_base
+                at = self._own_at[k] if 0 <= k < len(self._own_at) else now
+                self._finish_lag[rank].append(1e3 * (now - at))
+            self._stage_seen[rank] = max(self._stage_seen[rank], count)
+            if count == finished:
+                self._min_steps[rank] += 1
+        drop = min(min(self._stage_seen), own) - self._own_base
+        if drop > 0:
+            del self._own_at[:drop]
+            self._own_base += drop
 
     def attach_store(self, store):
         self.store = store
@@ -216,6 +243,7 @@ class PPLinkerRelay:
             self._covered_at.extend([(self._decide_step, now)] * (finished - self._covered))
             self._covered = finished
         if stats:
+            self._track_finish_lag(counts, finished)
             self._log_offload_stats(finished)
         if any(e != self.epoch for e in self.store.collect("lkoe")) or any(
             s is None or not 0 <= self.offload_issued - s < self.commit_window
@@ -263,6 +291,12 @@ class PPLinkerRelay:
             return
         self._stats_next = now + 60.0
 
+        def pct50_90(xs):
+            xs = sorted(xs)
+            if not xs:
+                return "-"
+            return f"{xs[len(xs) // 2]:.0f}/{xs[len(xs) * 9 // 10]:.0f}"
+
         def pct(xs):
             xs = sorted(xs)
             if not xs:
@@ -283,6 +317,17 @@ class PPLinkerRelay:
         self._lag_steps, self._lag_ms = [], []
         self._locked_max = locked
         self._split_peak, self._split_sum, self._split_n = (locked[1], split), [0, 0, 0], 0
+        logger.info(
+            "Linker PP offload finish lag behind PP0, ms p50/p90 (steps holding the "
+            "all-stage minimum): %s",
+            ", ".join(
+                f"PP{r} {pct50_90(lag)} ({held})"
+                for r, (lag, held) in enumerate(zip(self._finish_lag, self._min_steps))
+                if r
+            ),
+        )
+        self._finish_lag = [[] for _ in range(self.size)]
+        self._min_steps = [0] * self.size
 
     def _apply_offload(self, value):
         head, successes = value
@@ -492,6 +537,7 @@ class PPLinkerRelay:
         self.offload_head, self.offload_results = 0, []
         self.offload_issued_head = 0
         self._offload_posted = -1
+        self._reset_finish_lag()
         self.entries.clear()
         self.inbox.clear()
         self.outbox.clear()
