@@ -178,7 +178,6 @@ class _GCTimer:
             "ms": [round(x, 1) for x in self.ms],
             "max_ms": [round(x, 1) for x in self.max_ms],
             "collected": self.collected,
-            "freeze_count": gc.get_freeze_count(),
         }
         self._reset()
         return stats

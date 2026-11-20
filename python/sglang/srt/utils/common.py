@@ -4439,19 +4439,23 @@ class BatchCountGCFreezer:
         after: int,
         every: int = 0,
         threshold: Optional[Sequence[int]] = None,
+        log_frozen: bool = False,
     ):
         self.context = context
         self.next_at = after
         self.every = every
+        # gc.get_freeze_count() walks the whole frozen list (O(heap)): only once, and
+        # only when asked (log_frozen, the PP diag), right after the first freeze.
+        self.log_frozen = log_frozen
+        self.frozen_logged = False
         if threshold:
             gc.set_threshold(*threshold)
         logger.info(
-            "%s GC: freeze after %d batches, every %d; threshold %s, freeze_count %d",
+            "%s GC: freeze after %d batches, every %d; threshold %s",
             context,
             after,
             every,
             gc.get_threshold(),
-            gc.get_freeze_count(),
         )
 
     def on_batch(self, count: int) -> bool:
@@ -4460,14 +4464,16 @@ class BatchCountGCFreezer:
         t0 = time.perf_counter()
         gc.collect(1)
         gc.freeze()
+        ms = (time.perf_counter() - t0) * 1e3
         self.next_at = count + self.every if self.every else 0
-        logger.info(
-            "%s gc.freeze at batch %d: %d objects frozen, %.1f ms",
-            self.context,
-            count,
-            gc.get_freeze_count(),
-            (time.perf_counter() - t0) * 1e3,
-        )
+        logger.info("%s gc.freeze at batch %d: %.1f ms", self.context, count, ms)
+        if self.log_frozen and not self.frozen_logged:
+            self.frozen_logged = True
+            logger.info(
+                "%s GC: %d objects frozen at the first freeze",
+                self.context,
+                gc.get_freeze_count(),
+            )
         return True
 
 

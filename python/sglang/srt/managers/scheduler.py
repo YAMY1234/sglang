@@ -1368,6 +1368,7 @@ class Scheduler(
                 envs.SGLANG_SCHED_GC_FREEZE_AFTER.get(),
                 envs.SGLANG_SCHED_GC_FREEZE_EVERY.get(),
                 [int(x) for x in threshold.split(",")] if threshold else None,
+                log_frozen=envs.SGLANG_PP_BUBBLE_DIAG.get(),
             )
         self.return_health_check_ipcs: Deque[Optional[str]] = deque()
         self.flush_wrapper = SchedulerFlushWrapper(
