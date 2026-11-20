@@ -2797,6 +2797,178 @@ def hc_mix_stats_sinkhorn_deepgemm(
     return pre, post, comb
 
 
+# Prefill (4096+ rows) variant of the compensated projection: the three bf16 weight parts are packed
+# K-major into one [3, K, 32] buffer and both operands are loaded as TMA tiles, and the per-row
+# reduce/Sinkhorn runs BLOCK_M rows per program instead of one row per single-warp program.
+_HC_PACKED_COLS = 32
+_HC_PACKED_SLICES = 16
+_HC_PACKED_BLOCK_M = 256
+_HC_PACKED_BLOCK_K = 64
+_HC_PACKED_NUM_WARPS = 8
+_HC_PACKED_NUM_STAGES = 3
+_HC_PACKED_REDUCE_BLOCK_M = 32
+
+
+def pack_bf16_hc_weight(parts) -> torch.Tensor:
+    hi = parts[0]
+    mix, k = hi.shape
+    assert mix <= _HC_PACKED_COLS
+    packed = torch.zeros(
+        (3, k, _HC_PACKED_COLS), dtype=torch.bfloat16, device=hi.device
+    )
+    for i, part in enumerate(parts):
+        packed[i, :, :mix] = part.t()
+    return packed
+
+
+@triton.jit
+def _hc_mix_stats_packed_kernel(
+    X_DESC,
+    W_DESC,
+    MIX,
+    SQ,
+    M,
+    K: tl.constexpr,
+    K_PER_SLICE: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    NUM_STAGES: tl.constexpr,
+):
+    # TMA tiles: x [BLOCK_M, BLOCK_K] (rows past M read as zero) and each weight
+    # part [BLOCK_K, 32] from the packed [3 * K, 32] view.
+    k0 = tl.program_id(1) * K_PER_SLICE
+    row0 = tl.program_id(0) * BLOCK_M
+    hi = tl.zeros((BLOCK_M, 32), tl.float32)
+    mid = tl.zeros((BLOCK_M, 32), tl.float32)
+    lo = tl.zeros((BLOCK_M, 32), tl.float32)
+    sq = tl.zeros((BLOCK_M,), tl.float32)
+    for b in tl.range(0, K_PER_SLICE // BLOCK_K, num_stages=NUM_STAGES):
+        k = k0 + b * BLOCK_K
+        x = X_DESC.load([row0, k])
+        hi = tl.dot(x, W_DESC.load([k, 0]), hi)
+        mid = tl.dot(x, W_DESC.load([K + k, 0]), mid)
+        lo = tl.dot(x, W_DESC.load([2 * K + k, 0]), lo)
+        xf = x.to(tl.float32)
+        sq += tl.sum(xf * xf, 1)
+    rows = row0 + tl.arange(0, BLOCK_M)
+    cols = tl.arange(0, 32)
+    offsets = (tl.program_id(1) * M + rows[:, None]) * 32 + cols[None, :]
+    tl.store(MIX + offsets, (hi + mid) + lo, rows[:, None] < M)
+    tl.store(SQ + tl.program_id(1) * M + rows, sq, rows < M)
+
+
+@triton.jit
+def _hc_mix_reduce_sinkhorn_rows_kernel(
+    MIX,
+    SQ,
+    SCALE,
+    BASE,
+    PRE,
+    POST,
+    COMB,
+    M,
+    inv_k,
+    rms_eps,
+    NUM_SLICES: tl.constexpr,
+    ITERS: tl.constexpr,
+    EPS: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+):
+    # Same slice order and arithmetic as _hc_mix_reduce_sinkhorn_kernel, BLOCK_M rows at a time;
+    # partial columns: 0-3 pre, 4-7 post, 8-23 comb (row-major 4x4).
+    rows = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)
+    rm = rows[:, None] < M
+    j = tl.arange(0, 4)
+    jk = tl.arange(0, 16)
+    a_pre = tl.zeros((BLOCK_M, 4), tl.float32)
+    a_post = tl.zeros((BLOCK_M, 4), tl.float32)
+    a_comb = tl.zeros((BLOCK_M, 16), tl.float32)
+    sq = tl.zeros((BLOCK_M,), tl.float32)
+    for s in tl.static_range(NUM_SLICES):
+        base = MIX + (s * M + rows[:, None]) * 32
+        a_pre += tl.load(base + j[None, :], rm, 0)
+        a_post += tl.load(base + 4 + j[None, :], rm, 0)
+        a_comb += tl.load(base + 8 + jk[None, :], rm, 0)
+        sq += tl.load(SQ + s * M + rows, rows < M, 0)
+    rsqrt = (1.0 / tl.sqrt(sq * inv_k + rms_eps))[:, None]
+    pre = tl.sigmoid(a_pre * rsqrt * tl.load(SCALE) + tl.load(BASE + j)[None, :]) + EPS
+    tl.store(PRE + rows[:, None] * 4 + j[None, :], pre, rm)
+    post = 2.0 * tl.sigmoid(
+        a_post * rsqrt * tl.load(SCALE + 1) + tl.load(BASE + 4 + j)[None, :]
+    )
+    tl.store(POST + rows[:, None] * 4 + j[None, :], post, rm)
+    c = a_comb * rsqrt * tl.load(SCALE + 2) + tl.load(BASE + 8 + jk)[None, :]
+    c = tl.reshape(c, (BLOCK_M, 4, 4))
+    c = tl.exp(c - tl.max(c, axis=2)[:, :, None])
+    c = c / tl.sum(c, axis=2)[:, :, None] + EPS
+    c = c / (tl.sum(c, axis=1)[:, None, :] + EPS)
+    for _ in tl.static_range(ITERS - 1):
+        c = c / (tl.sum(c, axis=2)[:, :, None] + EPS)
+        c = c / (tl.sum(c, axis=1)[:, None, :] + EPS)
+    tl.store(COMB + rows[:, None] * 16 + jk[None, :], tl.reshape(c, (BLOCK_M, 16)), rm)
+
+
+def hc_mix_stats_sinkhorn_packed(
+    x: torch.Tensor,
+    packed: torch.Tensor,
+    scale: torch.Tensor,
+    base: torch.Tensor,
+    sinkhorn_iters: int,
+    rms_eps: float,
+    hc_eps: float,
+    hc_mult: int = 4,
+):
+    m, k = x.shape
+    slices = _HC_PACKED_SLICES
+    assert hc_mult == 4 and x.stride(1) == 1 and x.dtype == torch.bfloat16
+    assert packed.shape == (3, k, _HC_PACKED_COLS) and packed.is_contiguous()
+    assert k % (slices * _HC_PACKED_BLOCK_K) == 0
+    part_mix = torch.empty((slices, m, _HC_PACKED_COLS), device=x.device, dtype=torch.float32)
+    sq = torch.empty((slices, m), device=x.device, dtype=torch.float32)
+    pre = torch.empty((m, hc_mult), device=x.device, dtype=torch.float32)
+    post = torch.empty_like(pre)
+    comb = torch.empty((m, hc_mult, hc_mult), device=x.device, dtype=torch.float32)
+    if m == 0:
+        return pre, post, comb
+    from triton.tools.tensor_descriptor import TensorDescriptor
+
+    _hc_mix_stats_packed_kernel[(triton.cdiv(m, _HC_PACKED_BLOCK_M), slices)](
+        TensorDescriptor.from_tensor(x, [_HC_PACKED_BLOCK_M, _HC_PACKED_BLOCK_K]),
+        TensorDescriptor.from_tensor(
+            packed.view(3 * k, _HC_PACKED_COLS), [_HC_PACKED_BLOCK_K, _HC_PACKED_COLS]
+        ),
+        part_mix,
+        sq,
+        m,
+        K=k,
+        K_PER_SLICE=k // slices,
+        BLOCK_K=_HC_PACKED_BLOCK_K,
+        BLOCK_M=_HC_PACKED_BLOCK_M,
+        NUM_STAGES=_HC_PACKED_NUM_STAGES,
+        num_warps=_HC_PACKED_NUM_WARPS,
+    )
+    _hc_mix_reduce_sinkhorn_rows_kernel[
+        (triton.cdiv(m, _HC_PACKED_REDUCE_BLOCK_M),)
+    ](
+        part_mix,
+        sq,
+        scale,
+        base,
+        pre,
+        post,
+        comb,
+        m,
+        1.0 / k,
+        rms_eps,
+        NUM_SLICES=slices,
+        ITERS=sinkhorn_iters,
+        EPS=hc_eps,
+        BLOCK_M=_HC_PACKED_REDUCE_BLOCK_M,
+        num_warps=4,
+    )
+    return pre, post, comb
+
+
 def mhc_combine(
     x_flat: torch.Tensor, pre: torch.Tensor, hc: int, out_dtype: torch.dtype
 ) -> torch.Tensor:
