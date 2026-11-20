@@ -34,7 +34,7 @@
 #ifndef FSTK_SERVING
 #define FSTK_SERVING 0
 #endif
-// FSTK_VARIANTS=1 (not serving) builds only the layout-5 variants 6-13.
+// FSTK_VARIANTS=1 (not serving) builds only the variants 6-14.
 #ifndef FSTK_VARIANTS
 #define FSTK_VARIANTS 0
 #endif
@@ -168,8 +168,12 @@ struct ScoreParams {
 //      thread reduces both halves' keys together, 16 heads per TMEM load (8 FMA chains).
 template <int kLayout>
 struct LayoutTraits {
-  static constexpr int kBase = kLayout == 3 ? 0 : (kLayout == 4 ? 2 : (kLayout >= 6 ? 5 : kLayout));
-  static constexpr bool kWarpArrive = kLayout >= 6 and kLayout != 13;
+  static constexpr int kBase =
+      (kLayout == 3 or kLayout == 14) ? 0 : (kLayout == 4 ? 2 : (kLayout >= 6 ? 5 : kLayout));
+  static constexpr bool kWarpArrive = kLayout >= 6 and kLayout != 13 and kLayout != 14;
+  // 14: DeepGEMM's layout (2 math warpgroups, 4 rows per thread) with a lean filter: one vote for a
+  // key's 4 rows, no window test when the warpgroup's 128 keys sit inside every row's window.
+  static constexpr bool kLean0 = kLayout == 14;
   static constexpr bool kSplitVote = kLayout == 7 or kLayout == 9 or kLayout == 10 or kLayout == 12 or kLayout == 13;
   static constexpr bool kStagger = kLayout == 8 or kLayout == 9;
   static constexpr bool kPairHalves = kLayout == 10;
@@ -703,6 +707,17 @@ __global__ __launch_bounds__(LayoutTraits<kLayout>::kNumThreads, 1) void fstk_sc
         CUTE_TIE_DECL(q_pipeline.advance(), q_stage_idx, q_phase);
         smem.full_q_barriers[q_stage_idx].wait(q_phase);
         load_tau(q_block_idx);
+        // kLean0: the 4 rows' common window (the latest start, the earliest end).
+        uint32_t lean0_ks_max = 0, lean0_ke_min = 0;
+        if constexpr (kFilter and Traits::kLean0) {
+          lean0_ks_max = seq_k_start[0];
+          lean0_ke_min = seq_k_end[0];
+#pragma unroll
+          for (uint32_t i = 1; i < kBlockQ; ++i) {
+            lean0_ks_max = cute::max(lean0_ks_max, seq_k_start[i]);
+            lean0_ke_min = cute::min(lean0_ke_min, seq_k_end[i]);
+          }
+        }
         if constexpr (kMode != kModeNoEpi) {
 #pragma unroll
           for (uint32_t i = 0; i < kBlockQ; ++i) {
@@ -786,7 +801,24 @@ __global__ __launch_bounds__(LayoutTraits<kLayout>::kNumThreads, 1) void fstk_sc
                 handle(q_block_idx, i, i, 0, 0, 0.0f, kv_offset, result);
               }
             }
-            if constexpr (kFilter) {
+            if constexpr (kFilter and Traits::kLean0) {
+              // Same appends as below, in the same order; skipped by the whole warp when no row takes
+              // any of its 32 keys.
+              const uint32_t half_base = kv_offset - math_thread_idx % 128;
+              const bool inside = half_base >= lean0_ks_max and half_base + 128 <= lean0_ke_min;
+              bool any_take = false;
+#pragma unroll
+              for (uint32_t i = 0; i < kBlockQ; ++i) {
+                bool t = results[i] >= tau[i];
+                if (not inside) t = t and kv_offset - seq_k_start[i] < seq_k_end[i] - seq_k_start[i];
+                any_take = any_take or t;
+              }
+              if (__any_sync(0xffffffffu, any_take)) {
+#pragma unroll
+                for (uint32_t i = 0; i < kBlockQ; ++i)
+                  handle(q_block_idx, i, i, seq_k_start[i], seq_k_end[i] - seq_k_start[i], tau[i], kv_offset, results[i]);
+              }
+            } else if constexpr (kFilter) {
 #pragma unroll
               for (uint32_t i = 0; i < kBlockQ; ++i)
                 handle(q_block_idx, i, i, seq_k_start[i], seq_k_end[i] - seq_k_start[i], tau[i], kv_offset, results[i]);
@@ -1941,7 +1973,7 @@ struct FusedIndexerTopK {
 #elif FSTK_VARIANTS
     // The layout-5 variants only (a build of its own).
     sglang::host::RuntimeCheck(alu_heads == 0 or alu_heads == 16, "fstk: alu_heads must be 0 or 16");
-    sglang::host::RuntimeCheck(layout >= 6 and layout <= 13, "fstk variants: layout must be 6..13");
+    sglang::host::RuntimeCheck(layout >= 6 and layout <= 14, "fstk variants: layout must be 6..14");
     if (layout == 6) {
       if (alu_heads) FSTK_DISPATCH(6, 16);
       FSTK_DISPATCH(6, 0);
@@ -1969,6 +2001,10 @@ struct FusedIndexerTopK {
     if (layout == 13) {
       if (alu_heads) FSTK_DISPATCH(13, 16);
       FSTK_DISPATCH(13, 0);
+    }
+    if (layout == 14) {
+      if (alu_heads) FSTK_DISPATCH(14, 16);
+      FSTK_DISPATCH(14, 0);
     }
     if (alu_heads) FSTK_DISPATCH(9, 16);
     FSTK_DISPATCH(9, 0);

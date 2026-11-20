@@ -29,7 +29,7 @@ MODE_LOGITS, MODE_NO_EPI, MODE_NO_STORE, MODE_FILTER, MODE_TAU, MODE_FILTER_COMP
 MODE_NO_MMA_NO_STORE, MODE_NO_MMA_FILTER = 6, 7
 # layout -> (rows per q-block, keys per split); see LayoutTraits in the kernel.
 LAYOUTS = {0: (4, 256), 1: (4, 256), 2: (8, 128), 3: (4, 256), 4: (8, 128), 5: (4, 256)}
-LAYOUTS.update({v: (4, 256) for v in range(6, 14)})  # layout-5 variants (their own build)
+LAYOUTS.update({v: (4, 256) for v in range(6, 15)})  # variants (their own build)
 DEFAULT_LAYOUT = 5  # measured fastest for the filter pass (VR, 11-20)
 MATH_WARPS = 8  # candidate sub-lists per row in layouts 0-4: one per math warp of the row's CTA
 SUB_LISTS = 4  # layout 5 (the fused path): one per warp of the row's warpgroup
@@ -53,7 +53,7 @@ def _deep_gemm_include() -> tuple[str, bool]:
 @cache_once
 def _jit_module(cuh_path: Optional[str] = None, serving: bool = False, variants: bool = False):
     """serving builds only what the prefill path runs (DEFAULT_LAYOUT, threshold and filter);
-    variants (not serving) only the layout-5 variants 6-13."""
+    variants (not serving) only the variants 6-14."""
     dg_root, dg_legacy = _deep_gemm_include()
     return load_jit(
         "dsa_fused_indexer_topk",
