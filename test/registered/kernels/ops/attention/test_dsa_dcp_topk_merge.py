@@ -67,6 +67,8 @@ def _rows(kind: str, seed: int) -> list[torch.Tensor]:
     g = torch.Generator().manual_seed(seed)
     if kind == "random":
         return [torch.randn(131072, generator=g)]
+    if kind == "random2":  # two rows, as the skewed kinds
+        return [torch.randn(65536, generator=g), torch.randn(65532, generator=g)]
     if kind == "dense_top":
         # many distinct scores near the global threshold: overflows the v2
         # merge's 10-bit threshold bin, not the local 12-bit ones
@@ -263,17 +265,18 @@ def _push_merge(cand_k: int) -> DcpTopKMerge:
     return _PUSH_MERGES[cand_k]
 
 
-def _failed_ranks(kind: str, cand_k: int) -> Optional[int]:
-    """Ranks that fail the certificate on every row of `kind` (None: not fixed)."""
+def _expected_failures(kind: str, cand_k: int) -> tuple[Optional[bool], Optional[int]]:
+    """(every row falls back, ranks failing the certificate per row); None: not fixed."""
     if cand_k == TOPK:
-        return 0
+        return False, 0
     if 4 * cand_k == TOPK:  # every candidate is in the top-k: each rank with more keys fails
-        return None if kind == "short" else 4
-    if kind == "periodic":  # rank 3 holds the whole top-k
-        return 1
+        return (None, None) if kind == "short" else (True, 4)
+    if kind == "periodic":  # rank 3 holds the whole top-k; ranks with a high phase may fail too
+        return True, None
     if kind in _HOT:
-        return sum(n > cand_k for n in _HOT[kind])
-    return 0 if kind in ("random", "short") else None
+        n = sum(h > cand_k for h in _HOT[kind])
+        return n > 0, n
+    return (False, 0) if kind in ("random", "short") else (None, None)
 
 
 @pytest.mark.parametrize("cand_k", [512, 768, 1024, 2048])
@@ -294,7 +297,7 @@ def test_dcp4_topk_merge_pushed(kind: str, cand_k: int) -> None:
         pytest.skip("multimem multicast unavailable")
     assert merge.cand_k == cand_k
     span = PAGE_SIZE * world
-    n_fail = _failed_ranks(kind, cand_k)
+    all_fall_back, n_fail = _expected_failures(kind, cand_k)
     for seed in SEEDS:
         case = _Case(kind, seed, rank, world, span)
         published = int(merge.stats[1])
@@ -302,10 +305,11 @@ def test_dcp4_topk_merge_pushed(kind: str, cand_k: int) -> None:
         torch.cuda.synchronize()
         bad = case.pushed_failures(rank, world)
         assert _all_ranks_ok(not bad), bad or "failed on another rank"
+        fell_back = merge.fallback[: case.rows].tolist()
+        if all_fall_back is not None:
+            assert all(fell_back) if all_fall_back else not any(fell_back), fell_back
         if n_fail is None:
             continue
-        fell_back = merge.fallback[: case.rows].tolist()
-        assert all(fell_back) if n_fail else not any(fell_back), fell_back
         total = torch.tensor([int(merge.stats[1]) - published])
         dist.all_reduce(total)
         assert int(total) == n_fail * case.rows, (int(total), n_fail, case.rows)
@@ -325,7 +329,7 @@ def test_dcp4_topk_merge_pushed_stale_slot() -> None:
         pytest.skip("multimem multicast unavailable")
     span = PAGE_SIZE * world
     first, idle, again = (_Case(k, seed, rank, world, span) for k, seed in
-                          (("skew", 1234), ("random", 1235), ("skew", 1236)))
+                          (("skew", 1234), ("random2", 1235), ("skew", 1236)))
     assert first.rows == idle.rows == again.rows
     calls = int(merge.counters[0])
     first.run_pushed(merge, span)
