@@ -13,7 +13,9 @@ same 128 outputs, FC2 rows as in the checkpoint, both with ue8m0 scales in 128x4
 
 from __future__ import annotations
 
+import logging
 import threading
+import time
 from typing import Tuple, Union
 
 import msgspec
@@ -23,8 +25,9 @@ import triton.language as tl
 
 _ROWS = 128  # routing padding per expert segment = scale-atom height
 _CFG = ((512, 192, 128), (256, 192, 64), (2, 1))  # mma tiler, mma instruction, cluster
-# Test hook: when a list, run() appends (routing slot, FC1 rows, FC1 scale atoms) of each call.
+# Test hook: when a list, run() appends (expanded->permuted map, FC1 rows, FC1 scale atoms) of each call.
 _capture = None
+logger = logging.getLogger(__name__)
 
 
 class CutePrefillMoeWeights(msgspec.Struct, frozen=True, kw_only=True):
@@ -63,6 +66,7 @@ def prepare_weights(
     """Checkpoint-order weights (w13 rows: gate [0, I), up [I, 2I)) -> this path's layout."""
     e, two_i, half_h = w13.shape
     inter, hidden = two_i // 2, half_h * 2
+    logger.debug("CuTe prefill MoE: weights to the grouped layout, %d experts", e)
     if hidden % 128 or inter % 128 or tuple(w2.shape) != (e, hidden, inter // 2):
         raise ValueError(f"unsupported MoE shape: w13 {tuple(w13.shape)}, w2 {tuple(w2.shape)}")
 
@@ -219,6 +223,7 @@ class _Engine:
             self.t.append((ts, tuple(from_dlpack(x, assumed_align=16) for x in ts)))
         self.comp = [None, None]
         self.lock = threading.Lock()
+        self.calls = 0
         # FlashInfer staged-routing operands that this path does not use
         self.unit_scales = torch.ones(num_groups, dtype=torch.float32, device=device)
         self.no_weights = torch.empty((0,), dtype=torch.bfloat16, device=device)
@@ -233,9 +238,13 @@ class _Engine:
         if self.comp[which] is None:
             with self.lock:
                 if self.comp[which] is None:
+                    t0 = time.perf_counter()
                     self.comp[which] = cute.compile(
                         self.kern[which], a0, b0, c0, sfa0, sfb0, self.G, shapes, strides, ptrs, sfptrs,
                         self.mac, tmap, self.mac, cu_stream,
+                    )
+                    logger.info(
+                        "CuTe prefill MoE: compiled %s in %.1f s", ("FC1", "FC2")[which], time.perf_counter() - t0
                     )
         self.comp[which](a0, b0, c0, sfa0, sfb0, shapes, strides, ptrs, sfptrs, tmap, cu_stream)
 
@@ -280,6 +289,12 @@ def run(
     H, I, E = w.hidden, w.inter, w.num_experts
     device = x_quant.device
     eng = _engine(w, device)
+    eng.calls += 1
+    if eng.calls & (eng.calls - 1) == 0:  # engagement log at calls 1, 2, 4, 8, ...
+        logger.info(
+            "SGLANG_K31_PREFILL_MOE_CUTE_FC1: CuTe prefill MoE call %d (tokens=%d, top_k=%d)",
+            eng.calls, num_tokens, top_k,
+        )
     module = get_trtllm_moe_sm100_module()
     fp8 = torch.float8_e4m3fn
 
@@ -288,7 +303,8 @@ def run(
         None, None, ids, eng.no_weights if packed else weights, x_quant.view(fp8), x_scale.view(fp8),
         w.w13, w.s13, w.w2, w.s2, eng.unit_scales, eng.unit_scales, eng.unit_scales,
         num_experts, top_k, None, None, I, local_expert_offset, local_num_experts, None,
-        RoutingMethodType.TopK.value, enable_pdl, [_ROWS, -1], WeightLayout.MajorK.value,
+        # config -1 would replace the tile with FlashInfer's default for this T; the staged routing ignores config
+        RoutingMethodType.TopK.value, enable_pdl, [_ROWS, 0], WeightLayout.MajorK.value,
         ActivationType.Situ.value, True, None,
     )
     # Slot 0 is the caller's weights in the unpacked form (an undefined tensor there: never convert it).

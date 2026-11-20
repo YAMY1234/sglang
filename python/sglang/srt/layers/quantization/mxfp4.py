@@ -17,6 +17,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 from dataclasses import fields, replace
 from functools import lru_cache
@@ -64,6 +65,7 @@ from sglang.srt.utils import (
 from sglang.srt.utils.common import get_bool_env_var
 from sglang.srt.utils.custom_op import register_custom_op
 
+logger = logging.getLogger(__name__)
 has_triton_kernels = is_triton_kernels_available()
 
 # Serialized MXFP4 scales use raw UE8M0 bytes. Keep fresh parameters valid for
@@ -1259,6 +1261,9 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         layer.w2_weight = Parameter(weights.w2, requires_grad=False)
         layer.w2_weight_scale = Parameter(weights.s2, requires_grad=False)
         layer.cute_prefill_moe = weights
+        logger.info(
+            "SGLANG_K31_PREFILL_MOE_CUTE_FC1: MoE layer %d weights in the CuTe prefill layout", layer.layer_id
+        )
 
     def _process_weights_for_sm90_cutlass(self, layer):
         """De-interleave + pad + halving-swap + byte-interleave MXFP4 weights
