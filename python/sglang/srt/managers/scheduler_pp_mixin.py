@@ -710,6 +710,7 @@ class SchedulerPPMixin:
             reqs = self.pop_bootstrapped_and_resolve_parked_pp()
         else:
             reqs = self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
+        self.send_early_readiness_bootstrapped(reqs)
         self.waiting_queue.extend(reqs)
 
     @scheduler_stage_method(SCHEDULER_STAGE_PD_CONSENSUS)

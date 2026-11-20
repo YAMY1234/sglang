@@ -85,6 +85,7 @@ from sglang.srt.mem_cache.common import (
     checkpoint_kv_cache,
     kv_to_page_indices,
     kv_to_page_num,
+    match_kv_cache,
     release_kv_cache,
 )
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
@@ -759,9 +760,9 @@ class SchedulerDisaggregationPrefillMixin:
             if self._engine_paused:
                 self._record_scheduler_state_for_paused_engine()
                 continue
-            self.waiting_queue.extend(
-                self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
-            )
+            bootstrapped_reqs = self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
+            self.send_early_readiness_bootstrapped(bootstrapped_reqs)
+            self.waiting_queue.extend(bootstrapped_reqs)
 
             # Get the next batch to run
             plan = self.get_next_disagg_prefill_batch_to_run(
@@ -857,6 +858,7 @@ class SchedulerDisaggregationPrefillMixin:
                 self._yield_gil_if_needed()
                 continue
             bootstrapped_reqs = self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
+            self.send_early_readiness_bootstrapped(bootstrapped_reqs)
             self.waiting_queue.extend(bootstrapped_reqs)
             # Resume batch creation on completion, new/ready requests, or an idle step.
             if not waiting_for_batch_result or received_inputs or bootstrapped_reqs:
@@ -1647,8 +1649,39 @@ class SchedulerDisaggregationPrefillMixin:
             return
         req.disagg_ready_checked = True
         threshold = envs.SGLANG_PREFILL_COMPLETE_MIN_WORK_TOKENS.get()
-        if threshold > 0 and len(req.origin_input_ids) - req.num_matched_prefix_tokens < threshold:
+        if threshold <= 0:
+            return
+        early = len(req.origin_input_ids) - req.num_matched_prefix_tokens < threshold
+        if early:
             req.disagg_kv_sender.mark_prefill_complete()
+        # [early readiness sent, requests decided, window start]
+        counts = getattr(self, "_early_ready_counts", None)
+        if counts is None:
+            counts = self._early_ready_counts = [0, 0, time.monotonic()]
+        counts[0] += early
+        counts[1] += 1
+        if time.monotonic() - counts[2] >= 60:
+            logger.info(
+                "PD prefill early readiness (MIN_WORK_TOKENS %d): %d of %d requests in %.0f s",
+                threshold, counts[0], counts[1], time.monotonic() - counts[2],
+            )
+            self._early_ready_counts = None
+
+    def send_early_readiness_bootstrapped(self: Scheduler, reqs: List[Req]) -> None:
+        """Early readiness as requests enter the waiting queue, prefix matched once here, so
+        decode reserves during their queue wait even while no batch is being scheduled."""
+        if (
+            not reqs
+            or envs.SGLANG_PREFILL_COMPLETE_MIN_WORK_TOKENS.get() <= 0
+            or get_disagg().disaggregation_decode_allocation_policy
+            != "prefill_complete"
+            or not self.tree_cache.supports_fast_match_prefix()
+        ):
+            return
+        for req in reqs:
+            if req.pending_bootstrap and not req.disagg_ready_checked:
+                match_kv_cache(req, self.tree_cache)
+                self.maybe_send_early_readiness(req)
 
     def send_early_readiness_waiting(self: Scheduler) -> None:
         """Early readiness for waiting requests once their prefix is matched, so decode
