@@ -11,6 +11,7 @@ import unittest
 import weakref
 from array import array
 from collections import deque
+from contextlib import nullcontext
 
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
@@ -20,7 +21,8 @@ maybe_stub_sgl_kernel()
 import torch  # noqa: E402
 
 from sglang.srt.managers import pp_decouple  # noqa: E402
-from sglang.srt.managers.pp_decouple import PPSendWindow  # noqa: E402
+from sglang.srt.managers.pp_decouple import PPSendWindow, PPSendWindows  # noqa: E402
+from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin  # noqa: E402
 from sglang.srt.mem_cache.allocator.token import TokenToKVPoolAllocator  # noqa: E402
 from sglang.srt.mem_cache.base_prefix_cache import (  # noqa: E402
     EvictParams,
@@ -80,6 +82,31 @@ class TestPPSendWindow(CustomTestCase):
         self.assertEqual(window.drain(), 2)
         self.assertEqual(log[4:], ["r2.0", "r2.1", "r3.0", "r3.1"])
         self.assertTrue(all(ref() is None for ref in payloads))
+
+    def test_commit_windows_sends_but_waits_a_cuda_graph_fenced_proxy_now(self):
+        log = []
+        scheduler = SchedulerPPMixin()
+        scheduler.pp_comm_stream_ctx = nullcontext()
+        scheduler.scheduler_stage_metrics = None
+        scheduler.pp_send_windows = PPSendWindows.create(bound=1)
+        recorded = []
+        scheduler._pp_record_comm_event = lambda: recorded.append("event") or "event"
+
+        work = _round("req0", log)
+        scheduler._pp_commit_comm_work(work, window=scheduler.pp_send_windows.req)
+        self.assertEqual((log, work, len(scheduler.pp_send_windows.req)), ([], [], 1))
+
+        scheduler.send_proxy_work = _round("proxy0", log)
+        scheduler.send_proxy_requires_forward_fence = False
+        scheduler._pp_commit_proxy_send_work()
+        self.assertEqual(log, [])
+        # A CUDA-graph proxy aliases replay buffers: the next forward is fenced on it.
+        scheduler.send_proxy_work = _round("proxy1", log)
+        scheduler.send_proxy_requires_forward_fence = True
+        scheduler._pp_commit_proxy_send_work()
+        self.assertEqual(log, ["proxy1.0", "proxy1.1"])
+        self.assertEqual(scheduler.pp_send_done_event, "event")
+        self.assertEqual(len(scheduler.pp_send_windows.proxy), 1)
 
 
 class _StageModel:
