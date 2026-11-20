@@ -2308,6 +2308,12 @@ class Envs:
     SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD = EnvInt(2048)
     SGLANG_DSA_HIP_DISABLE_PRESHUFFLE = EnvBool(False)
     SGLANG_DSA_MQA_LOGITS_FREE_MEM_FRACTION = EnvFloat(0.2)
+    # Prefill indexer input dump for offline kernel work (dsa/indexer_dump.py): DIR turns
+    # it on; LAYER -1 = the first DSA layer the rank builds; SKIP batches, then BATCHES saved.
+    SGLANG_DSA_INDEXER_DUMP_DIR = EnvStr(None)
+    SGLANG_DSA_INDEXER_DUMP_LAYER = EnvInt(-1)
+    SGLANG_DSA_INDEXER_DUMP_BATCHES = EnvInt(4)
+    SGLANG_DSA_INDEXER_DUMP_SKIP = EnvInt(0)
     # Requires a DeepGEMM paged-MQA scheduler supporting batches > SM count
     # (0.2.3 does); set to 0 for an older DeepGEMM.
     SGLANG_DSA_FULL_BATCH_MQA = EnvBool(True)
