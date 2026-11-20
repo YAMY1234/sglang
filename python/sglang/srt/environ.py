@@ -2524,6 +2524,10 @@ class Envs:
     # rows), the side-stream [f_a | b] TGV, and the SM107 attention side-stream
     # row caps below (kimi_k3._k31_sm107_tuning). Off: SM107 keeps the generic
     # picks and the 128-row side streams.
+    # Kimi-K3.1, default off: fold the KDA output gated RMSNorm into the target-verify
+    # recurrence kernel for any attention-TP head count (the fully fused decode kernel
+    # is built for 12 heads, which also gated this fold).
+    SGLANG_K31_KDA_ONORM_FOLD_ANY_HEADS = EnvBool(False)
     SGLANG_K31_SM107_GEMM_TACTICS = EnvBool(False)
     # Optional path of a JSON table that replaces the built-in SM107 table.
     SGLANG_K31_SM107_GEMM_TABLE = EnvStr(None)
