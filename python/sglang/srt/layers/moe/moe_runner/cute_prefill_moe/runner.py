@@ -25,7 +25,7 @@ import triton.language as tl
 
 _ROWS = 128  # routing padding per expert segment = scale-atom height
 _CFG = ((512, 192, 128), (256, 192, 64), (2, 1))  # mma tiler, mma instruction, cluster
-# Test hook: when a list, run() appends (expanded->permuted map, FC1 rows, FC1 scale atoms) of each call.
+# Test hook: when a list, run() appends (expanded->permuted map, FC1 rows, FC1 scale atoms, FC2 rows) of each call.
 _capture = None
 logger = logging.getLogger(__name__)
 
@@ -341,7 +341,7 @@ def run(
     eng.launch(0, stream)  # FC1: SiTU + MXFP8 rows o1, scale atoms o1sf
     eng.launch(1, stream)  # FC2: BF16 rows o2
     if _capture is not None:
-        _capture.append((expanded, o1.view(u8), o1sf.view(u8)))
+        _capture.append((expanded, o1.view(u8), o1sf.view(u8), o2))
     if defer_finalize:
         return o2, expert_weights, expanded
     module.trtllm_moe_run_finalize(
