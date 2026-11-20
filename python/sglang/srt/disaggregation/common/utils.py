@@ -36,6 +36,8 @@ class TransferKVChunk:
     wait_event: Optional[object] = None
     # Must complete before reading asynchronously copied host indices.
     indices_event: Optional[object] = None
+    # perf_counter() at enqueue when SGLANG_DISAGG_TRANSFER_TIME_STATS_INTERVAL > 0, else 0.
+    enqueued_at: float = 0.0
 
 
 def bind_thread_to_device(gpu_id: int) -> None:
