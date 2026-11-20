@@ -710,6 +710,69 @@ class TestAllocationIntegration(CustomTestCase):
                 self.assertEqual(receiver.poll(), KVPoll.WaitingForInput)
                 self.assertEqual(list(self.wire), [])
 
+    def test_min_work_tokens_readies_short_waiting_requests_before_launch(self):
+        scheduler = SimpleNamespace()
+        for name in ("maybe_send_early_readiness", "send_early_readiness_waiting"):
+            setattr(scheduler, name, MethodType(getattr(SchedulerDisaggregationPrefillMixin, name), scheduler))
+        short, long_ = (
+            SimpleNamespace(
+                pending_bootstrap=True,
+                disagg_ready_checked=False,
+                origin_input_ids=[0] * 100,
+                num_matched_prefix_tokens=100 - uncached,
+                disagg_kv_sender=Mock(),
+            )
+            for uncached in (36, 64)
+        )
+        scheduler.waiting_queue = [short, long_]
+        with envs.SGLANG_PREFILL_COMPLETE_MIN_WORK_TOKENS.override(64):
+            scheduler.send_early_readiness_waiting()
+        short.disagg_kv_sender.mark_prefill_complete.assert_called_once()
+        long_.disagg_kv_sender.mark_prefill_complete.assert_not_called()
+        self.assertTrue(long_.disagg_ready_checked)
+
+    def test_pp_poll_finalizes_waiting_requests_decode_reserved(self):
+        # Early readiness lets decode reserve while the request waits; under PP the
+        # waiting poll finalizes it before launch, as the non-PP waiting check does.
+        ready, pending = (
+            SimpleNamespace(
+                rid=rid,
+                pending_bootstrap=True,
+                disagg_kv_sender=Mock(),
+                to_finish=None,
+                finished_reason=None,
+            )
+            for rid in ("ready", "pending")
+        )
+        queue = SimpleNamespace(
+            queue=[],
+            pp_rank=0,
+            pp_size=2,
+            pp_poll_sync_work_list=[],
+            admit_room_waiters=Mock(),
+            pop_bootstrapped=Mock(return_value=[]),
+            finalize_bootstrap=Mock(return_value=True),
+        )
+        scheduler = SimpleNamespace(
+            disagg_prefill_bootstrap_queue=queue,
+            waiting_queue=[ready, pending],
+            disagg_prefill_inflight_queue=[],
+            attn_cp_cpu_group=None,
+            attn_tp_cpu_group=None,
+            pp_group=None,
+            scheduler_stage_metrics=None,
+        )
+        for name in ("pop_bootstrapped_and_resolve_parked_pp", "_drop_failed_waiting_bootstrap", "_resolve_parked_bootstrap"):
+            setattr(scheduler, name, MethodType(getattr(SchedulerDisaggregationPrefillMixin, name), scheduler))
+        polls = ([], [KVPoll.WaitingForInput, KVPoll.Bootstrapping], [])
+        with patch(
+            "sglang.srt.disaggregation.prefill.poll_and_all_reduce_prefill_pp_sections",
+            return_value=polls,
+        ):
+            self.assertEqual(scheduler.pop_bootstrapped_and_resolve_parked_pp(), [])
+        queue.finalize_bootstrap.assert_called_once_with(ready)
+        self.assertEqual(scheduler.waiting_queue, [ready, pending])
+
     def test_matched_tp_dcp_peer_needs_flag_and_equal_layout(self):
         # Decode attention TP8 + DCP8; one prefill rank per decode rank only
         # when the prefill uses the same attention TP and DCP.

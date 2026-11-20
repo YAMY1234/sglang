@@ -4545,6 +4545,8 @@ class Scheduler(
             ),
             chunked_req=self.chunked_req,
         )
+        if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            self.send_early_readiness_waiting()
 
         if TEST_RETRACT and running_bs > TEST_RETRACT_NO_PREFILL_BS:
             # If we are testing retraction and the running batch size exceeds

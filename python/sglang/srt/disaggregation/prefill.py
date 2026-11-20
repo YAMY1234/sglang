@@ -1525,6 +1525,10 @@ class SchedulerDisaggregationPrefillMixin:
             )
         )
         self._drop_failed_waiting_bootstrap(waiting=waiting, polls=waiting_polls)
+        for req, poll in zip(waiting, waiting_polls, strict=True):
+            # Decode reserved it before launch (early readiness): send as under early.
+            if poll == KVPoll.WaitingForInput and not should_force_retry(req):
+                bootstrap_queue.finalize_bootstrap(req)
         bootstrapped = bootstrap_queue.pop_bootstrapped(polls=queued_polls)
         self._resolve_parked_bootstrap(parked=parked, polls=parked_polls)
         return bootstrapped
@@ -1629,6 +1633,17 @@ class SchedulerDisaggregationPrefillMixin:
         if threshold > 0 and len(req.origin_input_ids) - req.num_matched_prefix_tokens < threshold:
             req.disagg_kv_sender.mark_prefill_complete()
 
+    def send_early_readiness_waiting(self: Scheduler) -> None:
+        """Early readiness for waiting requests once their prefix is matched, so decode
+        reserves before launch and their KV can be sent at forward completion."""
+        if (
+            envs.SGLANG_PREFILL_COMPLETE_MIN_WORK_TOKENS.get() > 0
+            and get_disagg().disaggregation_decode_allocation_policy
+            == "prefill_complete"
+        ):
+            for req in self.waiting_queue:
+                self.maybe_send_early_readiness(req)
+
     def maybe_send_cached_prefix_chunk(
         self: Scheduler, req: Req, allow_send: bool = True
     ) -> None:
@@ -1673,13 +1688,13 @@ class SchedulerDisaggregationPrefillMixin:
     def _pp_pd_early_send_enabled(self: Scheduler) -> bool:
         """SGLANG_PP_PD_PREFILL_EARLY_SEND, where the last chunk needs nothing that
         only the result brings (logprobs, checksums, EAGLE hidden states) and the
-        transfer engine can leave the aux to another stage (Mooncake)."""
+        transfer engine can leave the aux to another stage (Mooncake). Under
+        prefill_complete only requests decode reserved before their last chunk
+        (early readiness) qualify; the rest are still pending bootstrap then."""
         return (
             envs.SGLANG_PP_PD_PREFILL_EARLY_SEND.get()
             and get_parallel().pp_size > 1
             and get_disagg().disaggregation_transfer_backend == "mooncake"
-            and get_disagg().disaggregation_decode_allocation_policy
-            != "prefill_complete"
             and self.kv_checksum_computer is None
             and not self.enable_staging
             and not self.enable_unified_cache_external_linker
@@ -1818,7 +1833,7 @@ class SchedulerDisaggregationPrefillMixin:
             ps.full_num_used, ps.full_available_size, ps.full_evictable_size,
             ps.full_capacity, ps.mamba_num_used, ps.mamba_available_size,
             len(self.disagg_prefill_inflight_queue), held,
-            # set only with early send, which prefill_complete turns off
+            # set only with early send (SGLANG_PP_PD_PREFILL_EARLY_SEND)
             getattr(self, "disagg_prefill_early_send_stats", {}).get("deferred", 0),
         )
 
