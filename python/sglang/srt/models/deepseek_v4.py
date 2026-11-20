@@ -3760,7 +3760,7 @@ class DeepseekV4DecoderLayerBase(nn.Module):
                         self._hc_ffn_bf16_packed = pack_bf16_hc_weight(
                             self._hc_ffn_bf16_parts
                         )
-                        if self.layer_id == 0:
+                        if getattr(self, "layer_id", None) == 0:
                             # The first layer's streams are the broadcast embedding.
                             summed = self.hc_attn_fn.data.view(24, 4, -1).sum(1)
                             self._hc_attn_bf16_packed_bcast = pack_bf16_hc_weight(
