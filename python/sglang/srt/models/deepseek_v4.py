@@ -2409,7 +2409,13 @@ class MQALayer(MqaAttentionBase):
                 )
 
         stream_kv.wait_stream(current_stream)
-        q_lora, q_for_wqb = self._compute_q_a(x_linear, qkv_a=qkv_a)
+        fused_qkv = self._fused_qkv_norm_to_cache(
+            qkv_a, positions, forward_batch, attn_backend
+        )
+        if fused_qkv is not None:
+            q_lora, q_for_wqb = fused_qkv
+        else:
+            q_lora, q_for_wqb = self._compute_q_a(x_linear, qkv_a=qkv_a)
         # NOTE: wait for the q_lora ready
         if self.indexer is not None:
             stream_sources.wait_stream(current_stream)
@@ -2431,10 +2437,11 @@ class MQALayer(MqaAttentionBase):
                     run_compressor=False,
                 )
 
-        with torch.cuda.stream(stream_kv):
-            self._compute_kv_to_cache(
-                x_linear, positions, forward_batch, attn_backend, qkv_a=qkv_a
-            )
+        if fused_qkv is None:
+            with torch.cuda.stream(stream_kv):
+                self._compute_kv_to_cache(
+                    x_linear, positions, forward_batch, attn_backend, qkv_a=qkv_a
+                )
 
         current_stream.wait_stream(stream_kv)
         if self.compressor is not None or self.indexer is not None:
