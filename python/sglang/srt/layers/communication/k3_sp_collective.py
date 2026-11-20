@@ -73,8 +73,11 @@ def _init_state() -> Optional[_State]:
     else:
         comm_disabled = None
         has_multicast = None
+    # SM107 runs the same multimem/PDL kernels; it is not auto-probed, and
+    # takes them only when the variable is set (and a table for the device
+    # exists, checked below).
     if (
-        device_sm not in (100, 103)
+        (device_sm not in (100, 103) and not (explicit and device_sm == 107))
         or group.world_size not in _SUPPORTED_WORLD_SIZES
         or a2a not in ("megamoe", "deepep")
         or not is_custom_allreduce
@@ -82,7 +85,8 @@ def _init_state() -> Optional[_State]:
         or not has_multicast
     ):
         message = (
-            "K3 SP collective requires SM100/SM103, TP4/TP8/TP16, "
+            "K3 SP collective requires SM100/SM103 (SM107 when set explicitly), "
+            "TP4/TP8/TP16, "
             "MegaMoE/DeepEP, and CustomAllReduceV2 with multicast; using NCCL "
             "(sm=%s, world_size=%s, a2a=%s, comm=%s, disabled=%s, "
             "has_multicast=%s)."
@@ -184,6 +188,38 @@ def requires_symmetric_rs(
         device,
     )
     return fusion is not None and fusion.strategy == "fused_pull"
+
+
+def takes_reduce_scatter(
+    num_tokens: int, device: torch.device, element_size: int
+) -> bool:
+    """Whether a tuned kernel here (standalone, or fused with the
+    attention-residual read) takes the SP reduce-scatter of ``num_tokens`` rows."""
+    state = _init_state()
+    if state is None:
+        return False
+    from sglang.kernels.ops.communication import sp_collective
+
+    world_size = state.group.world_size
+    if (
+        sp_collective.get_dispatch(
+            "reduce_scatter",
+            world_size,
+            _HIDDEN_SIZE,
+            num_tokens,
+            device,
+            element_size=element_size,
+            max_push_size=state.comm.max_push_size,
+        )
+        is not None
+    ):
+        return True
+    return envs.SGLANG_K3_SP_ATTN_RES.get() and (
+        sp_collective.get_fusion_dispatch(
+            "reduce_scatter_attn_res", world_size, _HIDDEN_SIZE, num_tokens, device
+        )
+        is not None
+    )
 
 
 def get_o_proj_output_buffer(

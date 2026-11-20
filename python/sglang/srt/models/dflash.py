@@ -5,6 +5,8 @@
 from __future__ import annotations
 
 import logging
+import os
+from contextlib import nullcontext
 from functools import partial
 from typing import Iterable, Optional, Tuple
 
@@ -47,7 +49,8 @@ from sglang.srt.model_loader.weight_utils import (
 )
 from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
 from sglang.srt.models.utils import apply_qk_norm
-from sglang.srt.runtime_context import get_parallel, get_spec
+from sglang.srt.runtime_context import get_forward, get_parallel, get_spec
+from sglang.srt.speculative import k31ht_draft_ar_site as k31ht_site
 from sglang.srt.speculative.dflash_utils import (
     can_dflash_slice_qkv_weight,
     get_dflash_attention_sliding_window_size,
@@ -71,6 +74,39 @@ try:
     from flashinfer import top_k as _flashinfer_top_k
 except ImportError:
     _flashinfer_top_k = None
+
+
+def _k31ht_topk_gather_pack_requested() -> bool:
+    """K31HT_DRAFT_TOPK_GATHER_PACK (default off): fail-closed parse ('' / '0' off, '1' on, else ValueError)."""
+    v = os.environ.get("K31HT_DRAFT_TOPK_GATHER_PACK", "")
+    if v in ("", "0"):
+        return False
+    if v == "1":
+        return True
+    raise ValueError(f"K31HT_DRAFT_TOPK_GATHER_PACK must be unset, '', '0' or '1', got {v!r}")
+
+
+_K31HT_TOPK_GATHER_PACK = _k31ht_topk_gather_pack_requested()
+_K31HT_TOPK_GATHER_PACK_LOGGED = False
+
+
+def k31ht_topk_gather_packed(group, vals: torch.Tensor, global_ids: torch.Tensor):
+    """K31HT_DRAFT_TOPK_GATHER_PACK (sgl-project/sglang#50040): the vocab-sharded top-k values (fp32 bits) and ids
+    (int32) in ONE all-gather of an [N, K, 2] int32 tensor, rank-major along K like the two dim=-1 gathers; values
+    bit-identical, ids equal in value (int32, the caller widens the selected K)."""
+    packed = torch.stack(
+        (vals.float().contiguous().view(torch.int32), global_ids.to(torch.int32)), dim=-1
+    )
+    g = group.all_gather(packed, dim=-2)
+    global _K31HT_TOPK_GATHER_PACK_LOGGED
+    if not _K31HT_TOPK_GATHER_PACK_LOGGED:
+        _K31HT_TOPK_GATHER_PACK_LOGGED = True
+        logger.info(
+            "K31HT_DRAFT_TOPK_GATHER_PACK ENGAGED: candidate top-k values + ids in one all-gather (world %d, K %d)",
+            group.world_size,
+            int(vals.shape[-1]),
+        )
+    return g[..., 0].contiguous().view(torch.float32), g[..., 1]
 
 
 def _radix_topk(scores: torch.Tensor, k: int) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -245,6 +281,8 @@ def candidate_topk(
     gathered = _fused_candidate_all_gather(group, vals, global_ids)
     if gathered is not None:
         gathered_vals, gathered_ids = gathered
+    elif _K31HT_TOPK_GATHER_PACK:
+        gathered_vals, gathered_ids = k31ht_topk_gather_packed(group, vals, global_ids)
     else:
         gathered_vals = group.all_gather(vals.float(), dim=-1)
         gathered_ids = group.all_gather(global_ids, dim=-1)
@@ -1131,6 +1169,10 @@ class DFlashDraftModel(nn.Module):
         hidden_states = input_embeds
         residual: Optional[torch.Tensor] = None
 
+        if k31ht_site.k31ht_draft_site_epi_requested():
+            sited = self._k31ht_forward_ar_sites(positions, hidden_states, forward_batch)
+            if sited is not None:
+                return LogitsProcessorOutput(next_token_logits=None, hidden_states=sited)
         for layer in self.layers:
             hidden_states, residual = layer(
                 positions, hidden_states, forward_batch, residual
@@ -1146,6 +1188,70 @@ class DFlashDraftModel(nn.Module):
             next_token_logits=None,
             hidden_states=hidden_states,
         )
+
+    def _k31ht_site_layout_reason(self, hidden_states: torch.Tensor) -> Optional[str]:
+        """Why the K31HT_DRAFT_SITE_EPI layer loop cannot replace the stock one for this forward (None = it can)."""
+        if hidden_states.numel() == 0 or hidden_states.dim() != 2:
+            return f"hidden {tuple(hidden_states.shape)}"
+        if hidden_states.dtype != torch.bfloat16 or hidden_states.shape[1] != k31ht_site.HIDDEN:
+            return f"hidden dtype {hidden_states.dtype} width {hidden_states.shape[1]}"
+        if get_forward().sp_active:
+            return "sequence parallel active"
+        norms = [self.norm] + [n for l in self.layers for n in (l.input_layernorm, l.post_attention_layernorm)]
+        if any(type(n) is not RMSNorm or n.cast_x_before_out_mul or n.weight.dtype != torch.bfloat16 for n in norms):
+            return "norms are not plain bf16 RMSNorm"
+        for layer in self.layers:
+            for conv in (layer.attention_conv, layer.mlp_conv):
+                if conv is None or conv.taps != k31ht_site.TAPS or conv.group_size != k31ht_site.GROUP:
+                    return "draft conv missing or not 2-tap / 16-group"
+                if conv.base_kernel.dtype != torch.bfloat16:
+                    return f"conv base dtype {conv.base_kernel.dtype}"
+            for lin in (layer.self_attn.o_proj, layer.mlp.down_proj):
+                if not lin.reduce_results or getattr(lin, "use_decode_attn_tp", False):
+                    return "projection all-reduce is not the plain reduce_results path"
+        return None
+
+    def _k31ht_site(self, linear, partial, conv, kernel, residual, norm, lean=0):
+        """One site: ``partial`` is the projection output, already all-reduced by the stock path, or (``lean``,
+        K31HT_DRAFT_AR_LEAN) unreduced and reduced here by the stock 2shot_push kernel with ``lean`` threads per CTA; one
+        epilogue kernel then replaces conv finish + fused add-RMSNorm (same arithmetic)."""
+        if lean:
+            partial = k31ht_site.lean_all_reduce(k31ht_site.stock_group_for(linear), partial, lean)
+        return k31ht_site.draft_site_epilogue(
+            partial, kernel, conv.base_kernel[1], residual, norm.weight, norm.variance_epsilon, conv.block_size
+        )
+
+    def _k31ht_forward_ar_sites(self, positions, hidden_states, forward_batch) -> Optional[torch.Tensor]:
+        """K31HT_DRAFT_SITE_EPI=1 (sgl-project/sglang#50040): the stock layer loop with each projection's conv finish and
+        the following add-RMSNorm (post-attention norm; next layer's input norm; the model norm after the last layer) done
+        by one epilogue kernel after the projection's all-reduce. Bit-identical to the stock loop; None runs the stock loop."""
+        reason = self._k31ht_site_layout_reason(hidden_states)
+        if reason is not None:
+            k31ht_site.decline(reason)
+            return None
+        n = len(self.layers)
+        h = hidden_states
+        residual = None
+        lean = k31ht_site.k31ht_draft_ar_lean_threads()  # K31HT_DRAFT_AR_LEAN
+        for i, layer in enumerate(self.layers):
+            if i == 0:
+                residual = h
+                x = layer.input_layernorm(h)
+            else:
+                x = h  # the previous MLP site applied this layer's input_layernorm
+            x, attention_kernel = layer.attention_conv.prepare(x)
+            with k31ht_site.no_reduce(layer.self_attn.o_proj) if lean else nullcontext():
+                partial = layer.self_attn(positions=positions, hidden_states=x, forward_batch=forward_batch)
+            h = self._k31ht_site(
+                layer.self_attn.o_proj, partial, layer.attention_conv, attention_kernel, residual,
+                layer.post_attention_layernorm, lean=lean,
+            )
+            x, mlp_kernel = layer.mlp_conv.prepare(h)
+            with k31ht_site.no_reduce(layer.mlp.down_proj) if lean else nullcontext():
+                partial = layer.mlp(x)
+            norm = self.layers[i + 1].input_layernorm if i + 1 < n else self.norm
+            h = self._k31ht_site(layer.mlp.down_proj, partial, layer.mlp_conv, mlp_kernel, residual, norm, lean=lean)
+        return h
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [

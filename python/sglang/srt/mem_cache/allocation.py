@@ -172,6 +172,15 @@ def alloc_token_slots(
     return out_cache_loc
 
 
+def paged_extend_num_tokens(prefix_lens, seq_lens, page_size: int) -> int:
+    """Pool tokens a paged extend takes: each request fills its partial last
+    page, then takes whole new pages (``alloc_extend``'s page count)."""
+    return page_size * sum(
+        max(-(-seq // page_size) - -(-prefix // page_size), 0)
+        for prefix, seq in zip(prefix_lens, seq_lens)
+    )
+
+
 def alloc_paged_token_slots_extend(
     tree_cache: BasePrefixCache,
     prefix_lens: torch.Tensor,

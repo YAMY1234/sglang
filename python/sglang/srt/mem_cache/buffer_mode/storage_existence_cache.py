@@ -51,6 +51,9 @@ class PoolExistenceBeliefs:
     def __init__(self, max_entries: int = HICACHE_EXISTENCE_CACHE_MAX_ENTRIES):
         self.max_entries = max_entries
         self._entries: OrderedDict[str, None] = OrderedDict()
+        # The generation before the last rotate(): still believed, but a lookup
+        # does not renew it; only a new write (add) does.
+        self._old: dict[str, None] = {}
         self._inflight: dict[str, int] = {}
 
     def add(self, hashes: Iterable[str]) -> None:
@@ -66,18 +69,19 @@ class PoolExistenceBeliefs:
     def contains(self, page_hash: str) -> bool:
         entries = self._entries
         if page_hash not in entries:
-            return False
+            return page_hash in self._old
         entries.move_to_end(page_hash)
         return True
 
     def contains_all(self, hashes: Iterable[str]) -> bool:
-        entries = self._entries
+        entries, old = self._entries, self._old
         move_to_end = entries.move_to_end
         for h in hashes:
             try:
                 move_to_end(h)
             except KeyError:
-                return False
+                if h not in old:
+                    return False
         return True
 
     def covered(self, hashes: Iterable[str]) -> bool:
@@ -85,12 +89,12 @@ class PoolExistenceBeliefs:
         inflight = self._inflight
         if not inflight:
             return self.contains_all(hashes)
-        entries = self._entries
+        entries, old = self._entries, self._old
         move_to_end = entries.move_to_end
         for h in hashes:
             if h in entries:
                 move_to_end(h)
-            elif h not in inflight:
+            elif h not in inflight and h not in old:
                 return False
         return True
 
@@ -114,12 +118,20 @@ class PoolExistenceBeliefs:
     def invalidate_beyond(self, hashes: Sequence[str], keep_pages: int) -> None:
         """Discard the beliefs beyond the leading ``keep_pages`` of ``hashes``;
         the next insert re-writes that span."""
-        pop = self._entries.pop
+        pop, pop_old = self._entries.pop, self._old.pop
         for h in hashes[keep_pages:]:
             pop(h, None)
+            pop_old(h, None)
+
+    def rotate(self) -> None:
+        """Start a new generation: beliefs not re-written since the previous
+        rotate() are dropped (the store may have evicted them unannounced)."""
+        self._old = self._entries
+        self._entries = OrderedDict()
 
     def clear(self) -> None:
         self._entries.clear()
+        self._old = {}
         self._inflight.clear()
 
     def clear_inflight(self) -> None:
@@ -132,6 +144,10 @@ class StorageExistenceCache:
     def __init__(self, max_entries: int = HICACHE_EXISTENCE_CACHE_MAX_ENTRIES):
         self.max_entries = max_entries
         self._pools: dict[str, PoolExistenceBeliefs] = {}
+
+    def rotate(self) -> None:
+        for beliefs in self._pools.values():
+            beliefs.rotate()
 
     def pool(self, name: str) -> PoolExistenceBeliefs:
         beliefs = self._pools.get(name)

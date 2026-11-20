@@ -246,7 +246,12 @@ class StagingBuffer:
 
     def get_gather_stream(self) -> torch.Stream:
         if self._gather_stream is None:
-            self._gather_stream = self.create_stream()
+            from sglang.srt.environ import envs
+
+            if envs.SGLANG_DISAGG_GATHER_STREAM_HIGH_PRIORITY.get() and self.device.type == "cuda":
+                self._gather_stream = torch.cuda.Stream(device=self.device, priority=-1)
+            else:
+                self._gather_stream = self.create_stream()
         return self._gather_stream
 
 

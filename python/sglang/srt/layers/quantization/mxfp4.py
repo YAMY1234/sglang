@@ -787,12 +787,31 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                     (layer.w2_weight.data, layer.w2_weight_scale.data),
                     mma_type=mma_type,
                 )
+                from sglang.srt.layers.moe.mega_moe import (
+                    _is_mega_moe_localization_enabled,
+                    localize_mega_moe_weights,
+                )
+
+                localized = (
+                    mma_type == "fp8xfp4" and _is_mega_moe_localization_enabled()
+                )
+                if localized:
+                    l1_pair, l2_pair = localize_mega_moe_weights(l1_pair, l2_pair)
                 layer.mega_l1_weights = l1_pair
                 layer.mega_l2_weights = l2_pair
-                layer.w13_weight.data = l1_pair[0]
+                # Localized weights are (domains, experts, ...): the params keep an
+                # expert-major view of the same memory and the plain copies are freed.
+                layer.w13_weight.data = (
+                    l1_pair[0].transpose(0, 1) if localized else l1_pair[0]
+                )
                 layer.w13_weight_scale.data = l1_pair[1]
-                layer.w2_weight.data = l2_pair[0]
+                layer.w2_weight.data = (
+                    l2_pair[0].transpose(0, 1) if localized else l2_pair[0]
+                )
                 layer.w2_weight_scale.data = l2_pair[1]
+                layer._mega_moe_weights_localized = localized
+                if localized:
+                    torch.cuda.empty_cache()
                 layer._mega_moe_weights_built = True
             layer._mxfp4_backend = "deep_gemm"
             return
@@ -1628,6 +1647,12 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
 
         routing_bias = layer._situ_routing_bias_bf16
         topk_output = dispatch_output.topk_output
+        if TopKOutputChecker.format_is_standard(topk_output):
+            from sglang.srt.layers.moe import expert_count_log
+
+            expert_count_log.maybe_record(
+                layer.layer_id, topk_output.topk_ids, layer.num_experts
+            )
         if (
             self.moe_runner_config.activation == "situ"
             and routing_bias is None

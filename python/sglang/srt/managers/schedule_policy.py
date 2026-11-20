@@ -35,6 +35,7 @@ logger = logging.getLogger(__name__)
 
 import os
 import random
+import time
 from collections import Counter
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
@@ -71,6 +72,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     zero_match_result,
 )
 from sglang.srt.mem_cache.common import match_kv_cache, touch_waiting_prefix
+from sglang.srt.mem_cache.prefill_budget import park_chunked_prefill_enabled
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
 from sglang.srt.mem_cache.unified_cache.components import (
     CacheTransferPhase,
@@ -206,6 +208,12 @@ class SchedulePolicy:
         self.priority_sign = 1 if schedule_low_priority_values_first else -1
         self._shortest_prefill_calls = 0
         self._waiting_prefix_refresh_calls = 0
+        self._prefix_match_passes = 0
+        self._prefix_matched_at: Dict[str, int] = {}
+        self._prefix_match_seconds = 0.0
+        self._spf_processed_tokens = 0
+        self._spf_aged_promotions = 0
+        self._spf_last_promotion_call = -(1 << 30)
 
         # It is used to find the matching prefix for in-batch prefix caching.
         self.waiting_queue_radix_tree = RadixCache.create_simulated()
@@ -216,6 +224,7 @@ class SchedulePolicy:
         running_batch: Optional[ScheduleBatch] = None,
         processed_tokens: int = 0,
         bootstrap_queue: List[Req] = [],
+        chunked_req: Optional[Req] = None,
     ) -> None:
         policy = self._determine_active_policy(waiting_queue)
 
@@ -235,9 +244,11 @@ class SchedulePolicy:
                     waiting_queue, self.priority_sign
                 )
         elif isinstance(policy, CacheAwarePolicy):
+            match_start = time.perf_counter()
             temporary_deprioritized = self._compute_prefix_matches(
                 waiting_queue, policy
             )
+            self._prefix_match_seconds += time.perf_counter() - match_start
             if policy == CacheAwarePolicy.LPM:
                 SchedulePolicy._sort_by_longest_prefix(
                     waiting_queue, temporary_deprioritized
@@ -252,13 +263,21 @@ class SchedulePolicy:
                 SchedulePolicy._sort_by_shortest_prefill(
                     waiting_queue, temporary_deprioritized
                 )
+                self._spf_processed_tokens = processed_tokens
+                if chunked_req is None:
+                    self._promote_aged_prefill(waiting_queue, temporary_deprioritized)
                 self._shortest_prefill_calls += 1
                 if waiting_queue and self._shortest_prefill_calls % 128 == 1:
+                    # prefix_match_ms: mean prefix-match time per pass since the last line.
                     logger.info(
-                        "Experimental shortest-prefill-first: queue=%d shortest_uncached=%d",
+                        "Experimental shortest-prefill-first: queue=%d shortest_uncached=%d "
+                        "prefix_match_ms=%.2f aged_promotions=%d",
                         len(waiting_queue),
                         self._shortest_prefill_work(waiting_queue[0]),
+                        1e3 * self._prefix_match_seconds / 128,
+                        self._spf_aged_promotions,
                     )
+                    self._prefix_match_seconds = 0.0
             else:
                 raise ValueError(f"Unknown CacheAware Policy: {policy=}")
         else:
@@ -358,12 +377,18 @@ class SchedulePolicy:
     ) -> Set[int]:
         temporary_deprioritized: Set[int] = set()
         self.waiting_queue_radix_tree.reset()
+        rematch = self._prefix_rematch_rids(waiting_queue, policy)
 
         for r in waiting_queue:
-            prefix_ids = r.origin_input_ids + r.output_ids
+            if rematch is not None and not r.output_ids:
+                prefix_ids = r.origin_input_ids
+            else:
+                prefix_ids = r.origin_input_ids + r.output_ids
             extra_key = r.extra_key
             cache_salt = r.cache_salt
-            match_result = match_kv_cache(r, self.tree_cache, prefix_ids)
+            # A skipped request keeps the prefix fields of its last match.
+            if rematch is None or r.rid in rematch:
+                match_result = match_kv_cache(r, self.tree_cache, prefix_ids)
 
             # NOTE(sang): This logic is for in-batch prefix caching;
             # If there are more than 1 request that have small matching prefix from
@@ -405,6 +430,33 @@ class SchedulePolicy:
                     )
         return temporary_deprioritized
 
+    def _prefix_rematch_rids(
+        self, waiting_queue: List[Req], policy: CacheAwarePolicy
+    ) -> Optional[Set[str]]:
+        """With SGLANG_SPF_MATCH_REFRESH_PASSES=N under shortest-prefill-first,
+        the rids to match this pass: new requests plus the ceil(len/N) whose last
+        match is oldest. None matches every request. Admission re-matches anyway."""
+        refresh_passes = envs.SGLANG_SPF_MATCH_REFRESH_PASSES.get()
+        if refresh_passes <= 0 or policy != CacheAwarePolicy.SHORTEST_PREFILL_FIRST:
+            return None
+        this_pass = self._prefix_match_passes
+        self._prefix_match_passes += 1
+        matched_at = self._prefix_matched_at
+        # Pass counts and queue order agree across ranks, so every rank picks
+        # the same requests.
+        seen = sorted(
+            (r for r in waiting_queue if r.rid in matched_at),
+            key=lambda r: matched_at[r.rid],
+        )
+        rematch = {r.rid for r in waiting_queue if r.rid not in matched_at}
+        budget = -(-len(waiting_queue) // refresh_passes)
+        rematch.update(r.rid for r in seen[:budget])
+        self._prefix_matched_at = {
+            r.rid: this_pass if r.rid in rematch else matched_at[r.rid]
+            for r in waiting_queue
+        }
+        return rematch
+
     @staticmethod
     def _shortest_prefill_work(r: Req) -> int:
         return max(
@@ -425,8 +477,41 @@ class SchedulePolicy:
             )
         )
 
+    def _spf_aged(self, req: Req) -> bool:
+        # Age in prefilled tokens, which every PP/TP rank counts alike (wall time does not).
+        age = envs.SGLANG_SPF_AGE_TOKENS.get()
+        return age > 0 and (
+            self._spf_processed_tokens - req.arrival_processed_tokens >= age
+        )
+
+    def _promote_aged_prefill(
+        self, waiting_queue: List[Req], temporary_deprioritized: Set[int]
+    ) -> None:
+        """Move the longest-waiting aged request to the head. The caller skips
+        this while a chunk is in flight: a second chunked request is refused."""
+        aged = [
+            i
+            for i, r in enumerate(waiting_queue)
+            if r.rid not in temporary_deprioritized and self._spf_aged(r)
+        ]
+        if not aged:
+            return
+        every = envs.SGLANG_SPF_AGE_EVERY_N.get()
+        if every > 0 and self._shortest_prefill_calls - self._spf_last_promotion_call < every:
+            return
+        i = min(aged, key=lambda i: waiting_queue[i].arrival_processed_tokens)
+        if i:
+            waiting_queue.insert(0, waiting_queue.pop(i))
+            self._spf_aged_promotions += 1
+            self._spf_last_promotion_call = self._shortest_prefill_calls
+
     def shortest_prefill_chunk_limit(
-        self, chunked_req: Req, waiting_queue: List[Req], budget: int, page_size: int
+        self,
+        chunked_req: Req,
+        waiting_queue: List[Req],
+        budget: int,
+        page_size: int,
+        adder: Optional[PrefillAdder] = None,
     ) -> Optional[int]:
         """Cap the active prefill chunk to reserve tokens for shorter waiting requests."""
         if (
@@ -435,12 +520,33 @@ class SchedulePolicy:
         ):
             return None
         remaining = len(chunked_req.full_untruncated_fill_ids) - chunked_req.prefix_len
+        # An aged chunk keeps a fixed share; shorter requests get the rest.
+        keep = page_size
+        if self._spf_aged(chunked_req):
+            share = envs.SGLANG_SPF_AGED_CHUNK_SHARE.get()
+            keep = max(page_size, int(budget * share) // page_size * page_size)
         reserved = 0
+        reserved_kv = 0
         for req in waiting_queue:
             work = self._shortest_prefill_work(req)
             charge = _ceil_div(work, page_size) * page_size
-            if work >= remaining or reserved + charge > budget - page_size:
+            if work >= remaining or reserved + charge > budget - keep:
                 break
+            # A request the adder will park beside the chunk's reserved tail
+            # must not shrink the chunk.
+            headroom = (
+                None if adder is None else adder.chunked_tail_headroom(chunked_req, req)
+            )
+            if headroom is not None:
+                # Host hits load into device KV, so they are not free here.
+                reserved_kv += (
+                    _ceil_div(work + req.host_hit_length, page_size) + 1
+                ) * page_size + min(
+                    max(req.sampling_params.max_new_tokens - len(req.output_ids), 0),
+                    CLIP_MAX_NEW_TOKENS,
+                )
+                if reserved_kv > headroom:
+                    break
             reserved += charge
         if not reserved:
             return None
@@ -648,6 +754,14 @@ class PrefillAdder:
         self.rem_input_tokens = rem_input_tokens - num_mixed_decode_tokens
         self.rem_chunk_tokens = rem_chunk_tokens
         self.chunked_req_limit: Optional[int] = None
+        # Shortest-prefill-first admits requests beside a truncated chunk, and
+        # their KV stays locked until it is sent. Hold the chunk's uncomputed
+        # tail in the budget, or its later chunks find no KV left.
+        self.reserve_chunked_tail = (
+            envs.SGLANG_K31_PF_SPF_RESERVE_CHUNKED_TAIL.get()
+            and get_context().is_config_namespace_published("schedule")
+            and get_schedule().schedule_policy == "shortest-prefill-first"
+        )
         self.dllm_config = dllm_config
         # Mamba checkpoints only land on page-aligned chunk ends.
         self.exact_chunk_fill = (
@@ -869,6 +983,43 @@ class PrefillAdder:
 
     def ceil_paged_tokens(self, tokens: int) -> int:
         return -(-tokens // self.page_size) * self.page_size
+
+    def _chunked_tail_tokens(self, req: Req, start: int) -> int:
+        """KV a chunked request still needs past `start`: the part of its
+        admission check (extend, page overhead, decode headroom) no chunk
+        has charged yet."""
+        tail = len(req.full_untruncated_fill_ids) - start
+        if tail <= 0:
+            return 0
+        return (
+            self.memory_budget.ceil_paged_tokens(self.ceil_paged_tokens(tail))
+            + self.per_req_token_overhead
+            + min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS)
+        )
+
+    def _reserve_chunked_tail(self, req: Req, start: int) -> None:
+        # Reserved like decode headroom: in the total budget only, since this
+        # pass allocates none of it.
+        if self.reserve_chunked_tail:
+            self.memory_budget.total_offset += self._chunked_tail_tokens(req, start)
+
+    def chunked_tail_headroom(self, req: Req, beside: Req) -> Optional[int]:
+        """KV left for `beside` once the chunked request's whole remainder is
+        held, or None when the tail is not reserved. Pins `beside`'s cached
+        prefix, as its admission check will."""
+        if not self.reserve_chunked_tail:
+            return None
+        with (
+            self._lock_node(beside.last_node)
+            if beside.last_node is not None
+            else nullcontext()
+        ):
+            remaining = int(self.rem_total_tokens)
+        return (
+            remaining
+            - self._chunked_tail_tokens(req, req.prefix_len)
+            - self.per_req_token_overhead
+        )
 
     def floor_chunked_tokens(self, trunc_len: int, remaining: int) -> int:
         """Round a *truncated* chunk down to the mamba kernel chunk grid.
@@ -1155,6 +1306,7 @@ class PrefillAdder:
                 self.rem_chunk_tokens
             )
             if _rem_tokens is None:
+                self._reserve_chunked_tail(req, req.prefix_len)
                 return req
             if self.kv_shard_granule:
                 # Align the absolute boundary to keep pages within one scratch region.
@@ -1163,7 +1315,20 @@ class PrefillAdder:
                 floored = (
                     prefix_len + _rem_tokens
                 ) // self.kv_shard_granule * self.kv_shard_granule - prefix_len
-                _rem_tokens = floored if floored > 0 else self.rem_chunk_tokens
+                if floored > 0:
+                    _rem_tokens = floored
+                elif (
+                    park_chunked_prefill_enabled()
+                    and _rem_tokens < self.rem_chunk_tokens
+                ):
+                    # #44823: memory holds less than one aligned step; wait for
+                    # it instead of taking a full chunk past the budget.
+                    self._reserve_chunked_tail(req, req.prefix_len)
+                    return req
+                elif not park_chunked_prefill_enabled():
+                    _rem_tokens = self.rem_chunk_tokens
+                # Gate on: the chunk itself is shorter than one aligned step;
+                # take it unaligned so the continuation cannot park forever.
 
         # A mid-chunk rank prefills this pass regardless of the delayer
         # verdict, so report prefillable=True and ignore the result.
@@ -1187,6 +1352,7 @@ class PrefillAdder:
             chunk_limit=_rem_tokens,
         )
         if _rem_tokens is None:
+            self._reserve_chunked_tail(req, req.prefix_len)
             return req
         truncated = cand_extend_input_len > _rem_tokens
         new_len = self.floor_chunked_tokens(
@@ -1205,6 +1371,7 @@ class PrefillAdder:
             max_new_tokens=self._swa_new_tokens(req),
             chunk_limit=self.rem_chunk_tokens,
         ):
+            self._reserve_chunked_tail(req, req.prefix_len)
             return req
         # The continuing chunk must fit. Keep reservation outside assert for -O.
         reserved = self._kv_shard_reserve_scratch(
@@ -1227,6 +1394,8 @@ class PrefillAdder:
             request_slot_reserve=request_slot_reserve,
             is_chunked_continuation=True,
         )
+        if truncated:
+            self._reserve_chunked_tail(req, req.extend_end)
 
         # Return if chunked prefill not finished
         return req if truncated else None
@@ -1712,6 +1881,8 @@ class PrefillAdder:
             ),
             replay_len=admission.replay_len,
         )
+        if admission.is_chunked:
+            self._reserve_chunked_tail(req, req.extend_end)
         self._account_prefill_cache_admission(req, admission.prefix_len)
 
     def preempt_to_schedule(self, req: Req) -> bool:
