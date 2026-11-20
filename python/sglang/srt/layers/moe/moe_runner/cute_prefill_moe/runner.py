@@ -1,10 +1,11 @@
 """MXFP4 x MXFP8 routed experts on SM107 with CuTe DSL grouped GEMMs (SGLANG_K31_PREFILL_MOE_CUTE_FC1).
 
-Replaces the trtllm-gen FC1 -> FC2 body for prefill: FlashInfer routing metadata (tile 128) -> one Triton pass that
-writes each expert's routed token rows and their ue8m0 scales in permuted order -> FC1 (swap-AB grouped GEMM with the
-SiTU + MXFP8 requant epilogue, bit-exact with trtllm-gen's fused FC1) -> FC2 (same kernel, BF16 rows) -> FlashInfer
-finalize, or SGLang's deferred finalize. Every buffer is in FlashInfer's permuted-row layout (experts in order, each
-padded to 128 rows), so finalize consumes FlashInfer's own expanded->permuted map.
+Replaces the trtllm-gen FC1 -> FC2 body for prefill, the way FlashInfer's staged MXFP4 x MXFP8 runner does:
+FlashInfer's staged routing (tile 128; it also allocates the FC1 / FC2 output buffers) -> one Triton pass that writes
+each expert's routed token rows and their ue8m0 scales in permuted order -> FC1 (swap-AB grouped GEMM with the SiTU +
+MXFP8 requant epilogue, bit-exact with trtllm-gen's fused FC1) -> FC2 (same kernel, BF16 rows) -> FlashInfer finalize,
+or SGLang's deferred finalize. Every buffer is in FlashInfer's permuted-row layout (experts in order, each padded to
+128 rows), so finalize consumes FlashInfer's own expanded->permuted map.
 
 Weights take this path's layout at load (one copy per layer): FC1 rows in 256-row blocks [gate 128 | up 128] of the
 same 128 outputs, FC2 rows as in the checkpoint, both with ue8m0 scales in 128x4 atoms.
@@ -28,9 +29,9 @@ _capture = None
 
 class CutePrefillMoeWeights(msgspec.Struct, frozen=True, kw_only=True):
     w13: torch.Tensor  # [E, 2I, H/2] packed FP4; 256-row block b = gate[128b:+128], up[128b:+128]
-    s13: torch.Tensor  # [E, 2I/128 * H/128 * 512] ue8m0 in 128x4 atoms
+    s13: torch.Tensor  # [E, 2I, H/32] ue8m0 bytes (float8_e4m3fn view) in 128x4 atoms, K atoms fastest
     w2: torch.Tensor  # [E, H, I/2] packed FP4
-    s2: torch.Tensor  # [E, H/128 * I/128 * 512]
+    s2: torch.Tensor  # [E, H, I/32] like s13
     hidden: int
     inter: int
     num_experts: int
@@ -39,13 +40,14 @@ class CutePrefillMoeWeights(msgspec.Struct, frozen=True, kw_only=True):
 
 
 def _swizzle_sf(s: torch.Tensor) -> torch.Tensor:
-    """[E, rows, kb] linear ue8m0 -> [E, rows/128 * kb/4 * 512] 128x4 atoms, K atoms fastest."""
+    """[E, rows, kb] linear ue8m0 -> same shape holding 128x4 atoms, K atoms fastest."""
     n, r, kb = s.shape
     return (
         s.reshape(n, r // 128, 4, 32, kb // 4, 4)
         .permute(0, 1, 4, 3, 2, 5)
         .contiguous()
-        .reshape(n, -1)
+        .reshape(n, r, kb)
+        .view(torch.float8_e4m3fn)
     )
 
 
@@ -123,14 +125,24 @@ def _plan_kernel(
 
 
 @triton.jit
+def _count_kernel(ids_ptr, n, counts_ptr, n_experts, SHIFT: tl.constexpr, BLOCK: tl.constexpr):
+    # tokens per expert from the routed ids (SHIFT 16: packed id << 16 | weight)
+    i = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    m = i < n
+    e = tl.load(ids_ptr + i, mask=m, other=-1) >> SHIFT
+    m = m & (e >= 0) & (e < n_experts)
+    tl.atomic_add(counts_ptr + e, 1 + 0 * e, mask=m)
+
+
+@triton.jit
 def _permute_kernel(
-    p2t_ptr, xs_ptr, sfb_ptr, xq_ptr, xp_ptr, n_rows, n_tokens,
+    p2t_ptr, total_ptr, xs_ptr, sfb_ptr, xq_ptr, xp_ptr, n_rows, n_tokens,
     KB: tl.constexpr, HW: tl.constexpr, BLOCK_P: tl.constexpr, BLOCK_H: tl.constexpr,
 ):
     # permuted row p <- token p2t[p]: its 8-byte words and its ue8m0 scales into the 128x4 atoms
-    # (rows with no token: scales 0, data untouched)
+    # (rows with no token: scales 0, data untouched; rows past the live padded count: untouched)
     p = tl.program_id(0) * BLOCK_P + tl.arange(0, BLOCK_P)
-    pm = p < n_rows
+    pm = (p < n_rows) & (p < tl.load(total_ptr))
     t = tl.load(p2t_ptr + p, mask=pm, other=-1)
     ok = pm & (t >= 0) & (t < n_tokens)
     c = tl.arange(0, 128)
@@ -207,6 +219,9 @@ class _Engine:
             self.t.append((ts, tuple(from_dlpack(x, assumed_align=16) for x in ts)))
         self.comp = [None, None]
         self.lock = threading.Lock()
+        # FlashInfer staged-routing operands that this path does not use
+        self.unit_scales = torch.ones(num_groups, dtype=torch.float32, device=device)
+        self.no_weights = torch.empty((0,), dtype=torch.bfloat16, device=device)
 
     def launch(self, which: int, stream) -> None:
         import cuda.bindings.driver as cuda
@@ -254,65 +269,70 @@ def run(
     routing: packed (id << 16 | bf16 weight) ids [T, K], or (ids, weights). Returns None after finalizing into
     output, or (gemm2_out, expert_weights, expanded_idx_to_permuted_idx) for the deferred finalize.
     """
-    from flashinfer.fused_moe.core import (
-        get_trtllm_moe_sm100_module,
-        populate_trtllm_moe_routing_metadata_,
-        trtllm_moe_allocate_routing_metadata_multi_tile,
-    )
-    from flashinfer.tllm_enums import RoutingInputMode
+    from flashinfer.fused_moe.core import get_trtllm_moe_sm100_module
+    from flashinfer.tllm_enums import ActivationType, RoutingMethodType, WeightLayout
 
     if local_num_experts != w.num_experts or local_expert_offset != 0 or num_experts != w.num_experts:
         raise NotImplementedError("the CuTe prefill MoE path supports EP size 1 only")
-    ids, weights = routing if isinstance(routing, tuple) else (routing, None)
-    mode = RoutingInputMode.PackedPrecomputed if weights is None else RoutingInputMode.UnpackedPrecomputed
+    packed = not isinstance(routing, tuple)
+    ids, weights = (routing, None) if packed else routing
     num_tokens, top_k = ids.shape
     H, I, E = w.hidden, w.inter, w.num_experts
     device = x_quant.device
     eng = _engine(w, device)
-    stream = torch.cuda.current_stream(device)
+    module = get_trtllm_moe_sm100_module()
+    fp8 = torch.float8_e4m3fn
 
-    metadata = trtllm_moe_allocate_routing_metadata_multi_tile(
-        ids,
-        num_experts=num_experts,
-        top_k=top_k,
-        local_expert_offset=local_expert_offset,
-        num_local_experts=local_num_experts,
-        tile_ns=(_ROWS,),
-        routing_input_mode=mode,
-        topk_weights=weights,
+    # The multi-tile routing-metadata API takes top_k <= 8; the staged routing takes any top_k.
+    raw = module.moe_op.trtllm_moe_run_routing_fp4_mxfp4_mxfp8(
+        None, None, ids, eng.no_weights if packed else weights, x_quant.view(fp8), x_scale.view(fp8),
+        w.w13, w.s13, w.w2, w.s2, eng.unit_scales, eng.unit_scales, eng.unit_scales,
+        num_experts, top_k, None, None, I, local_expert_offset, local_num_experts, None,
+        RoutingMethodType.TopK.value, enable_pdl, [_ROWS, -1], WeightLayout.MajorK.value,
+        ActivationType.Situ.value, True, None,
     )
-    populate_trtllm_moe_routing_metadata_(metadata, ids, weights)
-    slot = metadata.slots[0]
-    rows = -(-(slot.permuted_idx_to_token_idx.numel() - 1) // _ROWS) * _ROWS  # capacity of the padded layout
+    # Slot 0 is the caller's weights in the unpacked form (an undefined tensor there: never convert it).
+    assert len(raw) == 10, len(raw)
+    t = [_torch_view(r) for r in raw[1:]]
+    expanded, p2t, total, o1, o1sf, o2 = t[0], t[1], t[5], t[6], t[7], t[8]
+    expert_weights = _torch_view(raw[0]) if packed else weights
 
+    counts = torch.zeros((E,), dtype=torch.int32, device=device)
+    n_ids = num_tokens * top_k
+    _count_kernel[(triton.cdiv(n_ids, 1024),)](
+        ids, n_ids, counts, E, SHIFT=16 if packed else 0, BLOCK=1024, num_warps=4,
+    )
+    n_map = p2t.numel() - 1  # FlashInfer keeps one guard element past the map
+    rows = -(-n_map // _ROWS) * _ROWS
     u8 = torch.uint8
     xp = torch.empty((rows, H), dtype=u8, device=device)
     sfb = torch.empty((rows // 128 * (H // 128) * 512,), dtype=u8, device=device)
-    o1 = torch.empty((rows, I), dtype=u8, device=device)
-    o1sf = torch.empty((rows * (I // 32),), dtype=u8, device=device)
-    o2 = torch.empty((rows, H), dtype=torch.bfloat16, device=device)
     (s1, _, p1, f1, _), _ = eng.t[0]
     (s2t, _, p2, f2, _), _ = eng.t[1]
     _plan_kernel[(1,)](
-        slot.num_tokens_per_expert, E,
+        counts, E,
         s1, p1, f1, s2t, p2, f2,
         w.w13.data_ptr(), w.w13[0].numel(), w.s13.data_ptr(), w.s13[0].numel(),
         w.w2.data_ptr(), w.w2[0].numel(), w.s2.data_ptr(), w.s2[0].numel(),
         xp.data_ptr(), sfb.data_ptr(), o1.data_ptr(), o1sf.data_ptr(), o2.data_ptr(),
         H=H, I=I, BLOCK=triton.next_power_of_2(E),
     )
-    _permute_kernel[(triton.cdiv(rows, 64),)](
-        slot.permuted_idx_to_token_idx, x_scale.view(u8), sfb, x_quant.view(torch.int64), xp.view(torch.int64),
-        rows, num_tokens, KB=H // 32, HW=H // 8, BLOCK_P=64, BLOCK_H=64, num_warps=4,
+    _permute_kernel[(triton.cdiv(n_map, 64),)](
+        p2t, total, x_scale.view(u8), sfb, x_quant.view(torch.int64), xp.view(torch.int64),
+        n_map, num_tokens, KB=H // 32, HW=H // 8, BLOCK_P=64, BLOCK_H=64, num_warps=4,
     )
+    stream = torch.cuda.current_stream(device)
     eng.launch(0, stream)  # FC1: SiTU + MXFP8 rows o1, scale atoms o1sf
     eng.launch(1, stream)  # FC2: BF16 rows o2
     if _capture is not None:
-        _capture.append((slot, o1, o1sf))
+        _capture.append((expanded, o1.view(u8), o1sf.view(u8)))
     if defer_finalize:
-        return o2, slot.expert_weights, slot.expanded_idx_to_permuted_idx
-    get_trtllm_moe_sm100_module().trtllm_moe_run_finalize(
-        o2, output, slot.expert_weights, slot.expanded_idx_to_permuted_idx, slot.total_num_padded_tokens,
-        num_tokens, num_experts, top_k, H, enable_pdl, False,
+        return o2, expert_weights, expanded
+    module.trtllm_moe_run_finalize(
+        o2, output, expert_weights, expanded, total, num_tokens, num_experts, top_k, H, enable_pdl, False,
     )
     return None
+
+
+def _torch_view(value) -> torch.Tensor:
+    return value if isinstance(value, torch.Tensor) else torch.from_dlpack(value)
