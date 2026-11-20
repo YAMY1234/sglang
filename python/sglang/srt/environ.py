@@ -933,6 +933,8 @@ class Envs:
     SGLANG_HICACHE_LOAD_BLOCK_QUOTA = EnvInt(0)
     # Grid cap for the Mamba state device-to-host backup kernel; 0 keeps 2 blocks.
     SGLANG_HICACHE_MAMBA_BACKUP_BLOCK_QUOTA = EnvInt(0)
+    # Build the host Mamba transfer JIT kernel when the host pool is created.
+    SGLANG_HICACHE_PRECOMPILE_TRANSFER_MAMBA = EnvBool(False)
     # --mamba-max-states-per-path also counts host copies, and a capped state
     # loses its host copy too (HiCache); 0 (default) caps device states only.
     SGLANG_MAMBA_PATH_CAP_COUNTS_HOST = EnvBool(False)
@@ -1968,6 +1970,9 @@ class Envs:
     # Admit SM107 (Rubin) to FlashInfer's CuTe DSL KDA prefill (flashinfer#6201), on
     # FlashInfer v0.7.4's kernel module (#8684 hang and #8599 fixes; vendored).
     SGLANG_K31_KDA_PREFILL_FI_SM107 = EnvBool(False)
+    # FlashInfer KDA prefill: fill its cu_seqlens contents memo from host lengths
+    # so planning does not read cu_seqlens back. 0 off, 1 on, 2 on + verify (syncs).
+    SGLANG_K31_KDA_SEED_CU_SEQLENS = EnvInt(0)
     # KDA prefill on FlashInfer: the causal conv writes Q, K and V as separate
     # contiguous planes instead of one token-major tensor the kernel copies three
     # times (backport of #46738).
