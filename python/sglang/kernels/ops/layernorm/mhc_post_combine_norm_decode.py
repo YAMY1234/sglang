@@ -10,6 +10,7 @@ from typing import Optional, Tuple
 import torch
 
 from sglang.kernels.jit.utils import cache_once, load_jit
+from sglang.srt.environ import envs
 from sglang.srt.utils import get_device_core_count
 from sglang.srt.utils.custom_op import register_custom_op
 
@@ -20,17 +21,20 @@ SPLIT2_MAX_ROWS = 640
 
 
 @cache_once
-def _module(threads: int, split: int = 1):
+def _module(threads: int, split: int = 1, gate_trigger: bool = False):
+    # gate_trigger: SGLANG_OPT_MHC_POST_GATE_PDL_TRIGGER, the MegaMoE-input variant triggers the mega gate
+    trig = "true" if gate_trigger else "false"
     return load_jit(
         "mhc_post_combine_norm_decode",
         str(threads),
         str(split),
+        *(["gate_trigger"] if gate_trigger else []),
         cuda_files=["deepseek_v4/mhc_post_combine_norm_decode.cuh"],
         cuda_wrappers=[
-            ("run", f"MhcPostCombineNormDecode<{threads}, {split}>::run"),
+            ("run", f"MhcPostCombineNormDecode<{threads}, {split}, {trig}>::run"),
             (
                 "max_active_ctas",
-                f"MhcPostCombineNormDecode<{threads}, {split}>::max_active_ctas",
+                f"MhcPostCombineNormDecode<{threads}, {split}, {trig}>::max_active_ctas",
             ),
         ],
     )
@@ -91,7 +95,10 @@ def _mhc_post_combine_norm_decode(
     moe_shared_sf: Optional[torch.Tensor] = None,
     moe_shared_block_m: int = 0,
 ) -> None:
-    _module(threads, split).run(
+    gate_trigger = (
+        moe_x is not None and envs.SGLANG_OPT_MHC_POST_GATE_PDL_TRIGGER.get()
+    )
+    _module(threads, split, gate_trigger).run(
         x,
         residual,
         post,

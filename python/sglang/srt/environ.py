@@ -666,6 +666,10 @@ class Envs:
     # from their host ints by one write_host_ints launch, instead of sub + clamp + copy and two
     # fills per replay. Same values.
     SGLANG_OPT_GRAPH_FILL_HOST_INTS = EnvBool(False)
+    # mhc_post_combine_norm_decode's MegaMoE-input variant issues griddepcontrol.launch_dependents
+    # after its PDL wait, so the mega gate's prologue overlaps its tail (the gate waits before
+    # reading). Scheduling only.
+    SGLANG_OPT_MHC_POST_GATE_PDL_TRIGGER = EnvBool(False)
     # Request-window commit of new SWA rows with a tile of rows per program instead of
     # one program per row. Same copies.
     SGLANG_OPT_DSV41_WINDOW_COMMIT_TILED = EnvBool(False)
