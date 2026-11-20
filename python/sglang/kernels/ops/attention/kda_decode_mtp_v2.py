@@ -727,6 +727,9 @@ def kda_decode_mtp_kernel(
             # (the first commit group) must have landed in every thread first.
             cute.arch.cp_async_wait_group(STATE_STAGES)
             cute.arch.barrier()
+            if cutlass.const_expr(PROF):
+                if tidx == 0:
+                    prof[prof_row + 2] = _clock()
 
     if cutlass.const_expr(ASYNC_P1):
         bos = bos_pre
@@ -1193,6 +1196,9 @@ def kda_decode_mtp_kernel(
 
     if cutlass.const_expr(FOLD_PENDING):
         if n_pend > 0:
+            if cutlass.const_expr(PROF):
+                if tidx == 0:
+                    prof[prof_row + 6] = _clock()
             cute.arch.cp_async_wait_group(0)
             cute.arch.barrier()
             # Keys: warp t normalizes pending token t (lane l owns 4l..4l+3) and
@@ -1237,39 +1243,62 @@ def kda_decode_mtp_kernel(
             r_fs = cute.make_rmem_tensor(
                 cute.make_layout((FOLD_RPT * 16,), stride=(1,)), cutlass.Float32
             )
+            r_kn = cute.make_rmem_tensor(
+                cute.make_layout((16,), stride=(1,)), cutlass.Float32
+            )
+            r_e = cute.make_rmem_tensor(
+                cute.make_layout((16,), stride=(1,)), cutlass.Float32
+            )
             for r in cutlass.range_constexpr(FOLD_RPT):
                 f_stage = (r * FOLD_RPP) // TILE_V
                 f_row = (r * FOLD_RPP) % TILE_V + frg
                 for b in cutlass.range_constexpr(4):
-                    for cc in cutlass.range_constexpr(4):
-                        r_fs[(r * 4 + b) * 4 + cc] = sState[
-                            f_row, b * 32 + 4 * fj + cc, f_stage
-                        ]
+                    cute.autovec_copy(
+                        cute.local_tile(
+                            sState[(f_row, None, f_stage)], (4,), (b * 8 + fj,)
+                        ),
+                        cute.make_tensor(
+                            r_fs.iterator + (r * 4 + b) * 4, cute.make_layout((4,))
+                        ),
+                    )
             for t in cutlass.range_constexpr(T_LOOP):
                 if t < n_pend:
                     bt = sPB[t]
+                    for b in cutlass.range_constexpr(4):
+                        cute.autovec_copy(
+                            cute.local_tile(sKN, (4,), (t * 32 + b * 8 + fj,)),
+                            cute.make_tensor(
+                                r_kn.iterator + b * 4, cute.make_layout((4,))
+                            ),
+                        )
+                        cute.autovec_copy(
+                            cute.local_tile(sE, (4,), (t * 32 + b * 8 + fj,)),
+                            cute.make_tensor(
+                                r_e.iterator + b * 4, cute.make_layout((4,))
+                            ),
+                        )
                     for r in cutlass.range_constexpr(FOLD_RPT):
                         blk = []
                         for b in cutlass.range_constexpr(4):
                             i0 = (r * 4 + b) * 4
-                            kc = t * HEAD_DIM + b * 32 + 4 * fj
+                            e0 = b * 4
                             h0_, h1_ = _f32x2_asm(
-                                "mul", r_fs[i0], r_fs[i0 + 1], sE[kc], sE[kc + 1]
+                                "mul", r_fs[i0], r_fs[i0 + 1], r_e[e0], r_e[e0 + 1]
                             )
                             h2_, h3_ = _f32x2_asm(
                                 "mul",
                                 r_fs[i0 + 2],
                                 r_fs[i0 + 3],
-                                sE[kc + 2],
-                                sE[kc + 3],
+                                r_e[e0 + 2],
+                                r_e[e0 + 3],
                             )
                             r_fs[i0] = h0_
                             r_fs[i0 + 1] = h1_
                             r_fs[i0 + 2] = h2_
                             r_fs[i0 + 3] = h3_
-                            p0, p1 = _f32x2_asm("mul", h0_, h1_, sKN[kc], sKN[kc + 1])
+                            p0, p1 = _f32x2_asm("mul", h0_, h1_, r_kn[e0], r_kn[e0 + 1])
                             p2, p3 = _f32x2_asm(
-                                "mul", h2_, h3_, sKN[kc + 2], sKN[kc + 3]
+                                "mul", h2_, h3_, r_kn[e0 + 2], r_kn[e0 + 3]
                             )
                             blk.append(_lane_sum4(p0, p1, p2, p3))
                         sr = _add_rn(_add_rn(blk[0], blk[2]), _add_rn(blk[1], blk[3]))
@@ -1288,12 +1317,16 @@ def kda_decode_mtp_kernel(
                         )
                         for b in cutlass.range_constexpr(4):
                             i0 = (r * 4 + b) * 4
-                            kc = t * HEAD_DIM + b * 32 + 4 * fj
+                            e0 = b * 4
                             r_fs[i0], r_fs[i0 + 1] = _fma2_scalar_b(
-                                sKN[kc], sKN[kc + 1], uu, r_fs[i0], r_fs[i0 + 1]
+                                r_kn[e0], r_kn[e0 + 1], uu, r_fs[i0], r_fs[i0 + 1]
                             )
                             r_fs[i0 + 2], r_fs[i0 + 3] = _fma2_scalar_b(
-                                sKN[kc + 2], sKN[kc + 3], uu, r_fs[i0 + 2], r_fs[i0 + 3]
+                                r_kn[e0 + 2],
+                                r_kn[e0 + 3],
+                                uu,
+                                r_fs[i0 + 2],
+                                r_fs[i0 + 3],
                             )
             # Back to smem (this verify's initial state) and to the pool (the
             # committed state the eager fold would have left).
@@ -1303,10 +1336,14 @@ def kda_decode_mtp_kernel(
                 f_row = (r * FOLD_RPP) % TILE_V + frg
                 g_row = r * FOLD_RPP + frg
                 for b in cutlass.range_constexpr(4):
-                    for cc in cutlass.range_constexpr(4):
-                        sState[f_row, b * 32 + 4 * fj + cc, f_stage] = r_fs[
-                            (r * 4 + b) * 4 + cc
-                        ]
+                    cute.autovec_copy(
+                        cute.make_tensor(
+                            r_fs.iterator + (r * 4 + b) * 4, cute.make_layout((4,))
+                        ),
+                        cute.local_tile(
+                            sState[(f_row, None, f_stage)], (4,), (b * 8 + fj,)
+                        ),
+                    )
                     cute.autovec_copy(
                         cute.make_tensor(
                             r_fs.iterator + (r * 4 + b) * 4, cute.make_layout((4,))
