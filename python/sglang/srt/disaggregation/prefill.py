@@ -480,6 +480,8 @@ class PrefillBootstrapQueue:
         if not self.create_sender(req, num_kv_heads):
             return
         self.queue.append(req)
+        if envs.SGLANG_PREFILL_COMPLETE_MIN_WORK_TOKENS.get() > 0:
+            self.scheduler.send_early_readiness_for([req])
 
     def admit_room_waiters(self) -> None:
         """Enqueue the waiting recomputes whose rooms have been released."""
@@ -493,6 +495,8 @@ class PrefillBootstrapQueue:
                 self.room_waiters.append((req, num_kv_heads))
             elif self.create_sender(req, num_kv_heads):
                 self.queue.append(req)
+                if envs.SGLANG_PREFILL_COMPLETE_MIN_WORK_TOKENS.get() > 0:
+                    self.scheduler.send_early_readiness_for([req])
 
     def extend(self, reqs: List[Req], num_kv_heads: int) -> None:
         for req in reqs:
@@ -747,7 +751,7 @@ class SchedulerDisaggregationPrefillMixin:
                 self._record_scheduler_state_for_paused_engine()
                 continue
             bootstrapped_reqs = self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
-            self.send_early_readiness_bootstrapped(bootstrapped_reqs)
+            self.send_early_readiness_for(bootstrapped_reqs)
             self.waiting_queue.extend(bootstrapped_reqs)
 
             # Get the next batch to run
@@ -844,7 +848,7 @@ class SchedulerDisaggregationPrefillMixin:
                 self._yield_gil_if_needed()
                 continue
             bootstrapped_reqs = self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
-            self.send_early_readiness_bootstrapped(bootstrapped_reqs)
+            self.send_early_readiness_for(bootstrapped_reqs)
             self.waiting_queue.extend(bootstrapped_reqs)
             # Resume batch creation on completion, new/ready requests, or an idle step.
             if not waiting_for_batch_result or received_inputs or bootstrapped_reqs:
@@ -1650,9 +1654,10 @@ class SchedulerDisaggregationPrefillMixin:
             )
             self._early_ready_counts = None
 
-    def send_early_readiness_bootstrapped(self: Scheduler, reqs: List[Req]) -> None:
-        """Early readiness as requests enter the waiting queue, prefix matched once here, so
-        decode reserves during their queue wait even while no batch is being scheduled."""
+    def send_early_readiness_for(self: Scheduler, reqs: List[Req]) -> None:
+        """Early readiness at the handshake (the request entering the bootstrap queue), prefix
+        matched once here, so decode reserves during the bootstrap and waiting-queue waits as
+        under early; the bootstrap-to-waiting transition repeats it for any request missed."""
         if (
             not reqs
             or envs.SGLANG_PREFILL_COMPLETE_MIN_WORK_TOKENS.get() <= 0

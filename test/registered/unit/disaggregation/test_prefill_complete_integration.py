@@ -752,7 +752,7 @@ class TestAllocationIntegration(CustomTestCase):
             scheduler_stage_metrics=None,
             pop_bootstrapped_and_resolve_parked_pp=Mock(return_value=[short, long_]),
         )
-        for name in ("send_early_readiness_bootstrapped", "maybe_send_early_readiness"):
+        for name in ("send_early_readiness_for", "maybe_send_early_readiness"):
             setattr(scheduler, name, MethodType(getattr(SchedulerDisaggregationPrefillMixin, name), scheduler))
         matched = {"short": 64, "long": 36}
 
@@ -770,6 +770,24 @@ class TestAllocationIntegration(CustomTestCase):
         long_.disagg_kv_sender.mark_prefill_complete.assert_not_called()
         self.assertTrue(long_.disagg_ready_checked)
         self.assertIn("early readiness (MIN_WORK_TOKENS 64): 1 of 2 requests", logs.output[0])
+
+    def test_min_work_tokens_readies_at_the_handshake(self):
+        # Decode allocates while the request waits in the bootstrap and waiting
+        # queues, as under early, instead of after the prefill picks it up.
+        queue = PrefillBootstrapQueue.__new__(PrefillBootstrapQueue)
+        queue.queue = []
+        queue.kv_manager = SimpleNamespace(deferred_bootstrap=None)
+        queue.create_sender = Mock(return_value=True)
+        queue.scheduler = SimpleNamespace(send_early_readiness_for=Mock())
+        req = SimpleNamespace(rid="r", to_finish=None, is_retracted=False)
+        with patch("sglang.srt.disaggregation.prefill.is_unadmitted_reject", return_value=False):
+            with envs.SGLANG_PREFILL_COMPLETE_MIN_WORK_TOKENS.override(0):
+                queue.add(req, num_kv_heads=1)
+            queue.scheduler.send_early_readiness_for.assert_not_called()
+            with envs.SGLANG_PREFILL_COMPLETE_MIN_WORK_TOKENS.override(64):
+                queue.add(req, num_kv_heads=1)
+        queue.scheduler.send_early_readiness_for.assert_called_once_with([req])
+        self.assertEqual(queue.queue, [req, req])
 
     def test_pp_poll_finalizes_waiting_requests_decode_reserved(self):
         # Early readiness lets decode reserve while the request waits; under PP the
