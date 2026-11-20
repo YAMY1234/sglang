@@ -2910,6 +2910,27 @@ def test_pp_offload_consensus_logs_locked_tokens_by_wait(caplog):
     assert "at peak 40 / 20 / 10, mean 40 / 20 / 10" in caplog.text
 
 
+def test_pp_offload_consensus_logs_which_stage_holds_the_minimum(caplog):
+    # PP0 records, per stage, each offload's finish lag behind PP0 and the steps
+    # that stage held "finished on all" back; a reset starts the record over.
+    import logging
+
+    stages, _ = _consensus_stages(3, [[True, True], [True, True], [True]])
+    pp0 = stages[0][1]
+    _consensus_step(stages)
+    assert [len(x) for x in pp0._finish_lag] == [2, 2, 1]
+    assert pp0._min_steps == [0, 0, 1]
+    stages[2][3].append(True)
+    pp0._stats_next = 0
+    with caplog.at_level(logging.INFO):
+        _consensus_step(stages)
+    assert "finish lag behind PP0" in caplog.text and "PP2 " in caplog.text
+    assert pp0._finish_lag == [[], [], []] and pp0._min_steps == [0, 0, 0]
+    for _, relay, _, _ in stages:
+        relay.reset()
+    assert pp0._own_base == 0 and pp0._stage_seen == [0, 0, 0]
+
+
 @pytest.mark.parametrize("swa_stored", [True, False], ids=["stored", "unstored"])
 @pytest.mark.parametrize(
     "completion", [True, False, None], ids=["success", "failure", "reset"]
