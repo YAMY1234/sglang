@@ -1884,6 +1884,10 @@ class UnifiedRadixCache(BasePrefixCache):
         self, num_tokens: int, component_type: ComponentType = BASE_COMPONENT_TYPE
     ) -> int:
         """Evict host resources for a specific component to free host pool space."""
+        with pp_bubble_diag.sub("evict_host"):
+            return self._evict_host_timed(num_tokens, component_type)
+
+    def _evict_host_timed(self, num_tokens: int, component_type: ComponentType) -> int:
         if not pmicro_hoststats.ON:
             return self._evict_host(num_tokens, component_type)
         pmicro_hoststats.note_host_evict_call()
@@ -1975,6 +1979,10 @@ class UnifiedRadixCache(BasePrefixCache):
         return evicted
 
     def _wait_mamba_storage_backup(self, operation_id: int) -> None:
+        with pp_bubble_diag.wait("mamba_l3_backup"):
+            return self._wait_mamba_storage_backup_impl(operation_id)
+
+    def _wait_mamba_storage_backup_impl(self, operation_id: int) -> None:
         cc = self.cache_controller
         ack_queue = cc.ack_backup_queue
         start = time.monotonic()
@@ -2395,6 +2403,12 @@ class UnifiedRadixCache(BasePrefixCache):
         )
 
     def _execute_kv_backup(self, node_id, device_value, comp_xfers, sidecar_xfers):
+        with pp_bubble_diag.sub("kv_backup"):
+            return self._execute_kv_backup_impl(
+                node_id, device_value, comp_xfers, sidecar_xfers
+            )
+
+    def _execute_kv_backup_impl(self, node_id, device_value, comp_xfers, sidecar_xfers):
         """Execute Backup action."""
         kv_tokens = len(device_value)
         anchor_entry = self.cache_controller.mem_pool_host.anchor_entry
@@ -2775,6 +2789,10 @@ class UnifiedRadixCache(BasePrefixCache):
             self._l3_tier_stats["belief_rotations"] += 1
 
     def _write_ahead_device_tail(self) -> None:
+        with pp_bubble_diag.sub("write_ahead_tail"):
+            self._write_ahead_device_tail_impl()
+
+    def _write_ahead_device_tail_impl(self) -> None:
         """Keep the device LRU tail backed on host so device eviction demotes
         without a D2H wait (SGLANG_HICACHE_DEVICE_WRITE_AHEAD).
 

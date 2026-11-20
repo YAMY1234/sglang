@@ -46,7 +46,7 @@ def _bin(queue_len: int) -> int:
 
 
 class _Span:
-    __slots__ = ("diag", "label", "prev")
+    __slots__ = ("diag", "label", "prev", "t0")
 
     def __init__(self, diag: "PPBubbleDiag", label: str):
         self.diag = diag
@@ -55,9 +55,18 @@ class _Span:
     def __enter__(self):
         self.prev = self.diag._switch(self.label)
         self.diag.calls[self.label] += 1
+        self.t0 = self.diag._t
 
     def __exit__(self, *exc):
         self.diag._switch(self.prev)
+        if self.diag.slow_ns and self.diag._t - self.t0 >= self.diag.slow_ns:
+            logger.info(
+                "PP slow span rank %d: %s ms=%.1f wall=%.3f",
+                self.diag.pp_rank,
+                self.label,
+                (self.diag._t - self.t0) / 1e6,
+                time.time(),
+            )
         return False
 
 
@@ -119,6 +128,7 @@ class _GCTimer:
         self._pp_rank = pp_rank
         self._long_ms = long_ms
         self._t0 = 0.0
+        self.it_ms = 0.0
         self._reset()
         logger.info(
             "PP GC rank %d: enabled=%s threshold=%s freeze_count=%d counts=%s",
@@ -129,6 +139,10 @@ class _GCTimer:
             gc.get_count(),
         )
         gc.callbacks.append(self._callback)
+
+    def take_iteration_ms(self) -> float:
+        ms, self.it_ms = self.it_ms, 0.0
+        return ms
 
     def _reset(self) -> None:
         self.n = [0, 0, 0]
@@ -141,6 +155,7 @@ class _GCTimer:
             self._t0 = time.perf_counter()
             return
         ms = (time.perf_counter() - self._t0) * 1e3
+        self.it_ms += ms
         gen = info.get("generation", 0)
         self.n[gen] += 1
         self.ms[gen] += ms
@@ -196,6 +211,11 @@ class PPBubbleDiag:
         self._pass_relay0 = (0, 0, 0)
         self.stack_sampler: Optional[_StackSampler] = None
         self.gc_timer: Optional[_GCTimer] = None
+        # Slow-event log (SGLANG_PP_DIAG_SLOW_MS): per-iteration label time and walls.
+        self.slow_ns = 0
+        self._it_ns: dict[str, int] = defaultdict(int)
+        self._it_t0 = self._t
+        self._it_walls: deque = deque(maxlen=64)
         self._reset()
 
     def _reset(self) -> None:
@@ -236,6 +256,8 @@ class PPBubbleDiag:
     def _switch(self, label: str) -> str:
         now = time.perf_counter_ns()
         self.ns[self._label] += now - self._t
+        if self.slow_ns:
+            self._it_ns[self._label] += now - self._t
         self._t = now
         prev = self._label
         self._label = label
@@ -246,6 +268,35 @@ class PPBubbleDiag:
         self._phase = name
         if self._label.startswith("host."):
             self._switch("host." + name)
+        if self.slow_ns and name == "ingest":
+            self._end_iteration()
+
+    def _end_iteration(self) -> None:
+        """At each loop start: log the previous iteration if it ran slow_ns over the
+        rolling median of recent iterations, with its time per label and its GC time."""
+        self._switch(self._label)
+        wall = self._t - self._it_t0
+        gc_ms = self.gc_timer.take_iteration_ms() if self.gc_timer is not None else -1.0
+        if len(self._it_walls) >= 16:
+            median = sorted(self._it_walls)[len(self._it_walls) // 2]
+            if wall - median >= self.slow_ns:
+                labels = {
+                    k: round(v / 1e6, 1)
+                    for k, v in self._it_ns.items()
+                    if v >= 2_000_000
+                }
+                logger.info(
+                    "PP slow iter rank %d: wall_ms=%.1f median_ms=%.1f gc_ms=%.1f end=%.3f labels=%s",
+                    self.pp_rank,
+                    wall / 1e6,
+                    median / 1e6,
+                    gc_ms,
+                    time.time(),
+                    json.dumps(labels, separators=(",", ":")),
+                )
+        self._it_walls.append(wall)
+        self._it_ns.clear()
+        self._it_t0 = self._t
 
     def span(self, label: str) -> _Span:
         return _Span(self, "wait." + label)
@@ -442,12 +493,18 @@ def init(pp_rank: int, event_factory, chunk_budget: int) -> Optional[PPBubbleDia
             fwd_file,
         )
         logger.info("PP bubble diag on (SGLANG_PP_BUBBLE_DIAG), rank %d", pp_rank)
+        slow_ms = envs.SGLANG_PP_DIAG_SLOW_MS.get()
+        if slow_ms > 0:
+            _diag.slow_ns = int(slow_ms * 1e6)
+            _diag.gc_timer = _GCTimer(pp_rank)
+            logger.info("PP slow-event log on, rank %d, %.0f ms", pp_rank, slow_ms)
         hz = envs.SGLANG_PP_STACK_SAMPLE_HZ.get()
         ranks = envs.SGLANG_PP_STACK_SAMPLE_RANKS.get().split(",")
         if fwd_dir and hz > 0 and str(pp_rank) in ranks:
             path = os.path.join(fwd_dir, f"stacks-pp{pp_rank}-{os.getpid()}.txt")
             _diag.stack_sampler = _StackSampler(_diag, threading.get_ident(), hz, path)
-            _diag.gc_timer = _GCTimer(pp_rank)
+            if _diag.gc_timer is None:
+                _diag.gc_timer = _GCTimer(pp_rank)
             logger.info(
                 "PP stack sampler on, rank %d, %.1f Hz -> %s", pp_rank, hz, path
             )
@@ -461,6 +518,11 @@ def get() -> Optional[PPBubbleDiag]:
 def wait(label: str):
     """Context for a blocking wait; a no-op when the diag is off."""
     return _NULL if _diag is None else _diag.span(label)
+
+
+def sub(name: str):
+    """Context for a named piece of host work, booked as host.sub.<name>."""
+    return _NULL if _diag is None else _Span(_diag, "host.sub." + name)
 
 
 def wait_in_phase(prefix: str):

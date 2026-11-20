@@ -99,6 +99,48 @@ class TestWallPartition(unittest.TestCase):
         self.assertIn("wait.send_commit.ingest", d.snapshot(1.0)["calls"])
 
 
+class TestSlowEvents(unittest.TestCase):
+    def test_slow_span_and_sub_label_are_logged(self):
+        d, _ = _diag()
+        d.slow_ns = 5_000_000
+        with self.assertLogs(pp_bubble_diag.logger, level="INFO") as cm:
+            pp_bubble_diag._diag = d
+            try:
+                with pp_bubble_diag.sub("evict_host"):
+                    time.sleep(0.01)
+                with d.span("quick"):
+                    pass
+            finally:
+                pp_bubble_diag._diag = None
+        self.assertEqual(len(cm.output), 1)
+        self.assertIn("PP slow span rank 3: host.sub.evict_host ms=", cm.output[0])
+        self.assertGreaterEqual(d.ns["host.sub.evict_host"], 10_000_000)
+
+    def test_slow_iteration_logs_its_labels(self):
+        d, _ = _diag()
+        d.slow_ns = 20_000_000
+        for _ in range(20):
+            d.phase("ingest")
+            d.phase("admit")
+        with self.assertLogs(pp_bubble_diag.logger, level="INFO") as cm:
+            d.phase("ingest")
+            d.phase("admit")
+            time.sleep(0.05)
+            d.phase("ingest")
+        (line,) = [l for l in cm.output if "PP slow iter rank 3" in l]
+        labels = json.loads(line.split("labels=", 1)[1])
+        self.assertGreaterEqual(labels["host.admit"], 50)
+
+    def test_slow_events_off_by_default(self):
+        d, _ = _diag()
+        self.assertEqual(d.slow_ns, 0)
+        d.phase("ingest")
+        with d.span("x"):
+            time.sleep(0.002)
+        d.phase("ingest")
+        self.assertEqual(len(d._it_walls), 0)
+
+
 class TestPasses(unittest.TestCase):
     def test_vote_relay_is_binned_by_queue_length(self):
         d, _ = _diag()
