@@ -758,7 +758,9 @@ __global__ void __launch_bounds__(32 * kNumRanks, kNumRanks == 8 ? 4 : 1)
     if (fail) atomicAdd(&p.stats[kStatFallback], 1ull);
     if (row == 0) atomicAdd(&p.stats[kStatRows], static_cast<unsigned long long>(gridDim.x));
   }
-  if (fail) {
+  // kCandK == kTopK never fails (above): no fallback code, and none of its registers
+  constexpr bool kCanFail = kCandK < kTopK;
+  if (kCanFail && fail) {
     if (fail >> p.rank & 1) {
       const bool selected = publish_local_topk<kNumRanks, kTopK>(p, row, full_off, tag, t, s);
       if (tid == 0) {
@@ -766,13 +768,24 @@ __global__ void __launch_bounds__(32 * kNumRanks, kNumRanks == 8 ? 4 : 1)
         if (selected) atomicAdd(&p.stats[kStatSelected], 1ull);
       }
     }
-    // every thread polls its entries of each failed rank's full slot once; the
-    // rounds below re-read them (unchanged until this rank's call c + 1)
+    // every thread polls its entries of each failed rank's full slot once and, for up to two
+    // failed ranks, keeps the keys in registers; with more, the rounds below re-read them over
+    // NVLink (unchanged until this rank's call c + 1)
+    const bool regs = __popc(fail) <= 2;
+    const int q0 = __ffs(fail) - 1;
+    uint64_t f0[kPerThread] = {}, f1[kPerThread] = {};
 #pragma unroll 1
     for (int q = 0; q < kNumRanks; ++q) {
       if (fail >> q & 1) {
         uint64_t tmp[kPerThread];
         poll_tagged<kPerThread>(reinterpret_cast<const uint64_t*>(p.peer_ptrs[q]) + full_off + tid, kThreads, tag, tmp);
+        if (regs) {
+#pragma unroll
+          for (int j = 0; j < kPerThread; ++j) {
+            if (q == q0) f0[j] = entry_key(tmp[j]);
+            else f1[j] = entry_key(tmp[j]);
+          }
+        }
       }
     }
     const bool drop = fail >> warp & 1;
@@ -780,6 +793,14 @@ __global__ void __launch_bounds__(32 * kNumRanks, kNumRanks == 8 ? 4 : 1)
 #pragma unroll
       for (int i = 0; i < kPerLane; ++i)
         f(drop ? uint64_t{0} : cand[i]);
+      if (regs) {
+#pragma unroll
+        for (int j = 0; j < kPerThread; ++j) {
+          f(f0[j]);
+          f(f1[j]);
+        }
+        return;
+      }
 #pragma unroll 1
       for (int q = 0; q < kNumRanks; ++q) {
         if (fail >> q & 1) {
@@ -809,7 +830,7 @@ __global__ void __launch_bounds__(32 * kNumRanks, kNumRanks == 8 ? 4 : 1)
     out_local[e] = slot / kNumRanks;
   };
   int n;
-  if (fail >> p.rank & 1) {
+  if (kCanFail && (fail >> p.rank & 1)) {
     // its keys >= t* are in its local top-k, in its own full slot
     const uint64_t* const src = p.buffer + full_off + tid;
     bool sel[kPerThread];
