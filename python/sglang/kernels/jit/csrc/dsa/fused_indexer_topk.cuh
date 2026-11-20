@@ -87,6 +87,7 @@ enum Stat : int {
   kStatMaxRepair = 2,    // most such rows in one call
   kStatCompactions = 3,  // candidate sub-list compactions in the filter pass
   kStatUnrepaired = 4,   // rows the repair select could not settle (must stay 0)
+  kStatRepairCalls = 5,  // calls with at least one row repaired
   kNumStats = 8,
 };
 
@@ -1322,6 +1323,7 @@ __global__ __launch_bounds__(kRepairThreads) void fstk_repair_prep_kernel(const 
     atomicAdd(p.stats + kStatCalls, 1ull);
     atomicAdd(p.stats + kStatRepairRows, static_cast<unsigned long long>(n));
     atomicMax(p.stats + kStatMaxRepair, static_cast<unsigned long long>(n));
+    if (n > 0) atomicAdd(p.stats + kStatRepairCalls, 1ull);
   }
 #pragma unroll 1
   for (uint32_t i = blockIdx.x; i < n_pad; i += gridDim.x) {

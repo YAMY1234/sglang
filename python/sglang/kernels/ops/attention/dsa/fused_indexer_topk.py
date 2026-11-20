@@ -32,7 +32,7 @@ MATH_WARPS = 8  # candidate sub-lists per row in layouts 0-4: one per math warp 
 SUB_LISTS = 4  # layout 5 (the fused path): one per warp of the row's warpgroup
 SELECT_KEYS, SELECT_REPAIR_KEYS = 8192, 16384  # select kernel shared-memory capacity, in keys
 # Device counters (int64) of fused_indexer_topk; see Stat in the kernel.
-STAT_CALLS, STAT_REPAIR_ROWS, STAT_MAX_REPAIR, STAT_COMPACTIONS, STAT_UNREPAIRED = range(5)
+STAT_CALLS, STAT_REPAIR_ROWS, STAT_MAX_REPAIR, STAT_COMPACTIONS, STAT_UNREPAIRED, STAT_REPAIR_CALLS = range(6)
 NUM_STATS = 8
 
 
@@ -339,7 +339,7 @@ class FusedTopKStats:
     counters are exact; the device counters (repaired rows, compactions) come from the newest
     completed snapshot, so they may trail by one interval."""
 
-    _DEVICE_KEYS = ("dev_calls", "repair_rows", "max_repair", "compactions", "unrepaired")
+    _DEVICE_KEYS = ("dev_calls", "repair_rows", "max_repair", "compactions", "unrepaired", "repair_calls")
 
     def __init__(self, log_interval: int, check_interval: int):
         self.log_interval = log_interval
