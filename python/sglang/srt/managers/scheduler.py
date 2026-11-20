@@ -5100,6 +5100,7 @@ class Scheduler(
             # later request matched as device prefix; don't early-send them (#44070).
             load_pending = batch.hicache_consumer_index >= 0
             for req in batch.reqs:
+                self.maybe_send_early_readiness(req)
                 self.maybe_send_cached_prefix_chunk(req, allow_send=not load_pending)
 
         # Run forward
