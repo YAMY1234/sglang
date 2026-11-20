@@ -1819,27 +1819,22 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             forward_batch=forward_batch, q_offset=q_offset
         )
         row_lo, row_hi = (0, q_offset) if tp_split is None else tp_split[1:3]
-        if self._dump is not None:
-            self._dump.maybe_save(
-                tensors=dict(
-                    q_fp8=q_fp8[:q_offset].view(torch.uint8),
-                    weights=weights[:q_offset],
-                    k_fp8=k_fp8.view(torch.uint8),
-                    k_scale=k_scale,
-                    ks=ks,
-                    ke=ke,
-                    lengths=seq_lens_expanded,
-                    row_to_batch=token_to_batch_idx,
-                    page_table=metadata.get_page_table_64(),
-                ),
-                meta=dict(
-                    rows=q_offset,
-                    keys=k_offset,
-                    page_size=page_size,
-                    index_topk=self.index_topk,
-                    seq_lens=forward_batch.seq_lens_cpu.tolist(),
-                    extend_lens=list(forward_batch.extend_seq_lens_cpu),
-                ),
+        if self._dump is not None and self._dump.active:
+            self._dump.capture(
+                q_fp8=q_fp8,
+                weights=weights,
+                k_fp8=k_fp8,
+                k_scale=k_scale,
+                ks=ks,
+                ke=ke,
+                lengths=seq_lens_expanded,
+                row_to_batch=token_to_batch_idx,
+                metadata=metadata,
+                forward_batch=forward_batch,
+                rows=q_offset,
+                keys=k_offset,
+                page_size=page_size,
+                index_topk=self.index_topk,
             )
         need_chunk, logits_budget_bytes = mqa_logits_should_chunk(
             num_rows=row_hi - row_lo,
