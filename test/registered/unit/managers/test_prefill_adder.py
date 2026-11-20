@@ -251,6 +251,30 @@ class TestPrefillAdder(CustomTestCase):
         self.assertEqual(adder.rem_chunk_tokens, 0)
         self.assertGreaterEqual(adder.rem_total_tokens, 0)
 
+    def test_branch_split_never_opens_a_second_chunked_request(self):
+        # SGLANG_MAMBA_BRANCH_TRACK_SPLIT cuts a request that would finish in one
+        # forward, but not while the continuation's chunked prefill is unfinished.
+        for has_chunked, end, chunked in ((True, 1024, False), (False, 512, True)):
+            adder = self.create_shortest_prefill_adder()
+            waiting = self.create_shared_req("waiting")
+            waiting.full_untruncated_fill_ids = list(range(1024))
+            waiting.mamba_branching_seqlen = 512
+            with (
+                self.subTest(has_chunked=has_chunked),
+                envs.SGLANG_MAMBA_BRANCH_TRACK_SPLIT.override(True),
+                get_context().override_server_args(_mamba_cache_chunk_size=64),
+            ):
+                if has_chunked:
+                    continuation = self.create_shared_req("continuation")
+                    continuation.full_untruncated_fill_ids = list(range(16384))
+                    adder.chunked_req_limit = 2560
+                    self.assertIs(adder.add_chunked_req(continuation), continuation)
+                adder.add_one_req(
+                    waiting, has_chunked_req=has_chunked, truncation_align_size=None
+                )
+                self.assertEqual(waiting.extend_end, end)
+                self.assertIs(adder.new_chunked_req, waiting if chunked else None)
+
     def test_shortest_prefill_rejects_second_unfinished_chunk(self):
         adder = self.create_shortest_prefill_adder(chunk_tokens=512)
         req = self.create_shared_req("second-chunk")
@@ -1925,6 +1949,29 @@ class TestPrefillAdder(CustomTestCase):
         self.assertIsNone(result)
         self.assertEqual((req.prefix_len, req.extend_end), (0, 200))
         self.assertIn(req, adder.can_run_list)
+
+    def test_add_chunked_req_cuts_the_last_forward_at_the_branching_point(self):
+        # SGLANG_MAMBA_BRANCH_TRACK_SPLIT on a continuing chunk (the path the next
+        # chunk takes, also across PP micro-batches): stop at the branching point.
+        for split, end, kept in ((False, 8096, None), (True, 6144, "req")):
+            adder, req = self._build_hybrid_swa_chunked_req(
+                page_size=64,
+                rem_swa=0,
+                rem_chunk=16384,
+                extend_input_len=8096,
+                is_hybrid_swa=False,
+            )
+            req.prefix_len, req.mamba_branching_seqlen = 4096, 6144
+            with (
+                self.subTest(split=split),
+                envs.SGLANG_MAMBA_BRANCH_TRACK_SPLIT.override(split),
+                get_context().override_server_args(_mamba_cache_chunk_size=64),
+            ):
+                result = adder.add_chunked_req(req)
+                self.assertEqual(req.extend_end, end)
+                self.assertIs(result, req if kept else None)
+                if split:
+                    self.assertEqual(adder.rem_chunk_tokens, 0)
 
     # Prefill KV exhaustion (K3.1 c640 PD jobs died in alloc_extend with
     # "Prefill out of memory"): a continuation forced into a spent budget
