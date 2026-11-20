@@ -20,7 +20,11 @@ from sglang.srt.managers.schedule_batch import (
     ScheduleBatch,
     _MambaRadixCacheV2TrackEntry,
 )
-from sglang.srt.managers.schedule_policy import PrefillAdder, mamba_prefill_chunk_grid
+from sglang.srt.managers.schedule_policy import (
+    PrefillAdder,
+    _PrefillAdmission,
+    mamba_prefill_chunk_grid,
+)
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.runtime_context import get_context, mamba_track_grid
 from sglang.srt.sampling.sampling_params import SamplingParams
@@ -156,6 +160,82 @@ class TestBranchingTrackInTheLastForward(unittest.TestCase):
             self.assertEqual(
                 _track_seqlen(**self.ARGS, branching=6144, input_len=40000), 6144
             )
+
+
+class TestBranchTrackSplit(unittest.TestCase):
+    # SGLANG_MAMBA_BRANCH_TRACK_SPLIT: a forward that would end the input with the
+    # branching point (6144) inside is cut there, so both states get tracked.
+    def _adder(self, new_chunked_req=None) -> PrefillAdder:
+        adder = object.__new__(PrefillAdder)
+        adder.page_size = CHUNK
+        adder.new_chunked_req = new_chunked_req
+        return adder
+
+    def _req(self, branching, input_len=8096):
+        return SimpleNamespace(
+            mamba_branching_seqlen=branching, full_untruncated_fill_ids=[1] * input_len
+        )
+
+    def _split(self, adder, req, prefix_len=4096, extend_len=4000):
+        with get_context().override_server_args(_mamba_cache_chunk_size=CHUNK):
+            return adder._branch_split_len(req, prefix_len, extend_len)
+
+    def test_off_by_default(self):
+        self.assertIsNone(self._split(self._adder(), self._req(6144)))
+
+    def test_the_last_forward_is_cut_at_the_branching_point(self):
+        with envs.SGLANG_MAMBA_BRANCH_TRACK_SPLIT.override(True):
+            self.assertEqual(self._split(self._adder(), self._req(6144)), 2048)
+
+    def test_no_cut_when_not_needed_or_not_possible(self):
+        with envs.SGLANG_MAMBA_BRANCH_TRACK_SPLIT.override(True):
+            # an earlier forward (the input continues past this one) already tracks it
+            self.assertIsNone(self._split(self._adder(), self._req(6144, 40000)))
+            self.assertIsNone(self._split(self._adder(), self._req(None)))
+            self.assertIsNone(self._split(self._adder(), self._req(6100)))  # off-grid
+            self.assertIsNone(self._split(self._adder(), self._req(4096 + 32)))
+            # another request already holds this batch's one chunked slot
+            self.assertIsNone(self._split(self._adder(object()), self._req(6144)))
+
+    def test_the_cut_forward_tracks_k_and_the_next_one_the_input_end(self):
+        args = dict(tree_page=CHUNK, input_len=8096)
+        self.assertEqual(
+            _track_seqlen(prefix_len=4096, extend_len=2048, branching=6144, **args),
+            6144,
+        )
+        end = _track_seqlen(prefix_len=6144, extend_len=1952, branching=6144, **args)
+        self.assertEqual(end, _track_seqlen(prefix_len=6144, extend_len=1952, **args))
+        self.assertGreater(end, 6144)
+
+    def test_a_split_admission_holds_the_chunked_slot_and_closes_the_batch(self):
+        adder = self._adder()
+        adder.rem_chunk_tokens = 16384
+        adder.can_run_list = []
+        adder.tree_cache = MagicMock()
+        for name in (
+            "_update_prefill_budget",
+            "_reserve_chunked_tail",
+            "_account_prefill_cache_admission",
+            "_request_slot_reserve_for_req",
+        ):
+            setattr(adder, name, MagicMock(return_value=0))
+        req = SimpleNamespace(prefix_len=4096, last_node=None, retracted_stain=False)
+        admission = _PrefillAdmission(4096, 2048, 0, True, 0, branch_split=True)
+        adder._commit_prefill_admission(req, admission, mamba_gap_reserve=0)
+        self.assertEqual(req.extend_end, 6144)
+        self.assertIs(adder.new_chunked_req, req)
+        self.assertEqual(adder.rem_chunk_tokens, 0)
+
+    def test_chunk_skip_keeps_the_chunk_cut_at_the_branching_point(self):
+        from sglang.srt.mem_cache.unified_cache.components.mamba import MambaComponent
+
+        req = SimpleNamespace(
+            origin_input_ids=[1] * 8096, extend_end=6144, mamba_branching_seqlen=6144
+        )
+        with envs.SGLANG_MAMBA_CHUNK_CKPT.override("none"):
+            self.assertFalse(MambaComponent._skip_chunk_checkpoint(req))
+            req.mamba_branching_seqlen = None
+            self.assertTrue(MambaComponent._skip_chunk_checkpoint(req))
 
 
 class TestChunkedPrefillStaysOnTheChunkGrid(unittest.TestCase):

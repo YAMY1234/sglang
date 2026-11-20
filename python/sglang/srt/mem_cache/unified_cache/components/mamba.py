@@ -679,6 +679,8 @@ class MambaComponent(TreeComponent):
         remaining = len(req.origin_input_ids) - req.extend_end
         if mode == "all" or remaining <= 0:  # the input end or a decode checkpoint
             return False
+        if req.extend_end == req.mamba_branching_seqlen:  # a forward cut at the branch
+            return False
         if mode == "none":
             return True
         assert mode == "last", f"SGLANG_MAMBA_CHUNK_CKPT={mode!r}: all, none or last"

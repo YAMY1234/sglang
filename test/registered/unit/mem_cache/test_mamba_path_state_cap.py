@@ -248,7 +248,9 @@ class TestMambaPathStateCap(unittest.TestCase):
         }
         for remaining, expected in cases.items():
             req = SimpleNamespace(
-                origin_input_ids=[0] * 100000, extend_end=100000 - remaining
+                origin_input_ids=[0] * 100000,
+                extend_end=100000 - remaining,
+                mamba_branching_seqlen=None,
             )
             for mode, keep in zip(("all", "none", "last"), expected):
                 with (

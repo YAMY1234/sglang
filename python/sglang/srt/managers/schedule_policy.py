@@ -12,6 +12,7 @@ from sglang.srt.runtime_context import (
     get_parallel,
     get_schedule,
     mamba_cache_chunk_size,
+    mamba_checkpoint_grid,
 )
 from sglang.srt.utils import get_bool_env_var, is_gfx95_supported, is_hip
 
@@ -697,6 +698,7 @@ class _PrefillAdmission:
     max_new_tokens: int
     is_chunked: bool
     replay_len: int
+    branch_split: bool = False
 
 
 def mamba_prefill_chunk_grid() -> int:
@@ -1032,6 +1034,22 @@ class PrefillAdder:
             return trunc_len
         return trunc_len // self.mamba_chunk_grid * self.mamba_chunk_grid or trunc_len
 
+    def _branch_split_len(
+        self, req: Req, prefix_len: int, extend_len: int
+    ) -> Optional[int]:
+        """SGLANG_MAMBA_BRANCH_TRACK_SPLIT: the extend length that ends this forward at
+        the branching point, when the forward would otherwise end the input (where the
+        branching point would take the input end's track); else None."""
+        if not envs.SGLANG_MAMBA_BRANCH_TRACK_SPLIT.get() or self.new_chunked_req:
+            return None
+        k = req.mamba_branching_seqlen
+        if k is None or prefix_len + extend_len < len(req.full_untruncated_fill_ids):
+            return None
+        split, grid = k - prefix_len, mamba_checkpoint_grid(self.page_size)
+        if not grid <= split < extend_len or split % grid or k % self.page_size:
+            return None
+        return split
+
     def budget_state(self):
         no_token = not self.memory_budget.has_capacity()
         # Gate new mamba slots separately: rem_total_tokens' full_evictable can't
@@ -1358,6 +1376,11 @@ class PrefillAdder:
         new_len = self.floor_chunked_tokens(
             min(cand_extend_input_len, _rem_tokens), cand_extend_input_len
         )
+        branch_split = False
+        if not truncated and self.dllm_config is None:
+            split = self._branch_split_len(req, req.prefix_len, new_len)
+            if split is not None:
+                new_len, truncated, branch_split = split, True, True
         request_slot_reserve = self._request_slot_reserve_for_req(
             req, extend_input_len=new_len
         )
@@ -1396,6 +1419,8 @@ class PrefillAdder:
         )
         if truncated:
             self._reserve_chunked_tail(req, req.extend_end)
+        if branch_split:
+            self.rem_chunk_tokens = 0  # the request stays chunked: admit no more
 
         # Return if chunked prefill not finished
         return req if truncated else None
@@ -1857,8 +1882,14 @@ class PrefillAdder:
         if (verdict := self._check_prefill_tile_budget(tile_tokens)) is not None:
             return verdict
 
+        branch_split = False
+        if not is_chunked and self.dllm_config is None:
+            split = self._branch_split_len(req, prefix_len, extend_len)
+            if split is not None:
+                extend_len, is_chunked, max_new_tokens = split, True, 0
+                branch_split = True
         return _PrefillAdmission(
-            prefix_len, extend_len, max_new_tokens, is_chunked, replay_len
+            prefix_len, extend_len, max_new_tokens, is_chunked, replay_len, branch_split
         )
 
     def _commit_prefill_admission(
@@ -1883,6 +1914,8 @@ class PrefillAdder:
         )
         if admission.is_chunked:
             self._reserve_chunked_tail(req, req.extend_end)
+        if admission.branch_split:
+            self.rem_chunk_tokens = 0  # one chunked request per batch: admit no more
         self._account_prefill_cache_admission(req, admission.prefix_len)
 
     def preempt_to_schedule(self, req: Req) -> bool:
