@@ -161,7 +161,7 @@ def pack_dcp_row_segments(
                 widths,
             )
             row_offset += n
-    gather_stream.synchronize()
+    wait_cuda(gather_stream)
     return bases
 
 
