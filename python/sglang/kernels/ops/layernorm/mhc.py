@@ -2920,7 +2920,7 @@ def hc_mix_stats_sinkhorn_packed(
 ):
     m, k = x.shape
     slices = _HC_PACKED_SLICES
-    assert hc_mult == 4 and x.is_contiguous() and x.dtype == torch.bfloat16
+    assert hc_mult == 4 and x.stride(1) == 1 and x.dtype == torch.bfloat16
     assert packed.shape == (3, k, _HC_PACKED_COLS) and packed.is_contiguous()
     assert k % (slices * _HC_PACKED_BLOCK_K) == 0
     part_mix = torch.empty((slices, m, _HC_PACKED_COLS), device=x.device, dtype=torch.float32)

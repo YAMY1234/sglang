@@ -307,6 +307,30 @@ def test_packed_compensated_mhc_prefill(num_tokens):
         torch.testing.assert_close(a, b, rtol=1e-5, atol=2e-6)
 
 
+@pytest.mark.parametrize("num_tokens", [8192, 32000])
+def test_packed_broadcast_stats_matches_full(num_tokens):
+    if not (torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 10):
+        pytest.skip("SM10x only")
+    torch.manual_seed(5 + num_tokens)
+    emb = torch.randn(num_tokens, 5120, device="cuda", dtype=torch.bfloat16)
+    streams = mhc.hc_broadcast(emb, 4)
+    w = torch.randn(24, 20480, device="cuda") * 0.01
+    scale = torch.tensor([0.5, 0.25, 0.25], device="cuda")
+    base = torch.randn(24, device="cuda")
+    packed = mhc.pack_bf16_hc_weight(mhc.split_bf16_hc_weight(w))
+    summed = mhc.pack_bf16_hc_weight(
+        mhc.split_bf16_hc_weight(w.view(24, 4, -1).sum(1).contiguous())
+    )
+    full = mhc.hc_mix_stats_sinkhorn_packed(
+        streams.flatten(1), packed, scale, base, 20, 1e-6, 1e-6
+    )
+    bcast = mhc.hc_mix_stats_sinkhorn_packed(
+        streams[:, 0, :], summed, scale, base, 20, 1e-6, 1e-6
+    )
+    for a, b in zip(bcast, full):
+        torch.testing.assert_close(a, b, rtol=1e-5, atol=2e-6)
+
+
 @pytest.mark.parametrize("num_tokens", [32, 100, 256, 512, 1024])
 def test_deepgemm_prenorm_dual_matches_two_calls(num_tokens):
     from types import SimpleNamespace

@@ -344,6 +344,9 @@ def use_stats_stream(cfg: HcConfig, forward_batch: ForwardBatch, x: torch.Tensor
     )
 
 
+_PACKED_MIN_ROWS = 8192
+
+
 def mix_stats(
     hc: HcSubLayer, x: torch.Tensor, stats_stream: Optional[torch.cuda.Stream] = None
 ) -> HcTriplet:
@@ -402,7 +405,13 @@ def _mix_stats_impl(hc: HcSubLayer, x: torch.Tensor) -> HcTriplet:
     if x.is_cuda and use_fused_stats and x.dtype == torch.bfloat16:
         # The default split-K/Sinkhorn fusion preserves batch invariance;
         # compensated projections above are disabled in batch-invariant mode.
-        if use_bf16_projection and hc.bf16_packed is not None and not hopper_medium:
+        # Below 8192 rows the packed kernel's 256-row tiles leave the grid under one
+        # wave; the stock projection is as fast there (VR200).
+        if (
+            use_bf16_projection
+            and hc.bf16_packed is not None
+            and x_flat.shape[0] >= _PACKED_MIN_ROWS
+        ):
             from sglang.kernels.ops.layernorm.mhc import (
                 hc_mix_stats_sinkhorn_packed,
             )
@@ -520,6 +529,30 @@ def combine(
     """The sublayer's input: ``norm(sum_k pre[k] * R[k])``, short-circuited by
     whatever the previous post left in ``state.input``."""
     return combine_input(hc.cfg, hc.norm, state, quantized)
+
+
+def broadcast_mix_stats(
+    hc: HcSubLayer, packed_sum: Optional[torch.Tensor], streams: torch.Tensor
+) -> Optional[HcTriplet]:
+    """The triplet of ``mix_stats(hc, streams)`` when all hc streams are copies of
+    stream 0 (the first layer's broadcast embedding): one quarter of the reads,
+    through the weight summed over streams."""
+    if packed_sum is None or not envs.SGLANG_OPT_DSV41_HC_STATS_PACKED.get():
+        return None
+    if not (_PACKED_MIN_ROWS <= streams.shape[0] <= 65536 and streams.is_contiguous()):
+        return None
+    from sglang.kernels.ops.layernorm.mhc import hc_mix_stats_sinkhorn_packed
+
+    cfg = hc.cfg
+    return hc_mix_stats_sinkhorn_packed(
+        streams[:, 0, :],
+        packed_sum,
+        hc.scale,
+        hc.base,
+        cfg.sinkhorn_iters,
+        cfg.rms_eps,
+        cfg.eps,
+    )
 
 
 def combine_input(
