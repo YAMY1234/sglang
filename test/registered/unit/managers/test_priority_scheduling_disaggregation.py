@@ -364,6 +364,29 @@ class TestOptimisticPrefillCacheOwnership(unittest.TestCase):
         )
         self.assertFalse(req.pending_bootstrap)
 
+    def test_prefill_complete_with_l3_never_yields_an_optimistic_request(self):
+        """Optimistic prefill runs with the nixl_dram L3 under prefill_complete only
+        because such a request is never yielded: its pages may be in flight to L3 or
+        evicted to host meanwhile, and the yield would release and requeue them."""
+        req = SimpleNamespace(rid="req", pending_bootstrap=True)
+        scheduler = SimpleNamespace(enable_hicache_storage=True, tree_cache=MagicMock())
+        disagg = SimpleNamespace(
+            disaggregation_decode_allocation_policy="prefill_complete",
+            optimistic_prefill_attempts=1,
+        )
+        with (
+            patch("sglang.srt.disaggregation.prefill.get_disagg", return_value=disagg),
+            patch("sglang.srt.disaggregation.prefill.checkpoint_kv_cache") as checkpoint,
+            patch("sglang.srt.disaggregation.prefill.release_kv_cache") as release,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "cannot yield"):
+                SchedulerDisaggregationPrefillMixin.optimistic_release_and_requeue(
+                    scheduler, req
+                )
+        checkpoint.assert_not_called()
+        release.assert_not_called()
+        self.assertTrue(req.pending_bootstrap)
+
     def test_write_through_pending_chunk_does_not_publish(self):
         scheduler = SimpleNamespace()
         cache = UnifiedRadixCache.__new__(UnifiedRadixCache)

@@ -834,6 +834,7 @@ class TestAllocationIntegration(CustomTestCase):
             disagg_prefill_bootstrap_queue=SimpleNamespace(queue=[]),
             metrics_reporter=SimpleNamespace(enable_metrics=False),
             processed_tokens_counter=0,
+            enable_hicache_storage=False,
             req_to_metadata_buffer_idx_allocator=Mock(),
         )
         with (
@@ -904,6 +905,7 @@ class TestAllocationIntegration(CustomTestCase):
             disagg_prefill_bootstrap_queue=SimpleNamespace(queue=[]),
             metrics_reporter=SimpleNamespace(enable_metrics=False),
             processed_tokens_counter=0,
+            enable_hicache_storage=False,
         )
         scheduler._release_aborted_request = MethodType(
             Scheduler._release_aborted_request, scheduler
@@ -1026,6 +1028,25 @@ class TestAllocationIntegration(CustomTestCase):
         self.assertEqual(scheduler.process_disagg_prefill_inflight_queue(), [])
         scheduler.send_kv_chunk.assert_called_once_with(req, last_chunk=True)
         self.assertFalse(req.pending_bootstrap)
+
+    def test_parked_prefill_never_yields_under_prefill_complete(self):
+        # The yield that early takes when the request pool is full (below) would
+        # release a parked request's KV; prefill_complete keeps it parked.
+        reqs = [Req(str(i), "", [1], SamplingParams()) for i in range(2)]
+        for i, req in enumerate(reqs):
+            req.pending_bootstrap = True
+            req.disagg_kv_sender = self.sender(room=i + 1)
+        scheduler = self.inflight_scheduler(reqs)
+        pool = scheduler.req_to_token_pool = ReqToTokenPool(2, 2, "cpu", False)
+        pool.alloc(reqs)
+        scheduler.waiting_queue = [object()]
+        scheduler.disagg_prefill_bootstrap_queue = SimpleNamespace(queue=[])
+        scheduler.optimistic_release_and_requeue = Mock(side_effect=pool.free)
+        for _ in range(2):
+            scheduler.process_disagg_prefill_inflight_queue()
+        scheduler.optimistic_release_and_requeue.assert_not_called()
+        self.assertEqual(scheduler.disagg_prefill_inflight_queue, reqs)
+        self.assertEqual(pool.available_size(), 0)
 
     def test_parked_prefill_reclaims_only_one_slot(self):
         reqs = [Req(str(i), "", [1], SamplingParams()) for i in range(2)]
