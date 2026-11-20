@@ -4,10 +4,11 @@ Scores are bitwise DeepGEMM's legacy ``fp8_mqa_logits`` (32 heads x 128, FP8, FP
 reduction); the [rows, num_kv] score matrix is never written. Each row first gets a
 threshold ``tau`` from every ``sample_stride``-th key of its window (the ``rank``-th largest
 sample score its threads kept), the main pass appends the scores >= tau of the row's window
-to per-warp candidate sub-lists (a sub-list about to overflow drops keys that cannot be in
-the warp's top-k), and the exact top-k (equal scores: smaller column first) is selected and
-mapped through the page table. Rows whose list holds fewer than ``topk`` entries (tau too
-high) are rescored on the device with tau = -inf, so every row is exact with no host sync.
+to per-warp candidate sub-lists, and the exact top-k (equal scores: smaller column first) is
+selected and mapped through the page table. Rows whose sub-list overflowed or that hold fewer
+than ``topk`` candidates (tau too high) are rescored on the device by a pass whose sub-lists
+compact (they keep a superset of each warp's exact top-k), so every row is exact with no host
+sync.
 """
 
 from __future__ import annotations
@@ -23,12 +24,13 @@ from sglang.kernels.jit.utils import cache_once, cuda_stubs_dir, load_jit
 
 logger = logging.getLogger(__name__)
 
-MODE_LOGITS, MODE_NO_EPI, MODE_NO_STORE, MODE_FILTER, MODE_TAU = 0, 1, 2, 3, 4
+MODE_LOGITS, MODE_NO_EPI, MODE_NO_STORE, MODE_FILTER, MODE_TAU, MODE_FILTER_COMPACT = 0, 1, 2, 3, 4, 5
 # layout -> (rows per q-block, keys per split); see LayoutTraits in the kernel.
 LAYOUTS = {0: (4, 256), 1: (4, 256), 2: (8, 128), 3: (4, 256), 4: (8, 128), 5: (4, 256)}
 DEFAULT_LAYOUT = 5  # measured fastest for the filter pass (VR, 11-20)
 MATH_WARPS = 8  # candidate sub-lists per row in layouts 0-4: one per math warp of the row's CTA
 SUB_LISTS = 4  # layout 5 (the fused path): one per warp of the row's warpgroup
+SELECT_KEYS, SELECT_REPAIR_KEYS = 8192, 16384  # select kernel shared-memory capacity, in keys
 # Device counters (int64) of fused_indexer_topk; see Stat in the kernel.
 STAT_CALLS, STAT_REPAIR_ROWS, STAT_MAX_REPAIR, STAT_COMPACTIONS, STAT_UNREPAIRED = range(5)
 NUM_STATS = 8
@@ -117,6 +119,7 @@ def score(
     topk: int = 0,
     rank: int = 0,
     keep_all: int = 0,
+    ks_div: int = 1,
     reuse_kv: bool = False,
     layout: int = DEFAULT_LAYOUT,
     alu_heads: int = 0,
@@ -148,6 +151,7 @@ def score(
         topk,
         rank,
         keep_all,
+        ks_div,
         mode,
         int(reuse_kv),
         layout,
@@ -194,9 +198,9 @@ def scratch_bytes_per_row(num_kv: int, sample_stride: int = 16, cand_cap: int = 
 
 
 def workspace_fixed_bytes(num_kv: int, sample_stride: int = 16) -> int:
-    """Workspace bytes of a call that do not scale with its rows (sample keys, row padding, alignment)."""
+    """Workspace bytes of a call that do not scale with its rows (sample keys, alignment)."""
     num_samples = (num_kv + sample_stride - 1) // sample_stride
-    return num_samples * (128 + 4) + 4 * scratch_bytes_per_row(num_kv) + 16 * 256
+    return num_samples * (128 + 4) + 16 + 16 * 256
 
 
 class FusedTopKResult(NamedTuple):
@@ -224,8 +228,7 @@ def fused_indexer_topk(
     rank: int = 192,
     cand_cap: int = 16384,
     keep_all: Optional[int] = None,
-    order: Optional[torch.Tensor] = None,
-    sample_order: Optional[torch.Tensor] = None,
+    lpt: bool = False,
     out: Optional[torch.Tensor] = None,
     workspace: Optional[torch.Tensor] = None,
     stats: Optional[torch.Tensor] = None,
@@ -236,40 +239,45 @@ def fused_indexer_topk(
 
     ``workspace`` (uint8, at least ``rows * scratch_bytes_per_row + workspace_fixed_bytes``)
     holds every scratch buffer, so a call allocates nothing large. ``stats``: optional
-    [NUM_STATS] int64 device counters."""
+    [NUM_STATS] int64 device counters. ``lpt``: visit q-blocks longest span first (else in
+    order; the kernel deals them out snake-wise either way)."""
     dev = q_fp8.device
     ws = _Carver(workspace)
     rows = q_fp8.shape[0]
     num_kv = kv_fp8.shape[0]
     sub_cap = _sub_cap(cand_cap)
-    # Rows this short keep every score: at most keep_all / SUB_LISTS per sub-list, no compaction.
+    # Rows this short keep every score: at most keep_all / SUB_LISTS per sub-list.
     keep_all = cand_cap // 2 if keep_all is None else keep_all
     jit = _jit_module(cuh_path, serving)
     common = dict(layout=DEFAULT_LAYOUT, cuh_path=cuh_path, serving=serving, stats=stats, topk=topk)
+    i32, i64 = _empty(dev, torch.int32), _empty(dev, torch.int64)
+    st = stats if stats is not None else i64
+    sms = _num_sms(dev)
 
     # Sample keys: every sample_stride-th flattened position; a row's window [ks, ke)
-    # holds the samples [ceil(ks / s), ceil(ke / s)).
+    # holds the samples [ceil(ks / s), ceil(ke / s)) (the kernel divides).
     n_s = (num_kv + sample_stride - 1) // sample_stride
     kv_s = ws.take((n_s, kv_fp8.shape[1]), kv_fp8.dtype, dev)
     kv_s.copy_(kv_fp8[::sample_stride])
     sc_s = ws.take((n_s,), kv_scale.dtype, dev)
     sc_s.copy_(kv_scale[::sample_stride])
-    sks = (ks + sample_stride - 1) // sample_stride
-    ske = (ke + sample_stride - 1) // sample_stride
-    if sample_order is None:
-        sample_order = lpt_order(sks, ske, n_s)
+    sample_order = order = None
+    if lpt:
+        sks = (ks + sample_stride - 1) // sample_stride
+        sample_order = lpt_order(sks, (ke + sample_stride - 1) // sample_stride, n_s)
+        order = lpt_order(ks, ke, num_kv)
     tau = ws.take((rows,), torch.float32, dev)
     score(
-        q_fp8, kv_s, sc_s, weights, sks, ske, mode=MODE_TAU, order=sample_order,
-        tau_out=tau, lengths=lengths, rank=rank, keep_all=keep_all, **common,
+        q_fp8, kv_s, sc_s, weights, ks, ke, mode=MODE_TAU, order=sample_order, tau_out=tau,
+        lengths=lengths, rank=rank, keep_all=keep_all, ks_div=sample_stride, **common,
     )
 
     # Select keys: (order-preserving score bits << 32) | ~window column, one sub-list per warp.
     cand_key = ws.take((rows, SUB_LISTS, sub_cap), torch.int64, dev)
-    cand_count = ws.take((rows, SUB_LISTS), torch.int32, dev)
-    cand_count.zero_()
-    if order is None:
-        order = lpt_order(ks, ke, num_kv)
+    counts = ws.take((rows * SUB_LISTS + 1,), torch.int32, dev)
+    counts.zero_()
+    cand_count = counts[: rows * SUB_LISTS].view(rows, SUB_LISTS)
+    num_repair = counts[rows * SUB_LISTS:]
     score(
         q_fp8, kv_fp8, kv_scale, weights, ks, ke, mode=MODE_FILTER, order=order,
         tau=tau, cand_key=cand_key, cand_count=cand_count, **common,
@@ -279,29 +287,24 @@ def fused_indexer_topk(
     if dst is None:
         dst = torch.empty(rows, topk, device=dev, dtype=torch.int32)
     repair_rows = ws.take((rows,), torch.int32, dev)
-    num_repair = ws.take((1,), torch.int32, dev)
-    num_repair.zero_()
-    i32, i64 = _empty(dev, torch.int32), _empty(dev, torch.int64)
-    st = stats if stats is not None else i64
-    sms = _num_sms(dev)
     jit.select(cand_key, cand_count, lengths, row_to_batch, page_table, dst,
-               repair_rows, num_repair, i32, i32, st, page_size, sms)
+               repair_rows, num_repair, i32, i32, st, page_size, sms, SELECT_KEYS)
 
-    # Device-side repair: listed rows are rescored with tau = -inf (every key a candidate) and
-    # selected again; three launches that do nothing when the list is empty.
+    # Device-side repair of the listed rows (overflowed, or tau too high): rescored by the
+    # compacting filter and selected again; three launches that do nothing when the list is empty.
     q_c = ws.take((rows, 32, 128), q_fp8.dtype, dev)
     w_c = ws.take((rows, 32), torch.float32, dev)
     ks_c = ws.take((rows,), torch.int32, dev)
     ke_c = ws.take((rows,), torch.int32, dev)
     tau_c = ws.take((rows,), torch.float32, dev)
-    jit.repair_prep(repair_rows, num_repair, q_fp8, weights, ks, ke, q_c, w_c, ks_c, ke_c, tau_c,
-                    cand_count, st, 4 * sms)
+    jit.repair_prep(repair_rows, num_repair, q_fp8, weights, ks, ke, q_c, w_c, ks_c, ke_c, tau, tau_c,
+                    cand_count, st, sub_cap, 4 * sms)
     score(
-        q_c, kv_fp8, kv_scale, w_c, ks_c, ke_c, mode=MODE_FILTER, tau=tau_c,
+        q_c, kv_fp8, kv_scale, w_c, ks_c, ke_c, mode=MODE_FILTER_COMPACT, tau=tau_c,
         cand_key=cand_key, cand_count=cand_count, row_map=repair_rows, num_rows=num_repair, **common,
     )
     jit.select(cand_key, cand_count, lengths, row_to_batch, page_table, dst,
-               i32, i32, repair_rows, num_repair, st, page_size, 4 * sms)
+               i32, i32, repair_rows, num_repair, st, page_size, 4 * sms, SELECT_REPAIR_KEYS)
     if out is None:
         out = dst
     elif dst is not out:
