@@ -659,7 +659,7 @@ class Envs:
     # V4.1 SWA cache store in one launch before wq_b, instead of two. Bitwise equal outputs.
     SGLANG_OPT_DSV4_FUSED_QKV_NORM = EnvBool(False)
     # Decode/verify, low-ratio multi-stream prepare: the index-source layers' head-weight GEMM
-    # (weights_proj(x)) runs in the source stream's compressor block, beside wqkv_a, instead of
+    # (weights_proj(x)) runs on the idle KV stream beside wqkv_a and the compressor, instead of
     # after the indexer wq_b. Same kernels and inputs (bitwise); only the stream order moves.
     SGLANG_OPT_DSV41_HOIST_INDEX_WEIGHTS = EnvBool(False)
     # CUDA-graph replay fill: the num_token_non_padded and global_num_tokens slots are written

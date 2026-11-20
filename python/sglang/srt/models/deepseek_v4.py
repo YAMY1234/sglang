@@ -2373,6 +2373,35 @@ class MQALayer(MqaAttentionBase):
 
         return q
 
+    def _hoisted_index_head_weights(
+        self, x, forward_batch, stream_w, stream_sources
+    ) -> Optional[Tuple[torch.Tensor, torch.cuda.Event]]:
+        """SGLANG_OPT_DSV41_HOIST_INDEX_WEIGHTS: the index-source layer's weights_proj(x) on
+        the otherwise idle KV stream, beside wqkv_a and the compressor, instead of inside the
+        indexer chain after its wq_b. Returns (weights, ready event) or None."""
+        if not (
+            envs.SGLANG_OPT_DSV41_HOIST_INDEX_WEIGHTS.get()
+            and self.indexer is not None
+            and not self.indexer.key_only
+            and stream_w is not stream_sources
+            and (
+                forward_batch.forward_mode.is_decode()
+                or forward_batch.forward_mode.is_target_verify()
+            )
+        ):
+            return None
+        from sglang.srt.model_executor.runner_utils.capture_mode import (
+            skip_low_ratio_indexer,
+        )
+
+        if skip_low_ratio_indexer(self.compress_ratio):
+            return None
+        stream_w.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream_w):
+            weights = self.indexer.head_weights_raw(x)
+            ready = stream_w.record_event()
+        return weights, ready
+
     def _forward_prepare_low_ratio_multi_stream(
         self,
         x: torch.Tensor,
@@ -2393,6 +2422,9 @@ class MQALayer(MqaAttentionBase):
         # NOTE: wait for x ready
         if self.compressor is not None:
             stream_sources.wait_stream(current_stream)
+        head_weights = self._hoisted_index_head_weights(
+            x, forward_batch, stream_kv, stream_sources
+        )
         qkv_a: Optional[torch.Tensor] = None
         if self.fuse_wqa_wkv:
             qkv_a, _ = self.wqkv_a(x_linear)
@@ -2428,6 +2460,11 @@ class MQALayer(MqaAttentionBase):
             # attention-TP collective: all ranks must keep the same communicator
             # ordering, even though the indexer overlaps local Q/KV work.
             with torch.cuda.stream(stream_sources):
+                if head_weights is not None:
+                    stream_sources.wait_event(head_weights[1])
+                    head_weights[0].record_stream(stream_sources)
+                    # Taken by this layer's indexer pass (_index_q_and_weights).
+                    self.indexer.hoisted_head_weights = (x, head_weights[0])
                 attn_backend.forward_low_ratio_sources(
                     layer=self,
                     x=x,
