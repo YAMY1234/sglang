@@ -180,6 +180,18 @@ def locality_inplace_out(residual: torch.Tensor) -> Optional[torch.Tensor]:
     return residual
 
 
+def locality_stream_out(residual: torch.Tensor) -> Optional[torch.Tensor]:
+    """Where a row-local op on the stream's current ``residual`` writes the next residual: in place when it is the
+    slot's rows; the slot's rows when the stream already left the slot (its old residual there is dead); else None."""
+    pool = _reserved_for(residual.shape[0])
+    if pool is None:
+        return None
+    out = pool.residual_rows(residual.shape[0])
+    if residual.data_ptr() == out.data_ptr():
+        return out if residual.shape == out.shape and residual.stride() == out.stride() else None
+    return None if _overlaps(residual, pool.residuals[0]) or residual.shape != out.shape else out
+
+
 def locality_normed_rows(rows: int) -> Optional[torch.Tensor]:
     """The reserved normed slot's rows for a sublayer input built outside the Mega mHC boundary, or None."""
     pool = _reserved_for(rows)
