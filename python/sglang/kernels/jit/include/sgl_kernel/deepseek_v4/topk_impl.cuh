@@ -637,13 +637,17 @@ struct TopKRadixBase : TopKConfig {
   /// Re-stages the tie buffer exactly when the threshold bin overflows it: radix
   /// rounds narrow the bin to one bucket, then a final scan emits what lies above
   /// it and stages the bucket for the caller's handle_tie.
+  /// [key_min, key_max]: the exact keys of the tie set, when known; leading digits they share are taken without a
+  /// scan (such a round would match that digit with nothing above it).
   template <uint32_t kUnroll = 0>
   SGL_DEVICE static void refine_ties(  //
       const TopKProblem& problem,
       Smem* smem,
       const float v_lo,
       const float v_hi,
-      const uint32_t count_eq) {
+      const uint32_t count_eq,
+      const uint32_t key_min = 0u,
+      const uint32_t key_max = ~0u) {
     constexpr uint32_t kRefineRounds = (32 + kRefineBits - 1) / kRefineBits;
     const auto topk = problem.topk;
     if (smem->count_gt >= topk) [[unlikely]]
@@ -683,10 +687,18 @@ struct TopKRadixBase : TopKConfig {
     uint32_t bucket_lo = 0;
     uint32_t bucket_mask = ~0u;
 
+    bool shared_prefix = true;
 #pragma unroll
     for (uint32_t round = 0; round < kRefineRounds; ++round) {
       // round 0: bits [20, 32), round 1: bits [8, 20), round 2: bits [0, 8)
       const uint32_t lo = (round + 1) * kRefineBits < 32 ? 32 - (round + 1) * kRefineBits : 0;
+      shared_prefix = shared_prefix && ((key_min ^ key_max) >> lo) == 0;
+      if (shared_prefix) {
+        bucket_lo = key_min & ~((1u << lo) - 1u);
+        bucket_mask = (1u << lo) - 1u;
+        if (lo == 0) break;
+        continue;
+      }
 #pragma unroll
       for (uint32_t i = 0; i < kRefineItems; ++i) {
         hist[tx * kRefineItems + i] = 0;
@@ -849,12 +861,18 @@ struct TopKRegister : TopKRadixBase<12> {
 // Streaming path: seq_len > 8192 -- two vectorized passes over global memory
 // ---------------------------------------------------------------------------
 
-/// kUnroll > 0: every pass over the input keeps kUnroll loads in flight per thread (for_each_input_mlp);
-/// the selection and its tie order are unchanged.
-template <uint32_t kUnroll = 0>
+/// kUnroll > 0: every pass over the input keeps kUnroll loads in flight per thread (for_each_input_mlp).
+/// kRangeSkip: the collect pass also records the exact-key range of the threshold bin, so an overflowing
+/// bin's refinement skips the leading digits all its scores share. The selection and tie order are unchanged.
+template <uint32_t kUnroll = 0, bool kRangeSkip = false>
 struct TopKStreamingT : TopKRadixBase<12> {
  public:
   static constexpr uint32_t kMaxSeqLen = std::numeric_limits<uint32_t>::max();
+  struct RangeSmem : TopKRadixBase<12>::Smem {
+    uint32_t tie_key_min;
+    uint32_t tie_key_max;
+  };
+  using Smem = std::conditional_t<kRangeSkip, RangeSmem, TopKRadixBase<12>::Smem>;
 
   template <bool kUsePDL>
   SGL_DEVICE static void forward(TopKProblem problem, void* _smem) {
@@ -865,6 +883,10 @@ struct TopKStreamingT : TopKRadixBase<12> {
     if (tx == 0) {
       smem->count_eq = 0;
       smem->count_gt = 0;
+      if constexpr (kRangeSkip) {
+        smem->tie_key_min = ~0u;
+        smem->tie_key_max = 0u;
+      }
     }
     __syncthreads();
     PDLWaitPrimary<kUsePDL>();
@@ -901,6 +923,7 @@ struct TopKStreamingT : TopKRadixBase<12> {
       if (tx == 0) smem->tie_nonzero = 0;
       __syncthreads();
     }
+    uint32_t key_min = ~0u, key_max = 0u;
     scan_input<kUnroll>(problem.in, problem.seq_len, [&](float val, uint32_t idx) {
       if (val >= v_hi) {
         const auto pos = atomicAdd(&smem->count_gt, 1);
@@ -913,8 +936,20 @@ struct TopKStreamingT : TopKRadixBase<12> {
         if (pos < kMaxNumTie) [[likely]] {
           smem->tie_values[pos] = {val, idx};
         }
+        if constexpr (kRangeSkip) {
+          key_min = min(key_min, extract_exact_bin(val));
+          key_max = max(key_max, extract_exact_bin(val));
+        }
       }
     });
+    if constexpr (kRangeSkip) {
+      key_min = __reduce_min_sync(0xFFFFFFFFu, key_min);
+      key_max = __reduce_max_sync(0xFFFFFFFFu, key_max);
+      if (tx % kWarpSize == 0) {
+        atomicMin(&smem->tie_key_min, key_min);
+        atomicMax(&smem->tie_key_max, key_max);
+      }
+    }
 
     // Phase 4: Handle ties. Drive the output layout from the *collect* counts so it
     // is self-consistent with the fp32 classification above (rather than the fp16
@@ -924,7 +959,11 @@ struct TopKStreamingT : TopKRadixBase<12> {
     __syncthreads();
     if (smem->count_eq > kMaxNumTie && (!zero_bin || smem->tie_nonzero != 0)) [[unlikely]] {
       // See the register path.
-      refine_ties<kUnroll>(problem, smem, v_lo, v_hi, smem->count_eq);
+      if constexpr (kRangeSkip) {
+        refine_ties<kUnroll>(problem, smem, v_lo, v_hi, smem->count_eq, smem->tie_key_min, smem->tie_key_max);
+      } else {
+        refine_ties<kUnroll>(problem, smem, v_lo, v_hi, smem->count_eq);
+      }
     }
     const auto count_gt = smem->count_gt;
     const auto count_eq = smem->count_eq;

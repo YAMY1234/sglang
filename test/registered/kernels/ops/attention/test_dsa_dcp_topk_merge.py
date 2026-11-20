@@ -343,7 +343,7 @@ def test_dcp4_topk_merge_pushed(kind: str, cand_k: int) -> None:
         assert int(total) == n_fail * case.rows, (int(total), n_fail, case.rows)
 
 
-@pytest.mark.parametrize("unroll", [2, 4])
+@pytest.mark.parametrize("unroll", [2, 4, 20])
 @pytest.mark.parametrize("kind", ["random", "dense_top", "ties_long"])
 @torch.inference_mode()
 def test_dcp4_topk_merge_pushed_unroll(kind: str, unroll: int) -> None:

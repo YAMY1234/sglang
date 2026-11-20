@@ -252,7 +252,7 @@ using RaggedSmem = impl::MaxSmem<Register2::Smem, Register4::Smem, Streaming::Sm
  * `score[row_start : row_start + seq_len]`: writes each selected column plus
  * `offset` into `out`. The head mask is explained at `topk_ragged_kernel`.
  */
-template <bool kPDL, uint32_t kUnroll = 0>
+template <bool kPDL, uint32_t kUnroll = 0, bool kRangeSkip = false>
 SGL_DEVICE void ragged_window_topk(
     float* score,
     const uint32_t row_start,
@@ -286,7 +286,7 @@ SGL_DEVICE void ragged_window_topk(
   } else if (problem.seq_len <= Register4::kMaxSeqLen) {
     Register4::forward<kPDL>(problem, smem);
   } else {
-    impl::TopKStreamingT<kUnroll>::template forward<kPDL>(problem, smem);
+    impl::TopKStreamingT<kUnroll, kRangeSkip>::template forward<kPDL>(problem, smem);
   }
 }
 
@@ -517,7 +517,7 @@ struct CandidateSink {
  * staged in shared memory; the epilogue then reads each selected score and
  * writes (score bits, global position), `(0, -1)` padded.
  */
-template <bool kPDL, bool kPush = false, uint32_t kUnroll = 0>
+template <bool kPDL, bool kPush = false, uint32_t kUnroll = 0, bool kRangeSkip = false>
 SGL_DEVICE void
 candidates_one_block(const TopKCandidatesParams& params, const uint32_t bx, RaggedSmem* smem, int32_t* s_topk_indices) {
   const auto seq_len = static_cast<uint32_t>(params.seq_lens[bx]);
@@ -536,23 +536,30 @@ candidates_one_block(const TopKCandidatesParams& params, const uint32_t bx, Ragg
     return;
   }
 
-  ragged_window_topk<kPDL, kUnroll>(score, row_start, seq_len, topk, s_topk_indices, 0, smem);
+  ragged_window_topk<kPDL, kUnroll, kRangeSkip>(score, row_start, seq_len, topk, s_topk_indices, 0, smem);
   device::PDLTriggerSecondary<kPDL>();
   __syncthreads();
   const auto sink = CandidateSink<kPush>::make(params, bx);
   for_each_item(topk, [&](uint32_t tx, uint32_t) { emit(sink, tx, s_topk_indices[tx]); });
 }
 
-/// kUnroll > 0: rows past the register paths stream with kUnroll loads in flight per thread (same selection).
-template <bool kPDL, bool kPush = false, uint32_t kUnroll = 0>
+/// kUnroll > 0: rows past the register paths stream with kUnroll loads in flight per thread; kRangeSkip: an
+/// overflowing threshold bin refines only the digits its scores do not share (impl::TopKStreamingT). Same selection.
+template <bool kPDL, bool kPush = false, uint32_t kUnroll = 0, bool kRangeSkip = false>
 TOPK_KERNEL void topk_candidates_kernel(const __grid_constant__ TopKCandidatesParams params) {
   device::enable_smem_spilling();
-  __shared__ RaggedSmem smem;
+  using Smem = std::conditional_t<
+      kRangeSkip,
+      impl::MaxSmem<RaggedSmem, typename impl::TopKStreamingT<kUnroll, true>::Smem>,
+      RaggedSmem>;
+  __shared__ Smem smem;
   __shared__ int32_t s_topk_indices[kMaxTopK];
-  candidates_one_block<kPDL, kPush, kUnroll>(params, blockIdx.x, &smem, s_topk_indices);
+  candidates_one_block<kPDL, kPush, kUnroll, kRangeSkip>(
+      params, blockIdx.x, reinterpret_cast<RaggedSmem*>(&smem), s_topk_indices);
 }
 
-/// The one-block candidates launch with `unroll` (0 = today's streaming loop, 2 or 4) loads in flight.
+/// The one-block candidates launch with `unroll` (0 = today's streaming loop, 2 or 4) loads in flight;
+/// `unroll` + 16 adds the refinement's shared-digit skip.
 template <bool kPDL, bool kPush>
 inline void launch_candidates_one_block(
     const TopKCandidatesParams& params, uint32_t rows, DLDevice device, int64_t unroll) {
@@ -567,8 +574,12 @@ inline void launch_candidates_one_block(
       return launch(topk_candidates_kernel<kPDL, kPush, 2>);
     case 4:
       return launch(topk_candidates_kernel<kPDL, kPush, 4>);
+    case 18:
+      return launch(topk_candidates_kernel<kPDL, kPush, 2, true>);
+    case 20:
+      return launch(topk_candidates_kernel<kPDL, kPush, 4, true>);
     default:
-      RuntimeCheck(false, "unroll must be 0, 2 or 4, got ", unroll);
+      RuntimeCheck(false, "unroll must be 0, 2, 4, 18 or 20, got ", unroll);
   }
 }
 

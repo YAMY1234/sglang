@@ -2293,7 +2293,8 @@ class Envs:
     # slow fallback (the failing rank's full local top-k) and holds the whole merge.
     SGLANG_DCP4_PUSH_CAND_K = EnvInt(768)
     # DCP push: loads in flight per thread (0 = today, 2 or 4) in the one-block local
-    # top-k's streaming passes (rows past 16384 local keys); same candidates.
+    # top-k's streaming passes (rows past 16384 local keys); + 16 also skips the tie
+    # refinement's digits the threshold bin's scores share. Same candidates.
     SGLANG_OPT_DSA_DCP_TOPK_CAND_UNROLL = EnvInt(0)
     # merge_kernel (push off): stage the candidate push in smem, register fallback
     # for <= 2 failed ranks (sgl-project/sglang#49922); same output. MIN_BLOCKS: its
