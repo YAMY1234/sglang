@@ -81,12 +81,15 @@ class PPLinkerRelay:
         # Offload actions only: applied here, and (PP0) issued. Prefetch actions
         # in flight never hold an offload commit back.
         self.offload_serial = self.offload_issued = 0
+        self.commit_window = max(1, envs.SGLANG_LINKER_PP_OFFLOAD_COMMIT_WINDOW.get())
         # PP0 commit-lag stats (SGLANG_EXTERNAL_LINKER_LOOKUP_STATS).
         self._decide_step = 0
         self._covered = 0
         self._covered_at = []
         self._lag_steps, self._lag_ms = [], []
         self._locked_max = (0, 0)
+        # Locked tokens by wait: this stage's own put, another stage's put, the commit.
+        self._split_peak, self._split_sum, self._split_n = (0, [0, 0, 0]), [0, 0, 0], 0
         self._stats_next = time.monotonic() + 60.0
 
     def attach_store(self, store):
@@ -200,8 +203,10 @@ class PPLinkerRelay:
 
     def offload_decide(self):
         """PP0: commit what every stage has finished, the AND of their outcomes,
-        once every stage acknowledged this epoch and every action issued so far
-        (GLM: a vote predating an action cannot authorize another offload unlock)."""
+        once every stage acknowledged this epoch and all but the last
+        SGLANG_LINKER_PP_OFFLOAD_COMMIT_WINDOW - 1 offload actions issued so far.
+        Votes are absolute and per epoch, so one cast before an action only
+        undercounts; window 1 is GLM's rule (every action acknowledged)."""
         self._decide_step += 1
         stats = self.w.log_lookup_stats
         counts = self.store.collect(f"lkoc{self.epoch}")
@@ -211,16 +216,17 @@ class PPLinkerRelay:
             self._covered_at.extend([(self._decide_step, now)] * (finished - self._covered))
             self._covered = finished
         if stats:
-            self._log_offload_stats()
+            self._log_offload_stats(finished)
         if any(e != self.epoch for e in self.store.collect("lkoe")) or any(
-            s != self.offload_issued for s in self.store.collect("lkos")
+            s is None or not 0 <= self.offload_issued - s < self.commit_window
+            for s in self.store.collect("lkos")
         ):
             return
-        assert self.offload_issued_head == self.offload_head, "PP linker offload head drift"
-        count = finished - self.offload_head
+        assert self.offload_issued_head >= self.offload_head, "PP linker offload head drift"
+        count = finished - self.offload_issued_head
         if count <= 0:
             return
-        head = self.offload_head
+        head = self.offload_issued_head
         successes = [
             all(v is None for v in self.store.collect(self._offload_key(head + i)))
             for i in range(count)
@@ -235,12 +241,23 @@ class PPLinkerRelay:
                 self._lag_ms.append(1e3 * (now - at))
             del self._covered_at[:count]
 
-    def _log_offload_stats(self):
+    def _log_offload_stats(self, finished):
         w = self.w
         pending = getattr(w, "pending_offloads", ())
         tokens = getattr(w, "pending_offload_tokens", {})
-        locked = (len(pending), sum(tokens.get(p.lock_node_id, 0) for p in pending))
+        done = self.offload_head + len(self.offload_results)
+        split = [0, 0, 0]
+        for i, p in enumerate(pending):
+            index = self.offload_head + i
+            split[0 if index >= done else 1 if index >= finished else 2] += tokens.get(
+                p.lock_node_id, 0
+            )
+        locked = (len(pending), sum(split))
         self._locked_max = max(self._locked_max, locked)
+        if locked[1] >= self._split_peak[0]:
+            self._split_peak = (locked[1], split)
+        self._split_sum = [a + b for a, b in zip(self._split_sum, split)]
+        self._split_n += 1
         now = time.monotonic()
         if now < self._stats_next:
             return
@@ -253,14 +270,19 @@ class PPLinkerRelay:
             return (f"n={len(xs)} p50 {xs[len(xs) // 2]:.0f} p90 "
                     f"{xs[len(xs) * 9 // 10]:.0f} max {xs[-1]:.0f}")
 
+        n = max(self._split_n, 1)
         logger.info(
             "Linker PP offload commits: lag steps %s; lag ms %s; locked now %d nodes "
-            "%d tokens, max %d nodes %d tokens; committed head %d, finished on all %d",
+            "%d tokens, max %d nodes %d tokens; committed head %d, finished on all %d; "
+            "locked tokens waiting on own put / other stages' puts / commit: "
+            "at peak %d / %d / %d, mean %d / %d / %d",
             pct(self._lag_steps), pct(self._lag_ms), locked[0], locked[1],
             self._locked_max[0], self._locked_max[1], self.offload_head, self._covered,
+            *self._split_peak[1], *(x // n for x in self._split_sum),
         )
         self._lag_steps, self._lag_ms = [], []
         self._locked_max = locked
+        self._split_peak, self._split_sum, self._split_n = (locked[1], split), [0, 0, 0], 0
 
     def _apply_offload(self, value):
         head, successes = value
