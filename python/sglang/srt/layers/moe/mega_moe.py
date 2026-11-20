@@ -128,10 +128,22 @@ def _mega_moe_dg(mma_type: str):
         import deep_gemm_fp4acts
 
         _log_fp4_acts_build_once(deep_gemm_fp4acts)
+        _maybe_enable_fp4_acts_pdl(deep_gemm_fp4acts)
         return deep_gemm_fp4acts
     import deep_gemm
 
     return deep_gemm
+
+
+@functools.lru_cache(maxsize=None)
+def _maybe_enable_fp4_acts_pdl(dg) -> None:
+    # update_deep_gemm_config enables PDL on deep_gemm only; the FP4-act build is a separate extension.
+    if envs.SGLANG_OPT_DEEPGEMM_FP4_ACTS_PDL.get() and hasattr(dg, "set_pdl"):
+        dg.set_pdl(True)
+    logger.info(
+        "MegaMoE FP4-act build PDL: %s",
+        dg.get_pdl() if hasattr(dg, "get_pdl") else "n/a",
+    )
 
 
 def _get_block_m_for_mega_moe(
