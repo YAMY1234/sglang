@@ -13,6 +13,7 @@ fallback path, so the output set is exact for every row.
 from __future__ import annotations
 
 import logging
+import math
 import os
 from typing import NamedTuple, Optional
 
@@ -134,6 +135,23 @@ def score(
     )
 
 
+class _Carver:
+    """Hands out 256-byte aligned views of one byte workspace (no allocation per call)."""
+
+    def __init__(self, ws: Optional[torch.Tensor]):
+        self.ws, self.off = ws, 0
+
+    def take(self, shape, dtype, device) -> torch.Tensor:
+        if self.ws is None:
+            return torch.empty(shape, device=device, dtype=dtype)
+        n = math.prod(shape) * torch.empty((), dtype=dtype).element_size()
+        start = (self.off + 255) // 256 * 256
+        if start + n > self.ws.numel():
+            raise ValueError(f"fused indexer top-k: workspace of {self.ws.numel()} B is too small")
+        self.off = start + n
+        return self.ws[start : start + n].view(dtype).view(shape)
+
+
 def _sample_stride_elems(num_samples: int) -> int:
     return (num_samples + 512 + 255) // 256 * 256
 
@@ -142,6 +160,12 @@ def scratch_bytes_per_row(num_kv: int, sample_stride: int = 16, cand_cap: int = 
     """Device scratch of fused_indexer_topk per query row (sample scores, candidates)."""
     num_samples = (num_kv + sample_stride - 1) // sample_stride
     return 4 * _sample_stride_elems(num_samples) + 8 * cand_cap + 4 * MATH_WARPS + 16
+
+
+def workspace_fixed_bytes(num_kv: int, sample_stride: int = 16) -> int:
+    """Workspace bytes of a call that do not scale with its rows (sample keys, padding rows, alignment)."""
+    num_samples = (num_kv + sample_stride - 1) // sample_stride
+    return num_samples * (128 + 4) + 8 * 4 * _sample_stride_elems(num_samples) + 16 * 256
 
 
 class FusedTopKResult(NamedTuple):
@@ -173,11 +197,16 @@ def fused_indexer_topk(
     layout: int = DEFAULT_LAYOUT,
     alu_heads: int = 0,
     out: Optional[torch.Tensor] = None,
+    workspace: Optional[torch.Tensor] = None,
     cuh_path: Optional[str] = None,
     serving: bool = False,
 ) -> FusedTopKResult:
-    """Exact top-k of every packed row; rows listed in ``fallback_rows`` were not written."""
+    """Exact top-k of every packed row; rows listed in ``fallback_rows`` were not written.
+
+    ``workspace`` (uint8, at least ``rows * scratch_bytes_per_row + workspace_fixed_bytes``)
+    holds every scratch buffer, so a call allocates nothing large."""
     dev = q_fp8.device
+    ws = _Carver(workspace)
     rows = q_fp8.shape[0]
     num_kv = kv_fp8.shape[0]
     # Rows this short keep every score; the 8 sub-lists of such a row stay within the cap.
@@ -187,14 +216,16 @@ def fused_indexer_topk(
 
     # Sample keys: every sample_stride-th flattened position; a row's window [ks, ke)
     # holds the samples [ceil(ks / s), ceil(ke / s)).
-    kv_s = kv_fp8[::sample_stride].contiguous()
-    sc_s = kv_scale[::sample_stride].contiguous()
+    n_s = (num_kv + sample_stride - 1) // sample_stride
+    kv_s = ws.take((n_s, kv_fp8.shape[1]), kv_fp8.dtype, dev)
+    kv_s.copy_(kv_fp8[::sample_stride])
+    sc_s = ws.take((n_s,), kv_scale.dtype, dev)
+    sc_s.copy_(kv_scale[::sample_stride])
     sks = (ks + sample_stride - 1) // sample_stride
     ske = (ke + sample_stride - 1) // sample_stride
-    n_s = kv_s.shape[0]
     # Room for a q-block's span past the last key and for its padded rows.
     stride_s = _sample_stride_elems(n_s)
-    sample_logits = torch.empty(rows + 8, stride_s, device=dev, dtype=torch.float32)
+    sample_logits = ws.take((rows + 8, stride_s), torch.float32, dev)
     score(
         q_fp8,
         kv_s,
@@ -210,15 +241,16 @@ def fused_indexer_topk(
         cuh_path=cuh_path,
         serving=serving,
     )
-    tau = torch.empty(rows, device=dev, dtype=torch.float32)
+    tau = ws.take((rows,), torch.float32, dev)
     module = _jit_module(cuh_path, serving)
     module.tau(sample_logits, sks, ske, lengths, tau, rank, topk, keep_all)
     del sample_logits
 
     # Select keys: (order-preserving score bits << 32) | ~window column, one sub-list per
     # math warp; a warp that never sees a row leaves its zero count.
-    cand_key = torch.empty(rows, MATH_WARPS, cand_cap // MATH_WARPS, device=dev, dtype=torch.int64)
-    cand_count = torch.zeros(rows, MATH_WARPS, device=dev, dtype=torch.int32)
+    cand_key = ws.take((rows, MATH_WARPS, cand_cap // MATH_WARPS), torch.int64, dev)
+    cand_count = ws.take((rows, MATH_WARPS), torch.int32, dev)
+    cand_count.zero_()
     score(
         q_fp8,
         kv_fp8,
@@ -240,8 +272,9 @@ def fused_indexer_topk(
     dst = out if out is not None and out.is_contiguous() else None
     if dst is None:
         dst = torch.empty(rows, topk, device=dev, dtype=torch.int32)
-    fallback_rows = torch.empty(rows, device=dev, dtype=torch.int32)
-    num_fallback = torch.zeros(1, device=dev, dtype=torch.int32)
+    fallback_rows = ws.take((rows,), torch.int32, dev)
+    num_fallback = ws.take((1,), torch.int32, dev)
+    num_fallback.zero_()
     module.select(
         cand_key,
         cand_count,

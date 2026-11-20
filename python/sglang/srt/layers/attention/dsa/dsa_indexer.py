@@ -228,6 +228,31 @@ def _fused_topk_precompile() -> bool:
 
 
 _FUSED_TOPK_STATS = None
+_FUSED_TOPK_SCRATCH: Dict[int, Any] = {}
+
+
+class _FusedTopkScratch:
+    """Device buffers of the fused path, allocated once per device on the first call (the
+    workspace at the unfused path's logits budget) and never reallocated: per-call scratch
+    of varying size fragmented the caching allocator next to the KV pool."""
+
+    MAX_ROWS = 1 << 16
+    MAX_CHUNKS = 64
+
+    def __init__(self, device: torch.device, budget: int):
+        self.workspace = torch.empty(budget, device=device, dtype=torch.uint8)
+        self.fallback_rows = torch.empty(self.MAX_ROWS, device=device, dtype=torch.int32)
+        self.counts = torch.zeros(self.MAX_CHUNKS + 1, device=device, dtype=torch.int32)
+        logger.info(
+            "SGLANG_DSA_FUSED_INDEXER_TOPK: %.0f MiB workspace on %s", budget / 2**20, device
+        )
+
+    @staticmethod
+    def get(device: torch.device, budget: int) -> "_FusedTopkScratch":
+        idx = device.index
+        if idx not in _FUSED_TOPK_SCRATCH:
+            _FUSED_TOPK_SCRATCH[idx] = _FusedTopkScratch(device, budget)
+        return _FUSED_TOPK_SCRATCH[idx]
 
 
 class _IndexerTopkTimer:
@@ -1932,7 +1957,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 indexer_seq_lens_cpu, forward_batch.extend_seq_lens_cpu, q_offset
             )
         ):
-            return self._get_topk_fused(
+            fused = self._get_topk_fused(
                 device_index=device_index,
                 metadata=metadata,
                 q_fp8=q_fp8[:q_offset],
@@ -1945,6 +1970,8 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 row_to_batch=token_to_batch_idx,
                 topk_result=topk_result,
             )
+            if fused is not None:
+                return fused
         need_chunk, logits_budget_bytes = mqa_logits_should_chunk(
             num_rows=row_hi - row_lo,
             num_cols=k_offset,
@@ -2200,10 +2227,12 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         lengths: torch.Tensor,
         row_to_batch: torch.Tensor,
         topk_result: torch.Tensor,
-    ) -> torch.Tensor:
+    ) -> Optional[torch.Tensor]:
+        """None when the call does not fit the workspace (the caller takes the unfused path)."""
         from sglang.kernels.ops.attention.dsa.fused_indexer_topk import (
             fused_indexer_topk,
             scratch_bytes_per_row,
+            workspace_fixed_bytes,
         )
 
         attn_metadata = metadata.attn_metadata
@@ -2211,12 +2240,16 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         lengths = lengths.to(torch.int32)
         row_to_batch = row_to_batch.to(torch.int32)
         weights = weights.float()
-        # Row chunks keep the scratch within the unfused path's logits budget.
+        # Row chunks fit the persistent workspace (sized at the unfused path's logits budget).
         budget = self._get_mqa_logits_budget_bytes(device_index)
-        chunk = max(64, min(rows, budget // scratch_bytes_per_row(num_kv)))
-        nums, fbs = [], []
-        for r0 in range(0, rows, chunk):
-            r1 = min(rows, r0 + chunk)
+        scratch = _FusedTopkScratch.get(q_fp8.device, budget)
+        room = scratch.workspace.numel() - workspace_fixed_bytes(num_kv)
+        chunk = room // scratch_bytes_per_row(num_kv)
+        chunks = -(-rows // max(chunk, 1))
+        if chunk < 64 or rows > scratch.MAX_ROWS or chunks > scratch.MAX_CHUNKS:
+            return None
+        bounds = [(r0, min(rows, r0 + chunk)) for r0 in range(0, rows, chunk)]
+        for ci, (r0, r1) in enumerate(bounds):
             res = fused_indexer_topk(
                 q_fp8[r0:r1],
                 k_fp8,
@@ -2230,17 +2263,22 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 attn_metadata.page_size,
                 self.index_topk,
                 out=topk_result[r0:r1],
+                workspace=scratch.workspace,
                 serving=True,
             )
-            nums.append(res.num_fallback)
-            fbs.append(res.fallback_rows if r0 == 0 else res.fallback_rows + r0)
-        long_rows = (lengths > self.index_topk).sum(dtype=torch.int32).view(1)
+            # The next chunk reuses the workspace: keep this chunk's fallback list.
+            scratch.counts[ci : ci + 1].copy_(res.num_fallback)
+            scratch.fallback_rows[r0:r1].copy_(res.fallback_rows)
+        scratch.counts[-1:].copy_((lengths > self.index_topk).sum(dtype=torch.int32).view(1))
         # The one host sync: rows whose sampled threshold missed (expected none) are
         # rescored in full and selected by the packed v2 top-k.
-        counts = torch.cat(nums + [long_rows]).tolist()
+        vals = scratch.counts.tolist()
+        counts = vals[: len(bounds)] + vals[-1:]
         num_fallback = sum(counts[:-1])
         if num_fallback:
-            fb = torch.cat([f[:n] for f, n in zip(fbs, counts[:-1]) if n]).long()
+            fb = torch.cat(
+                [scratch.fallback_rows[r0 : r0 + n] + r0 for (r0, _), n in zip(bounds, counts) if n]
+            ).long()
             self._topk_rows_unfused(
                 fb,
                 budget=budget,
@@ -2260,7 +2298,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             rows=rows,
             long_rows=counts[-1],
             fallback_rows=num_fallback,
-            chunks=len(nums),
+            chunks=len(bounds),
             budget=budget,
         ):
             self._fused_topk_check(
