@@ -78,7 +78,16 @@ enum Mode : int {
   kModeTau = 4,
   // Layout 5 only: kModeFilter whose sub-lists compact instead of overflowing (the repair pass).
   kModeFilterCompact = 5,
+  // Calibration only: kModeNoStore / kModeFilter with no UMMA issued (the epilogue alone, on stale TMEM).
+  kModeNoMmaNoStore = 6,
+  kModeNoMmaFilter = 7,
 };
+
+// The math warps' mode of a launch mode, and whether the UMMA warp skips its MMAs.
+constexpr int math_mode(int mode) {
+  return mode == kModeNoMmaNoStore ? kModeNoStore : (mode == kModeNoMmaFilter ? kModeFilter : mode);
+}
+constexpr bool skips_mma(int mode) { return mode == kModeNoMmaNoStore or mode == kModeNoMmaFilter; }
 
 // Device counters of the fused path (uint64, read asynchronously by the host).
 enum Stat : int {
@@ -344,7 +353,7 @@ CUTLASS_DEVICE float dg_reduce(const float* accum, const float* w) {
   return (sum.x + sum.y) / 2;
 }
 
-template <int kMode, bool kReuseKV, int kLayout, uint32_t kAluHeads>
+template <int kLaunchMode, bool kReuseKV, int kLayout, uint32_t kAluHeads>
 __global__ __launch_bounds__(LayoutTraits<kLayout>::kNumThreads, 1) void fstk_score_kernel(
     const __grid_constant__ ScoreParams params,
     const __grid_constant__ cute::TmaDescriptor tensor_map_q,
@@ -352,6 +361,7 @@ __global__ __launch_bounds__(LayoutTraits<kLayout>::kNumThreads, 1) void fstk_sc
     const __grid_constant__ cute::TmaDescriptor tensor_map_sf_kv,
     const __grid_constant__ cute::TmaDescriptor tensor_map_weights) {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+  constexpr int kMode = math_mode(kLaunchMode);
   using Traits = LayoutTraits<kLayout>;
   using qk_dtype_t = cutlass::float_e4m3_t;
   using reduce_dtype_t = float;
@@ -512,6 +522,10 @@ __global__ __launch_bounds__(LayoutTraits<kLayout>::kNumThreads, 1) void fstk_sc
 
             smem.empty_tmem_barriers[tmem_stage_idx].wait(tmem_phase ^ 1);
             ptx::tcgen05_after_thread_sync();
+            if constexpr (skips_mma(kLaunchMode)) {
+              smem.full_tmem_barriers[tmem_stage_idx].arrive();
+              continue;
+            }
 
             // Same descriptors and K order as DeepGEMM: the FP32 accumulators are bitwise its.
             auto instr_desc = cute::UMMA::make_instr_desc<
@@ -1401,7 +1415,7 @@ struct ScoreExtras {
   int64_t ks_div;
 };
 
-template <int kMode, bool kReuseKV, int kLayout, uint32_t kAluHeads>
+template <int kLaunchMode, bool kReuseKV, int kLayout, uint32_t kAluHeads>
 inline void score_impl(
     tvm::ffi::TensorView q,        // [T, 32, 128] e4m3
     tvm::ffi::TensorView kv,       // [N, 128] e4m3
@@ -1418,6 +1432,7 @@ inline void score_impl(
     int64_t num_ctas) {
   using namespace sglang::host;
   using Traits = LayoutTraits<kLayout>;
+  constexpr int kMode = math_mode(kLaunchMode);
   const auto num_q = static_cast<uint32_t>(q.size(0));
   const auto num_kv = static_cast<uint32_t>(kv.size(0));
   RuntimeCheck(q.size(1) == kNumHeads and q.size(2) == kHeadDim, "fstk: q must be [T, 32, 128]");
@@ -1483,7 +1498,7 @@ inline void score_impl(
       kNumHeads, kHeadDim, false, Traits::kBlockQ, Traits::kSplitKV, kNumQStages, Traits::kNumKVStages,
       Traits::kNumTmemStages, cutlass::float_e4m3_t, float>;
   constexpr size_t kSmem = sizeof(SharedStorage);
-  constexpr auto kernel = fstk_score_kernel<kMode, kReuseKV, kLayout, kAluHeads>;
+  constexpr auto kernel = fstk_score_kernel<kLaunchMode, kReuseKV, kLayout, kAluHeads>;
   const DLDevice device = q.device();
   runtime::init_per_device(device, [=] { runtime::set_max_dynamic_smem(kernel, kSmem); });
   LaunchKernel(static_cast<uint32_t>(num_ctas), Traits::kNumThreads, device, kSmem)
@@ -1525,6 +1540,10 @@ inline void score_dispatch(
       return FSTK_SCORE(kModeNoEpi, false);
     case kModeNoStore:
       return FSTK_SCORE(kModeNoStore, false);
+    case kModeNoMmaNoStore:
+      return FSTK_SCORE(kModeNoMmaNoStore, false);
+    case kModeNoMmaFilter:
+      return FSTK_SCORE(kModeNoMmaFilter, false);
     case kModeFilter:
       return FSTK_SCORE(kModeFilter, false);
     case kModeTau:

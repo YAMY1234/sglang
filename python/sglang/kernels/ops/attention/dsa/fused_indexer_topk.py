@@ -25,6 +25,8 @@ from sglang.kernels.jit.utils import cache_once, cuda_stubs_dir, load_jit
 logger = logging.getLogger(__name__)
 
 MODE_LOGITS, MODE_NO_EPI, MODE_NO_STORE, MODE_FILTER, MODE_TAU, MODE_FILTER_COMPACT = 0, 1, 2, 3, 4, 5
+# Calibration only (full build): the no-store / filter epilogue with no UMMA issued.
+MODE_NO_MMA_NO_STORE, MODE_NO_MMA_FILTER = 6, 7
 # layout -> (rows per q-block, keys per split); see LayoutTraits in the kernel.
 LAYOUTS = {0: (4, 256), 1: (4, 256), 2: (8, 128), 3: (4, 256), 4: (8, 128), 5: (4, 256)}
 DEFAULT_LAYOUT = 5  # measured fastest for the filter pass (VR, 11-20)
