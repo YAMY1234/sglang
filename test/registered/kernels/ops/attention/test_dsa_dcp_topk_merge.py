@@ -259,12 +259,13 @@ def _push_merge(cand_k: int) -> DcpTopKMerge:
     return _PUSH_MERGES[cand_k]
 
 
-@pytest.mark.parametrize("cand_k", [768, 1024])
+@pytest.mark.parametrize("cand_k", [768, 1024, 2048])
 @pytest.mark.parametrize("kind", ["random", "dense_top", "ties", "periodic", "skew", "short"])
 @torch.inference_mode()
 def test_dcp4_topk_merge_pushed(kind: str, cand_k: int) -> None:
-    """DCP4 push merge: exact for either candidate count (SGLANG_DCP4_PUSH_CAND_K);
-    a rank holding 768-1023 of the top-k fails the certificate only at 768."""
+    """DCP4 push merge: exact for every candidate count (SGLANG_DCP4_PUSH_CAND_K);
+    a rank holding 768-1023 of the top-k fails the certificate only at 768, and at
+    2048 a rank holding the whole top-k (periodic) needs no fallback."""
     _init_once()
     world, rank = ps._WORLD.world_size, ps._WORLD.rank_in_group
     if world != 4:
@@ -281,9 +282,9 @@ def test_dcp4_topk_merge_pushed(kind: str, cand_k: int) -> None:
         bad = case.pushed_failures(rank, world)
         assert _all_ranks_ok(not bad), bad or "failed on another rank"
         fell_back = merge.fallback[: case.rows].tolist()
-        if kind == "periodic" or (kind == "skew" and cand_k == 768):
+        if (kind == "periodic" and cand_k < TOPK) or (kind == "skew" and cand_k == 768):
             assert all(fell_back), fell_back
-        elif kind in ("random", "short", "skew"):
+        elif kind in ("random", "short", "skew", "periodic"):
             assert not any(fell_back), fell_back
 
 

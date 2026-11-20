@@ -746,7 +746,10 @@ __global__ void __launch_bounds__(32 * kNumRanks, kNumRanks == 8 ? 4 : 1)
   unsigned fail = 0;
 #pragma unroll
   for (int q = 0; q < kNumRanks; ++q) {
-    if (want > 0 && s.kept[q] == s.sent[q] && local_len<kNumRanks, false>(L, q) > s.sent[q]) fail |= 1u << q;
+    // kept == kTopK: rank q's candidates are the whole top-k and its unsent keys are below t*,
+    // so with kCandK == kTopK the certificate never fails
+    if (want > 0 && s.kept[q] == s.sent[q] && s.kept[q] < kTopK && local_len<kNumRanks, false>(L, q) > s.sent[q])
+      fail |= 1u << q;
   }
   if (tid == 0) {
     p.fallback[row] = fail != 0;
