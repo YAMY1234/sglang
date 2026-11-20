@@ -865,6 +865,10 @@ class Envs:
     SGLANG_PP_BUBBLE_DIAG = EnvBool(False)
     SGLANG_PP_BUBBLE_DIAG_INTERVAL_S = EnvFloat(60.0)
     SGLANG_PP_BUBBLE_DIAG_FWD_DIR = EnvStr(None)
+    # With the diag and its FWD_DIR on: sample the scheduler thread's Python stack at
+    # this rate on the listed PP ranks, folded per diag label into stacks-pp<r>-<pid>.txt.
+    SGLANG_PP_STACK_SAMPLE_HZ = EnvFloat(0.0)
+    SGLANG_PP_STACK_SAMPLE_RANKS = EnvStr("0")
     # PP PD prefill (Mooncake): each stage sends a request's last KV chunk when its
     # own forward of that chunk completes, not when the result returns pp_size - 1
     # micro-batches later; only the last stage, which samples the first token, sends

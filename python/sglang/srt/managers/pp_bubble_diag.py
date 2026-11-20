@@ -15,6 +15,7 @@ import json
 import logging
 import os
 import sys
+import threading
 import time
 from collections import defaultdict, deque
 from contextlib import nullcontext
@@ -59,6 +60,56 @@ class _Span:
         return False
 
 
+def _fold_stack(frame, max_depth: int = 96) -> str:
+    """Root-to-leaf frames below the scheduler's event loop. The loop frame and the
+    leaf keep their line numbers (which call, which line); frames between do not."""
+    names = []
+    while frame is not None and len(names) < max_depth:
+        code = frame.f_code
+        name = f"{code.co_name}@{os.path.basename(code.co_filename)}"
+        if not names or code.co_name.startswith("event_loop"):
+            name += f":{frame.f_lineno}"
+        names.append(name)
+        if code.co_name.startswith("event_loop"):
+            break
+        frame = frame.f_back
+    return ";".join(reversed(names))
+
+
+class _StackSampler:
+    """Samples one thread's Python stack from a daemon thread and counts it under the
+    diag's current label. Each sample holds the GIL for one stack walk, and is taken
+    when the sampled thread next releases the GIL (long GIL-holding C calls show up
+    on the line after them)."""
+
+    def __init__(self, diag: "PPBubbleDiag", thread_id: int, hz: float, path: str):
+        self._diag = diag
+        self._thread_id = thread_id
+        self._period = 1.0 / hz
+        self._counts: dict[str, int] = defaultdict(int)
+        self._lock = threading.Lock()
+        self._file = open(path, "a", buffering=1 << 20)
+        threading.Thread(target=self._run, name="pp-stack-sampler", daemon=True).start()
+
+    def _run(self) -> None:
+        while True:
+            time.sleep(self._period)
+            frame = sys._current_frames().get(self._thread_id)
+            if frame is None:
+                continue
+            key = self._diag._label + ";" + _fold_stack(frame)
+            with self._lock:
+                self._counts[key] += 1
+
+    def flush(self) -> None:
+        with self._lock:
+            counts, self._counts = self._counts, defaultdict(int)
+        self._file.write(f"# {time.time():.3f}\n")
+        for key, n in counts.items():
+            self._file.write(f"{key} {n}\n")
+        self._file.flush()
+
+
 class PPBubbleDiag:
     """Scheduler-thread accumulator for one PP rank."""
 
@@ -84,6 +135,7 @@ class PPBubbleDiag:
         self._pass_queue = 0
         self._pass_skips = 0
         self._pass_relay0 = (0, 0, 0)
+        self.stack_sampler: Optional[_StackSampler] = None
         self._reset()
 
     def _reset(self) -> None:
@@ -299,6 +351,8 @@ class PPBubbleDiag:
         logger.info("PP bubble diag: %s", json.dumps(stats, separators=(",", ":")))
         if self._fwd_file is not None:
             self._fwd_file.flush()
+        if self.stack_sampler is not None:
+            self.stack_sampler.flush()
         self._logged_at = now
         self._reset()
         return stats
@@ -326,6 +380,12 @@ def init(pp_rank: int, event_factory, chunk_budget: int) -> Optional[PPBubbleDia
             fwd_file,
         )
         logger.info("PP bubble diag on (SGLANG_PP_BUBBLE_DIAG), rank %d", pp_rank)
+        hz = envs.SGLANG_PP_STACK_SAMPLE_HZ.get()
+        ranks = envs.SGLANG_PP_STACK_SAMPLE_RANKS.get().split(",")
+        if fwd_dir and hz > 0 and str(pp_rank) in ranks:
+            path = os.path.join(fwd_dir, f"stacks-pp{pp_rank}-{os.getpid()}.txt")
+            _diag.stack_sampler = _StackSampler(_diag, threading.get_ident(), hz, path)
+            logger.info("PP stack sampler on, rank %d, %.1f Hz -> %s", pp_rank, hz, path)
     return _diag
 
 

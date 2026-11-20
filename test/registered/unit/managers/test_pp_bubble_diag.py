@@ -241,6 +241,51 @@ class TestModuleHooks(unittest.TestCase):
                 self.assertEqual(f.read(), pp_bubble_diag.FWD_CSV_HEADER)
             d._fwd_file.close()
 
+    def test_stack_sampler_folds_the_loop_thread_under_the_current_label(self):
+        import os
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp, envs.SGLANG_PP_BUBBLE_DIAG.override(
+            True
+        ), envs.SGLANG_PP_BUBBLE_DIAG_FWD_DIR.override(
+            tmp
+        ), envs.SGLANG_PP_STACK_SAMPLE_HZ.override(
+            200.0
+        ), envs.SGLANG_PP_STACK_SAMPLE_RANKS.override(
+            "0"
+        ):
+
+            def event_loop_fake(d):
+                d.phase("admit")
+                deadline = time.monotonic() + 0.3
+                while time.monotonic() < deadline:
+                    sum(range(1000))
+
+            d = pp_bubble_diag.init(0, None, 16384)
+            event_loop_fake(d)
+            d.maybe_log(now=d._logged_at + 61)
+            (name,) = [n for n in os.listdir(tmp) if n.startswith("stacks-pp0-")]
+            with open(os.path.join(tmp, name)) as f:
+                lines = [l for l in f.read().splitlines() if not l.startswith("#")]
+            d._fwd_file.close()
+        stacks = {l.rsplit(" ", 1)[0]: int(l.rsplit(" ", 1)[1]) for l in lines}
+        admit = [k for k in stacks if k.startswith("host.admit;event_loop_fake@")]
+        self.assertTrue(admit, stacks)
+        # Frames above the loop are cut; the loop frame keeps its line number.
+        self.assertRegex(admit[0], r"^host\.admit;event_loop_fake@test_pp_bubble_diag\.py:\d+")
+
+    def test_stack_sampler_stays_off_on_other_ranks(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp, envs.SGLANG_PP_BUBBLE_DIAG.override(
+            True
+        ), envs.SGLANG_PP_BUBBLE_DIAG_FWD_DIR.override(
+            tmp
+        ), envs.SGLANG_PP_STACK_SAMPLE_HZ.override(20.0):
+            d = pp_bubble_diag.init(3, None, 16384)
+            self.assertIsNone(d.stack_sampler)
+            d._fwd_file.close()
+
 
 if __name__ == "__main__":
     unittest.main()
