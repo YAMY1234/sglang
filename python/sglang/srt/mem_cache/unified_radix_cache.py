@@ -613,6 +613,8 @@ class UnifiedRadixCache(BasePrefixCache):
         self._wa_evicted_tokens = 0
         self._wa_peak_evicted = 0.0
         self._wa_ready_count = 0
+        self._wa_preevict_tokens = 0
+        self._hostcomp_last = (0, 0, 0, 0)
         self.ongoing_load_back: dict[int, _OngoingLoadBack] = {}
         self.enable_storage = False
         self.prefetch_loaded_tokens_by_reqid: dict[CacheRequestHandle, int] = {}
@@ -2829,7 +2831,7 @@ class UnifiedRadixCache(BasePrefixCache):
         ):
             needed = sum(n for _, n in batch) - cc.mem_pool_host.available_size()
             if needed > 0:
-                self.evict_host(needed)
+                self._wa_preevict_tokens += self.evict_host(needed)
         issued = 0
         for node_id, num_tokens in batch:
             device_value, comp_xfers = self.tree_core.build_backup_spec(node_id)
@@ -2855,6 +2857,20 @@ class UnifiedRadixCache(BasePrefixCache):
             self._wa_issue_steps.append(self._wa_step)
         if pmicro_hoststats.ON:
             pmicro_hoststats.OPS["write_ahead"].add(time.perf_counter() - t0, issued)
+
+    def host_composition_line(self) -> str:
+        """PMICRO_HOSTCOMP (SGLANG_HICACHE_HOST_COMPOSITION_LOG): Full host tokens by
+        kind now, and Full host tokens freed by kind since the previous line
+        (wa_preevict: freed by the write-ahead walk's batch eviction, any kind)."""
+        dup, spared, host_only, evicted = self.tree_core.host_composition()
+        now = (*evicted, self._wa_preevict_tokens)
+        d = [a - b for a, b in zip(now, self._hostcomp_last)]
+        self._hostcomp_last = now
+        return (
+            f"PMICRO_HOSTCOMP host_free={self.cache_controller.mem_pool_host.available_size()} "
+            f"dup={dup} dup_wa_tail={spared} host_only={host_only} | evict_dup={d[0]} "
+            f"evict_leaf={d[1]} evict_leaf_mamba={d[2]} wa_preevict={d[3]}"
+        )
 
     def _write_ahead_stream(self) -> torch.Stream:
         """A private D2H stream: an eviction's fallback copy never queues behind

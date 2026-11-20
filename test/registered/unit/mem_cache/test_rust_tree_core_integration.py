@@ -5757,6 +5757,31 @@ def test_peek_device_eviction_candidates_follows_the_device_eviction_walk(backen
 
 
 @pytest.mark.parametrize("backend", ["python", "rust"])
+def test_host_composition_counts_host_tokens_and_evictions_by_kind(backend):
+    core = _tree_core(backend)
+    core.set_hicache_enabled()
+    core.is_write_back = True
+    _insert(core, [1, 2, 3], [10, 11, 12])
+    spared = _insert(core, [1, 2], [10, 11]).last_device_node
+    _back_up_and_ack(core, spared, [20, 21])
+    dup = _insert(core, [5, 6], [50, 51]).last_device_node
+    _back_up_and_ack(core, dup, [60, 61])
+    leaf = _insert(core, [7, 8], [70, 71]).last_device_node
+    _back_up_and_ack(core, leaf, [80, 81])
+    _accumulate_step(core.demote(leaf), {}, {}, {})
+    core.set_write_ahead_spare([spared])
+    assert core.host_composition() == (4, 2, 2, [0, 0, 0])
+    # The unspared duplicate is reclaimed first, then the host-only leaf is evicted.
+    tracker = {}
+    with envs.SGLANG_HICACHE_SKIP_HOST_DUPLICATE_RECLAIM.override(False):
+        _accumulate_step(
+            core.drive_host_eviction(ComponentType.FULL, 4), tracker, {}, {}
+        )
+    assert tracker[ComponentType.FULL] == 4
+    assert core.host_composition() == (2, 2, 0, [2, 2, 0])
+
+
+@pytest.mark.parametrize("backend", ["python", "rust"])
 @pytest.mark.parametrize("spare_first", [False, True])
 def test_write_ahead_spare_is_never_reclaimed_as_a_duplicate(backend, spare_first):
     core = _tree_core(backend)

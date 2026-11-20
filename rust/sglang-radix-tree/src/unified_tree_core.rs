@@ -622,9 +622,12 @@ pub struct UnifiedTreeCore<K: ChildKeyType> {
     pub(crate) evictable_host_leaves: NodeSet,
     /// Full has no device LRU; track host/device duplicates in insertion order.
     pub(crate) full_coexisting_host_nodes: NodeSet,
-    /// Device-tail nodes the write-ahead walk keeps backed (SGLANG_HICACHE_DEVICE_WRITE_AHEAD); the first
-    /// Full duplicate-reclaim pass spares them like the imminent demotes. Ids guard against slot reuse.
+    /// Device-tail nodes the write-ahead walk keeps backed (SGLANG_HICACHE_DEVICE_WRITE_AHEAD); Full
+    /// duplicate reclaim never takes them. Ids guard against slot reuse.
     pub(crate) write_ahead_spare: HashMap<NodeIdx_, NodeId>,
+    /// Full host tokens freed, cumulative: [duplicate reclaim, host-leaf eviction under Full
+    /// pressure, host-leaf eviction under Mamba pressure] (SGLANG_HICACHE_HOST_COMPOSITION_LOG).
+    pub(crate) host_evicted_tokens: [usize; 3],
     pub(crate) write_back_coexist_reclaim_digest: i64,
     /// Present only during a device-eviction step, including its cascades.
     tracked_unbacked_tokens: Option<usize>,
@@ -976,6 +979,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             evictable_host_leaves: NodeSet::new(),
             full_coexisting_host_nodes: NodeSet::new(),
             write_ahead_spare: HashMap::new(),
+            host_evicted_tokens: [0; 3],
             write_back_coexist_reclaim_digest: 0,
             tracked_unbacked_tokens: None,
             // Disabled components keep harmless empty lists, like component_states.
@@ -1022,6 +1026,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         self.evictable_host_leaves = NodeSet::new();
         self.full_coexisting_host_nodes = NodeSet::new();
         self.write_ahead_spare.clear();
+        self.host_evicted_tokens = [0; 3];
         self.write_back_coexist_reclaim_digest = 0;
         self.tracked_unbacked_tokens = None;
         self.lru_lists = Self::new_lru_lists();
@@ -3310,6 +3315,8 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         if let Some(component) = self.try_component_by_type_(component_type) {
             // The drive gates on the driven component's entry, so seed it.
             result.tracker.insert(component_type, 0);
+            let full = |r: &EvictionStepResult| r.tracker.get(&BASE_COMPONENT_TYPE).copied().unwrap_or(0);
+            let before = full(&result);
             if self.is_write_back
                 && !(skip_full_duplicate_reclaim && component_type == BASE_COMPONENT_TYPE)
             {
@@ -3322,6 +3329,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
                     &mut result.cache_actions,
                 );
             }
+            let reclaimed = full(&result);
             component.drive_host_eviction(
                 self,
                 num_tokens,
@@ -3330,8 +3338,33 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
                 &mut result.host_frees,
                 &mut result.cache_actions,
             );
+            self.host_evicted_tokens[0] += reclaimed - before;
+            let leaf_kind = if component_type == BASE_COMPONENT_TYPE { 1 } else { 2 };
+            self.host_evicted_tokens[leaf_kind] += full(&result) - reclaimed;
         }
         result
+    }
+
+    /// Full host tokens by kind, read-only: (device duplicates, the duplicates in the write-ahead
+    /// spare, host-only) plus the cumulative host_evicted_tokens counters. One walk of the live nodes.
+    pub fn host_composition(&self) -> (usize, usize, usize, [usize; 3]) {
+        let (mut dup, mut spared, mut host_only) = (0, 0, 0);
+        for idx in self.arena.live_ids() {
+            let node = self.arena.node(idx);
+            if node.is_root() || !node.has_host_value(BASE_COMPONENT_TYPE) {
+                continue;
+            }
+            let tokens = node.key.atom_len();
+            if node.has_device_value(BASE_COMPONENT_TYPE) {
+                dup += tokens;
+                if self.is_write_ahead_spared_(idx) {
+                    spared += tokens;
+                }
+            } else {
+                host_only += tokens;
+            }
+        }
+        (dup, spared, host_only, self.host_evicted_tokens)
     }
 
     pub(crate) fn can_reclaim_coexisting_host_value_(
