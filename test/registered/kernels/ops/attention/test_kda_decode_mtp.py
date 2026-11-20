@@ -109,8 +109,8 @@ class TestKdaDecodeMtp(CustomTestCase):
         if get_device_sm() < 100:
             raise unittest.SkipTest("Kimi K3 compute kernels require SM100a+")
 
-    def _run(self, num_requests, num_spec, *, onorm, block_threads=None):
-        kwargs = _make_inputs(num_requests, num_spec)
+    def _run(self, num_requests, num_spec, *, onorm, block_threads=None, num_heads=2):
+        kwargs = _make_inputs(num_requests, num_spec, num_heads=num_heads)
         _, num_tokens, num_heads, key_dim = kwargs["x_v"].shape
         intermediate = torch.zeros(
             num_requests,
@@ -139,10 +139,11 @@ class TestKdaDecodeMtp(CustomTestCase):
         return output, intermediate, gate, weight
 
     def test_output_norm(self):
-        for num_spec in (0, 2):
-            with self.subTest(num_spec=num_spec):
-                raw, raw_states, gate, weight = self._run(4, num_spec, onorm=False)
-                fused, fused_states, _, _ = self._run(4, num_spec, onorm=True)
+        # 24 heads: the attention-TP4 rank, folded under SGLANG_K31_KDA_ONORM_FOLD_ANY_HEADS
+        for num_spec, num_heads in ((0, 2), (2, 2), (4, 24)):
+            with self.subTest(num_spec=num_spec, num_heads=num_heads):
+                raw, raw_states, gate, weight = self._run(4, num_spec, onorm=False, num_heads=num_heads)
+                fused, fused_states, _, _ = self._run(4, num_spec, onorm=True, num_heads=num_heads)
                 raw = raw.float()
                 expected = (
                     raw
