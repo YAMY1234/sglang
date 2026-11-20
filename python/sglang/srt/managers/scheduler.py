@@ -439,6 +439,8 @@ else:
 
 
 logger = logging.getLogger(__name__)
+# Rig only: per-forward GPU time of extend batches (see Scheduler._rig_fwd_timer_start).
+_RIG_FWD_TIMING = os.environ.get("SGLANG_RIG_FWD_TIMING") == "1"
 
 # Cap on rids printed per --log-schedule-decisions line.
 _MAX_LOGGED_RIDS = 16
@@ -5275,6 +5277,7 @@ class Scheduler(
             for req in batch.reqs:
                 self.maybe_send_cached_prefix_chunk(req, allow_send=not load_pending)
 
+        rig_fwd_t = self._rig_fwd_timer_start(batch)
         # Run forward
         if self.is_generation:
             if self.enable_overlap:
@@ -5570,6 +5573,9 @@ class Scheduler(
                     can_run_cuda_graph=can_run_cuda_graph,
                 )
 
+        if rig_fwd_t is not None:
+            self._rig_fwd_timer_end(batch, rig_fwd_t)
+
         if self.enable_unified_cache_external_linker:
             failed = self.tree_cache.finish_external_linker_loads(batch.reqs)
             if self.chunked_req in failed:
@@ -5581,6 +5587,53 @@ class Scheduler(
 
         ret.forward_launch = launch
         return ret
+
+    def _rig_fwd_timer_start(self, batch: ScheduleBatch):
+        """Rig only: SGLANG_RIG_FWD_TIMING=1 brackets each extend forward with CUDA
+        events on the stream it runs on; completed ones are logged without a sync."""
+        if not _RIG_FWD_TIMING or not batch.forward_mode.is_extend():
+            return None
+        stream = (
+            self.forward_stream
+            if self.enable_overlap
+            else self.device_module.current_stream()
+        )
+        start = self.device_module.Event(enable_timing=True)
+        start.record(stream)
+        return stream, start
+
+    def _rig_fwd_timer_end(self, batch: ScheduleBatch, token) -> None:
+        stream, start = token
+        end = self.device_module.Event(enable_timing=True)
+        end.record(stream)
+        ext, pre = list(batch.extend_lens or ()), list(batch.prefix_lens or ())
+        pending = self.__dict__.setdefault("_rig_fwd_pending", deque())
+        pending.append(
+            (
+                start,
+                end,
+                time.time(),
+                len(ext),
+                sum(ext),
+                sum(pre),
+                sum(n * (c + n / 2) for n, c in zip(ext, pre)),
+                max(ext, default=0),
+            )
+        )
+        while pending and pending[0][1].query():
+            s0, e0, wall, seqs, rows, cached, pairs, mx = pending.popleft()
+            logger.info(
+                "RIG_FWD_TIMING dp=%d wall=%.3f ms=%.3f seqs=%d rows=%d cached=%d "
+                "pairs=%.6e max_new=%d",
+                get_parallel().attn_dp_rank,
+                wall,
+                s0.elapsed_time(e0),
+                seqs,
+                rows,
+                cached,
+                pairs,
+                mx,
+            )
 
     def _maybe_report_active_ranks(self) -> None:
         if not (self.attn_dp_enabled and get_exec().moe.elastic_ep_backend is not None):
