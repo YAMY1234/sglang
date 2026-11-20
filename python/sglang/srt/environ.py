@@ -2495,6 +2495,10 @@ class Envs:
     SGLANG_K31_SM107_GEMM_TACTICS = EnvBool(False)
     # Optional path of a JSON table that replaces the built-in SM107 table.
     SGLANG_K31_SM107_GEMM_TABLE = EnvStr(None)
+    # The built-in NDT=5 tactics rows (verify M = 5 x graph bs, --speculative-num-draft-tokens 5) in place of the
+    # M = 6 x bs table; _PEAK_ROWS adds the EP16 peak rows (graph bs 136-224). Under SGLANG_K31_SM107_GEMM_TACTICS.
+    SGLANG_K31_SM107_NDT5_ROWS = EnvBool(False)
+    SGLANG_K31_SM107_NDT5_PEAK_ROWS = EnvBool(False)
     # Under SGLANG_K31_SM107_GEMM_TACTICS on SM107: the largest graphed rows
     # whose KDA [f_a | b] GEMM runs on the side stream beside [q,k,v,g]
     # (default 1152 = the largest verify rows, the stable table's

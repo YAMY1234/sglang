@@ -126,6 +126,10 @@ class Bf16GemmBackend(Enum):
 _BF16_GEMM_BACKEND: Optional[Bf16GemmBackend] = None
 _cutedsl_bf16_gemm = None
 _use_cutedsl_bf16_gemm = None
+_use_cublaslt_bf16_gemm = None
+_cublaslt_bf16_linear = None
+_cublaslt_bf16_mm_out = None
+_cublaslt_seen: set = set()
 _hopper_bf16_gemv = None
 _use_hopper_bf16_gemv = None
 _splitk_tactic = None
@@ -298,6 +302,7 @@ def should_enable_bf16_splitk_gemm(backend: Bf16GemmBackend) -> bool:
 def initialize_bf16_gemm_config() -> None:
     global _BF16_GEMM_BACKEND
     global _cutedsl_bf16_gemm, _use_cutedsl_bf16_gemm
+    global _use_cublaslt_bf16_gemm, _cublaslt_bf16_linear, _cublaslt_bf16_mm_out
     global _splitk_tactic
     global _run_splitk_dense
     global _direct_default_tactic
@@ -340,12 +345,22 @@ def initialize_bf16_gemm_config() -> None:
             )
 
         from sglang.kernels.ops.gemm.cutedsl_bf16_gemm import (
+            cublaslt_bf16_linear,
+            cublaslt_bf16_mm_out,
             cutedsl_bf16_gemm,
+            use_cublaslt_bf16_gemm,
             use_cutedsl_bf16_gemm,
         )
 
         _cutedsl_bf16_gemm = cutedsl_bf16_gemm
         _use_cutedsl_bf16_gemm = use_cutedsl_bf16_gemm
+        # aria S0: the cuBLASLt registry is filled only under
+        # SGLANG_K31_SM107_GEMM_TACTICS (kimi_k3), the decode role's env; without it the
+        # hooks stay None so a prefill worker's dispatch and apply_into are the image's.
+        if envs.SGLANG_K31_SM107_GEMM_TACTICS.get():
+            _use_cublaslt_bf16_gemm = use_cublaslt_bf16_gemm
+            _cublaslt_bf16_linear = cublaslt_bf16_linear
+            _cublaslt_bf16_mm_out = cublaslt_bf16_mm_out
 
     _enable_bf16_splitk_gemm = False
     if should_enable_bf16_splitk_gemm(backend):
@@ -418,6 +433,15 @@ def _bf16_splitk_gemm(
     return out.view(*x.shape[:-1], weight.shape[0])
 
 
+def _log_cublaslt_first_use(path: str, m: int, n: int, k: int) -> None:
+    """One INFO line per (path, m, n, k) on the first cuBLASLt m-range GEMM: proof that the
+    dispatch reached the registry (warmup and graph capture only; replay never runs host code)."""
+    key = (path, m, n, k)
+    if key not in _cublaslt_seen:
+        _cublaslt_seen.add(key)
+        logger.info("cuBLASLt m-range GEMM first use: %s m=%d n=%d k=%d", path, m, n, k)
+
+
 def _bf16_gemm_dispatch_impl(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -443,6 +467,16 @@ def _bf16_gemm_dispatch_impl(
         output = _hopper_bf16_gemv(x.view(-1, x.shape[-1]), weight).view(
             *x.shape[:-1], -1
         )
+    elif (
+        _use_cublaslt_bf16_gemm is not None
+        and bias is None
+        and addend is None
+        and _use_cublaslt_bf16_gemm(m, weight.shape[0], weight.shape[1])
+    ):
+        # A model registered this (m, n, k) for cuBLASLt (register_cublaslt_m_ranges):
+        # cuBLAS's heuristic loses there and TGV is not the best pick either.
+        _log_cublaslt_first_use("dispatch", m, weight.shape[0], weight.shape[1])
+        output = _cublaslt_bf16_linear(x, weight)
     elif _use_cutedsl_bf16_gemm is not None and _use_cutedsl_bf16_gemm(
         m, weight.shape[0], weight.shape[1]
     ):
@@ -656,6 +690,27 @@ class UnquantizedLinearMethod(LinearMethodBase):
             )
         ):
             return _bf16_splitk_gemm_out(x, layer.weight, None, output)
+        if (
+            _use_cublaslt_bf16_gemm is not None
+            and bias is None
+            and x.is_cuda
+            and x.ndim == 2
+            and x.dtype == torch.bfloat16
+            and layer.weight.dtype == torch.bfloat16
+            and output.dtype == torch.bfloat16
+            and output.is_contiguous()
+            and output.shape == (x.shape[0], layer.weight.shape[0])
+            and not layer.weight.requires_grad
+            and _use_cublaslt_bf16_gemm(
+                x.shape[0], layer.weight.shape[0], layer.weight.shape[1]
+            )
+        ):
+            # Same registry as _bf16_gemm_dispatch_impl: o_proj into a caller-owned buffer
+            # (SP attn-res, AR fusion) must reach the cuBLASLt rows too.
+            _log_cublaslt_first_use(
+                "apply_into", x.shape[0], layer.weight.shape[0], layer.weight.shape[1]
+            )
+            return _cublaslt_bf16_mm_out(x, layer.weight, output)
         if (
             get_bf16_gemm_backend().is_cutedsl()
             and x.is_cuda

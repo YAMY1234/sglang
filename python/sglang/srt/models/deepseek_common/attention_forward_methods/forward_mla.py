@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import os
+from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
 
@@ -66,6 +67,119 @@ logger = logging.getLogger(__name__)
 _SGLANG_EXPERIMENTAL_LORA_OPTI = envs.SGLANG_EXPERIMENTAL_LORA_OPTI.get()
 _ENABLE_DSA_Q8KV8_BORN_FP8_Q = envs.SGLANG_ENABLE_DSA_Q8KV8_BORN_FP8_Q.get()
 _ENABLE_DSA_Q8KV8_QPREP_OVERLAP = envs.SGLANG_ENABLE_DSA_Q8KV8_QPREP_OVERLAP.get()
+
+
+class _K31DsaChainPrio:
+    """DSA decode indexer chain on a high-priority stream (aria loop/d3-k7, K7).
+
+    Patched, default off. ``SGLANG_K31_DSA_CHAIN_PRIO=1`` (read here, at the call
+    site) runs the layer's indexer (q/k prologue, paged MQA logits, top-k and the
+    DCP top-k merge) on a stream of the greatest CUDA priority, forked from and
+    joined back to the current stream, when forward_absorb_prepare captures the
+    DSA decode / target-verify overlap (the side-stream q_b_proj, absorb bmm and
+    KV write under the indexer). Stream capture copies a stream's priority into
+    its kernel nodes and torch instantiates graphs with node priorities, so the
+    block scheduler dispatches pending chain CTAs ahead of pending side-stream
+    GEMM CTAs; the side GEMMs fill the SMs the chain leaves idle. Same kernels,
+    inputs and launch configurations: only graph edges and node priorities
+    change. ``SGLANG_K31_DSA_CHAIN_PRIO_MAX_ROWS=N`` (default 0 = no cap) limits it
+    to forwards of at most N token rows (small graph buckets). The stream is
+    created at layer init (outside capture); none means the unpatched order.
+    """
+
+    ENV = "SGLANG_K31_DSA_CHAIN_PRIO"
+    ENV_MAX_ROWS = "SGLANG_K31_DSA_CHAIN_PRIO_MAX_ROWS"
+    TAG = "aria loop/d3-k7"
+    _streams = {}
+    _logged_on = False
+    _logged_off = set()
+
+    @staticmethod
+    def enabled() -> bool:
+        value = os.environ.get(_K31DsaChainPrio.ENV, "").strip().lower()
+        if value in ("", "0", "off", "false", "no"):
+            return False
+        if value in ("1", "on", "true", "yes"):
+            return True
+        raise ValueError(f"{_K31DsaChainPrio.ENV}={value!r}: use 0/off or 1/on")
+
+    @staticmethod
+    def max_rows() -> int:
+        value = os.environ.get(_K31DsaChainPrio.ENV_MAX_ROWS, "").strip()
+        rows = int(value) if value else 0
+        if rows < 0:
+            raise ValueError(f"{_K31DsaChainPrio.ENV_MAX_ROWS}={value!r}: use N >= 0")
+        return rows
+
+    @staticmethod
+    def prepare_at_init(layer) -> None:
+        """Validate both knobs (a bad value raises at load) and create the stream."""
+        if not _K31DsaChainPrio.enabled():
+            return
+        _K31DsaChainPrio.max_rows()
+        if layer.use_dsa and layer.alt_stream is not None and torch.cuda.is_available():
+            device = torch.cuda.current_device()
+            if device not in _K31DsaChainPrio._streams:
+                try:
+                    _least, greatest = torch.cuda.Stream.priority_range()
+                except Exception:  # older torch: any negative maps to the top pool
+                    greatest = -1
+                _K31DsaChainPrio._streams[device] = torch.cuda.Stream(
+                    priority=int(greatest)
+                )
+
+    @staticmethod
+    def on_stream(stream):
+        """``torch.cuda.stream(stream)``, or a no-op that touches no device API."""
+        if stream is None:
+            return nullcontext()
+        return torch.cuda.stream(stream)
+
+    @staticmethod
+    def stream_for(layer, num_rows: int):
+        """The chain stream for this forward, or None for the unpatched order."""
+        cls = _K31DsaChainPrio
+        if not cls.enabled():
+            return None
+        stream = cls._streams.get(torch.cuda.current_device())
+        if stream is None:
+            cls._log_off_once(layer, "no priority stream (created at layer init)")
+            return None
+        cap = cls.max_rows()
+        if cap and num_rows > cap:
+            cls._log_off_once(layer, f"rows {num_rows} > {cls.ENV_MAX_ROWS}={cap}")
+            return None
+        if not cls._logged_on:
+            cls._logged_on = True
+            logger.info(
+                "K31 DSA chain priority ENGAGED (%s=1, %s): layer %d, %d rows; chain "
+                "stream priority %d (current %d, alt %d); max rows %s",
+                cls.ENV,
+                cls.TAG,
+                layer.layer_id,
+                num_rows,
+                stream.priority,
+                torch.cuda.current_stream().priority,
+                layer.alt_stream.priority,
+                cap or "none",
+            )
+        return stream
+
+    @staticmethod
+    def _log_off_once(layer, reason: str) -> None:
+        key = reason.split(" ")[0]
+        if key in _K31DsaChainPrio._logged_off:
+            return
+        _K31DsaChainPrio._logged_off.add(key)
+        logger.info(
+            "K31 DSA chain priority declined (%s set, %s): layer %d: %s; the unpatched "
+            "order runs",
+            _K31DsaChainPrio.ENV,
+            _K31DsaChainPrio.TAG,
+            layer.layer_id,
+            reason,
+        )
+
 # SGLANG_K31_DRAFT_SWA_INPLACE_Q (default off): sliding-window layers hand
 # the a2a / fi_a2a reduce strided [rows, heads, 512] partials (see
 # trtllm_mla_backend._forward_sliding_window); the pack reads them as is.
@@ -222,6 +336,8 @@ class DeepseekMLAForwardMixin:
         self.flashinfer_mla_disable_ragged = (
             get_exec().kernel.flashinfer_mla_disable_ragged
         )
+        # aria loop/d3-k7 (K7), default off: SGLANG_K31_DSA_CHAIN_PRIO
+        _K31DsaChainPrio.prepare_at_init(self)
 
     def should_run_indexer(
         self: DeepseekV2AttentionMLA,
@@ -500,13 +616,23 @@ class DeepseekMLAForwardMixin:
                 if not self.dsa_decode_absorb_under_indexer:
                     k_nope = k_nope.unsqueeze(1)
                 if self.should_run_indexer(prev_topk_indices):
-                    topk_indices = self.indexer(
-                        x=hidden_states,
-                        q_lora=q_lora,
-                        positions=positions,
-                        forward_batch=forward_batch,
-                        layer_id=self.layer_id,
+                    # aria loop/d3-k7 (K7), default off: the indexer chain on the
+                    # greatest-priority stream, forked here and joined right after.
+                    chain_stream = _K31DsaChainPrio.stream_for(
+                        self, hidden_states.shape[0]
                     )
+                    if chain_stream is not None:
+                        chain_stream.wait_stream(current_stream)
+                    with _K31DsaChainPrio.on_stream(chain_stream):
+                        topk_indices = self.indexer(
+                            x=hidden_states,
+                            q_lora=q_lora,
+                            positions=positions,
+                            forward_batch=forward_batch,
+                            layer_id=self.layer_id,
+                        )
+                    if chain_stream is not None:
+                        current_stream.wait_stream(chain_stream)
                 else:
                     # skip_topk reuses prev layer's indices; mirror into this
                     # layer's slot so the captured buffer matches what's used.
