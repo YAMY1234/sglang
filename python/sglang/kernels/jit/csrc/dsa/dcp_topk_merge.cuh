@@ -653,45 +653,79 @@ template <int kNumRanks, int kTopK>
 SGL_DEVICE bool
 publish_local_topk(const PushedParams& p, int row, int64_t full_off, uint64_t tag, uint64_t t_lo, PushSmem& s) {
   constexpr int kThreads = 32 * kNumRanks;
-  constexpr int kTile = 8;  // entries per thread per compaction round
+  // A row scan is latency bound in one CTA: each round keeps kVecs 16-byte loads per thread in
+  // flight (score rows are 16-byte aligned: the push top-k requires score_stride % 4 == 0).
+  constexpr int kVecs = 8, kE = 4 * kVecs, kRound = kThreads * kE;
   const int tid = threadIdx.x;
   const float* const scores = p.logits + static_cast<int64_t>(row) * p.logits_stride;
   const int n = p.local_lens[row];
-  const auto key_at = [&](int l) { return make_topk_key(__float_as_int(scores[l]), l * kNumRanks + p.rank); };
+  // entry e of this thread in the round at l0 is local position l0 + ((e / 4) * kThreads + tid) * 4 + e % 4
+  const auto pos_of = [&](int l0, int e) { return l0 + ((e / 4) * kThreads + tid) * 4 + e % 4; };
+  const auto load_round = [&](int l0, int32_t (&bits)[kE]) {
+#pragma unroll
+    for (int j = 0; j < kVecs; ++j) {
+      const int l = l0 + (j * kThreads + tid) * 4;
+      int4 v = make_int4(0, 0, 0, 0);
+      if (l + 4 <= n) {
+        v = *reinterpret_cast<const int4*>(scores + l);
+      } else if (l < n) {
+        v.x = __float_as_int(scores[l]);
+        if (l + 1 < n) v.y = __float_as_int(scores[l + 1]);
+        if (l + 2 < n) v.z = __float_as_int(scores[l + 2]);
+      }
+      bits[4 * j] = v.x;
+      bits[4 * j + 1] = v.y;
+      bits[4 * j + 2] = v.z;
+      bits[4 * j + 3] = v.w;
+    }
+  };
+  const auto key_of = [&](int l0, int e, int32_t bits) {
+    const int l = pos_of(l0, e);
+    return l < n ? make_topk_key(bits, l * kNumRanks + p.rank) : uint64_t{0};
+  };
   int mine = 0, above;
-  for (int l = tid; l < n; l += kThreads)
-    mine += key_at(l) >= t_lo;
+  for (int l0 = 0; l0 < n; l0 += kRound) {
+    int32_t bits[kE];
+    load_round(l0, bits);
+#pragma unroll
+    for (int e = 0; e < kE; ++e)
+      mine += key_of(l0, e, bits[e]) >= t_lo;
+  }
   block_exclusive_sum<kNumRanks>(mine, above, s);
   uint64_t t = t_lo;
   const bool select = above > kTopK;
   if (select) {
     const auto visit = [&](auto f) {
-      for (int l = tid; l < n; l += kThreads) {
-        const uint64_t k = key_at(l);
-        f(k >= t_lo ? k : uint64_t{0});
+      for (int l0 = 0; l0 < n; l0 += kRound) {
+        int32_t bits[kE];
+        load_round(l0, bits);
+#pragma unroll
+        for (int e = 0; e < kE; ++e) {
+          const uint64_t k = key_of(l0, e, bits[e]);
+          f(k >= t_lo ? k : uint64_t{0});
+        }
       }
     };
     t = select_kth_adaptive(visit, kTopK, s);
   }
   uint64_t* const dst = p.buffer + full_off;
   int written = 0;
-  for (int l0 = 0; l0 < n; l0 += kThreads * kTile) {
-    int32_t bits[kTile];
-    bool sel[kTile];
+  for (int l0 = 0; l0 < n; l0 += kRound) {
+    int32_t bits[kE];
+    load_round(l0, bits);
+    bool sel[kE];
     int cnt = 0;
 #pragma unroll
-    for (int j = 0; j < kTile; ++j) {
-      const int l = l0 + j * kThreads + tid;
-      bits[j] = l < n ? __float_as_int(scores[l]) : 0;
-      sel[j] = l < n && make_topk_key(bits[j], l * kNumRanks + p.rank) >= t;
-      cnt += sel[j];
+    for (int e = 0; e < kE; ++e) {
+      const uint64_t k = key_of(l0, e, bits[e]);
+      sel[e] = k != 0 && k >= t;
+      cnt += sel[e];
     }
     int total;
     int at = written + block_exclusive_sum<kNumRanks>(cnt, total, s);
 #pragma unroll
-    for (int j = 0; j < kTile; ++j)
-      if (sel[j])
-        device::ptx::store_relaxed_sys(dst + at++, pack_entry(bits[j], (l0 + j * kThreads + tid) * kNumRanks + p.rank, tag));
+    for (int e = 0; e < kE; ++e)
+      if (sel[e]) device::ptx::store_relaxed_sys(dst + at++, pack_entry(bits[e], pos_of(l0, e) * kNumRanks + p.rank, tag));
     written += total;
   }
   for (int e = written + tid; e < kTopK; e += kThreads)
