@@ -361,13 +361,10 @@ class UnifiedRadixCache(BasePrefixCache):
         self.pp_size = params.pp_size
         self.work_list: list[torch.distributed.Work] = []
         self.pp_sync_window = 1
-        if (
-            envs.SGLANG_PP_SYNC_WINDOW.get() or envs.SGLANG_PP_DECOUPLE_HOST.get()
-        ) and self.pp_size > 1:
+        if envs.SGLANG_PP_SYNC_WINDOW.get() and self.pp_size > 1:
             self.pp_sync_window = self.pp_size + get_parallel().pp_async_batch_depth
             logger.info(
-                "HiCache PP-sync window: %d rounds (SGLANG_PP_SYNC_WINDOW or "
-                "SGLANG_PP_DECOUPLE_HOST).",
+                "HiCache PP-sync window: %d rounds (SGLANG_PP_SYNC_WINDOW).",
                 self.pp_sync_window,
             )
         self.pp_sync_rounds: deque[list[torch.distributed.Work]] = deque()
