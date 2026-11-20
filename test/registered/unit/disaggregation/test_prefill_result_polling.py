@@ -1661,6 +1661,30 @@ class TestPPPrefillEarlySend(CustomTestCase):
                 stage.spec_algorithm = SpeculativeAlgorithm.DFLASH
                 self.assertFalse(stage._pp_pd_early_send_enabled())
 
+    def test_prefill_complete_sends_early_only_what_decode_reserved_first(self):
+        stage = _PPEarlySendScheduler(is_last_rank=False)
+        stage.kv_checksum_computer = None
+        stage.enable_staging = False
+        stage.enable_unified_cache_external_linker = False
+        stage.spec_algorithm = SpeculativeAlgorithm.DFLASH
+        with published_topology(
+            pp_size=2, disaggregation_decode_allocation_policy="prefill_complete"
+        ):
+            with envs.SGLANG_PP_PD_PREFILL_EARLY_SEND.override(True):
+                self.assertTrue(stage._pp_pd_early_send_enabled())
+        # Early readiness (below SGLANG_PREFILL_COMPLETE_MIN_WORK_TOKENS): decode
+        # reserved during prefill. Late: readiness waits for the result.
+        early = _early_req("early", 1)
+        late = _early_req(
+            "late", 2, status=KVPoll.Bootstrapping, pending_bootstrap=True
+        )
+        batch = SimpleNamespace(reqs=[early, late], forward_iter=3)
+        launch_event = _ForwardEvent()
+        stage._pp_pd_early_send_last_chunks(batch, None, launch_event)
+        no_aux = dict(first_output_id=None, send_aux=False)
+        self.assertEqual(stage.sent, [("early", True, no_aux, launch_event)])
+        self.assertEqual(stage.disagg_prefill_early_sent_rids, {"early"})
+
 
 class TestDeferredEarlySettle(CustomTestCase):
     """SGLANG_PP_PD_DEFER_EARLY_SETTLE: a result does not wait for its early-sent last
@@ -1762,7 +1786,7 @@ class TestDeferredEarlySettle(CustomTestCase):
         self.assertIn("holding deferred frees=1", logs.output[0])
 
     def test_idle_pool_log_without_early_send(self):
-        # prefill_complete turns early send off, so its stats are never set
+        # without early send its stats are never set
         sched = self._scheduler()
         del sched.disagg_prefill_early_send_stats
         sched.pool_stats_observer = SimpleNamespace(
