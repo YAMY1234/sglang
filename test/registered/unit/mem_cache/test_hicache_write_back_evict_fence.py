@@ -1140,5 +1140,192 @@ class TestPMicroD2HAndPutStats(CustomTestCase):
         self.assertLess(hs._hostwait["other_s"], 0.04)
 
 
+class TestDeviceWriteAhead(CustomTestCase):
+    """SGLANG_HICACHE_DEVICE_WRITE_AHEAD: the device LRU tail is backed up off
+    the eviction path; eviction never waits on those copies, and every batch
+    commits once, in order, at the rank-agreed count."""
+
+    def _wa_cache(self, tail=()):
+        cache = _cache()
+        cc = cache.cache_controller
+        cc.ack_write_ahead_queue = []
+        cache._device_write_ahead = True
+        cache._write_ahead_stream_ = "WA_STREAM"
+        cache.ongoing_write_ahead = {}
+        cache._wa_issue_steps = urc_mod.deque()
+        cache._wa_step = 0
+        cache._wa_evicted_tokens = 0
+        cache._wa_peak_evicted = 0.0
+        cache._wa_ready_count = 0
+        cache.tree_core.peek_device_eviction_candidates.return_value = list(tail)
+        cache.tree_core.build_backup_spec.side_effect = lambda n: (
+            torch.arange(4) + 10 * n,
+            {},
+        )
+        cache.tree_core.mark_write_through_pending.side_effect = lambda ids, ack_id: ids
+        cache._build_backup_sidecar = MagicMock(return_value=[])
+        cache._execute_kv_backup = MagicMock(
+            side_effect=lambda n, dv, cx, sx: dv + 100
+        )
+        cache.inc_lock_ref = MagicMock(
+            side_effect=lambda n: SimpleNamespace(to_dec_params=lambda: f"r{n}")
+        )
+        cache.dec_lock_ref = MagicMock()
+        cache.buffer_pipeline = None
+        cache.enable_storage = False
+        cc.mem_pool_host = SimpleNamespace(
+            available_size=lambda: 3,
+            anchor_entry=SimpleNamespace(
+                host_pool=SimpleNamespace(shared_allocation_domain=None),
+                host_evict_fn=None,
+            ),
+        )
+        cache.evict_host = MagicMock(side_effect=lambda n: n)
+        return cache
+
+    def test_eviction_wait_ignores_write_ahead_copies(self):
+        cache = self._wa_cache()
+        pending = SimpleNamespace(finish_event=MagicMock(), node_ids=[7])
+        cache.cache_controller.ack_write_ahead_queue.append(pending)
+        cache.ongoing_write_ahead = {7: urc_mod._OngoingWriteThrough(7, "r7", [7])}
+        cache.writing_check(write_back=True)
+        pending.finish_event.synchronize.assert_not_called()
+        self.assertIn(7, cache.ongoing_write_ahead)
+
+    def test_walk_spares_the_tail_and_writes_only_unbacked_idle_nodes(self):
+        # (node id, tokens, Full KV not on host, write pending)
+        tail = [(5, 4, True, False), (6, 4, False, False), (7, 4, True, True),
+                (8, 4, True, False)]
+        cache = self._wa_cache(tail)
+        cache._wa_evicted_tokens = 1000
+        with envs.SGLANG_HICACHE_DEVICE_WRITE_AHEAD_MIN_TOKENS.override(16):
+            cache._write_ahead_device_tail()
+        tc, cc = cache.tree_core, cache.cache_controller
+        tc.peek_device_eviction_candidates.assert_called_once_with(
+            ComponentType.FULL, 2000
+        )
+        tc.set_write_ahead_spare.assert_called_once_with([5, 6, 7, 8])
+        self.assertEqual([c.args[0] for c in cache._execute_kv_backup.call_args_list], [5, 8])
+        # One host eviction covers the batch's shortfall (8 tokens, 3 free).
+        self.assertEqual(cache.evict_host.call_args_list, [call(5)])
+        self.assertEqual([c.args[0] for c in cache.inc_lock_ref.call_args_list], [5, 8])
+        self.assertEqual(set(cache.ongoing_write_ahead), {5, 8})
+        # Earlier queued writes go out on their own; the batch acks separately.
+        self.assertEqual(
+            cc.start_writing.call_args_list,
+            [call(), call(ack_queue=cc.ack_write_ahead_queue, stream="WA_STREAM")],
+        )
+        self.assertEqual(list(cache._wa_issue_steps), [1])
+        # Next step: in-flight nodes are pending; only a new unbacked one is written.
+        tc.peek_device_eviction_candidates.return_value = [
+            (5, 4, True, True), (8, 4, True, True), (9, 4, True, False)
+        ]
+        cache._write_ahead_device_tail()
+        self.assertEqual(tc.set_write_ahead_spare.call_count, 2)
+        self.assertEqual([c.args[0] for c in cache._execute_kv_backup.call_args_list], [5, 8, 9])
+        self.assertEqual(cache.evict_host.call_args_list, [call(5), call(1)])
+        self.assertEqual(list(cache._wa_issue_steps), [1, 2])
+        # At the in-flight cap the spare set still refreshes, nothing is written.
+        tc.peek_device_eviction_candidates.return_value = [(10, 4, True, False)]
+        with envs.SGLANG_HICACHE_DEVICE_WRITE_AHEAD_MAX_INFLIGHT.override(2):
+            cache._write_ahead_device_tail()
+        self.assertEqual(tc.set_write_ahead_spare.call_count, 3)
+        self.assertEqual(cache._execute_kv_backup.call_count, 3)
+        self.assertEqual(cache.evict_host.call_count, 2)
+
+    def test_tail_target_follows_the_decayed_eviction_peak(self):
+        cache = self._wa_cache()
+        peek = cache.tree_core.peek_device_eviction_candidates
+        with envs.SGLANG_HICACHE_DEVICE_WRITE_AHEAD_MIN_TOKENS.override(1000):
+            for evicted in (100_000, 0, 0):
+                cache._wa_evicted_tokens = evicted
+                cache._write_ahead_device_tail()
+            cache._wa_evicted_tokens = 0
+            cache._wa_peak_evicted = 10.0
+            cache._write_ahead_device_tail()
+        targets = [c.args[1] for c in peek.call_args_list]
+        self.assertEqual(targets, [200_000, 198_000, 196_020, 1000])
+
+    def test_publish_count_needs_the_lag_and_a_finished_copy(self):
+        cache = self._wa_cache()
+        cc = cache.cache_controller
+        for step, done in ((1, True), (2, True), (3, False)):
+            cc.ack_write_ahead_queue.append(SimpleNamespace(finish_event=_FakeEvent(0, done)))
+            cache._wa_issue_steps.append(step)
+        cache._wa_step = 3
+        for lag, expected in ((0, 2), (1, 2), (2, 1), (3, 0)):
+            with envs.SGLANG_HICACHE_DEVICE_WRITE_AHEAD_ACK_LAG.override(lag):
+                self.assertEqual(cache._write_ahead_publish_count(), expected)
+
+    def test_commit_is_fifo_once_per_batch_and_unlocks(self):
+        cache = self._wa_cache()
+        cc = cache.cache_controller
+        cache._log_write_ack_metrics = MagicMock()
+        for step, ids in ((1, [5, 8]), (2, [9])):
+            cc.ack_write_ahead_queue.append(
+                SimpleNamespace(finish_event=MagicMock(), node_ids=ids)
+            )
+            cache._wa_issue_steps.append(step)
+            for n in ids:
+                cache.ongoing_write_ahead[n] = urc_mod._OngoingWriteThrough(n, f"r{n}", [n])
+        cache._write_ahead_commit(1)
+        tc = cache.tree_core
+        self.assertEqual(tc.finish_write_through.call_args_list, [call([5], 5), call([8], 8)])
+        self.assertEqual(cache.dec_lock_ref.call_args_list, [call(5, "r5"), call(8, "r8")])
+        self.assertEqual(set(cache.ongoing_write_ahead), {9})
+        cache._write_ahead_commit(1)
+        self.assertEqual(cache.ongoing_write_ahead, {})
+        self.assertEqual((cc.ack_write_ahead_queue, list(cache._wa_issue_steps)), ([], []))
+        # A second commit of a batch has nothing to commit.
+        cc.ack_write_ahead_queue.append(SimpleNamespace(finish_event=MagicMock(), node_ids=[5]))
+        cache._wa_issue_steps.append(3)
+        with self.assertRaises(KeyError):
+            cache._write_ahead_commit(1)
+
+    def test_split_of_an_in_flight_node_updates_its_batch(self):
+        cache = self._wa_cache()
+        cache.ongoing_write_ahead = {5: urc_mod._OngoingWriteThrough(5, "r5", [5])}
+        cache._replace_pending_write_through_node(5, 5, [11, 5])
+        self.assertEqual(cache.ongoing_write_ahead[5].publish_node_ids, [11, 5])
+
+    def test_ready_counts_carry_the_write_ahead_slot_only_when_on(self):
+        for on in (False, True):
+            cache = self._wa_cache()
+            cache._device_write_ahead = on
+            cache.pp_rank, cache.host_memory_mode, cache.enable_storage = 0, "cache", False
+            cc = cache.cache_controller
+            cc.ack_load_queue = []
+            cc.ack_write_ahead_queue.append(SimpleNamespace(finish_event=_FakeEvent(0)))
+            cache._wa_issue_steps.append(0)
+            cache._wa_step = 5
+            cache.tree_core.write_back_duplicate_reclaim_digest = 0
+            cache._shm_count_exchange = MagicMock(return_value=None)
+            sent = []
+            cache._all_reduce = lambda t, op: sent.append(t.tolist())
+            self.assertEqual(cache._sync_hicache_ready_counts(), (0, 0, (), ()))
+            self.assertEqual(sent, [[0, 0, 1, 0, 0] if on else [0, 0, 0, 0]])
+            self.assertEqual(cache._wa_ready_count, 1 if on else 0)
+
+    def test_check_hicache_events_runs_the_walk_only_when_on(self):
+        for on in (False, True):
+            cache = self._wa_cache()
+            cache._device_write_ahead = on
+            cache.linker = None
+            cache.buffer_pipeline = None
+            cache._l3_write_on_host_evict = False
+            cache._l3_lifetime_ledger = None
+            cache.enable_storage_metrics = False
+            cache._drain_async_work = MagicMock()
+            cache.flush_pending_backups = MagicMock()
+            cache._sync_hicache_ready_counts = MagicMock(return_value=(0, 0, (), ()))
+            cache.writing_check = MagicMock()
+            cache.loading_check = MagicMock()
+            cache._write_ahead_commit = MagicMock()
+            cache._write_ahead_device_tail = MagicMock()
+            cache.check_hicache_events()
+            self.assertEqual(cache._write_ahead_commit.call_count, int(on))
+            self.assertEqual(cache._write_ahead_device_tail.call_count, int(on))
+
+
 if __name__ == "__main__":
     unittest.main()

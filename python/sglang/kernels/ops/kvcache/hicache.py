@@ -79,8 +79,39 @@ def _jit_hicache_staged_module(
                 "launch_all_mla_lf_pf_staged",
                 f"&HiCacheStagedWriteBackKernel<{args}>::run_all_mla_lf_pf_staged",
             ),
+            (
+                "launch_all_lf_pf_staged_coalesced",
+                f"&HiCacheStagedWriteBackKernel<{args}>::run_all_lf_pf_staged_coalesced",
+            ),
+            (
+                "launch_all_mla_lf_pf_staged_coalesced",
+                f"&HiCacheStagedWriteBackKernel<{args}>::run_all_mla_lf_pf_staged_coalesced",
+            ),
         ],
     )
+
+
+# Calls, then pages and host runs over every 16th call: how far merging adjacent rows can go.
+_coalesced_write_back_stats = [0, 0, 0]
+
+
+def _use_coalesced_write_back(dst_indices: torch.Tensor, page_size: int) -> bool:
+    if not envs.SGLANG_OPT_HICACHE_BATCH_WRITE_BACK_COPY.get():
+        return False
+    stats = _coalesced_write_back_stats
+    stats[0] += 1
+    if stats[0] % 16 == 1 and dst_indices.numel():
+        rows = dst_indices[::page_size]
+        stats[1] += rows.numel()
+        stats[2] += 1 + int(torch.count_nonzero(torch.diff(rows) != page_size))
+    if stats[0] == 1 or stats[0] % 4096 == 0:
+        logging.getLogger(__name__).info(
+            "HiCache staged write-back: one batched copy per staging chunk, "
+            "adjacent host rows merged (SGLANG_OPT_HICACHE_BATCH_WRITE_BACK_COPY); "
+            "%d calls, sampled %d pages in %d host runs",
+            *stats,
+        )
+    return True
 
 
 # TMA staging ring per CTA: 32 KB stages x 6 keeps the host loads in flight
@@ -437,10 +468,15 @@ def transfer_hicache_all_layer_staged_lf_pf(
     staging_v = staging_v.view(staging_v.shape[0], staging_v.shape[1], -1)
     dst_k = dst_k.view(dst_k.shape[0], dst_k.shape[1], -1)
     dst_v = dst_v.view(dst_v.shape[0], dst_v.shape[1], -1)
+    launch = (
+        module.launch_all_lf_pf_staged_coalesced
+        if _use_coalesced_write_back(dst_indices, page_size)
+        else module.launch_all_lf_pf_staged
+    )
     for page_begin in range(0, src_page_indices.numel(), staging_page_capacity):
         chunk_pages = min(staging_page_capacity, src_page_indices.numel() - page_begin)
         chunk_tokens = chunk_pages * page_size
-        module.launch_all_lf_pf_staged(
+        launch(
             dst_k,
             dst_v,
             dst_indices[
@@ -481,10 +517,15 @@ def transfer_hicache_all_layer_mla_staged_lf_pf(
     staging_page_capacity = staging.shape[0] // page_size
     staging = staging.view(staging.shape[0], staging.shape[1], -1)
     dst = dst.view(dst.shape[0], dst.shape[1], -1)
+    launch = (
+        module.launch_all_mla_lf_pf_staged_coalesced
+        if _use_coalesced_write_back(dst_indices, page_size)
+        else module.launch_all_mla_lf_pf_staged
+    )
     for page_begin in range(0, src_page_indices.numel(), staging_page_capacity):
         chunk_pages = min(staging_page_capacity, src_page_indices.numel() - page_begin)
         chunk_tokens = chunk_pages * page_size
-        module.launch_all_mla_lf_pf_staged(
+        launch(
             dst,
             dst_indices[
                 page_begin * page_size : (page_begin + chunk_pages) * page_size

@@ -186,12 +186,17 @@ class OpStat:
 # host_evict: UnifiedRadixCache.evict_host; host_evict_l3: its L3 part
 # (StorageWriteBack.evict_host, Mamba state-with-storage victims).
 # write_behind: the per-step L3 write-behind of the host tail.
+# write_ahead: the per-step device-tail write-ahead walk (tokens issued per walk);
+# write_ahead_launch: its D2H submission; write_ahead_commit: its rank-agreed ack commit.
 OPS = {
     "evict_wait": OpStat(),
     "backup_launch": OpStat(sized=True),
     "host_evict": OpStat(),
     "host_evict_l3": OpStat(),
     "write_behind": OpStat(),
+    "write_ahead": OpStat(sized=True),
+    "write_ahead_launch": OpStat(sized=True),
+    "write_ahead_commit": OpStat(),
 }
 _ops_window_start = time.perf_counter()
 

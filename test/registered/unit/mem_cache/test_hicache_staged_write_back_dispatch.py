@@ -1,13 +1,19 @@
 """Unit tests for HiCache staged write-back host-pool dispatch."""
 
+import os
+import subprocess
+import tempfile
 import unittest
 from array import array
 from contextlib import contextmanager
+from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
 import torch
 
+from sglang.kernels.ops.kvcache import hicache as hicache_kernel
+from sglang.srt.environ import envs
 from sglang.srt.managers.cache_controller import CacheOperation, HiCacheController
 from sglang.srt.mem_cache import l2_transfer as transfer_module
 from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
@@ -1579,6 +1585,366 @@ class TestL2TransferRecordStream(CustomTestCase):
         )
 
         self.assertEqual(device.recorded, [])
+
+
+class _CPUStagedWriteBack:
+    """CPU leaves for the real Python staging/dispatch path.
+
+    The legacy leaf copies one page at a time; the coalesced leaf merges adjacent
+    destinations. Native descriptor construction is checked separately below.
+    """
+
+    def __init__(self, registry):
+        self.registry = registry
+        self.calls = []
+
+    def _copy(self, dst, dst_ids, staging, src_pages, ptrs, page_size, batched):
+        self.calls.append(batched)
+        layers = self.registry[_ptr_key_from_tensor(ptrs)]
+        for page, src_start in enumerate(src_pages.tolist()):
+            for layer_id, layer in enumerate(layers):
+                staging[page * page_size : (page + 1) * page_size, layer_id] = layer[
+                    src_start : src_start + page_size
+                ].reshape(page_size, -1)
+        page = 0
+        while page < len(src_pages):
+            end = page + 1
+            while (
+                batched
+                and end < len(src_pages)
+                and dst_ids[end * page_size]
+                == dst_ids[(end - 1) * page_size] + page_size
+            ):
+                end += 1
+            dst_start = int(dst_ids[page * page_size])
+            dst[dst_start : dst_start + (end - page) * page_size].copy_(
+                staging[page * page_size : end * page_size]
+            )
+            page = end
+
+    def launch_all_mla_lf_pf_staged(self, *args):
+        self._copy(*args, batched=False)
+
+    def launch_all_mla_lf_pf_staged_coalesced(self, *args):
+        self._copy(*args, batched=True)
+
+    def _mha(self, dst_k, dst_v, ids, sk, sv, pages, kp, vp, size, batched):
+        self._copy(dst_k, ids, sk, pages, kp, size, batched)
+        self._copy(dst_v, ids, sv, pages, vp, size, batched)
+
+    def launch_all_lf_pf_staged(self, *args):
+        self._mha(*args, batched=False)
+
+    def launch_all_lf_pf_staged_coalesced(self, *args):
+        self._mha(*args, batched=True)
+
+
+class TestHiCacheBatchWriteBackCPU(CustomTestCase):
+    def _pool(self, indexer):
+        # Five scattered source pages, adjacent + scattered destination pages,
+        # and a two-page staging buffer exercise reuse across three launches.
+        layer_num, dim, page_size = 2, 128, 2
+        rows = 10 if indexer else 20
+        layers = [
+            ((torch.arange(rows * dim).reshape(rows, 1, dim) + i * 71) % 251)
+            .to(torch.uint8)
+            .contiguous()
+            for i in range(layer_num)
+        ]
+        device_pool = _device_pool_stub(layer_num=layer_num)
+        if indexer:
+            device_pool.index_k_with_scale_buffer = layers
+            host = DSAIndexerPoolHost.__new__(DSAIndexerPoolHost)
+            host._live_target_layers = list(range(layer_num))
+            host._device_to_host_layer = {i: i for i in range(layer_num)}
+            host.indexer_page_stride_size = dim
+            host.indexer_layout_dim = dim * layer_num
+            host.index_k_device_ptrs = torch.tensor(
+                [x.data_ptr() for x in layers], dtype=torch.uint64
+            )
+            host.index_k_with_scale_buffer = torch.full(
+                (8, layer_num, 1, dim), 255, dtype=torch.uint8
+            )
+            target = host.index_k_with_scale_buffer
+            staging_rows = 2
+        else:
+            device_pool.kv_buffer = layers
+            host = MLATokenToKVPoolHost.__new__(MLATokenToKVPoolHost)
+            host._is_dummy = False
+            host._layer_shard_enabled = False
+            host._target_layer_indices = tuple(range(layer_num))
+            host._host_layer_by_controller = {i: i for i in range(layer_num)}
+            host._buffer_index_by_layer = {i: i for i in range(layer_num)}
+            host.device_kv_buffers = tuple(layers)
+            host.device_data_ptrs = torch.tensor(
+                [x.data_ptr() for x in layers], dtype=torch.uint64
+            )
+            host.kv_cache_dim = dim
+            host.token_stride_size = dim
+            host.layout_dim = dim * layer_num
+            host.dtype = torch.uint8
+            host.kv_buffer = torch.full((16, layer_num, 1, dim), 255, dtype=torch.uint8)
+            target = host.kv_buffer
+            staging_rows = 4
+        host.device_pool = device_pool
+        host.layout = "page_first"
+        host.layer_num = layer_num
+        host.page_size = page_size
+        host.can_use_jit = False
+        host.can_use_write_back_jit = True
+        host.staging_buffer = torch.empty(
+            staging_rows, layer_num, 1, dim, dtype=torch.uint8
+        )
+        host_ids = torch.tensor([8, 9, 10, 11, 2, 3, 12, 13, 14, 15])
+        dev_ids = torch.tensor([12, 13, 2, 3, 16, 17, 6, 7, 0, 1])
+        expected = target.clone()
+        h = host_ids[::page_size] // page_size if indexer else host_ids
+        d = dev_ids[::page_size] // page_size if indexer else dev_ids
+        for i, layer in enumerate(layers):
+            expected[h, i] = layer[d]
+        return host, device_pool, target, host_ids, dev_ids, expected, layers
+
+    def _check_pool(self, indexer):
+        snapshots = []
+        for batch in (False, True):
+            with self.subTest(batch=batch):
+                host, device, target, h, d, expected, layers = self._pool(indexer)
+                leaf = _CPUStagedWriteBack({_ptr_key_from_layers(layers): layers})
+                with (
+                    envs.SGLANG_OPT_HICACHE_BATCH_WRITE_BACK_COPY.override(batch),
+                    mock.patch.object(
+                        hicache_kernel, "_jit_hicache_staged_module", return_value=leaf
+                    ),
+                ):
+                    host.backup_from_device_all_layer(device, h, d, "kernel")
+                self.assertEqual(leaf.calls, [batch] * 3)
+                self.assertTrue(torch.equal(target, expected))
+                snapshots.append(target.numpy().tobytes())
+        self.assertEqual(snapshots[0], snapshots[1])
+
+    def test_kv_host_bytes_match_with_batch_flag_and_staging_reuse(self):
+        self._check_pool(indexer=False)
+
+    def test_indexer_host_bytes_match_with_batch_flag_and_staging_reuse(self):
+        self._check_pool(indexer=True)
+
+    def test_mha_k_and_v_host_bytes_match_with_small_page_batching(self):
+        page_size, layers, width = 2, 3, 128
+        src = [
+            (torch.arange(16 * width).reshape(16, width) + 39 * i).to(torch.uint8)
+            for i in range(layers * 2)
+        ]
+        kp = torch.tensor([x.data_ptr() for x in src[:layers]], dtype=torch.uint64)
+        vp = torch.tensor([x.data_ptr() for x in src[layers:]], dtype=torch.uint64)
+        h = torch.tensor([8, 9, 10, 11, 2, 3, 6, 7, 0, 1])
+        d = torch.tensor([4, 5, 0, 1, 12, 13, 2, 3, 10, 11])
+        outputs = []
+        for enabled in (False, True):
+            dst = [
+                torch.full((12, layers, width), 255, dtype=torch.uint8)
+                for _ in range(2)
+            ]
+            staging = [
+                torch.empty((4, layers, width), dtype=torch.uint8) for _ in range(2)
+            ]
+            leaf = _CPUStagedWriteBack(
+                {
+                    tuple(kp.tolist()): src[:layers],
+                    tuple(vp.tolist()): src[layers:],
+                }
+            )
+            with (
+                envs.SGLANG_OPT_HICACHE_BATCH_WRITE_BACK_COPY.override(enabled),
+                mock.patch.object(
+                    hicache_kernel, "_jit_hicache_staged_module", return_value=leaf
+                ),
+            ):
+                hicache_kernel.transfer_hicache_all_layer_staged_lf_pf(
+                    kp, vp, d, h, *staging, *dst, page_size=page_size
+                )
+            self.assertEqual(leaf.calls, [enabled] * 6)
+            for tensor, sources in zip(dst, (src[:layers], src[layers:])):
+                expected = torch.full_like(tensor, 255)
+                for i, source in enumerate(sources):
+                    expected[h, i] = source[d]
+                self.assertTrue(torch.equal(tensor, expected))
+            outputs.append([x.numpy().tobytes() for x in dst])
+        self.assertEqual(outputs[0], outputs[1])
+
+
+_NATIVE_STUB_PREFIX = r"""
+#include <algorithm>
+#include <cstdint>
+#include <cstring>
+#include <iostream>
+#include <numeric>
+#include <stdexcept>
+#include <vector>
+#define CUDA_VERSION 13000
+using cudaStream_t = int;
+using cudaError_t = int;
+constexpr int cudaSuccess = 0, cudaErrorNotSupported = 1;
+constexpr int cudaErrorCallRequiresNewerDriver = 2, cudaErrorInvalidValue = 3;
+constexpr int cudaMemcpyDeviceToHost = 1, cudaMemcpySrcAccessOrderStream = 2;
+constexpr int cudaMemLocationTypeDevice = 3, cudaMemLocationTypeHost = 4;
+struct cudaMemLocation { int type = 0, id = 0; };
+struct cudaMemcpyAttributes {
+  int srcAccessOrder = 0; cudaMemLocation srcLocHint, dstLocHint; int flags = 0;
+};
+namespace tvm::ffi {
+struct TensorView {
+  unsigned char* data; int64_t row_bytes;
+  int dtype() const { return 1; }
+  int64_t stride(int) const { return row_bytes; }
+  void* data_ptr() const { return data; }
+};
+}
+namespace host {
+inline size_t dtype_bytes(int) { return 1; }
+inline std::vector<int64_t> irange(int64_t n) {
+  std::vector<int64_t> r(n); std::iota(r.begin(), r.end(), 0); return r;
+}
+template<class... T> void RuntimeCheck(bool ok, T...) {
+  if (!ok) throw std::runtime_error("runtime check");
+}
+inline void RuntimeDeviceCheck(cudaError_t error) { RuntimeCheck(error == cudaSuccess); }
+}
+struct Copy { void* dst; const void* src; size_t bytes; };
+std::vector<Copy> queued;
+int driver_version = 13000, batch_result = 0, batch_calls = 0, fallback_calls = 0;
+bool batch_symbol = true;
+size_t descriptors = 0;
+using CudaMemcpyBatchPtr = const void*;
+using CudaMemcpyBatchAsyncFn = void (*)();
+void symbol_stub() {}
+CudaMemcpyBatchAsyncFn get_cuda_memcpy_batch_async() { return batch_symbol ? &symbol_stub : nullptr; }
+cudaError_t cudaDriverGetVersion(int* value) { *value = driver_version; return 0; }
+cudaError_t cudaGetLastError() { return 0; }
+const char* cudaGetErrorString(int) { return "stub"; }
+cudaError_t cudaMemcpyAsync(void* dst, const void* src, size_t bytes, int, int stream) {
+  host::RuntimeCheck(stream == 7); ++fallback_calls;
+  queued.push_back({dst, src, bytes}); return 0;
+}
+cudaError_t call_cuda_memcpy_batch_async(
+    CudaMemcpyBatchAsyncFn, const void** dst, const void** src, size_t* sizes, size_t count,
+    cudaMemcpyAttributes* attrs, size_t* offsets, size_t attrs_count, int stream) {
+  ++batch_calls;
+  host::RuntimeCheck(stream == 7 && attrs_count == 1 && offsets[0] == 0);
+  host::RuntimeCheck(attrs->srcAccessOrder == cudaMemcpySrcAccessOrderStream);
+  host::RuntimeCheck(attrs->srcLocHint.type == cudaMemLocationTypeDevice);
+  host::RuntimeCheck(attrs->dstLocHint.type == cudaMemLocationTypeHost);
+  if (batch_result) return batch_result;
+  descriptors += count;
+  for (size_t i = 0; i < count; ++i) queued.push_back({const_cast<void*>(dst[i]), src[i], sizes[i]});
+  return 0;
+}
+void drain() {
+  for (const auto& copy : queued) std::memmove(copy.dst, copy.src, copy.bytes);
+  queued.clear();
+}
+"""
+
+_NATIVE_STUB_MAIN = r"""
+int main() {
+  int cases = 0;
+  for (int mode = 0; mode < 6; ++mode) {
+    driver_version = mode == 4 ? 12000 : 13000;
+    batch_symbol = mode != 5;
+    batch_result = mode >= 1 && mode <= 3 ? mode : 0;
+    for (int row_bytes : {32, 123 * 512}) {  // 2-token pages: 64 B / 123 KiB
+      for (int tensors : {1, 2}) {
+        for (const auto& pages : std::vector<std::vector<int64_t>>{
+            {}, {3}, {1, 2, 3, 4, 5}, {6, 2, 7, 0, 4}, {3, 4, 1, 2, 7}}) {
+          constexpr int page_size = 2, host_pages = 9;
+          const int n = pages.size();
+          std::vector<int64_t> ids;
+          for (auto p : pages) { ids.push_back(p * page_size); ids.push_back(p * page_size + 1); }
+          std::vector<std::vector<unsigned char>> src(tensors), old(tensors), fresh(tensors);
+          std::vector<tvm::ffi::TensorView> sv, ov, nv;
+          for (int t = 0; t < tensors; ++t) {
+            src[t].resize(std::max(1, n) * row_bytes * page_size);
+            for (size_t i = 0; i < src[t].size(); ++i) src[t][i] = (i * 37 + t * 91) % 251;
+            old[t].assign(host_pages * row_bytes * page_size, 255); fresh[t] = old[t];
+            sv.push_back({src[t].data(), row_bytes}); ov.push_back({old[t].data(), row_bytes}); nv.push_back({fresh[t].data(), row_bytes});
+          }
+          copy_page_first_pages_fallback(sv, ov, ids.data(), n, page_size, 7);
+          drain();
+          batch_calls = fallback_calls = 0; descriptors = 0;
+          copy_page_first_pages_coalesced(sv, nv, ids.data(), n, page_size, 0, 7);
+          // Descriptors were copied before the local vectors died; host bytes
+          // change only when the stream reaches the queued copies.
+          for (auto& tensor : fresh) host::RuntimeCheck(std::all_of(tensor.begin(), tensor.end(), [](auto x){return x == 255;}));
+          drain();
+          host::RuntimeCheck(fresh == old);
+          int runs = 0;
+          for (int i = 0; i < n; ++i) if (i == 0 || pages[i] != pages[i-1] + 1) ++runs;
+          if (mode == 0 && n) {
+            host::RuntimeCheck(batch_calls == 1 && fallback_calls == 0);
+            host::RuntimeCheck(descriptors == static_cast<size_t>(runs * tensors));
+          } else host::RuntimeCheck(fallback_calls == runs * tensors);
+          ++cases;
+        }
+      }
+    }
+  }
+  std::cout << "NATIVE_COALESCED_CPU_PASS cases=" << cases << "\n";
+}
+"""
+
+
+@unittest.skipUnless(
+    os.getenv("SGLANG_HICACHE_NATIVE_CPU_TEST") == "1",
+    "native header CPU check is opt-in; needs a host C++17 compiler",
+)
+class TestHiCacheNativeCoalescedCPU(CustomTestCase):
+    def test_actual_native_copy_descriptors_preserve_all_host_bytes(self):
+        """The coalesced copy writes the same host bytes as the per-page fallback,
+        with one batch call (one descriptor per adjacent run) or one copy per run.
+
+        The production C++ functions are compiled with CPU CUDA stubs; this does
+        not test the CUDA relayout kernel itself.
+        """
+        header_path = os.getenv("SGLANG_HICACHE_NATIVE_HEADER") or (
+            Path(hicache_kernel.__file__).parents[2]
+            / "jit/csrc/kvcacheio/staged_write_back.cuh"
+        )
+        header = Path(header_path).read_text()
+
+        def extract(name):
+            start = header.index("inline void " + name + "(")
+            end = header.index("{", start) + 1
+            depth = 1
+            while depth:
+                depth += (header[end] == "{") - (header[end] == "}")
+                end += 1
+            return header[start:end]
+
+        functions = "\n".join(
+            extract(name)
+            for name in (
+                "copy_page_first_pages_fallback",
+                "copy_page_first_pages_coalesced",
+            )
+        )
+        with tempfile.TemporaryDirectory(prefix="hicache-native-") as directory:
+            source = Path(directory) / "check.cc"
+            binary = Path(directory) / "check"
+            source.write_text(_NATIVE_STUB_PREFIX + functions + _NATIVE_STUB_MAIN)
+            compile_result = subprocess.run(
+                [os.getenv("CXX", "c++"), "-std=c++17", "-O0", str(source)]
+                + ["-o", str(binary)],
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+            self.assertEqual(compile_result.returncode, 0, compile_result.stderr)
+            result = subprocess.run(
+                [str(binary)], capture_output=True, text=True, timeout=30
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(
+                result.stdout.strip(), "NATIVE_COALESCED_CPU_PASS cases=120"
+            )
 
 
 if __name__ == "__main__":

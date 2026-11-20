@@ -157,10 +157,14 @@ class L2TransferEngine:
                     (id(self), transfer_key),
                 )
 
-    def submit_device_to_host(self, transfers: list[L2Transfer]) -> TransferCompletion:
-        with self._submission(
-            transfers, self.device_to_host_stream, "device_to_host"
-        ) as (transfers, completion):
+    def submit_device_to_host(
+        self, transfers: list[L2Transfer], stream=None
+    ) -> TransferCompletion:
+        stream = self.device_to_host_stream if stream is None else stream
+        with self._submission(transfers, stream, "device_to_host") as (
+            transfers,
+            completion,
+        ):
             for transfer in transfers:
                 transfer.host_pool.backup_from_device_all_layer_physical(
                     transfer.device_pool,
