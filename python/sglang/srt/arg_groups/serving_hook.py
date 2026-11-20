@@ -527,6 +527,13 @@ def handle_other_validations(server_args: Any):
                 and cfg.hicache_host_memory_mode == "buffer_only"
                 and cfg.hicache_write_policy == "write_through"
             )
+            # prefill_complete never yields an optimistic request
+            # (optimistic_release_and_requeue), so L3 holds only tree-owned pages.
+            or (
+                cfg.disaggregation_decode_allocation_policy == "prefill_complete"
+                and cfg.hicache_storage_backend == "nixl_dram"
+                and cfg.hicache_write_policy == "write_back"
+            )
         ):
             logger.warning(
                 "Optimistic prefill supports L2 write-back/write-through or "

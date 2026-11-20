@@ -248,11 +248,11 @@ def _validate_prefill_complete(server_args: ServerArgs) -> None:
         cfg.disaggregation_mode == "prefill"
         and cfg.enable_hierarchical_cache
         and (
-            cfg.hicache_storage_backend is not None
+            cfg.hicache_storage_backend not in (None, "nixl_dram")
             or cfg.hicache_write_policy != "write_back"
         )
     ):
-        unsupported.append("prefill HiCache other than L2 write_back")
+        unsupported.append("prefill HiCache other than write_back to L2 or nixl_dram L3")
     if envs.SGLANG_DISAGG_STAGING_BUFFER.get():
         unsupported.append("staging buffers")
     if envs.SGLANG_RUST_SERVER.get():

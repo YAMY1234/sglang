@@ -2242,6 +2242,15 @@ class SchedulerDisaggregationPrefillMixin:
 
     def optimistic_release_and_requeue(self: Scheduler, req: Req) -> None:
         """Release KV cache and requeue an optimistic prefill request."""
+        if (
+            self.enable_hicache_storage
+            and get_disagg().disaggregation_decode_allocation_policy == "prefill_complete"
+        ):
+            # Optimistic prefill with an L3 backend is allowed only because
+            # prefill_complete never yields (serving_hook optimistic gate).
+            raise RuntimeError(
+                f"prefill_complete with HiCache storage cannot yield request {req.rid}"
+            )
         max_attempts = get_disagg().optimistic_prefill_attempts
         uses_write_through_cache = _uses_write_through_cache(self.tree_cache)
         if not uses_write_through_cache:
