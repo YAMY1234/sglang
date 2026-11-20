@@ -1985,6 +1985,14 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             )
             if ret is not None:
                 self._dcp_send_stats["packed"] += 1
+                if stats_on:
+                    # Packed sends count too; build time covers the plan only.
+                    self._record_dcp_send(
+                        num_kv_tokens,
+                        decode_prefix_len,
+                        src_page_offset == 0,
+                        sum(build_times),
+                    )
                 return ret
             if pack_cache is not None:
                 # The per-rank packs below overwrite the shared chunk pack.
