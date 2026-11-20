@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import dataclasses
+import gc
 import json
 import logging
 import os
@@ -708,6 +709,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     def init_running_status(self):
         # Request states
         self.rid_to_state: Dict[str, ReqState] = {}
+        # Finished requests counted toward the one-time post-warm-up gc.freeze (SGLANG_K31_TM_GC_FREEZE_AFTER).
+        self.num_finished_for_gc_freeze = 0
         self.encoder_dispatch_ready: Dict[str, threading.Event] = {}
         self.event_loop = None
         self.asyncio_tasks = set()
@@ -2417,6 +2420,21 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             self._dispatch_to_scheduler(obj)
         logging.info(f"Config logging: {obj=}")
 
+    def _maybe_freeze_gc_after_warmup(self):
+        # Long-lived import-time objects otherwise get rescanned by every gen2 collection
+        # (no post-warm-up /freeze_gc runs when this process is not SGLang's HTTP server).
+        n = envs.SGLANG_K31_TM_GC_FREEZE_AFTER.get()
+        if n <= 0 or self.num_finished_for_gc_freeze >= n:
+            return
+        self.num_finished_for_gc_freeze += 1
+        if self.num_finished_for_gc_freeze == n:
+            gc.collect()
+            freeze_gc("Tokenizer Manager", get_device().gc_threshold)
+            logger.info(
+                f"K31 TM gc freeze after {n} finished requests: "
+                f"{gc.get_freeze_count()} objects frozen"
+            )
+
     async def freeze_gc(self):
         """Send a freeze_gc message to the scheduler first, then freeze locally."""
         gc_threshold = get_device().gc_threshold
@@ -2772,6 +2790,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     )
 
                 del self.rid_to_state[rid]
+                self._maybe_freeze_gc_after_warmup()
 
                 self._release_lora_once(state)
 
