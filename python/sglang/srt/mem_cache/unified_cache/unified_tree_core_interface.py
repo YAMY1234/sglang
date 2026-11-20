@@ -622,6 +622,14 @@ class UnifiedTreeCoreInterface(ABC):
             f"{type(self).__name__} does not implement SGLANG_MAMBA_PATH_CAP_ANCHOR"
         )
 
+    def set_mamba_path_cap_count_evictable_only(self, enabled: bool) -> None:
+        """Make the per-path Mamba cap count only the states it may evict, plus
+        the tail (cache init)."""
+        raise NotImplementedError(
+            f"{type(self).__name__} does not implement "
+            "SGLANG_MAMBA_PATH_CAP_COUNT_EVICTABLE_ONLY"
+        )
+
     def set_mamba_path_cap_audit(self, enabled: bool) -> None:
         """Record each per-path Mamba cap walk as (tail depth, holder depths
         tail-first, kept depths) for SGLANG_MAMBA_PATH_CAP_AUDIT_EVERY."""

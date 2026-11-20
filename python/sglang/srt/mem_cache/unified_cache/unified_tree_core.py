@@ -438,6 +438,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         self.is_write_back = False
         self.mamba_path_cap_counts_host = False
         self.mamba_path_cap_anchor = False
+        self.mamba_path_cap_count_evictable_only = False
         self.mamba_path_cap_audit = None
         self.has_swa_host_pool = False
         self.enable_session_radix_cache = params.enable_session_radix_cache
@@ -2471,6 +2472,9 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
 
     def set_mamba_path_cap_anchor(self, enabled: bool) -> None:
         self.mamba_path_cap_anchor = enabled
+
+    def set_mamba_path_cap_count_evictable_only(self, enabled: bool) -> None:
+        self.mamba_path_cap_count_evictable_only = enabled
 
     def set_mamba_path_cap_audit(self, enabled: bool) -> None:
         self.mamba_path_cap_audit = [] if enabled else None

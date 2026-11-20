@@ -268,6 +268,26 @@ class MambaComponent(TreeComponent):
             return
         cache_actions.append(MambaEvictExcessPathStates(tail.id))
 
+    def _path_cap_frees_host(self, node: UnifiedTreeNode, count_host: bool) -> bool:
+        cd = node.component_data[self.component_type]
+        return (
+            count_host
+            and cd.host_value is not None
+            and cd.host_lock_ref == 0
+            and node.write_through_pending_id is None
+            and node.load_back_pending_id is None
+        )
+
+    def _path_cap_may_evict(self, node: UnifiedTreeNode, count_host: bool) -> bool:
+        """The per-path cap's victim predicate: not locked, not a fork, not a
+        device leaf, and holding a device state or a host copy it may free."""
+        cd = node.component_data[self.component_type]
+        if cd.lock_ref > 0 or len(node.children) != 1:
+            return False
+        if node in self.tree_core.evictable_device_leaves:
+            return False
+        return cd.value is not None or self._path_cap_frees_host(node, count_host)
+
     def _evict_excess_path_states(
         self,
         tail: UnifiedTreeNode,
@@ -285,6 +305,8 @@ class MambaComponent(TreeComponent):
         a capped state loses its host copy unless it is locked or in flight.
         With ``mamba_path_cap_anchor`` (cap >= 2), one older state at or below
         half the tail's depth is kept in place of the oldest of the newest cap.
+        With ``mamba_path_cap_count_evictable_only``, only the states this walk
+        may evict, plus the tail, count toward the cap.
         """
         cap = self.mamba_max_states_per_path
         if cap < 0:
@@ -294,13 +316,20 @@ class MambaComponent(TreeComponent):
         count_host = self.tree_core.mamba_path_cap_counts_host
         use_anchor = self.tree_core.mamba_path_cap_anchor and cap >= 2
         audit = self.tree_core.mamba_path_cap_audit
+        evictable_only = self.tree_core.mamba_path_cap_count_evictable_only
         holders = []
         below = []  # atoms from each holder's end down to the tail's end
         walked = 0
         node = tail
         while node is not None and node is not self.tree_core.root_node:
             cd = node.component_data[ct]
-            if cd.value is not None or (count_host and cd.host_value is not None):
+            if (
+                cd.value is not None or (count_host and cd.host_value is not None)
+            ) and (
+                not evictable_only
+                or node is tail
+                or self._path_cap_may_evict(node, count_host)
+            ):
                 holders.append(node)
                 below.append(walked)
             if use_anchor or audit is not None:
@@ -327,21 +356,11 @@ class MambaComponent(TreeComponent):
                 break
             if node is anchor:
                 continue
-            if node.component_data[ct].lock_ref > 0 or len(node.children) != 1:
-                continue
-            if node in self.tree_core.evictable_device_leaves:
+            if not self._path_cap_may_evict(node, count_host):
                 continue
             cd = node.component_data[ct]
-            free_host = (
-                count_host
-                and cd.host_value is not None
-                and cd.host_lock_ref == 0
-                and node.write_through_pending_id is None
-                and node.load_back_pending_id is None
-            )
+            free_host = self._path_cap_frees_host(node, count_host)
             has_device = cd.value is not None
-            if not has_device and not free_host:
-                continue
             if has_device:
                 self.tree_core._evict_component_and_detach_lru(
                     node,

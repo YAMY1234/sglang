@@ -2161,6 +2161,10 @@ macro_rules! tree_core_methods {
                 py.detach(|| self.core().set_mamba_path_cap_anchor(enabled));
             }
 
+            fn set_mamba_path_cap_count_evictable_only(&self, py: Python<'_>, enabled: bool) {
+                py.detach(|| self.core().set_mamba_path_cap_count_evictable_only(enabled));
+            }
+
             fn set_mamba_path_cap_audit(&self, py: Python<'_>, enabled: bool) {
                 py.detach(|| self.core().set_mamba_path_cap_audit(enabled));
             }
@@ -3595,6 +3599,18 @@ macro_rules! tree_core_binding {
             fn set_mamba_path_cap_anchor(&self, py: Python<'_>, enabled: bool) -> PyResult<()> {
                 catch_native_panic(|| {
                     self.inner.set_mamba_path_cap_anchor(py, enabled);
+                    Ok(())
+                })
+            }
+
+            /// Make the per-path Mamba cap count only the states it may evict, plus the tail.
+            fn set_mamba_path_cap_count_evictable_only(
+                &self,
+                py: Python<'_>,
+                enabled: bool,
+            ) -> PyResult<()> {
+                catch_native_panic(|| {
+                    self.inner.set_mamba_path_cap_count_evictable_only(py, enabled);
                     Ok(())
                 })
             }

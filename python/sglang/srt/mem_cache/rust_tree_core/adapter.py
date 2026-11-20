@@ -984,6 +984,17 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
             ) from None
         setter(enabled)
 
+    def set_mamba_path_cap_count_evictable_only(self, enabled: bool) -> None:
+        try:
+            setter = self._binding.set_mamba_path_cap_count_evictable_only
+        except AttributeError:
+            raise RuntimeError(
+                "SGLANG_MAMBA_PATH_CAP_COUNT_EVICTABLE_ONLY needs a Rust TreeCore "
+                "extension that has set_mamba_path_cap_count_evictable_only; rebuild "
+                "rust/sglang-radix-tree or set SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND=python"
+            ) from None
+        setter(enabled)
+
     def set_mamba_path_cap_audit(self, enabled: bool) -> None:
         self._binding.set_mamba_path_cap_audit(enabled)
 

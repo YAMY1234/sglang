@@ -926,6 +926,9 @@ class Envs:
     # --mamba-max-states-per-path keeps one older state at or below half the
     # path's depth in place of the oldest of the newest cap (needs cap >= 2).
     SGLANG_MAMBA_PATH_CAP_ANCHOR = EnvBool(False)
+    # --mamba-max-states-per-path counts only the states it may evict, plus the tail:
+    # forks, locked nodes and device leaves no longer use a path's budget.
+    SGLANG_MAMBA_PATH_CAP_COUNT_EVICTABLE_ONLY = EnvBool(False)
     # Check every per-path Mamba cap walk against the cap / anchor rule and log
     # the counts every N walks (diagnostic); 0 (default) records nothing.
     SGLANG_MAMBA_PATH_CAP_AUDIT_EVERY = EnvInt(0)

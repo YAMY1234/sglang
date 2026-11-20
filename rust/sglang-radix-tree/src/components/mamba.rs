@@ -80,6 +80,30 @@ impl MambaComponent {
     }
 }
 
+/// The per-path cap's victim test: `None` for a node it keeps (locked, a fork,
+/// a device leaf, or nothing it may free), else whether it frees the device
+/// state and the host copy there.
+fn path_cap_victim<K: ChildKeyType>(
+    tree_core: &UnifiedTreeCore<K>,
+    node_id: NodeIdx_,
+    count_host: bool,
+) -> Option<(bool, bool)> {
+    let node = tree_core.arena.node(node_id);
+    if node.device_lock_ref(MAMBA) > 0 || node.children.len() != 1 {
+        return None;
+    }
+    if tree_core.evictable_device_leaves.contains(node_id) {
+        return None;
+    }
+    let free_host = count_host
+        && node.has_host_value(MAMBA)
+        && node.host_lock_ref(MAMBA) == 0
+        && node.write_through_pending_id.is_none()
+        && !node.is_load_back_pending();
+    let has_device = node.has_device_value(MAMBA);
+    (has_device || free_host).then_some((has_device, free_host))
+}
+
 impl<K: ChildKeyType> TreeComponent<K> for MambaComponent {
     fn component_type(&self) -> ComponentType {
         MAMBA
@@ -200,6 +224,8 @@ impl<K: ChildKeyType> TreeComponent<K> for MambaComponent {
     /// a capped state loses its host copy unless that copy is locked or in flight.
     /// With `mamba_path_cap_anchor` (cap >= 2), one older state at or below half
     /// the tail's depth is kept in place of the oldest of the newest `cap` states.
+    /// With `mamba_path_cap_count_evictable_only`, only the states this walk may
+    /// evict, plus the tail, count toward the cap.
     fn evict_excess_path_states(
         &self,
         tree_core: &mut UnifiedTreeCore<K>,
@@ -212,6 +238,7 @@ impl<K: ChildKeyType> TreeComponent<K> for MambaComponent {
             return;
         };
         let count_host = tree_core.mamba_path_cap_counts_host;
+        let evictable_only = tree_core.mamba_path_cap_count_evictable_only;
         // Mamba-value holders on the root path, tail-first, with the atoms from
         // each holder's end down to the tail's end.
         let mut holders: Vec<NodeIdx_> = Vec::new();
@@ -223,7 +250,11 @@ impl<K: ChildKeyType> TreeComponent<K> for MambaComponent {
             if node.is_root() {
                 break;
             }
-            if node.has_device_value(MAMBA) || (count_host && node.has_host_value(MAMBA)) {
+            if (node.has_device_value(MAMBA) || (count_host && node.has_host_value(MAMBA)))
+                && (!evictable_only
+                    || node_id == tail_node_id
+                    || path_cap_victim(tree_core, node_id, count_host).is_some())
+            {
                 holders.push(node_id);
                 below.push(walked);
             }
@@ -250,22 +281,10 @@ impl<K: ChildKeyType> TreeComponent<K> for MambaComponent {
             if anchor == Some(node_id) {
                 continue;
             }
-            let node = tree_core.arena.node(node_id);
-            if node.device_lock_ref(MAMBA) > 0 || node.children.len() != 1 {
+            let Some((has_device, free_host)) = path_cap_victim(tree_core, node_id, count_host)
+            else {
                 continue;
-            }
-            if tree_core.evictable_device_leaves.contains(node_id) {
-                continue;
-            }
-            let free_host = count_host
-                && node.has_host_value(MAMBA)
-                && node.host_lock_ref(MAMBA) == 0
-                && node.write_through_pending_id.is_none()
-                && !node.is_load_back_pending();
-            let has_device = node.has_device_value(MAMBA);
-            if !has_device && !free_host {
-                continue;
-            }
+            };
             if has_device {
                 tree_core.evict_component_and_detach_lru_with_reason_(
                     node_id,

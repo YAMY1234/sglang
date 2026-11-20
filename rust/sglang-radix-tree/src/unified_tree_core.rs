@@ -669,6 +669,9 @@ pub struct UnifiedTreeCore<K: ChildKeyType> {
     /// The per-path Mamba cap keeps one older anchor state at or below half
     /// the tail's depth (opt-in, decided at HiCache init).
     pub(crate) mamba_path_cap_anchor: bool,
+    /// The per-path Mamba cap counts only the states it may evict, plus the
+    /// tail (opt-in, decided at cache init).
+    pub(crate) mamba_path_cap_count_evictable_only: bool,
     /// Per-path cap walks recorded for an audit (opt-in, drained by the cache).
     pub(crate) mamba_path_cap_audit: Option<Vec<MambaPathCapAudit>>,
 
@@ -1008,6 +1011,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             write_through_threshold: params.write_through_threshold,
             mamba_path_cap_counts_host: false,
             mamba_path_cap_anchor: false,
+            mamba_path_cap_count_evictable_only: false,
             mamba_path_cap_audit: None,
             component_uuid_counters: COMPONENT_UUID_INITIAL_VALUES,
             device: params.device,
@@ -3807,6 +3811,12 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
     /// Make the per-path Mamba cap keep a half-depth anchor state; decided at HiCache init.
     pub fn set_mamba_path_cap_anchor(&mut self, enabled: bool) {
         self.mamba_path_cap_anchor = enabled;
+    }
+
+    /// Make the per-path Mamba cap count only the states it may evict, plus the
+    /// tail; decided at cache init.
+    pub fn set_mamba_path_cap_count_evictable_only(&mut self, enabled: bool) {
+        self.mamba_path_cap_count_evictable_only = enabled;
     }
 
     pub fn set_mamba_path_cap_audit(&mut self, enabled: bool) {

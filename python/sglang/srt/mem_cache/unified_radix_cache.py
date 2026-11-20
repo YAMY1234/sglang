@@ -317,6 +317,7 @@ class UnifiedRadixCache(BasePrefixCache):
         for component in self.components.values():
             component.tree_core = self.tree_core
         self._init_mamba_path_cap_anchor()
+        self._init_mamba_path_cap_count_evictable_only()
         self._init_mamba_path_cap_audit()
 
         if (
@@ -900,6 +901,16 @@ class UnifiedRadixCache(BasePrefixCache):
             cap,
             type(self.tree_core).__name__,
         )
+
+    def _init_mamba_path_cap_count_evictable_only(self) -> None:
+        """SGLANG_MAMBA_PATH_CAP_COUNT_EVICTABLE_ONLY: the per-path cap counts only
+        the states it may evict, plus the tail. Off by default."""
+        if not envs.SGLANG_MAMBA_PATH_CAP_COUNT_EVICTABLE_ONLY.get():
+            return
+        if not self.is_mamba_enabled:
+            return
+        self.tree_core.set_mamba_path_cap_count_evictable_only(True)
+        logger.info("Mamba path cap counts only the states it may evict")
 
     def _init_mamba_path_cap_audit(self) -> None:
         every = envs.SGLANG_MAMBA_PATH_CAP_AUDIT_EVERY.get()

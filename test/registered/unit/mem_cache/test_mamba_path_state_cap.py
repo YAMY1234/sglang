@@ -45,6 +45,7 @@ class _FakeTreeCore:
         self.evictable_device_leaves = set()
         self.mamba_path_cap_counts_host = False
         self.mamba_path_cap_anchor = False
+        self.mamba_path_cap_count_evictable_only = False
         self.mamba_path_cap_audit = None
         self.component_evictable_size_ = {ComponentType.MAMBA: 0}
         self.component_protected_size_ = {ComponentType.MAMBA: 0}
@@ -166,6 +167,38 @@ class TestMambaPathStateCap(unittest.TestCase):
         self.assertIsNotNone(nodes[1].component_data[ComponentType.MAMBA].value)
         self.assertIsNone(nodes[2].component_data[ComponentType.MAMBA].value)
         self.assertIsNotNone(nodes[3].component_data[ComponentType.MAMBA].value)
+
+    def test_count_evictable_only_spares_the_budget_of_forks_and_locked_nodes(self):
+        # Six states (slot = depth - 1), cap 3: depth 1 is a fork shared with another
+        # path and depth 3 is locked. Counting them leaves the path's own states two
+        # slots; counting only evictable states (plus the tail) frees one, the first
+        # victim of the same shallow-first order.
+        for evictable_only, freed in ((False, [1, 3, 4]), (True, [1])):
+            with self.subTest(evictable_only=evictable_only):
+                component, nodes, core, cache = _build_unified_chain(cap=3, length=6)
+                core.mamba_path_cap_count_evictable_only = evictable_only
+                fork_child = UnifiedTreeNode(core.tree_components)
+                fork_child.parent = nodes[0]
+                nodes[0].children["fork"] = fork_child
+                nodes[2].component_data[ComponentType.MAMBA].lock_ref = 1
+                device_frees = defaultdict(list)
+                component._evict_excess_path_states(
+                    nodes[-1], device_frees, defaultdict(list), []
+                )
+                self.assertEqual(
+                    [v.item() for v in device_frees[ComponentType.MAMBA]], freed
+                )
+        # Without forks or locks both rules free the same shallow states.
+        for evictable_only in (False, True):
+            component, nodes, core, cache = _build_unified_chain(cap=2, length=4)
+            core.mamba_path_cap_count_evictable_only = evictable_only
+            device_frees = defaultdict(list)
+            component._evict_excess_path_states(
+                nodes[-1], device_frees, defaultdict(list), []
+            )
+            self.assertEqual(
+                [v.item() for v in device_frees[ComponentType.MAMBA]], [0, 1]
+            )
 
     def test_unified_cache_preserves_existing_host_backup(self):
         component, nodes, core, cache = _build_unified_chain(cap=2)
