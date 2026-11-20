@@ -462,6 +462,11 @@ class UnifiedCacheLinkerWrapper:
         self._window: set[CacheRequestHandle] = set()
         self._window_full = False
         self.log_lookup_stats = envs.SGLANG_EXTERNAL_LINKER_LOOKUP_STATS.get()
+        self.vectorized_restorable_mask = (
+            envs.SGLANG_EXTERNAL_LINKER_VECTORIZED_RESTORABLE_MASK.get()
+        )
+        if self.vectorized_restorable_mask:
+            logger.info("External linker: vectorized restorable-prefix mask on")
         self._lookup_stats = dict.fromkeys(
             (
                 "issued",
@@ -1297,9 +1302,14 @@ class UnifiedCacheLinkerWrapper:
         makes the reduction an intersection.
         """
         mask = torch.zeros(num_pages + 1, dtype=torch.int)
-        for pages in restorable:
-            if device_hit_pages < pages <= num_pages:
-                mask[pages] = 1
+        if self.vectorized_restorable_mask:
+            stops = [p for p in restorable if device_hit_pages < p <= num_pages]
+            if stops:
+                mask[torch.tensor(stops, dtype=torch.long)] = 1
+        else:
+            for pages in restorable:
+                if device_hit_pages < pages <= num_pages:
+                    mask[pages] = 1
         self.cache._all_reduce_attn_groups(mask, torch.distributed.ReduceOp.MIN)
         common = mask.nonzero()
         if common.numel() == 0:

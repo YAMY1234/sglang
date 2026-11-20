@@ -1011,6 +1011,9 @@ class Envs:
     # External linker prefetch mode: log lookup counters (issued, skipped for a
     # device anchor with no storage hash, zero restorable, re-queried) every 60 s.
     SGLANG_EXTERNAL_LINKER_LOOKUP_STATS = EnvBool(False)
+    # Build the cross-rank restorable-prefix mask with one indexed write instead of
+    # one tensor write per restorable page (scheduler-thread time per lookup).
+    SGLANG_EXTERNAL_LINKER_VECTORIZED_RESTORABLE_MASK = EnvBool(False)
     # Seconds between L3 lease renewals of a prefix the device serves: an
     # existence query renews its pages' leases, so Mooncake (oldest lease
     # evicted first) keeps hot prefixes. 0 disables.
