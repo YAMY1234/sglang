@@ -1419,6 +1419,8 @@ class Envs:
     # Kernel for the tabled shapes: "pdl" (the copy, PDL on), "nopdl" (the copy, PDL off),
     # "stock" (FlashInfer's SM107 runner pinned to the table's tactic).
     SGLANG_OPT_SM107_MXFP8_DENSE_TABLE_MODE = EnvStr("pdl")
+    # With the table on: also take DECODE_TABLE_BUCKETS (exact M of the decode graph buckets, incl. wo_b).
+    SGLANG_OPT_SM107_MXFP8_DENSE_TABLE_BUCKETS = EnvBool(False)
     # SM107 prefill (M >= 8192): run the MXFP8 dense linears whose (N, K) are in
     # fp8_utils._SM107_CUBLASLT_MXFP8_NK on cuBLASLt (torch._scaled_mm) instead of
     # FlashInfer's CuTe-DSL GEMM; same operands, bitwise-equal outputs.
