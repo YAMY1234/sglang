@@ -6802,6 +6802,10 @@ def configure_scheduler_process(
     # Configure the logger
     configure_logger(server_args, prefix=prefix)
     suppress_other_loggers()
+    if envs.SGLANG_FAULTHANDLER_SIGUSR2.get():
+        # For a hang watcher: every thread's stack (KV transfer workers too) to stderr.
+        faulthandler.register(signal.SIGUSR2, all_threads=True)
+        logger.info("faulthandler: SIGUSR2 dumps all thread stacks to stderr")
 
     # Set cpu affinity to this gpu process
     if envs.SGLANG_SET_CPU_AFFINITY.get():
