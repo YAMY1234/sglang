@@ -534,7 +534,8 @@ struct PushSmem : Smem {
 // After a row slot's kTopK full-slot entries (merge_pushed_kernel): the owner's stamp (call + 1)
 // once its full slot holds this call's keys. A full slot is written only when its rank fails, and
 // its 8-bit tag repeats every 510 calls, so the tag alone can pass an old failure's keys.
-constexpr int kPushExtra = 1;
+// 16 entries (one used) keep row slots 128-byte aligned, as the candidate blocks were before.
+constexpr int kPushExtra = 16;
 
 SGL_DEVICE void fence_acquire_sys() {
   asm volatile("fence.acq_rel.sys;" ::: "memory");

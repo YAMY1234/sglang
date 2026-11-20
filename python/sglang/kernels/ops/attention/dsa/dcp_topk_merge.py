@@ -74,7 +74,7 @@ def _stats_or_scratch(stats: Optional[torch.Tensor], device: torch.device) -> to
 
 
 # Entries after the full slot of a pushed-merge row slot: its stamp (kPushExtra in dcp_topk_merge.cuh).
-DCP_TOPK_MERGE_PUSH_EXTRA = 1
+DCP_TOPK_MERGE_PUSH_EXTRA = 16
 
 
 def dcp_topk_merge_buffer_numel(
