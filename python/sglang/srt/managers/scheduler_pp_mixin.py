@@ -768,7 +768,9 @@ class SchedulerPPMixin:
         ):
             return False
         bound = envs.SGLANG_PP_DECOUPLE_SEND_WINDOW.get() or self.pp_loop_size
-        self.pp_send_windows = PPSendWindows.create(bound)
+        self.pp_send_windows = PPSendWindows.create(
+            bound, envs.SGLANG_PP_DECOUPLE_TENSOR_WINDOW.get() or bound
+        )
         pp_rank = get_parallel().pp_rank
         # Proxy and output dicts from the previous stage (PP0: outputs from the last);
         # the thread takes their CPU-group part, the loop the device tensors.

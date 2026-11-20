@@ -879,6 +879,9 @@ class Envs:
     # Under SGLANG_PP_DECOUPLE_HOST: send rounds per channel left un-waited, and messages
     # per relay channel received ahead (0 = pp_size + pp_async_batch_depth).
     SGLANG_PP_DECOUPLE_SEND_WINDOW = EnvInt(0)
+    # Under SGLANG_PP_DECOUPLE_HOST: un-waited rounds for the proxy and output device-tensor
+    # sends, which keep their tensors alive until waited (0 = SGLANG_PP_DECOUPLE_SEND_WINDOW's).
+    SGLANG_PP_DECOUPLE_TENSOR_WINDOW = EnvInt(2)
     # PP PD prefill: log a digest of allocator and radix tree state every N loop
     # epochs (0 = off); every stage must log the same digest at the same epoch.
     SGLANG_DEBUG_PP_STATE_DIGEST_EVERY = EnvInt(0)

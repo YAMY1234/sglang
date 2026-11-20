@@ -70,11 +70,14 @@ class PPSendWindows(msgspec.Struct, frozen=True):
     release: Optional[PPSendWindow] = None
 
     @classmethod
-    def create(cls, bound: int) -> "PPSendWindows":
+    def create(cls, bound: int, tensor_bound: Optional[int] = None) -> "PPSendWindows":
+        # Proxy and output rounds hold their device tensors until waited (~0.5 GB a
+        # proxy round at a 16k chunk), so they get their own, smaller bound.
+        tensor_bound = bound if tensor_bound is None else tensor_bound
         return cls(
             req=PPSendWindow(bound),
-            proxy=PPSendWindow(bound),
-            output=PPSendWindow(bound),
+            proxy=PPSendWindow(tensor_bound),
+            output=PPSendWindow(tensor_bound),
             transfer=PPSendWindow(bound),
             release=PPSendWindow(bound),
         )
