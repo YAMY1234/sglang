@@ -2790,6 +2790,126 @@ def test_pp_offload_consensus_advances_under_continuous_prefetch_actions():
     assert sum(b > a for a, b in zip(committed, committed[1:])) >= 3
 
 
+def _window_step(stages, deliver):
+    """One iteration with a commit window: every stage reports (PP0 also
+    decides), PP0 applies its own actions at once, and each later stage r gets
+    them queued in ``deliver[r]``; a stage applies its queue only when listed."""
+    pp0 = stages[0][1]
+    for cache, *_ in reversed(stages):
+        cache._check_linker_events_pp()
+    actions = pp0.take_actions()
+    if actions is not None:
+        pp0.receive(actions.actions)
+        for queued in deliver.values():
+            queued.append(actions.actions)
+
+
+def _deliver(stages, deliver, ranks):
+    for r in ranks:
+        while deliver[r]:
+            stages[r][1].receive(deliver[r].pop(0))
+
+
+def test_pp_offload_consensus_window_issues_ahead_of_acks():
+    # SGLANG_LINKER_PP_OFFLOAD_COMMIT_WINDOW: PP0 issues up to N commits a stage
+    # has not applied yet, never more; delivered late, they apply in order.
+    stages, _ = _consensus_stages(2, [[True], [True]])
+    pp0, later = stages[0][1], stages[1][1]
+    pp0.commit_window = 2
+    deliver = {1: []}
+    _window_step(stages, deliver)
+    for *_, q in stages:
+        q.append(True)
+    _window_step(stages, deliver)  # stage 1 acked nothing yet: commit 2 still goes out
+    assert pp0.offload_issued == 2 and len(deliver[1]) == 2
+    for *_, q in stages:
+        q.append(True)
+    _window_step(stages, deliver)  # two unacknowledged: the window holds commit 3
+    assert pp0.offload_issued == 2 and later.offload_head == 0
+    _deliver(stages, deliver, [1])
+    assert stages[1][2]["committed"] == [[True], [True]] and later.offload_head == 2
+    _window_step(stages, deliver)  # stage 1's ack arrives with its next report
+    assert pp0.offload_issued == 3
+    _deliver(stages, deliver, [1])
+    assert [log["committed"] for _, _, log, _ in stages] == [[[True], [True], [True]]] * 2
+
+
+def test_pp_offload_consensus_window_gates_on_the_slowest_ack():
+    # Out-of-order acknowledgements: stage 2 applies every commit at once, stage
+    # 1 lags; the window counts from the slowest stage.
+    stages, _ = _consensus_stages(3, [[True]] * 3)
+    pp0 = stages[0][1]
+    pp0.commit_window = 2
+    deliver = {1: [], 2: []}
+    _window_step(stages, deliver)
+    _deliver(stages, deliver, [2])
+    for _ in range(2):
+        for *_, q in stages:
+            q.append(True)
+        _window_step(stages, deliver)
+        _deliver(stages, deliver, [2])
+    assert pp0.offload_issued == 2
+    assert stages[2][1].offload_head == 2 and stages[1][1].offload_head == 0
+    _deliver(stages, deliver, [1])
+    _window_step(stages, deliver)
+    assert pp0.offload_issued == 3
+    _deliver(stages, deliver, [1, 2])
+    assert [log["committed"] for _, _, log, _ in stages] == [[[True], [True], [True]]] * 3
+
+
+def test_pp_offload_consensus_window_reset_drops_commits_in_flight():
+    # A reset between PP0's issue and a stage's delivery: the old epoch's
+    # commits are dropped there, and the new epoch commits from head 0.
+    stages, maps = _consensus_stages(2, [[True], [True]])
+    pp0, later = stages[0][1], stages[1][1]
+    pp0.commit_window = 4
+    deliver = {1: []}
+    _window_step(stages, deliver)
+    for *_, q in stages:
+        q.append(True)
+    _window_step(stages, deliver)
+    assert pp0.offload_issued == 2 and len(deliver[1]) == 2
+    for _, relay, _, _ in stages:
+        relay.reset()
+    _deliver(stages, deliver, [1])
+    assert stages[1][2]["committed"] == [] and later.offload_head == 0
+    assert not any(k.startswith(("lko0:", "lkoc0")) for m in maps for k in m)
+    for *_, q in stages:
+        q.append(True)
+    _window_step(stages, deliver)
+    _deliver(stages, deliver, [1])
+    assert stages[1][2]["committed"] == [[True]]
+    assert pp0.offload_head == later.offload_head == 1 and pp0.epoch == later.epoch == 1
+
+
+def test_pp_offload_consensus_window_of_one_waits_like_before():
+    stages, _ = _consensus_stages(2, [[True], [True]])
+    pp0 = stages[0][1]
+    assert pp0.commit_window == 1
+    deliver = {1: []}
+    _window_step(stages, deliver)
+    for *_, q in stages:
+        q.append(True)
+    _window_step(stages, deliver)
+    assert pp0.offload_issued == 1
+
+
+def test_pp_offload_consensus_logs_locked_tokens_by_wait(caplog):
+    # PP0's locked tokens split by what each uncommitted offload waits for:
+    # index 0 finished everywhere (commit), 1 on PP0 only (other stages' puts),
+    # 2 not on PP0 (its own put).
+    import logging
+
+    stages, _ = _consensus_stages(2, [[True, True], [True]])
+    pp0 = stages[0][1]
+    pp0.w.pending_offloads = [SimpleNamespace(lock_node_id=k) for k in (1, 2, 3)]
+    pp0.w.pending_offload_tokens = {1: 10, 2: 20, 3: 40}
+    pp0._stats_next = 0
+    with caplog.at_level(logging.INFO):
+        _consensus_step(stages)
+    assert "at peak 40 / 20 / 10, mean 40 / 20 / 10" in caplog.text
+
+
 @pytest.mark.parametrize("swa_stored", [True, False], ids=["stored", "unstored"])
 @pytest.mark.parametrize(
     "completion", [True, False, None], ids=["success", "failure", "reset"]

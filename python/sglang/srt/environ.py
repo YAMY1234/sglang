@@ -1038,6 +1038,9 @@ class Envs:
     # it finished to the PP consensus store and PP0 commits the minimum, the AND of
     # their outcomes, as an ordered relay action; no stage waits for its puts.
     SGLANG_LINKER_PP_COUNTS_CONSENSUS = EnvBool(False)
+    # With SGLANG_LINKER_PP_COUNTS_CONSENSUS: how many offload commits PP0 may have
+    # issued and not yet seen applied on every stage (1: each waits for the last).
+    SGLANG_LINKER_PP_OFFLOAD_COMMIT_WINDOW = EnvInt(1)
     # Prefetch mode (GLM names): a published read keeps its prefix locked until
     # its request is admitted, the held prefixes under this share of the Full
     # device pool (0 releases at publish; PP requires > 0).
