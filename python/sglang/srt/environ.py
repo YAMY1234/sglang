@@ -2382,6 +2382,10 @@ class Envs:
     # Requires a DeepGEMM paged-MQA scheduler supporting batches > SM count
     # (0.2.3 does); set to 0 for an older DeepGEMM.
     SGLANG_DSA_FULL_BATCH_MQA = EnvBool(True)
+    # DG-native decode verify (next_n <= 8, 32 heads x 128): paged MQA logits with
+    # one Q block per request (kernels/ops/attention/dsa/paged_mqa_logits_1blk.py),
+    # bitwise DeepGEMM's logits; DeepGEMM streams next_n > 4 requests' KV twice.
+    SGLANG_K31_DSA_PAGED_MQA_ONEBLOCK = EnvBool(False)
     SGLANG_ENABLE_PCG_DSV2_DUAL_STREAM = EnvBool(False)
     SGLANG_DSA_TOPK_BROADCAST = EnvBool(False)
     SGLANG_DISABLE_DSA_INDEXER_FUSION = EnvBool(False)
