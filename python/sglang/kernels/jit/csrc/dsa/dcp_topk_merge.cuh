@@ -653,27 +653,68 @@ struct PushedParams {
 };
 
 // This rank failed the certificate: its keys >= t_lo, tagged into its full slot
-// (kTopK entries, empty-padded) for every rank to poll. t_lo, the k-th candidate
-// key, is at most the global k-th key, so these hold every global top-k key of
-// this rank, and the other ranks' candidates hold theirs (merge_kernel's
-// argument). One counting pass finds at most kTopK of them on almost every row;
-// otherwise the slot gets this rank's local top-k, selected among them.
-// Returns whether it had to select.
+// (kTopK entries, empty-padded) for every rank to poll after the stamp. t_lo, the
+// k-th candidate key, is at most the global k-th key, so these hold every global
+// top-k key of this rank, and the other ranks' candidates hold theirs (merge_kernel's
+// argument). One pass writes them; on the rare row with more than kTopK of them the
+// slot is rewritten with this rank's local top-k, selected among them (readers wait
+// for the stamp, written after this returns). Returns whether it had to select.
 template <int kNumRanks, int kTopK>
 SGL_DEVICE bool
 publish_local_topk(const PushedParams& p, int row, int64_t full_off, uint64_t tag, uint64_t t_lo, PushSmem& s) {
   constexpr int kThreads = 32 * kNumRanks;
-  constexpr int kTile = 8;  // entries per thread per compaction round
+  constexpr int kTile = 16;  // entries per thread per compaction round
+  constexpr int kRound = kThreads * kTile;
   const int tid = threadIdx.x;
   const float* const scores = p.logits + static_cast<int64_t>(row) * p.logits_stride;
   const int n = p.local_lens[row];
   const auto key_at = [&](int l) { return make_topk_key(__float_as_int(scores[l]), l * kNumRanks + p.rank); };
-  int mine = 0, above;
-  for (int l = tid; l < n; l += kThreads)
-    mine += key_at(l) >= t_lo;
-  block_exclusive_sum<kNumRanks>(mine, above, s);
-  uint64_t t = t_lo;
-  const bool select = above > kTopK;
+  const auto load = [&](int l0, int32_t (&bits)[kTile]) {
+#pragma unroll
+    for (int j = 0; j < kTile; ++j) {
+      const int l = l0 + j * kThreads + tid;
+      bits[j] = l < n ? __float_as_int(scores[l]) : 0;
+    }
+  };
+  uint64_t* const dst = p.buffer + full_off;
+  // this rank's keys >= t into dst in round order, the first kTopK of them; returns their count,
+  // or stops once it passes kTopK when `probe`. The next round's loads are issued before this
+  // round's compaction (latency bound in one CTA).
+  const auto write_at_least = [&](uint64_t t, bool probe) {
+    int written = 0;
+    int32_t next[kTile];
+    load(0, next);
+    for (int l0 = 0; l0 < n; l0 += kRound) {
+      int32_t bits[kTile];
+#pragma unroll
+      for (int j = 0; j < kTile; ++j)
+        bits[j] = next[j];
+      if (l0 + kRound < n) load(l0 + kRound, next);
+      bool sel[kTile];
+      int cnt = 0;
+#pragma unroll
+      for (int j = 0; j < kTile; ++j) {
+        const int l = l0 + j * kThreads + tid;
+        sel[j] = l < n && make_topk_key(bits[j], l * kNumRanks + p.rank) >= t;
+        cnt += sel[j];
+      }
+      int total;
+      int at = written + block_exclusive_sum<kNumRanks>(cnt, total, s);
+#pragma unroll
+      for (int j = 0; j < kTile; ++j) {
+        if (sel[j]) {
+          if (at < kTopK)
+            device::ptx::store_relaxed_sys(dst + at, pack_entry(bits[j], (l0 + j * kThreads + tid) * kNumRanks + p.rank, tag));
+          ++at;
+        }
+      }
+      written += total;
+      if (probe && written > kTopK) break;  // block-uniform: the select follows
+    }
+    return written;
+  };
+  int written = write_at_least(t_lo, true);
+  const bool select = written > kTopK;
   if (select) {
     const auto visit = [&](auto f) {
       for (int l = tid; l < n; l += kThreads) {
@@ -681,28 +722,7 @@ publish_local_topk(const PushedParams& p, int row, int64_t full_off, uint64_t ta
         f(k >= t_lo ? k : uint64_t{0});
       }
     };
-    t = select_kth_adaptive(visit, kTopK, s);
-  }
-  uint64_t* const dst = p.buffer + full_off;
-  int written = 0;
-  for (int l0 = 0; l0 < n; l0 += kThreads * kTile) {
-    int32_t bits[kTile];
-    bool sel[kTile];
-    int cnt = 0;
-#pragma unroll
-    for (int j = 0; j < kTile; ++j) {
-      const int l = l0 + j * kThreads + tid;
-      bits[j] = l < n ? __float_as_int(scores[l]) : 0;
-      sel[j] = l < n && make_topk_key(bits[j], l * kNumRanks + p.rank) >= t;
-      cnt += sel[j];
-    }
-    int total;
-    int at = written + block_exclusive_sum<kNumRanks>(cnt, total, s);
-#pragma unroll
-    for (int j = 0; j < kTile; ++j)
-      if (sel[j])
-        device::ptx::store_relaxed_sys(dst + at++, pack_entry(bits[j], (l0 + j * kThreads + tid) * kNumRanks + p.rank, tag));
-    written += total;
+    written = write_at_least(select_kth_adaptive(visit, kTopK, s), false);
   }
   for (int e = written + tid; e < kTopK; e += kThreads)
     device::ptx::store_relaxed_sys(dst + e, pack_entry(0, -1, tag));
