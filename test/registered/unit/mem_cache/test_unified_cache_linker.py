@@ -3743,6 +3743,33 @@ def test_pp_early_votes_never_publish_a_load_no_stage_submitted(pp0_voted_early)
     assert [w.finished for _, w in stages] == [[(handle, False)]] * 2
 
 
+def test_pp_deferred_actions_relay_loads_first():
+    """SGLANG_LINKER_PP_DEFER_ACTIONS: PP0 puts a round's loads ahead of its other
+    ops, so a stage applies them at ingest and defers the rest, in serial order."""
+    from sglang.srt.mem_cache.unified_cache.pp_linker_relay import split_after_loads
+
+    with envs.SGLANG_LINKER_PP_DEFER_ACTIONS.override(True):
+        stages = _relay_stages()
+    (pp0, w0), (pp1, w1) = stages
+    a, b = _Handle("a"), _Handle("b")
+    _queue_lookup(stages, a, [3])
+    _relay_round(stages)
+    for _, w in stages:
+        w.prefetches[a].future.set_result(True)
+    _queue_lookup(stages, b, [2])
+    for relay, _ in reversed(stages):
+        relay.poll()  # a finishes and b loads in one round
+    actions = pp0.take_actions().actions
+    assert [(op, serial) for _, serial, _, _, op, _ in actions] == [("load", 2), ("finish", 3)]
+    now, later = split_after_loads([SimpleNamespace(actions=actions)])
+    assert [x[2] for x in now] == [b] and [x[2] for x in later] == [a]
+    for relay, _ in stages:
+        relay.receive(now)
+        relay.receive(later)
+    assert [w.started[-1] for _, w in stages] == [(b, [2])] * 2
+    assert [w.finished for _, w in stages] == [[(a, True)]] * 2
+
+
 def _early_read_stages(size):
     """``size`` relay stages with real EarlyReads; staged and direct reads stay
     pending until the test completes them (``pending_early`` / ``pending_direct``).
