@@ -1138,6 +1138,13 @@ class Envs:
     # MXFP4 trtllm-gen MoE: deferred-finalize calls above 32 rows pass the finalized
     # output shape, so they hit FlashInfer's tuned tactics (off: only 97-384 rows do).
     SGLANG_OPT_MXFP4_DEFERRED_FINALIZED_SHAPE = EnvBool(False)
+    # MXFP4 trtllm-gen MoE: log the per-expert route counts of every Nth call with at
+    # least MIN_TOKENS rows (prefill chunks), one line per call; 0 off (moe/expert_count_log.py).
+    SGLANG_K31_MOE_EXPERT_COUNT_LOG_INTERVAL = EnvInt(0)
+    SGLANG_K31_MOE_EXPERT_COUNT_MIN_TOKENS = EnvInt(1024)
+    # MXFP4 trtllm-gen MoE (SM107, prefill servers): routed experts run as CuTe DSL grouped GEMMs (permute pass,
+    # FC1 with fused SiTU + MXFP8, FC2) instead of the trtllm-gen body; weights take that layout at load, EP 1 only.
+    SGLANG_K31_PREFILL_MOE_CUTE_FC1 = EnvBool(False)
     # Manual MoE input row limit (EPv1 and EPv2); 0 leaves it to SGLANG_MORI_RECV_BOUND.
     SGLANG_MORI_MOE_MAX_INPUT_TOKENS = EnvInt(0)
 
@@ -2328,6 +2335,16 @@ class Envs:
     SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD = EnvInt(2048)
     SGLANG_DSA_HIP_DISABLE_PRESHUFFLE = EnvBool(False)
     SGLANG_DSA_MQA_LOGITS_FREE_MEM_FRACTION = EnvFloat(0.2)
+    # Packed PAGED prefill top-k from a fused scorer that never writes the score
+    # matrix (kernels/ops/attention/dsa/fused_indexer_topk.py); its unsettled rows
+    # take the chunked path.
+    SGLANG_DSA_FUSED_INDEXER_TOPK = EnvBool(False)
+    # Log the fused path's row and fallback counters every N calls (0 = off).
+    SGLANG_DSA_FUSED_INDEXER_TOPK_LOG_INTERVAL = EnvInt(64)
+    # Debug: every N calls, compare 256 rows with the unfused path and log (0 = off).
+    SGLANG_DSA_FUSED_INDEXER_TOPK_CHECK_INTERVAL = EnvInt(0)
+    # Debug: log the GPU time of the prefill top-k (CUDA events) every N calls (0 = off).
+    SGLANG_DSA_INDEXER_TOPK_TIMING_INTERVAL = EnvInt(0)
     # Requires a DeepGEMM paged-MQA scheduler supporting batches > SM count
     # (0.2.3 does); set to 0 for an older DeepGEMM.
     SGLANG_DSA_FULL_BATCH_MQA = EnvBool(True)

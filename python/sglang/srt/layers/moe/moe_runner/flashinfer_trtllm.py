@@ -312,6 +312,8 @@ def select_trtllm_routed_body(
 ):
     from sglang.srt.layers.quantization.mxfp4 import Mxfp4MoEMethod
 
+    if envs.SGLANG_K31_PREFILL_MOE_CUTE_FC1.get():
+        return None  # no trtllm-gen body: the CuTe path routes at its own tile
     method = layer.quant_method
     if not (
         isinstance(method, Mxfp4MoEMethod)
@@ -1375,6 +1377,53 @@ class FlashInferTrtllmGenMxfp4MoeQuantInfo(MoeQuantInfo):
     hidden_size: int
     flashinfer_mxfp4_moe_precision: str
     routing_bias: Optional[torch.Tensor] = None
+    # SGLANG_K31_PREFILL_MOE_CUTE_FC1: weights in cute_prefill_moe's layout (the w13/w2 fields hold the same tensors)
+    cute_prefill_moe: Optional[Any] = None
+
+
+def _run_cute_prefill_moe(
+    *,
+    quant_info: FlashInferTrtllmGenMxfp4MoeQuantInfo,
+    topk_output,
+    prepared_packed_topk: Optional[torch.Tensor],
+    x_quant: torch.Tensor,
+    x_scale: torch.Tensor,
+    output: torch.Tensor,
+) -> StandardCombineInput:
+    from sglang.srt.layers.moe import route_quant_handoff
+    from sglang.srt.layers.moe.moe_runner.cute_prefill_moe import runner as cute_moe
+    from sglang.srt.layers.moe.token_dispatcher.standard import StandardCombineInput
+
+    if prepared_packed_topk is not None:
+        # The fused router's metadata is padded for a trtllm-gen tile; this path routes again at 128 rows.
+        route_quant_handoff.take_prepared_routing(prepared_packed_topk)
+        routing = prepared_packed_topk
+    else:
+        routing = _get_routing_for_flashinfer_routed(topk_output)
+    defer_finalize = _deferred_finalize_enabled.get()
+    result = cute_moe.run(
+        quant_info.cute_prefill_moe,
+        x_quant,
+        x_scale,
+        routing,
+        num_experts=quant_info.global_num_experts,
+        local_expert_offset=quant_info.local_expert_offset,
+        local_num_experts=quant_info.local_num_experts,
+        output=output,
+        defer_finalize=defer_finalize,
+        enable_pdl=trtllm_moe_enable_pdl(x_quant.shape[0]),
+    )
+    if defer_finalize:
+        gemm2_out, expert_weights, expanded_idx = result
+        return StandardCombineInput(
+            hidden_states=FlashInferTrtllmDeferredFinalizeOutput(
+                gemm2_out=gemm2_out,
+                expert_weights=expert_weights,
+                expanded_idx_to_permuted_idx=expanded_idx,
+                top_k=_routing_top_k(routing),
+            )
+        )
+    return StandardCombineInput(hidden_states=output)
 
 
 def _fused_experts_flashinfer_mxfp4_sm100_trtllm_gen(
@@ -1451,6 +1500,19 @@ def _fused_experts_flashinfer_mxfp4_sm100_trtllm_gen(
                 dtype=torch.bfloat16,
                 device=x_quant.device,
             )
+
+    if quant_info.cute_prefill_moe is not None:
+        assert is_standard and runner_config.activation == "situ", (
+            "SGLANG_K31_PREFILL_MOE_CUTE_FC1 covers the standard-topk SiTU path only"
+        )
+        return _run_cute_prefill_moe(
+            quant_info=quant_info,
+            topk_output=topk_output,
+            prepared_packed_topk=prepared_packed_topk,
+            x_quant=x_quant,
+            x_scale=x_scale,
+            output=symm_output,
+        )
 
     if runner_config.activation == "situ":
         from flashinfer import trtllm_fp4_block_scale_moe
