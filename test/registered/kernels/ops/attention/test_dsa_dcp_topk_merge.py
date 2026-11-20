@@ -121,6 +121,13 @@ def _rows(kind: str, seed: int) -> list[torch.Tensor]:
                 x[hot] = 10 + torch.rand(n_hot, generator=g)
             rows.append(x[shift:])
         return rows
+    if kind == "ties_long":
+        # local rows past 16384 (streaming path) whose 12-bit threshold bin holds the
+        # whole row: 100 exact levels, so the refinement and the stable tie order run
+        return [
+            10 + torch.randint(0, 100, (n,), generator=g).float() / 1024
+            for n in (131072, 100000)
+        ]
     if kind == "short":
         lengths = [1, 3, 7, 9, 300, 2047, 2048, 2049, 2055, 3000, 5000]
         return [torch.randn(n, generator=g) for n in lengths]
@@ -271,14 +278,19 @@ def test_dcp_topk_merge(kind: str) -> None:
         assert _all_ranks_ok(not bad), bad or "failed on another rank"
 
 
-_PUSH_MERGES: dict[int, DcpTopKMerge] = {}
+_PUSH_MERGES: dict[tuple[int, int], DcpTopKMerge] = {}
 
 
-def _push_merge(cand_k: int) -> DcpTopKMerge:
-    if cand_k not in _PUSH_MERGES:
-        with envs.SGLANG_DCP4_PUSH_CAND_K.override(cand_k):
-            _PUSH_MERGES[cand_k] = DcpTopKMerge(ps._WORLD, MAX_ROWS, TOPK, push=True)
-    return _PUSH_MERGES[cand_k]
+def _push_merge(cand_k: int, unroll: int = 0) -> DcpTopKMerge:
+    if (cand_k, unroll) not in _PUSH_MERGES:
+        with (
+            envs.SGLANG_DCP4_PUSH_CAND_K.override(cand_k),
+            envs.SGLANG_OPT_DSA_DCP_TOPK_CAND_UNROLL.override(unroll),
+        ):
+            _PUSH_MERGES[cand_k, unroll] = DcpTopKMerge(
+                ps._WORLD, MAX_ROWS, TOPK, push=True
+            )
+    return _PUSH_MERGES[cand_k, unroll]
 
 
 def _expected_failures(kind: str, cand_k: int) -> tuple[Optional[bool], Optional[int]]:
@@ -329,6 +341,29 @@ def test_dcp4_topk_merge_pushed(kind: str, cand_k: int) -> None:
         total = torch.tensor([int(merge.stats[1]) - published])
         dist.all_reduce(total)
         assert int(total) == n_fail * case.rows, (int(total), n_fail, case.rows)
+
+
+@pytest.mark.parametrize("unroll", [2, 4])
+@pytest.mark.parametrize("kind", ["random", "dense_top", "ties_long"])
+@torch.inference_mode()
+def test_dcp4_topk_merge_pushed_unroll(kind: str, unroll: int) -> None:
+    """SGLANG_OPT_DSA_DCP_TOPK_CAND_UNROLL: the push top-k's unrolled streaming passes
+    (local rows past 16384) give the same exact merge."""
+    _init_once()
+    world, rank = ps._WORLD.world_size, ps._WORLD.rank_in_group
+    if world != 4:
+        pytest.skip("the DCP4 push merge needs 4 ranks")
+    merge = _push_merge(768, unroll)
+    if merge.buffer is None:
+        pytest.skip("multimem multicast unavailable")
+    assert merge.cand_unroll == unroll
+    span = PAGE_SIZE * world
+    for seed in SEEDS:
+        case = _Case(kind, seed, rank, world, span)
+        case.run_pushed(merge, span)
+        torch.cuda.synchronize()
+        bad = case.pushed_failures(rank, world)
+        assert _all_ranks_ok(not bad), bad or "failed on another rank"
 
 
 @pytest.mark.parametrize("failing", ["stale1", "stale2"])
