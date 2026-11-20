@@ -436,6 +436,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         self.enable_external_cache_linker = False
         self.write_through_threshold = 256
         self.is_write_back = False
+        self.mamba_path_cap_counts_host = False
         self.has_swa_host_pool = False
         self.enable_session_radix_cache = params.enable_session_radix_cache
         self.eviction_strategy = get_eviction_strategy(
@@ -1999,6 +2000,30 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             )
         return result
 
+    def peek_host_eviction_candidates(
+        self, component_type: ComponentType, num_tokens: int
+    ) -> list[tuple[NodeId, int, Optional[list[str]]]]:
+        comp = self.components_by_type.get(component_type)
+        if comp is None or component_type != BASE_COMPONENT_TYPE:
+            return []
+        return comp.peek_host_eviction_candidates(num_tokens)
+
+    def peek_mamba_host_eviction_leaves(
+        self, max_states: int
+    ) -> list[tuple[NodeId, int, Optional[list[str]]]]:
+        if ComponentType.MAMBA not in self.components_by_type:
+            return []
+        host_lru = self.host_lru_lists[ComponentType.MAMBA]
+        out: list[tuple[NodeId, int, Optional[list[str]]]] = []
+        x = host_lru.get_lru_no_host_lock()
+        seen = 0
+        while x is not None and seen < max_states and host_lru.in_list(x):
+            seen += 1
+            if x in self.evictable_host_leaves:
+                out.append((x.id, len(x.key), x.hash_value))
+            x = host_lru.get_prev_no_host_lock(x)
+        return out
+
     def evict_excess_path_states(
         self,
         tail_node_id: NodeId,
@@ -2404,9 +2429,12 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             return False
         return True
 
-    def _is_host_leaf(self, node: UnifiedTreeNode) -> bool:
+    def _is_host_leaf(
+        self, node: UnifiedTreeNode, *, ignore_children: bool = False
+    ) -> bool:
         """H-leaf: evicted, Full host value present, no children, unlocked on
-        both tiers, not root.
+        both tiers, not root. ``ignore_children`` answers "would this be an
+        H-leaf once its children are gone" for eviction-order simulation.
 
         Only the Full (base) component host_value is required; auxiliary
         components are not mandatory for H-leaf membership. In-flight DMA
@@ -2421,7 +2449,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         # a live segment's anchor, and _evict_host_leaf would delete it.
         if any(cd.lock_ref > 0 for cd in node.component_data):
             return False
-        if len(node.children) > 0:
+        if not ignore_children and len(node.children) > 0:
             return False
         return True
 
@@ -2432,6 +2460,9 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
 
     def set_host_memory_buffer_only(self) -> None:
         self.is_host_memory_buffer_only = True
+
+    def set_mamba_path_cap_counts_host(self, enabled: bool) -> None:
+        self.mamba_path_cap_counts_host = enabled
 
     def insert_host(
         self,
@@ -2995,6 +3026,57 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                 actions.append(action)
             target = fragment
         self.set_component_device_value(target.id, component_type, values.clone())
+
+    def prepare_mamba_host_restore(
+        self, key: RadixKey, end_tokens: int
+    ) -> tuple[Optional[NodeId], list[CacheAction | ComponentAction]]:
+        """Locate/split a Full-covered checkpoint without changing KV ownership."""
+        actions = []
+        if (
+            ComponentType.MAMBA not in self.components_by_type
+            or end_tokens <= 0
+            or end_tokens > len(key)
+            or end_tokens % self.page_size
+        ):
+            return None, actions
+        node = self.root_node
+        offset = 0
+        while offset < end_tokens:
+            child = node.children.get(key.child_key_at(offset, self.page_size))
+            if child is None or (child.evicted and not child.backuped):
+                return None, actions
+            count = min(len(child.key), end_tokens - offset)
+            if child.key.match_at(key, offset, page_size=self.page_size) < count:
+                return None, actions
+            if count < len(child.key):
+                node, action = self._split_node(child.key, child, count)
+                if action is not None:
+                    actions.append(action)
+            else:
+                node = child
+            offset += count
+        return node.id, actions
+
+    def commit_mamba_host_restore(
+        self, node_id: NodeId, host_indices: torch.Tensor
+    ) -> bool:
+        """Take ownership of a fetched host state, preserving any device copy."""
+        node = self.node_by_id(node_id)
+        check = node
+        while check is not self.root_node:
+            if check.evicted and not check.backuped:
+                return False
+            check = check.parent
+        cd = node.component_data[ComponentType.MAMBA]
+        if cd.host_value is not None or host_indices.numel() != 1:
+            return False
+        cd.host_value = host_indices.clone()
+        if cd.value is None and cd.host_lock_ref == 0:
+            host_lru = self.host_lru_lists[ComponentType.MAMBA]
+            if not host_lru.in_list(node):
+                host_lru.insert_mru(node)
+        self._update_evictable_leaf_sets(node)
+        return True
 
     def set_component_device_value(
         self, node_id: NodeId, component_type: ComponentType, value: torch.Tensor
