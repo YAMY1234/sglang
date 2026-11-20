@@ -2306,6 +2306,28 @@ class Req(ReqDllmMixin):
         )
 
 
+_BRANCH_TRACK_COUNTS = {
+    "branch_tracked": 0,
+    "branch_tracked_last": 0,
+    "end_preferred": 0,
+}
+
+
+def _count_branch_track(branch_in_forward: bool, prefer_end: bool, last: bool) -> None:
+    """Counts forwards whose branching point competes with the tracked end; logs
+    every 1000 (branch tracked in the input's last forward = end state not cached)."""
+    if not branch_in_forward:
+        return
+    c = _BRANCH_TRACK_COUNTS
+    if prefer_end:
+        c["end_preferred"] += 1
+    else:
+        c["branch_tracked"] += 1
+        c["branch_tracked_last"] += last
+    if (c["branch_tracked"] + c["end_preferred"]) % 1000 == 0:
+        logger.info("Mamba branching track: %s", c)
+
+
 class _MambaRadixCacheV2TrackEntry(NamedTuple):
     track_mask: bool
     track_position: int
@@ -3228,17 +3250,29 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                         req.kv.mamba_next_track_idx
                     )
                 )
+            # SGLANG_MAMBA_BRANCH_TRACK_PREFER_END: in the forward that ends the input,
+            # keep the input-end state (what the next turn extends) over the branching point.
+            prefer_end = (
+                envs.SGLANG_MAMBA_BRANCH_TRACK_PREFER_END.get()
+                and seq_end >= len(req.origin_input_ids)
+            )
             if req.mamba_branching_seqlen is not None:
                 # track branching point in this forward if the branching point
                 # is within the current extend batch.
                 branching_seqlen_aligned_mask = (
                     req.mamba_branching_seqlen - req.prefix_len
                 ) % cache_chunk_size == 0
-                if (
+                branch_in_forward = (
                     req.mamba_branching_seqlen > req.prefix_len
                     and req.mamba_branching_seqlen < mamba_track_seqlen
                     and branching_seqlen_aligned_mask
-                ):
+                )
+                _count_branch_track(
+                    branch_in_forward,
+                    prefer_end,
+                    last=seq_end >= len(req.origin_input_ids),
+                )
+                if branch_in_forward and not prefer_end:
                     # We want to track mamba_track_seqlen_aligned, and it's not the last position,
                     # so we need to add 1 to the seqlen to retrieve the correct mamba state from h.
                     # See _force_track_h() for more details.

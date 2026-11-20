@@ -936,6 +936,13 @@ class Envs:
     # --mamba-max-states-per-path also counts host copies, and a capped state
     # loses its host copy too (HiCache); 0 (default) caps device states only.
     SGLANG_MAMBA_PATH_CAP_COUNTS_HOST = EnvBool(False)
+    # Mid-prefill chunk Mamba states donated to the radix tree: all (default),
+    # none, or last (only the chunk after which one chunk of input remains).
+    SGLANG_MAMBA_CHUNK_CKPT = EnvStr("all")
+    # When a branching point (KV hit past the deepest Mamba state) falls in the
+    # forward that ends the input, track the input end instead, so the request's
+    # own end state and tail KV reach the tree; off tracks the branching point.
+    SGLANG_MAMBA_BRANCH_TRACK_PREFER_END = EnvBool(False)
     # Scales the hierarchical Mamba host pool's share of --hicache-size (the KV
     # host pools take the rest); unset (default) splits it as the device pools are.
     SGLANG_HICACHE_MAMBA_HOST_SCALE = EnvFloat(None)
