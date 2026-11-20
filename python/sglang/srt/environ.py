@@ -1848,6 +1848,9 @@ class Envs:
     # On top of P1_HOIST: stage every phase-1 input in smem up front (cp.async /
     # 128-bit loads) and read q/k/decay as 128-bit vectors; bit-identical.
     SGLANG_OPT_KDA_MTP_VERIFY_ASYNC_P1 = EnvBool(False)
+    # KDA CuTe verify, persistent over (request, head) items: the next item's state
+    # and inputs are cp.async'd while the current item recurs; bit-identical.
+    SGLANG_OPT_KDA_MTP_VERIFY_PERSIST = EnvBool(False)
     SGLANG_ENABLE_LILICORR_SAMPLING = EnvBool(False)
     SGLANG_LILICORR_REQUIRE_SAMPLING = EnvBool(False)
     SGLANG_RAGGED_VERIFY_MODE = EnvStr("static")

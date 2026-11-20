@@ -1380,6 +1380,12 @@ def _launch_bounds(async_p1: bool, block_threads: int) -> dict:
     return dict(max_number_threads=(block_threads, 1, 1), min_blocks_per_mp=blocks)
 
 
+def _persist_enabled() -> bool:
+    from sglang.srt.environ import envs
+
+    return envs.SGLANG_OPT_KDA_MTP_VERIFY_PERSIST.get()
+
+
 def _async_p1_enabled() -> bool:
     from sglang.srt.environ import envs
 
@@ -1594,6 +1600,56 @@ def fused_kda_decode_mtp_dspark(
         if onorm_gate.dtype != torch.bfloat16 or onorm_weight.dtype != torch.float32:
             raise ValueError("expected output-norm gate=bf16 and weight=fp32")
     block_threads = _block_threads(H=H, N=N)
+    if (
+        cache_ring
+        and num_spec >= 1
+        and block_threads == BLOCK_THREADS_NARROW
+        and _persist_enabled()
+    ):
+        from sglang.kernels.ops.attention.kda_decode_mtp_v3 import run_persist
+
+        out = torch.empty_like(x_v)
+        run_persist(
+            (
+                recurrent_state,
+                x_q,
+                x_k,
+                x_v,
+                w_q,
+                w_k,
+                w_v,
+                cs_q,
+                cs_k,
+                cs_v,
+                A_log,
+                g,
+                dt_bias,
+                beta,
+                out,
+                intermediate_state_indices,
+                intermediate_conv_q,
+                intermediate_conv_k,
+                intermediate_conv_v,
+                ssm_state_indices,
+                cu_seqlens,
+                replayssm_rawv,
+                replayssm_rawk,
+                replayssm_g,
+                replayssm_beta,
+                onorm_gate if apply_onorm else x_v,
+                onorm_weight if apply_onorm else dt_bias,
+                prof_buf if prof_buf is not None else cu_seqlens,
+            ),
+            H=H,
+            N=N,
+            num_spec=num_spec,
+            scale=scale,
+            lower_bound=lower_bound,
+            apply_onorm=apply_onorm,
+            onorm_eps=onorm_eps,
+            prof=prof_buf is not None,
+        )
+        return out
     # The register-resident verify only (num_spec >= 1); see the kernel.
     async_p1 = num_spec >= 1 and _async_p1_enabled()
     import os
