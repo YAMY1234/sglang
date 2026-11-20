@@ -84,6 +84,7 @@ class PPBubbleDiag:
         self._pass_queue = 0
         self._pass_skips = 0
         self._pass_relay0 = (0, 0, 0)
+        self._kda_first_pending = False
         self._reset()
 
     def _reset(self) -> None:
@@ -140,6 +141,16 @@ class PPBubbleDiag:
 
     def span_in_phase(self, prefix: str) -> _Span:
         return _Span(self, f"wait.{prefix}.{self._phase}")
+
+    def begin_forward(self) -> None:
+        """The next KDA call is this forward's first; it may read cu_seqlens to host."""
+        self._kda_first_pending = True
+
+    def kda_span(self) -> _Span:
+        if self._kda_first_pending:
+            self._kda_first_pending = False
+            return _Span(self, "wait.kda_first")
+        return _Span(self, "wait.kda")
 
     # ---- admission passes ----
 
@@ -340,6 +351,11 @@ def wait(label: str):
 
 def wait_in_phase(prefix: str):
     return _NULL if _diag is None else _diag.span_in_phase(prefix)
+
+
+def kda_wait():
+    """Context for a KDA prefill kernel call (the first per forward is split out)."""
+    return _NULL if _diag is None else _diag.kda_span()
 
 
 def relay_wait():

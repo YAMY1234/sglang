@@ -5,6 +5,7 @@ import torch
 from sglang.srt.layers.attention.linear.kernels.kernel_backend import (
     LinearAttnKernelBase,
 )
+from sglang.srt.managers import pp_bubble_diag
 from sglang.srt.utils import is_cpu, is_hip, is_npu, is_xpu
 
 _is_hip = is_hip()
@@ -257,23 +258,24 @@ class TritonKDAKernel(LinearAttnKernelBase):
             )
             if out is not None:
                 return out
-        return chunk_kda(
-            q=q,
-            k=k,
-            v=v,
-            g=g,
-            beta=beta,
-            initial_state=ssm_states,
-            initial_state_indices=cache_indices,
-            use_qk_l2norm_in_kernel=True,
-            cu_seqlens=query_start_loc,
-            A_log=A_log,
-            dt_bias=dt_bias,
-            lower_bound=lower_bound,
-            beta_is_raw=beta_is_raw,
-            output_intermediate_states=return_intermediate_states,
-            track_state=kwargs.get("track_state"),
-            track_chunk_idx=kwargs.get("track_chunk_idx"),
-            chunk_indices=kwargs.get("chunk_indices"),
-            chunk_offsets=kwargs.get("chunk_offsets"),
-        )
+        with pp_bubble_diag.kda_wait():
+            return chunk_kda(
+                q=q,
+                k=k,
+                v=v,
+                g=g,
+                beta=beta,
+                initial_state=ssm_states,
+                initial_state_indices=cache_indices,
+                use_qk_l2norm_in_kernel=True,
+                cu_seqlens=query_start_loc,
+                A_log=A_log,
+                dt_bias=dt_bias,
+                lower_bound=lower_bound,
+                beta_is_raw=beta_is_raw,
+                output_intermediate_states=return_intermediate_states,
+                track_state=kwargs.get("track_state"),
+                track_chunk_idx=kwargs.get("track_chunk_idx"),
+                chunk_indices=kwargs.get("chunk_indices"),
+                chunk_offsets=kwargs.get("chunk_offsets"),
+            )
