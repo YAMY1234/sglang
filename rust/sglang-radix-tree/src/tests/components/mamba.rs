@@ -2234,6 +2234,58 @@ fn evict_excess_path_states_preserves_forks_locked_nodes_and_the_tail() {
     assert!(tc.arena.node(c).try_device_value(MAMBA).is_some());
 }
 
+fn freed_device_slots(tc: &mut UnifiedTreeCore<Vec<i64>>, tail: NodeIdx_) -> Vec<i64> {
+    let mut result = tc
+        .evict_excess_path_states(tc.arena.node(tail).id)
+        .expect("live test node");
+    let mut slots: Vec<i64> = result
+        .device_frees
+        .remove(&MAMBA)
+        .unwrap_or_default()
+        .iter()
+        .map(|t| t.int64_value(&[0]))
+        .collect();
+    slots.sort();
+    slots
+}
+
+#[test]
+fn evict_excess_path_states_count_evictable_only_spares_forks_and_locked_nodes() {
+    // States at depths 1..6, cap 3: depth 1 forks and depth 3 is locked. Counting
+    // them leaves the path's own states two slots; counting only evictable states
+    // (plus the tail) frees one, the first victim of the same shallow-first order.
+    for (evictable_only, expected) in [(false, vec![2, 4, 5]), (true, vec![2])] {
+        let mut tc = mamba_core_with_cap(3);
+        tc.set_mamba_path_cap_count_evictable_only(evictable_only);
+        let nodes = chain::<6>(&mut tc);
+        for (i, &node) in nodes.iter().enumerate() {
+            set_mamba_device(&mut tc, node, i as i64 + 1);
+        }
+        tc.arena
+            .alloc_child(
+                nodes[0],
+                /* key = */ vec![99],
+                /* priority = */ 0,
+                /* extra_key = */ None,
+            )
+            .unwrap();
+        tc.arena
+            .node_mut(nodes[2])
+            .set_lock_ref_(ValueSlotIdx::device(MAMBA), 1);
+        assert_eq!(freed_device_slots(&mut tc, nodes[5]), expected);
+    }
+    // Without forks or locks both rules free the same shallow states.
+    for evictable_only in [false, true] {
+        let mut tc = mamba_core_with_cap(2);
+        tc.set_mamba_path_cap_count_evictable_only(evictable_only);
+        let nodes = chain::<4>(&mut tc);
+        for (i, &node) in nodes.iter().enumerate() {
+            set_mamba_device(&mut tc, node, i as i64 + 1);
+        }
+        assert_eq!(freed_device_slots(&mut tc, nodes[3]), vec![1, 2]);
+    }
+}
+
 #[test]
 fn evict_excess_path_states_without_a_cap_is_a_no_op() {
     let mut tc = mamba_core(/* page_size = */ 1);

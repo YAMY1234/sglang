@@ -2168,6 +2168,10 @@ macro_rules! tree_core_methods {
                 py.detach(|| self.core().set_mamba_path_cap_counts_host(enabled));
             }
 
+            fn set_mamba_path_cap_count_evictable_only(&self, py: Python<'_>, enabled: bool) {
+                py.detach(|| self.core().set_mamba_path_cap_count_evictable_only(enabled));
+            }
+
             /// The current write-back (vs write-through) policy.
             fn is_write_back(&self, py: Python<'_>) -> bool {
                 self.core_attached(py).is_write_back()
@@ -3606,6 +3610,18 @@ macro_rules! tree_core_binding {
             fn set_mamba_path_cap_counts_host(&self, py: Python<'_>, enabled: bool) -> PyResult<()> {
                 catch_native_panic(|| {
                     self.inner.set_mamba_path_cap_counts_host(py, enabled);
+                    Ok(())
+                })
+            }
+
+            /// Make the per-path Mamba cap count only the states it may evict, plus the tail.
+            fn set_mamba_path_cap_count_evictable_only(
+                &self,
+                py: Python<'_>,
+                enabled: bool,
+            ) -> PyResult<()> {
+                catch_native_panic(|| {
+                    self.inner.set_mamba_path_cap_count_evictable_only(py, enabled);
                     Ok(())
                 })
             }
