@@ -42,7 +42,7 @@ def _simulated_bonus_row_partial_kernel(
 
 
 @triton.jit
-def _residual_lse_kernel(
+def _residual_lse_partial_kernel(
     logits_ptr,
     logits_stride,
     temperatures_ptr,
@@ -52,45 +52,59 @@ def _residual_lse_kernel(
     draft_stride0,
     draft_stride1,
     draft_temperatures_ptr,
-    lse_t_ptr,
-    lse_d_ptr,
+    part_ptr,
     vocab,
     width,
     ROWS: tl.constexpr,
+    NSPLIT: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
-    # Per request: logsumexp of the target row at correct_len (x / T) and of the
-    # draft step row that proposed the stop token (d / T_d).
+    # Per (request, vocab split): (max, sum exp(. - max)) of the target row at correct_len
+    # (x / T) and of the draft step row that proposed the stop token (d / T_d).
     req = tl.program_id(0)
+    split = tl.program_id(1)
     c = tl.load(correct_len_ptr + req * correct_len_stride)
     row = req * ROWS + c
     t = tl.maximum(tl.load(temperatures_ptr + req).to(tl.float32), 1e-5)
     td = tl.maximum(tl.load(draft_temperatures_ptr + req).to(tl.float32), 1e-5)
     dc = tl.minimum(c, ROWS - 2)
-    m_t = float("-inf")
-    s_t = 0.0
-    m_d = float("-inf")
-    s_d = 0.0
-    for start in range(0, vocab, BLOCK):
-        offs = start + tl.arange(0, BLOCK)
-        x = tl.load(
+    offs = split * BLOCK + tl.arange(0, BLOCK)
+    x = (
+        tl.load(
             logits_ptr + row.to(tl.int64) * logits_stride + offs,
             mask=offs < vocab,
             other=float("-inf"),
-        ).to(tl.float32) / t
-        nm = tl.maximum(m_t, tl.max(x, axis=0))
-        s_t = s_t * tl.exp(m_t - nm) + tl.sum(tl.exp(x - nm), axis=0)
-        m_t = nm
-        d = tl.load(
+        ).to(tl.float32)
+        / t
+    )
+    m_t = tl.max(x, axis=0)
+    s_t = tl.sum(tl.exp(x - m_t), axis=0)
+    d = (
+        tl.load(
             draft_ptr + req.to(tl.int64) * draft_stride0 + dc * draft_stride1 + offs,
             mask=offs < width,
             other=float("-inf"),
-        ).to(tl.float32) / td
-        nmd = tl.maximum(m_d, tl.max(d, axis=0))
-        s_d = s_d * tl.exp(m_d - nmd) + tl.sum(tl.exp(d - nmd), axis=0)
-        m_d = nmd
-    tl.store(lse_t_ptr + req, m_t + tl.log(s_t))
-    tl.store(lse_d_ptr + req, m_d + tl.log(s_d))
+        ).to(tl.float32)
+        / td
+    )
+    m_d = tl.max(d, axis=0)
+    s_d = tl.where(m_d > float("-inf"), tl.sum(tl.exp(d - m_d), axis=0), 0.0)
+    base = (req * NSPLIT + split) * 4
+    tl.store(part_ptr + base + 0, m_t)
+    tl.store(part_ptr + base + 1, s_t)
+    tl.store(part_ptr + base + 2, m_d)
+    tl.store(part_ptr + base + 3, s_d)
+
+
+@triton.jit
+def _combine_lse(part_ptr, req, which: tl.constexpr, NSPLIT: tl.constexpr):
+    k = tl.arange(0, NSPLIT)
+    base = (req * NSPLIT + k) * 4 + 2 * which
+    m = tl.load(part_ptr + base)
+    s = tl.load(part_ptr + base + 1)
+    top = tl.max(m, axis=0)
+    w = tl.where(m > float("-inf"), tl.exp(m - top), 0.0)
+    return top + tl.log(tl.sum(s * w, axis=0))
 
 
 @triton.jit
@@ -105,8 +119,7 @@ def _residual_bonus_row_partial_kernel(
     draft_stride0,
     draft_stride1,
     draft_temperatures_ptr,
-    lse_t_ptr,
-    lse_d_ptr,
+    lse_part_ptr,
     part_val_ptr,
     part_idx_ptr,
     vocab,
@@ -143,8 +156,8 @@ def _residual_bonus_row_partial_kernel(
         mask=offs < width,
         other=float("-inf"),
     ).to(tl.float32)
-    logp = x / ts - tl.load(lse_t_ptr + req)
-    logq = d / tl.maximum(td, 1e-5) - tl.load(lse_d_ptr + req)
+    logp = x / ts - _combine_lse(lse_part_ptr, req, 0, NSPLIT)
+    logq = d / tl.maximum(td, 1e-5) - _combine_lse(lse_part_ptr, req, 1, NSPLIT)
     r = tl.exp(logp) - tl.exp(logq)
     resid = tl.where(r > 0.0, tl.log(tl.maximum(r, 1e-38)) + g, logp + g - 1.0e4)
     v = tl.where(residual_row, resid, plain)
@@ -229,19 +242,30 @@ def simulated_bonus_partials_graph(
         # SGLANG_SIMULATE_ACC_RESIDUAL_BONUS: draft_logits [bs, gamma, width] (width <= vocab),
         # the draft step logits that proposed each verify row.
         assert draft_logits.stride(2) == 1 and draft_logits.shape[1] == rows_per_request - 1
-        lse_t = torch.empty((bs,), dtype=torch.float32, device=device)
-        lse_d = torch.empty((bs,), dtype=torch.float32, device=device)
+        lse_part = torch.empty((bs, nsplit, 4), dtype=torch.float32, device=device)
         width = min(int(draft_logits.shape[2]), vocab)
-        _residual_lse_kernel[(bs,)](
-            target_logits, target_logits.stride(0), temperatures, correct_len,
-            correct_len.stride(0), draft_logits, draft_logits.stride(0),
-            draft_logits.stride(1), draft_temperatures, lse_t, lse_d, vocab, width,
-            ROWS=rows_per_request, BLOCK=block, num_warps=8,
+        _residual_lse_partial_kernel[(bs, nsplit)](
+            target_logits,
+            target_logits.stride(0),
+            temperatures,
+            correct_len,
+            correct_len.stride(0),
+            draft_logits,
+            draft_logits.stride(0),
+            draft_logits.stride(1),
+            draft_temperatures,
+            lse_part,
+            vocab,
+            width,
+            ROWS=rows_per_request,
+            NSPLIT=nsplit,
+            BLOCK=block,
+            num_warps=8,
         )
         _residual_bonus_row_partial_kernel[(bs, nsplit)](
             target_logits, target_logits.stride(0), temperatures, correct_len,
             correct_len.stride(0), seed, draft_logits, draft_logits.stride(0),
-            draft_logits.stride(1), draft_temperatures, lse_t, lse_d, part_val,
+            draft_logits.stride(1), draft_temperatures, lse_part, part_val,
             part_idx, vocab, width, ROWS=rows_per_request, NSPLIT=nsplit,
             BLOCK=block, num_warps=8,
         )
