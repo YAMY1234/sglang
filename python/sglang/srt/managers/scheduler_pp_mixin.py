@@ -311,6 +311,7 @@ class SchedulerPPMixin:
         )
         windows = self.pp_send_windows
         digest_every = self._pp_state_digest_interval()
+        batch_log = pp_decouple.PPBatchLog() if digest_every else None
         epoch = 0
 
         diag = self.pp_bubble_diag
@@ -371,6 +372,8 @@ class SchedulerPPMixin:
                     batch = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(batch)
                 self.mbs[mb_id] = batch
                 self.running_mbs[mb_id] = self.running_batch
+                if batch_log is not None:
+                    batch_log.add(batch)
 
                 cur_batch: Optional[ScheduleBatch] = self.mbs[mb_id]
                 self.cur_batch_for_debug = cur_batch
@@ -479,7 +482,7 @@ class SchedulerPPMixin:
                 if digest_every:
                     epoch += 1
                     if epoch % digest_every == 0:
-                        self._pp_log_state_digest(epoch)
+                        self._pp_log_state_digest(epoch, batch_log)
 
             # When the server is idle, self-check and re-init some states
             if server_is_idle:
@@ -844,17 +847,34 @@ class SchedulerPPMixin:
             return 0
         return every
 
-    def _pp_log_state_digest(self: Scheduler, epoch: int) -> None:
+    def _pp_log_state_digest(
+        self: Scheduler, epoch: int, batch_log: pp_decouple.PPBatchLog
+    ) -> None:
         sizes, tensors = pp_decouple.collect_pp_state(
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
             req_to_token_pool=self.req_to_token_pool,
             tree_cache=self.tree_cache,
         )
+        live_reqs = [
+            req for batch in self.mbs if batch is not None for req in batch.reqs
+        ]
+        live_reqs += [req for batch in self.running_mbs for req in batch.reqs]
+        live_reqs += self.disagg_prefill_inflight_queue
+        if self.chunked_req is not None:
+            live_reqs.append(self.chunked_req)
+        parts = {
+            "batches": batch_log.hexdigest(),
+            "slots": pp_decouple.slot_map_digest(live_reqs),
+            # Free-page order and tree values: these differ across stages on the
+            # lockstep loop too once load is heavy, so they are informational.
+            "device": pp_decouple.pp_state_digest(sizes=sizes, tensors=tensors),
+        }
         record = pp_decouple.PPStateDigest(
             pp_rank=get_parallel().pp_rank,
             dp_rank=get_parallel().attn_dp_rank,
             epoch=epoch,
-            digest=pp_decouple.pp_state_digest(sizes=sizes, tensors=tensors),
+            digest=pp_decouple.combine_parts(parts, ("batches", "slots")),
+            parts=parts,
         )
         logger.info(pp_decouple.format_digest_line(record))
 

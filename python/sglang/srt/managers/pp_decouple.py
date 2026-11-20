@@ -2,8 +2,9 @@
 
 Send windows keep a bounded number of P2P send rounds un-waited, receive inboxes
 run the blocking host receives of a relay channel on a background thread, and the
-state digest lets a run check that every stage holds the same allocator and radix
-tree state at the same micro-batch epoch (SGLANG_DEBUG_PP_STATE_DIGEST_EVERY).
+state digest lets a run check that every stage built the same batches and holds
+the same request slots at the same micro-batch epoch
+(SGLANG_DEBUG_PP_STATE_DIGEST_EVERY).
 """
 
 from __future__ import annotations
@@ -143,7 +144,11 @@ class PPStateDigest(msgspec.Struct, frozen=True):
     # Attention DP ranks schedule independently; stages are compared per DP rank.
     dp_rank: int
     epoch: int
+    # Over the rank-invariant parts only; this is what stages are compared on.
     digest: str
+    # Every part's own digest, including informational ones that may legitimately
+    # differ across stages (device page order once HiCache write-back runs).
+    parts: Dict[str, str] = msgspec.field(default_factory=dict)
 
 
 class PPDigestReport(msgspec.Struct, frozen=True):
@@ -177,6 +182,47 @@ def collect_pp_state(
     return tuple(int(size) for size in sizes), tuple(tensors)
 
 
+class PPBatchLog:
+    """Rolling digest of the batches this stage built, in build order. Every stage
+    builds the same batches (rids, prefix and extend lengths) whatever its pace,
+    because the proxy tensors it receives are shaped by them."""
+
+    def __init__(self) -> None:
+        self._hasher = hashlib.blake2b(digest_size=8)
+
+    def add(self, batch: Any) -> None:
+        if batch is None:
+            self._hasher.update(b"-")
+            return
+        rows = [
+            [req.rid, int(prefix), int(extend)]
+            for req, prefix, extend in zip(
+                batch.reqs, batch.prefix_lens, batch.extend_lens
+            )
+        ]
+        self._hasher.update(json.dumps(rows).encode())
+
+    def hexdigest(self) -> str:
+        return self._hasher.hexdigest()
+
+
+def slot_map_digest(reqs: Iterable[Any]) -> str:
+    """Request -> request-pool slot over the live requests, in any collection order."""
+    slots = sorted(
+        {
+            (req.rid, int(req.req_pool_idx))
+            for req in reqs
+            if req.req_pool_idx is not None
+        }
+    )
+    return hashlib.blake2b(json.dumps(slots).encode(), digest_size=8).hexdigest()
+
+
+def combine_parts(parts: Dict[str, str], invariant: Sequence[str]) -> str:
+    joined = "|".join(f"{name}={parts[name]}" for name in invariant)
+    return hashlib.blake2b(joined.encode(), digest_size=8).hexdigest()
+
+
 def pp_state_digest(
     *, sizes: Sequence[int], tensors: Sequence[Optional[torch.Tensor]]
 ) -> str:
@@ -204,6 +250,24 @@ def parse_digest_lines(lines: Iterable[str]) -> List[PPStateDigest]:
         if sep:
             records.append(msgspec.json.decode(payload.strip(), type=PPStateDigest))
     return records
+
+
+def first_part_mismatches(
+    records: Iterable[PPStateDigest],
+) -> Dict[Tuple[str, int], int]:
+    """(part, dp_rank) -> first epoch where that part differs across stages."""
+    by_epoch: Dict[Tuple[int, int], List[PPStateDigest]] = defaultdict(list)
+    for record in records:
+        by_epoch[(record.epoch, record.dp_rank)].append(record)
+    first: Dict[Tuple[str, int], int] = {}
+    for (epoch, dp_rank), group in sorted(by_epoch.items()):
+        names = {name for record in group for name in record.parts}
+        for name in names:
+            if (name, dp_rank) not in first and (
+                len({record.parts.get(name) for record in group}) > 1
+            ):
+                first[(name, dp_rank)] = epoch
+    return first
 
 
 def find_digest_mismatches(

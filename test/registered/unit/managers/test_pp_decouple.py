@@ -12,6 +12,7 @@ import weakref
 from array import array
 from collections import deque
 from contextlib import nullcontext
+from types import SimpleNamespace
 
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
@@ -23,6 +24,7 @@ import torch  # noqa: E402
 from sglang.srt.managers import pp_decouple  # noqa: E402
 from sglang.srt.managers.pp_decouple import PPSendWindow, PPSendWindows  # noqa: E402
 from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin  # noqa: E402
+from sglang.srt.runtime_context import get_parallel  # noqa: E402
 from sglang.srt.mem_cache.allocator.token import TokenToKVPoolAllocator  # noqa: E402
 from sglang.srt.mem_cache.base_prefix_cache import (  # noqa: E402
     EvictParams,
@@ -265,6 +267,116 @@ class TestPPStateDigest(CustomTestCase):
         ]
         report = pp_decouple.find_digest_mismatches(records, pp_size=self.NUM_STAGES)
         self.assertEqual((report.mismatched, report.incomplete), ({}, [(8, 0)]))
+
+
+def _batch(*rows):
+    """rows: (rid, prefix_len, extend_len)."""
+    return SimpleNamespace(
+        reqs=[SimpleNamespace(rid=rid) for rid, _, _ in rows],
+        prefix_lens=[prefix for _, prefix, _ in rows],
+        extend_lens=[extend for _, _, extend in rows],
+    )
+
+
+def _record(rank, epoch, **parts):
+    return pp_decouple.PPStateDigest(
+        pp_rank=rank,
+        dp_rank=0,
+        epoch=epoch,
+        digest=pp_decouple.combine_parts(parts, ("batches", "slots")),
+        parts=parts,
+    )
+
+
+class TestPPRankInvariantDigest(CustomTestCase):
+    def test_batch_log_matches_only_for_the_same_batches_in_build_order(self):
+        logs = [pp_decouple.PPBatchLog() for _ in range(3)]
+        first, second = _batch(("r0", 0, 16), ("r1", 4096, 512)), _batch(("r2", 0, 8))
+        for log in logs[:2]:
+            for batch in (first, None, second):
+                log.add(batch)
+        # Same request, split at another prefix length.
+        for batch in (first, None, _batch(("r2", 4, 4))):
+            logs[2].add(batch)
+        self.assertEqual(logs[0].hexdigest(), logs[1].hexdigest())
+        self.assertNotEqual(logs[0].hexdigest(), logs[2].hexdigest())
+
+    def test_slot_map_ignores_collection_order_duplicates_and_slotless_requests(self):
+        reqs = [SimpleNamespace(rid=f"r{i}", req_pool_idx=i) for i in range(4)]
+        waiting = SimpleNamespace(rid="w", req_pool_idx=None)
+        self.assertEqual(
+            pp_decouple.slot_map_digest(reqs),
+            pp_decouple.slot_map_digest(reqs[::-1] + reqs[:2] + [waiting]),
+        )
+        swapped = [
+            SimpleNamespace(rid=r.rid, req_pool_idx=3 - i) for i, r in enumerate(reqs)
+        ]
+        self.assertNotEqual(
+            pp_decouple.slot_map_digest(reqs), pp_decouple.slot_map_digest(swapped)
+        )
+
+    def test_an_informational_part_does_not_make_stages_mismatch(self):
+        records = [
+            _record(
+                rank, epoch, batches="b", slots="s", device=f"d{rank * (epoch > 4)}"
+            )
+            for epoch in (4, 8)
+            for rank in range(4)
+        ] + [
+            _record(rank, 12, batches=f"b{rank == 3}", slots="s", device=f"d{rank}")
+            for rank in range(4)
+        ]
+        report = pp_decouple.find_digest_mismatches(records, pp_size=4)
+        self.assertEqual(set(report.mismatched), {(12, 0)})
+        self.assertEqual(
+            pp_decouple.first_part_mismatches(records),
+            {("device", 0): 8, ("batches", 0): 12},
+        )
+
+    def test_scheduler_logs_the_invariant_parts_of_its_live_requests(self):
+        stage = _StageModel()
+        stage.apply(("admit", "r0", [1, 2, 3, 4]))
+        running = SimpleNamespace(
+            rid="r1", req_pool_idx=stage.req_pool.alloc_rows(1)[0]
+        )
+        inflight = SimpleNamespace(
+            rid="r2", req_pool_idx=stage.req_pool.alloc_rows(1)[0]
+        )
+        scheduler = SimpleNamespace(
+            token_to_kv_pool_allocator=stage.allocator,
+            req_to_token_pool=stage.req_pool,
+            tree_cache=stage.cache,
+            mbs=[None, SimpleNamespace(reqs=[running])],
+            running_mbs=[SimpleNamespace(reqs=[running]), SimpleNamespace(reqs=[])],
+            disagg_prefill_inflight_queue=[inflight],
+            chunked_req=None,
+        )
+        batch_log = pp_decouple.PPBatchLog()
+        batch_log.add(_batch(("r1", 0, 4)))
+        with (
+            get_parallel().override(pp_rank=0, attn_dp_rank=0),
+            self.assertLogs(
+                "sglang.srt.managers.scheduler_pp_mixin", level="INFO"
+            ) as logs,
+        ):
+            SchedulerPPMixin._pp_log_state_digest(scheduler, 256, batch_log)
+        (record,) = pp_decouple.parse_digest_lines(logs.output)
+        self.assertEqual(
+            (record.epoch, sorted(record.parts)), (256, ["batches", "device", "slots"])
+        )
+        self.assertEqual(
+            record.parts["slots"], pp_decouple.slot_map_digest([running, inflight])
+        )
+        self.assertEqual(
+            record.digest, pp_decouple.combine_parts(record.parts, ("batches", "slots"))
+        )
+
+    def test_records_without_parts_still_parse(self):
+        line = pp_decouple.DIGEST_LOG_PREFIX + (
+            '{"pp_rank":1,"dp_rank":0,"epoch":256,"digest":"abc"}'
+        )
+        (record,) = pp_decouple.parse_digest_lines([line])
+        self.assertEqual((record.digest, record.parts), ("abc", {}))
 
 
 if __name__ == "__main__":
