@@ -731,6 +731,46 @@ class TestAllocationIntegration(CustomTestCase):
         long_.disagg_kv_sender.mark_prefill_complete.assert_not_called()
         self.assertTrue(long_.disagg_ready_checked)
 
+    def test_min_work_tokens_readies_at_bootstrap_even_while_batch_is_full(self):
+        # Readiness goes out as requests leave the bootstrap queue, not from batch
+        # scheduling, which returns early while the running batch is full.
+        short, long_ = (
+            SimpleNamespace(
+                rid=rid,
+                pending_bootstrap=True,
+                disagg_ready_checked=False,
+                origin_input_ids=[0] * 100,
+                num_matched_prefix_tokens=0,
+                disagg_kv_sender=Mock(),
+            )
+            for rid in ("short", "long")
+        )
+        scheduler = SimpleNamespace(
+            waiting_queue=[],
+            running_batch=SimpleNamespace(batch_is_full=True),
+            tree_cache=SimpleNamespace(supports_fast_match_prefix=lambda: True),
+            scheduler_stage_metrics=None,
+            pop_bootstrapped_and_resolve_parked_pp=Mock(return_value=[short, long_]),
+        )
+        for name in ("send_early_readiness_bootstrapped", "maybe_send_early_readiness"):
+            setattr(scheduler, name, MethodType(getattr(SchedulerDisaggregationPrefillMixin, name), scheduler))
+        matched = {"short": 64, "long": 36}
+
+        def match(req, tree_cache):
+            req.num_matched_prefix_tokens = matched[req.rid]
+
+        with envs.SGLANG_PREFILL_COMPLETE_MIN_WORK_TOKENS.override(64), patch(
+            "sglang.srt.disaggregation.prefill.match_kv_cache", side_effect=match
+        ), self.assertLogs("sglang.srt.disaggregation.prefill", level="INFO") as logs, patch(
+            "sglang.srt.disaggregation.prefill.time.monotonic", side_effect=[0.0, 1.0, 61.0, 61.0]
+        ):
+            SchedulerPPMixin.process_bootstrapped_queue(scheduler)
+        self.assertEqual(scheduler.waiting_queue, [short, long_])
+        short.disagg_kv_sender.mark_prefill_complete.assert_called_once()
+        long_.disagg_kv_sender.mark_prefill_complete.assert_not_called()
+        self.assertTrue(long_.disagg_ready_checked)
+        self.assertIn("early readiness (MIN_WORK_TOKENS 64): 1 of 2 requests", logs.output[0])
+
     def test_pp_poll_finalizes_waiting_requests_decode_reserved(self):
         # Early readiness lets decode reserve while the request waits; under PP the
         # waiting poll finalizes it before launch, as the non-PP waiting check does.
