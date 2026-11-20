@@ -20,6 +20,8 @@ from collections import defaultdict, deque
 from contextlib import nullcontext
 from typing import Optional
 
+import torch
+
 from sglang.srt.environ import envs
 
 logger = logging.getLogger(__name__)
@@ -307,6 +309,14 @@ class PPBubbleDiag:
             "bin_vote_calls": self.bin_vote_calls,
             "bin_ticket_ms": [r(x) for x in self.bin_ticket_ms],
         }
+        if torch.cuda.is_available():
+            # Allocator counters, no device sync; the peak is reset every interval.
+            gib = 1 << 30
+            stats["mem_gib"] = {
+                "max_alloc": r(torch.cuda.max_memory_allocated() / gib),
+                "alloc": r(torch.cuda.memory_allocated() / gib),
+                "reserved": r(torch.cuda.memory_reserved() / gib),
+            }
         return stats
 
     def maybe_log(self, now: Optional[float] = None) -> Optional[dict]:
@@ -320,6 +330,8 @@ class PPBubbleDiag:
             self._fwd_file.flush()
         self._logged_at = now
         self._reset()
+        if torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats()
         return stats
 
 

@@ -167,7 +167,7 @@ class TestForwardGaps(unittest.TestCase):
         self.assertEqual(s["full_load_cached"], 50000)
         rows = buf.getvalue().strip().splitlines()
         self.assertEqual(len(rows), 3)
-        self.assertEqual(rows[1].split(",")[1:], ["200.000", "30.000", "10.000", "16384", "50000", "1", "4"])
+        self.assertEqual(rows[1].split(",")[1:], ["200.000", "30.000", "10.000", "16384", "50000", "1", "4", "0.000"])
         self.assertEqual(rows[0].split(",")[2], "-1.000")
 
     def test_unfinished_forward_is_read_later(self):
