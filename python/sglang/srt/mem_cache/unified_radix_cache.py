@@ -233,6 +233,9 @@ class UnifiedRadixCache(BasePrefixCache):
     _l3_saved_token_threshold: bool = False
     _l3_lifetime_ledger: Optional[L3LifetimeLedger] = None
     _l3_tombstone_quarantined_ops: frozenset[int] = frozenset()
+    # SGLANG_HICACHE_L3_TOMBSTONE_ASYNC: storage op id -> pinned victim, in issue order.
+    _l3_tombstone_pending: Optional[dict[int, NodeId]] = None
+    _l3_tombstone_reserve: int = 0
     # Final stats at SIGTERM / exit under SGLANG_HICACHE_L3_WRITE_ON_HOST_EVICT.
     _l3_tier_final: Optional[WriteOnHostEvictFinalStats] = None
     # SGLANG_HICACHE_L3_ACK_LAG_STEPS on a PP>1 cache-mode PP0 (else 0); see
@@ -747,6 +750,13 @@ class UnifiedRadixCache(BasePrefixCache):
                 )
             # Fail at initialization with an extension missing the two-phase walk.
             self.tree_core.begin_mamba_host_eviction(0, min_depth=8192)
+            if envs.SGLANG_HICACHE_L3_TOMBSTONE_ASYNC.get():
+                self._l3_tombstone_pending = {}
+                self._l3_tombstone_reserve = max(0, envs.SGLANG_HICACHE_L3_TOMBSTONE_RESERVE.get())
+                logger.info(
+                    "HiCache L3 state tombstones written asynchronously (reserve %d host states).",
+                    self._l3_tombstone_reserve,
+                )
         self._l3_lifetime_ledger = None
         if self.pp_rank == 0 and envs.SGLANG_HICACHE_L3_LIFETIME_LEDGER.get():
             self._l3_lifetime_ledger = L3LifetimeLedger.from_env(
@@ -1947,6 +1957,8 @@ class UnifiedRadixCache(BasePrefixCache):
         it never waits on a scheduler-drained acknowledgment or enters a rank
         collective from this allocator-dependent path.
         """
+        if self._l3_tombstone_pending is not None:
+            return self._drive_mamba_host_eviction_async(num_states)
         evicted = 0
         while evicted < num_states:
             result = self.tree_core.begin_mamba_host_eviction(
@@ -1957,26 +1969,75 @@ class UnifiedRadixCache(BasePrefixCache):
             node_id = result.mamba_storage_backup_node_id
             if node_id is None:
                 break
-            # Advisory beliefs are not a transfer acknowledgment: force the
-            # backend to confirm the checkpoint, including after TTL eviction.
-            operation_id = self._write_backup_storage(
-                node_id, force=True, ledger_reason="state_tombstone"
-            )
-            if operation_id is None:
-                raise RuntimeError("Mamba tombstone victim has no writable host state")
+            operation_id = self._write_mamba_tombstone(node_id)
             t0 = time.perf_counter() if pmicro_hoststats.ON else 0.0
             self._wait_mamba_storage_backup(operation_id)
             if pmicro_hoststats.ON:
                 pmicro_hoststats.note_host_wait(time.perf_counter() - t0, True)
-            result = self.tree_core.finish_mamba_host_eviction(node_id)
-            self._apply_eviction_result(result)
-            freed = result.tracker.get(ComponentType.MAMBA, 0)
-            if freed == 0:
-                # No other scheduler mutation can run while we wait. A failed
-                # resume must not spin forever on the same allocator victim.
-                raise RuntimeError("Mamba tombstone victim changed while writing storage")
-            evicted += freed
+            evicted += self._finish_mamba_tombstone(node_id)
         return evicted
+
+    def _write_mamba_tombstone(self, node_id: NodeId) -> int:
+        # Advisory beliefs are not a transfer acknowledgment: force the
+        # backend to confirm the checkpoint, including after TTL eviction.
+        operation_id = self._write_backup_storage(
+            node_id, force=True, ledger_reason="state_tombstone"
+        )
+        if operation_id is None:
+            raise RuntimeError("Mamba tombstone victim has no writable host state")
+        return operation_id
+
+    def _finish_mamba_tombstone(self, node_id: NodeId, *, revived_ok: bool = False) -> int:
+        result = self.tree_core.finish_mamba_host_eviction(node_id)
+        self._apply_eviction_result(result)
+        freed = result.tracker.get(ComponentType.MAMBA, 0)
+        if freed == 0 and not revived_ok:
+            # No other scheduler mutation can run while we wait. A failed
+            # resume must not spin forever on the same allocator victim.
+            raise RuntimeError("Mamba tombstone victim changed while writing storage")
+        return freed
+
+    def _issue_mamba_tombstones(self, num_states: int) -> int:
+        """SGLANG_HICACHE_L3_TOMBSTONE_ASYNC: free plain victims now and start the
+        tombstone write of at most num_states pinned ones (the walk passes pinned
+        nodes); those slots free in _drain_backup. Returns the states freed now."""
+        evicted = issued = 0
+        while evicted + issued < num_states:
+            result = self.tree_core.begin_mamba_host_eviction(
+                num_states - evicted - issued, min_depth=8192
+            )
+            self._apply_eviction_result(result)
+            evicted += result.tracker.get(ComponentType.MAMBA, 0)
+            node_id = result.mamba_storage_backup_node_id
+            if node_id is None:
+                break
+            self._l3_tombstone_pending[self._write_mamba_tombstone(node_id)] = node_id
+            issued += 1
+        return evicted
+
+    def _drive_mamba_host_eviction_async(self, num_states: int) -> int:
+        evicted = self._issue_mamba_tombstones(num_states)
+        # The caller needs the slots now: finish the oldest writes synchronously,
+        # as the synchronous mode would have (the same step on every rank).
+        mamba_host_pool = self.host_pool_group.get_pool(PoolName.MAMBA)
+        while self._l3_tombstone_pending and mamba_host_pool.available_size() < num_states:
+            operation_id, node_id = next(iter(self._l3_tombstone_pending.items()))
+            del self._l3_tombstone_pending[operation_id]
+            self._wait_mamba_storage_backup(operation_id)
+            # Scheduling ran since the write: a hit may have revived the state.
+            evicted += self._finish_mamba_tombstone(node_id, revived_ok=True)
+        return evicted
+
+    def _refill_mamba_tombstone_reserve(self) -> None:
+        # After the synced drain, at the same point of every rank's step.
+        mamba_host_pool = self.host_pool_group.get_pool(PoolName.MAMBA)
+        deficit = (
+            self._l3_tombstone_reserve
+            - mamba_host_pool.available_size()
+            - len(self._l3_tombstone_pending)
+        )
+        if deficit > 0:
+            self._issue_mamba_tombstones(deficit)
 
     def _wait_mamba_storage_backup(self, operation_id: int) -> None:
         with pp_bubble_diag.wait("mamba_l3_backup"):
@@ -2010,6 +2071,22 @@ class UnifiedRadixCache(BasePrefixCache):
                 warn_at += 30.0
             time.sleep(0.0005)
 
+        self._check_mamba_tombstone_ack(operation, operation_id)
+        # This synchronous local write was issued after any enclosing drain's
+        # count snapshot. Remove only its own ACK, leaving that ordinary FIFO
+        # and count intact even if ranks wrote different numbers of tombstones.
+        # Do not seed rank-replicated write-behind beliefs from this local ACK.
+        with ack_queue.mutex:
+            ack_queue.queue.remove(operation)
+            ack_queue.not_full.notify()
+        if self._l3_ack_lag_steps:
+            self._l3_ack_removed += 1
+        node_id, lock_params = self.ongoing_backup.pop(operation_id)
+        self.dec_host_lock_ref(node_id, lock_params)
+
+    def _check_mamba_tombstone_ack(self, operation, operation_id: int) -> None:
+        """Keep a tombstone source pinned unless its KV and state reached storage."""
+        cc = self.cache_controller
         state_written = False
         succeeded = operation.completed_tokens >= len(operation.hash_value) * self.page_size
         for transfer in operation.pool_transfers or ():
@@ -2021,7 +2098,7 @@ class UnifiedRadixCache(BasePrefixCache):
             )
             succeeded = succeeded and expected > 0 and written >= expected
             state_written |= transfer.name == PoolName.MAMBA and expected > 0 and written >= expected
-        node_id, lock_params = self.ongoing_backup[operation_id]
+        node_id, _ = self.ongoing_backup[operation_id]
         if not succeeded or not state_written:
             operation.l3_tombstone_quarantined = True
             self._l3_tombstone_quarantined_ops |= {operation_id}
@@ -2037,17 +2114,6 @@ class UnifiedRadixCache(BasePrefixCache):
             # reading these slots. Retain ownership and stop the scheduler; a
             # later drain must not treat this receipt as permission to unlock.
             raise RuntimeError("Storage backup failed before Mamba host-state eviction")
-        # This synchronous local write was issued after any enclosing drain's
-        # count snapshot. Remove only its own ACK, leaving that ordinary FIFO
-        # and count intact even if ranks wrote different numbers of tombstones.
-        # Do not seed rank-replicated write-behind beliefs from this local ACK.
-        with ack_queue.mutex:
-            ack_queue.queue.remove(operation)
-            ack_queue.not_full.notify()
-        if self._l3_ack_lag_steps:
-            self._l3_ack_removed += 1
-        self.ongoing_backup.pop(operation_id)
-        self.dec_host_lock_ref(node_id, lock_params)
 
     # ---- Decode retraction ----
 
@@ -4662,6 +4728,19 @@ class UnifiedRadixCache(BasePrefixCache):
                         "Refusing to release a quarantined Mamba storage source"
                     )
                 drained += 1
+                tombstone = (
+                    self._l3_tombstone_pending.pop(operation.id, None)
+                    if self._l3_tombstone_pending
+                    else None
+                )
+                if tombstone is not None:
+                    # Every rank takes this ACK at the same step: unpin and free now.
+                    self._check_mamba_tombstone_ack(operation, operation.id)
+                    node_id, lock_params = self.ongoing_backup.pop(operation.id)
+                    self.dec_host_lock_ref(node_id, lock_params)
+                    # A hit since the write may have revived it: then it stays.
+                    self._finish_mamba_tombstone(tombstone, revived_ok=True)
+                    continue
                 if buffer_mode:
                     # Storage write acked: free the staging.
                     self.buffer_pipeline.finish_storage_write_ack(operation.id)
@@ -5519,6 +5598,8 @@ class UnifiedRadixCache(BasePrefixCache):
                 extra_release_counts=extra_release_counts,
                 log_metrics=True,
             )
+        if self._l3_tombstone_pending is not None:
+            self._refill_mamba_tombstone_reserve()
         if self._device_write_ahead:
             self._write_ahead_device_tail()
         if self._l3_write_on_host_evict:

@@ -180,6 +180,83 @@ class TestMambaTombstoneWrite(unittest.TestCase):
         self.assertEqual(cache.tree_core.begin_mamba_host_eviction.call_count, 1)
 
 
+def _async_fixture(*, available=lambda events: 8, **kwargs):
+    """SGLANG_HICACHE_L3_TOMBSTONE_ASYNC on top of _writer_fixture; the host Mamba
+    pool's free count is a function of the events so far."""
+    cache, op, events = _writer_fixture(**kwargs)
+    cache._l3_tombstone_pending = {}
+    cache._l3_tombstone_reserve = 0
+    cache._l3_ack_lag_steps = 0
+    cache.tree_core.begin_mamba_host_eviction = Mock(side_effect=[_step(pending=7), _step()])
+    pool = SimpleNamespace(available_size=lambda: available(events))
+    cache.host_pool_group = SimpleNamespace(get_pool=lambda name: pool)
+    cache.host_memory_mode = "cache"
+    cc = cache.cache_controller
+    cc.prefetch_hit_queue = Queue()
+    cc.ack_prefetch_queue = Queue()
+    cc.host_mem_release_queue = Queue()
+    return cache, op, events
+
+
+class TestMambaTombstoneAsyncWrite(unittest.TestCase):
+    def test_write_does_not_wait_and_the_synced_drain_frees_the_victim(self):
+        cache, operation, events = _async_fixture()
+        self.assertEqual(cache._drive_host_eviction(1, ComponentType.MAMBA), 0)
+        self.assertEqual(events, ["lock", "write"])
+        self.assertEqual(cache._l3_tombstone_pending, {11: 7})
+        cache.tree_core.finish_mamba_host_eviction.assert_not_called()
+        # The ACK stays in the FIFO for the rank-synced count.
+        self.assertEqual(cache.cache_controller.ack_backup_queue.qsize(), 1)
+        cache._drain_storage_control_queues_impl(0, 0, 1, 0, {}, False)
+        self.assertEqual(events, ["lock", "write", "unlock", "free"])
+        cache.tree_core.finish_mamba_host_eviction.assert_called_once_with(7)
+        self.assertEqual((cache._l3_tombstone_pending, cache.ongoing_backup), ({}, {}))
+        self.assertTrue(cache.cache_controller.ack_backup_queue.empty())
+
+    def test_a_caller_short_of_slots_finishes_the_oldest_write_as_before(self):
+        cache, _, events = _async_fixture(available=lambda events: events.count("free"))
+        self.assertEqual(cache._drive_host_eviction(1, ComponentType.MAMBA), 1)
+        self.assertEqual(events, ["lock", "write", "unlock", "free"])
+        self.assertEqual(cache._l3_tombstone_pending, {})
+        # Taken locally, as in synchronous mode: nothing left for the synced drain.
+        self.assertTrue(cache.cache_controller.ack_backup_queue.empty())
+
+    def test_a_failed_write_is_never_freed_by_the_drain(self):
+        cache, operation, events = _async_fixture(state_ok=False)
+        cache._drive_host_eviction(1, ComponentType.MAMBA)
+        with self.assertRaisesRegex(RuntimeError, "backup failed"):
+            cache._drain_storage_control_queues_impl(0, 0, 1, 0, {}, False)
+        self.assertEqual(events, ["lock", "write"])
+        self.assertTrue(operation.l3_tombstone_quarantined)
+        self.assertIn(operation.id, cache.ongoing_backup)
+        cache.tree_core.finish_mamba_host_eviction.assert_not_called()
+
+    def test_a_victim_revived_before_its_drain_is_kept(self):
+        cache, _, events = _async_fixture()
+        cache._drive_host_eviction(1, ComponentType.MAMBA)
+        # A prefix hit restored the state to the device: the walk no longer frees it.
+        cache.tree_core.finish_mamba_host_eviction.return_value = _step()
+        cache._drain_storage_control_queues_impl(0, 0, 1, 0, {}, False)
+        self.assertEqual(events, ["lock", "write", "unlock"])
+        self.assertEqual((cache._l3_tombstone_pending, cache.ongoing_backup), ({}, {}))
+
+    def test_reserve_refill_writes_only_the_deficit(self):
+        cache, _, events = _async_fixture(available=lambda events: 1)
+        cache._l3_tombstone_reserve = 4
+        cache._l3_tombstone_pending = {5: 3}
+        ids = iter([11, 12, 13])
+        cache.cache_controller.write_storage.side_effect = lambda *a, **k: (events.append("write"), next(ids))[1]
+        cache.tree_core.begin_mamba_host_eviction = Mock(
+            side_effect=[_step(pending=7), _step(pending=8), _step(pending=9)]
+        )
+        cache._refill_mamba_tombstone_reserve()
+        self.assertEqual(cache._l3_tombstone_pending, {5: 3, 11: 7, 12: 8})
+        self.assertEqual(
+            [c.args[0] for c in cache.tree_core.begin_mamba_host_eviction.call_args_list], [2, 1]
+        )
+        cache.tree_core.finish_mamba_host_eviction.assert_not_called()
+
+
 class TestSavedTokenThreshold(unittest.TestCase):
     def _cache(self, enabled=True):
         cache = UnifiedRadixCache.__new__(UnifiedRadixCache)

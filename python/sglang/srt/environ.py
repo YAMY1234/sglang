@@ -1066,6 +1066,11 @@ class Envs:
     SGLANG_HICACHE_L3_READ_PAST_TREE_KV = EnvBool(False)
     # Preserve actual host-state tombstones while FullHost survives (depth >= 8192).
     SGLANG_HICACHE_L3_WRITE_STATE_ON_TOMBSTONE = EnvBool(False)
+    # With it: write the tombstone without waiting; its host slot frees when the synced backup
+    # drain takes the ACK (same step on every rank). The reserve is refilled the same way
+    # each step so allocation rarely needs a slot early (then it waits as before).
+    SGLANG_HICACHE_L3_TOMBSTONE_ASYNC = EnvBool(False)
+    SGLANG_HICACHE_L3_TOMBSTONE_RESERVE = EnvInt(16)
     # Admit a real storage checkpoint by total prefill saved, including reusable tree KV.
     SGLANG_HICACHE_L3_SAVED_TOKEN_THRESHOLD = EnvBool(False)
     # Recover checkpoints inside the resident KV span, beyond the deepest live state.
