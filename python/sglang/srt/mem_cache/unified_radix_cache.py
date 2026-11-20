@@ -312,6 +312,7 @@ class UnifiedRadixCache(BasePrefixCache):
         # Components execute boundary actions through the tree core.
         for component in self.components.values():
             component.tree_core = self.tree_core
+        self._init_mamba_path_cap_anchor()
 
         if (
             page_interleave_shard_size(params.token_to_kv_pool_allocator) > 1
@@ -870,6 +871,29 @@ class UnifiedRadixCache(BasePrefixCache):
                 enable_storage_metrics=self._enable_metrics_flag,
                 extra_metric_labels=self.extra_metric_labels,
             )
+
+    def _init_mamba_path_cap_anchor(self) -> None:
+        """SGLANG_MAMBA_PATH_CAP_ANCHOR: --mamba-max-states-per-path keeps one
+        older state at or below half the path's depth. Off by default."""
+        if not envs.SGLANG_MAMBA_PATH_CAP_ANCHOR.get():
+            return
+        cap = (
+            self.components[ComponentType.MAMBA].mamba_max_states_per_path
+            if self.is_mamba_enabled
+            else -1
+        )
+        if cap < 2:
+            logger.info(
+                "SGLANG_MAMBA_PATH_CAP_ANCHOR ignored: it needs a Mamba tree with "
+                "--mamba-max-states-per-path >= 2"
+            )
+            return
+        self.tree_core.set_mamba_path_cap_anchor(True)
+        logger.info(
+            "Mamba path cap keeps a half-depth anchor state (cap %d, tree core %s)",
+            cap,
+            type(self.tree_core).__name__,
+        )
 
     def _init_mamba_path_cap_counts_host(self) -> None:
         """SGLANG_MAMBA_PATH_CAP_COUNTS_HOST: --mamba-max-states-per-path also

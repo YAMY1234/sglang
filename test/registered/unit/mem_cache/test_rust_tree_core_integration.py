@@ -4710,6 +4710,30 @@ def test_mamba_path_cap_evicts_excess_states_through_the_adapter():
     assert core.mamba_evictable_size() == 1
 
 
+def test_mamba_path_cap_anchor_keeps_a_half_depth_state_through_the_adapter():
+    from collections import defaultdict
+
+    from sglang.srt.mem_cache.unified_cache.cache_action import (
+        MambaEvictExcessPathStates,
+    )
+
+    core = _mamba_tree_core_with_cap(3)
+    core.set_mamba_path_cap_anchor(True)
+    for depth in range(1, 7):  # a state at each depth 1..6, slot = depth
+        ids = list(range(1, depth + 1))
+        result = _mamba_insert(core, ids, [10 + i for i in ids], depth)
+    (action,) = [
+        a for a in result.cache_actions if isinstance(a, MambaEvictExcessPathStates)
+    ]
+    device_frees = defaultdict(list)
+    core.evict_excess_path_states(
+        action.tail_node_id, device_frees, defaultdict(list), []
+    )
+    # Keeps the newest cap-1 (5, 6) and the anchor at half the tail's depth (3).
+    assert sorted(t.item() for t in device_frees[ComponentType.MAMBA]) == [1, 2, 4]
+    assert core.mamba_evictable_size() == 3
+
+
 def test_eagle_with_mamba_falls_back_to_the_unigram_binding():
     core = _mamba_tree_core(is_eagle=True)
     assert core.is_eagle is False

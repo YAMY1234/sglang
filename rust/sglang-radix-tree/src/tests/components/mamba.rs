@@ -2248,6 +2248,62 @@ fn evict_excess_path_states_without_a_cap_is_a_no_op() {
     assert!(tc.arena.node(a).try_device_value(MAMBA).is_some());
 }
 
+// A six-node single-atom chain (depths 1..6) with a device state at each of `depths`.
+fn anchored_path(cap: usize, depths: &[usize]) -> (UnifiedTreeCore<Vec<i64>>, [NodeIdx_; 6]) {
+    let mut tc = mamba_core_with_cap(cap);
+    tc.set_mamba_path_cap_anchor(true);
+    let nodes = chain::<6>(&mut tc);
+    for &d in depths {
+        set_mamba_device(&mut tc, nodes[d - 1], d as i64);
+    }
+    (tc, nodes)
+}
+
+fn freed_device_slots(tc: &mut UnifiedTreeCore<Vec<i64>>, tail: NodeIdx_) -> Vec<i64> {
+    let mut result = tc
+        .evict_excess_path_states(tc.arena.node(tail).id)
+        .expect("live test node");
+    let mut slots: Vec<i64> = result
+        .device_frees
+        .remove(&MAMBA)
+        .unwrap_or_default()
+        .iter()
+        .map(|t| t.int64_value(&[0]))
+        .collect();
+    slots.sort();
+    slots
+}
+
+#[test]
+fn evict_excess_path_states_anchor_keeps_the_deepest_state_at_half_depth() {
+    // Tail depth 6: keep the newest cap-1 (5, 6) and the anchor 3; the default keeps 4, 5, 6.
+    let (mut tc, nodes) = anchored_path(3, &[1, 2, 3, 4, 5, 6]);
+    assert_eq!(freed_device_slots(&mut tc, nodes[5]), vec![1, 2, 4]);
+    for d in [3, 5, 6] {
+        assert!(
+            tc.arena.node(nodes[d - 1]).has_device_value(MAMBA),
+            "depth {d}"
+        );
+    }
+}
+
+#[test]
+fn evict_excess_path_states_anchor_falls_back_to_the_default_without_a_shallow_state() {
+    // No state outside the newest cap-1 is at or below depth 3: same as the default.
+    let (mut tc, nodes) = anchored_path(2, &[4, 5, 6]);
+    assert_eq!(freed_device_slots(&mut tc, nodes[5]), vec![4]);
+    let (mut tc, nodes) = anchored_path(1, &[1, 2, 6]);
+    // cap 1 keeps only the tail: the anchor needs cap >= 2.
+    assert_eq!(freed_device_slots(&mut tc, nodes[5]), vec![1, 2]);
+}
+
+#[test]
+fn evict_excess_path_states_anchor_off_keeps_the_newest_cap() {
+    let (mut tc, nodes) = anchored_path(3, &[1, 2, 3, 4, 5, 6]);
+    tc.set_mamba_path_cap_anchor(false);
+    assert_eq!(freed_device_slots(&mut tc, nodes[5]), vec![1, 2, 3]);
+}
+
 // a: host-only state (in the host LRU), b: device + host copy, c: the device tail.
 fn capped_path_with_host_copies() -> (UnifiedTreeCore<Vec<i64>>, [NodeIdx_; 3]) {
     let mut tc = mamba_core_with_cap(1);

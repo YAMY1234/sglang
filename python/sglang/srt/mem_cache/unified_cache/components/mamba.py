@@ -281,6 +281,8 @@ class MambaComponent(TreeComponent):
         limit. Freed slots are collected into the caller's dicts. With
         ``mamba_path_cap_counts_host``, host copies count toward the cap too and
         a capped state loses its host copy unless it is locked or in flight.
+        With ``mamba_path_cap_anchor`` (cap >= 2), one older state at or below
+        half the tail's depth is kept in place of the oldest of the newest cap.
         """
         cap = self.mamba_max_states_per_path
         if cap < 0:
@@ -288,22 +290,40 @@ class MambaComponent(TreeComponent):
 
         ct = self.component_type
         count_host = self.tree_core.mamba_path_cap_counts_host
+        use_anchor = self.tree_core.mamba_path_cap_anchor and cap >= 2
         holders = []
+        below = []  # atoms from each holder's end down to the tail's end
+        walked = 0
         node = tail
         while node is not None and node is not self.tree_core.root_node:
             cd = node.component_data[ct]
             if cd.value is not None or (count_host and cd.host_value is not None):
                 holders.append(node)
+                below.append(walked)
+            if use_anchor:
+                walked += len(node.key)
             node = node.parent
 
         excess = len(holders) - cap
         if excess <= 0:
             return
+        anchor = None
+        if use_anchor:
+            anchor = next(
+                (
+                    holders[i]
+                    for i in range(cap - 1, len(holders))
+                    if 2 * (walked - below[i]) <= walked
+                ),
+                holders[cap - 1],
+            )
 
         tracker = {component: 0 for component in self.cache.tree_components}
         for node in reversed(holders):
             if excess <= 0 or node is tail:
                 break
+            if node is anchor:
+                continue
             if node.component_data[ct].lock_ref > 0 or len(node.children) != 1:
                 continue
             if node in self.tree_core.evictable_device_leaves:

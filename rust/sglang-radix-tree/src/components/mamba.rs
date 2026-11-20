@@ -198,6 +198,8 @@ impl<K: ChildKeyType> TreeComponent<K> for MambaComponent {
     /// and device leaves are preserved (a best-effort soft cap). With
     /// `mamba_path_cap_counts_host`, host copies count toward the cap too and
     /// a capped state loses its host copy unless that copy is locked or in flight.
+    /// With `mamba_path_cap_anchor` (cap >= 2), one older state at or below half
+    /// the tail's depth is kept in place of the oldest of the newest `cap` states.
     fn evict_excess_path_states(
         &self,
         tree_core: &mut UnifiedTreeCore<K>,
@@ -210,8 +212,11 @@ impl<K: ChildKeyType> TreeComponent<K> for MambaComponent {
             return;
         };
         let count_host = tree_core.mamba_path_cap_counts_host;
-        // Mamba-value holders on the root path, tail-first.
+        // Mamba-value holders on the root path, tail-first, with the atoms from
+        // each holder's end down to the tail's end.
         let mut holders: Vec<NodeIdx_> = Vec::new();
+        let mut below: Vec<usize> = Vec::new();
+        let mut walked = 0usize;
         let mut cursor = Some(tail_node_id);
         while let Some(node_id) = cursor {
             let node = tree_core.arena.node(node_id);
@@ -220,18 +225,30 @@ impl<K: ChildKeyType> TreeComponent<K> for MambaComponent {
             }
             if node.has_device_value(MAMBA) || (count_host && node.has_host_value(MAMBA)) {
                 holders.push(node_id);
+                below.push(walked);
             }
+            walked += node.key.atom_len();
             cursor = node.parent;
         }
         let mut excess = holders.len().saturating_sub(cap);
         if excess == 0 {
             return;
         }
+        // Anchor: the deepest holder outside the newest cap-1 whose depth is at
+        // most half the tail's; else the oldest of the newest cap (the default).
+        let anchor = (tree_core.mamba_path_cap_anchor && cap >= 2).then(|| {
+            (cap - 1..holders.len())
+                .find(|&i| 2 * (walked - below[i]) <= walked)
+                .map_or(holders[cap - 1], |i| holders[i])
+        });
         // Cache-level apply: the counts are not reported, only the frees.
         let mut tracker: HashMap<ComponentType, usize> = HashMap::new();
         for &node_id in holders.iter().rev() {
             if excess == 0 || node_id == tail_node_id {
                 break;
+            }
+            if anchor == Some(node_id) {
+                continue;
             }
             let node = tree_core.arena.node(node_id);
             if node.device_lock_ref(MAMBA) > 0 || node.children.len() != 1 {

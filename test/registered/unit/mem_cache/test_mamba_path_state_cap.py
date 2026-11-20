@@ -7,11 +7,13 @@ register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 register_cuda_ci(est_time=13, stage="base-b", runner_config="1-gpu-small")
 
 import unittest
+from array import array
 from collections import defaultdict
 from unittest import mock
 
 import torch
 
+from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache.cache_action import MambaEvictExcessPathStates
 from sglang.srt.mem_cache.unified_cache.components.base import (
     ComponentType,
@@ -35,6 +37,8 @@ class _FakeTreeCore:
     def __init__(self):
         self.root_node = UnifiedTreeNode(self.tree_components)
         self.evictable_device_leaves = set()
+        self.mamba_path_cap_counts_host = False
+        self.mamba_path_cap_anchor = False
         self.component_evictable_size_ = {ComponentType.MAMBA: 0}
         self.component_protected_size_ = {ComponentType.MAMBA: 0}
         self.lru_lists = {
@@ -83,6 +87,7 @@ def _build_unified_chain(cap, length=3):
     for index in range(length):
         node = UnifiedTreeNode(core.tree_components)
         node.parent = parent
+        node.key = RadixKey(array("q", [index]))
         node.component_data[ComponentType.FULL].value = torch.tensor([100 + index])
         node.component_data[ComponentType.MAMBA].value = torch.tensor([index])
         parent.children[index] = node
@@ -171,6 +176,38 @@ class TestMambaPathStateCap(unittest.TestCase):
         self.assertIsNone(mamba_data.value)
         self.assertIsNotNone(mamba_data.host_value)
         self.assertTrue(core.host_lru_lists[ComponentType.MAMBA].in_list(nodes[0]))
+
+    def _anchored_frees(self, cap, anchor):
+        # Six one-token nodes, a state at each depth 1..6 (slot = depth - 1).
+        component, nodes, core, cache = _build_unified_chain(cap=cap, length=6)
+        core.mamba_path_cap_anchor = anchor
+        device_frees = defaultdict(list)
+        component._evict_excess_path_states(
+            nodes[-1], device_frees, defaultdict(list), []
+        )
+        return sorted(v.item() for v in device_frees[ComponentType.MAMBA])
+
+    def test_unified_cache_anchor_keeps_the_deepest_state_at_half_depth(self):
+        # Tail depth 6: the newest cap-1 (depths 5, 6) plus the anchor at depth 3.
+        self.assertEqual(self._anchored_frees(cap=3, anchor=True), [0, 1, 3])
+        self.assertEqual(self._anchored_frees(cap=3, anchor=False), [0, 1, 2])
+
+    def test_unified_cache_anchor_needs_cap_two(self):
+        self.assertEqual(
+            self._anchored_frees(cap=1, anchor=True),
+            self._anchored_frees(cap=1, anchor=False),
+        )
+
+    def test_unified_cache_anchor_falls_back_without_a_shallow_state(self):
+        component, nodes, core, cache = _build_unified_chain(cap=2, length=6)
+        core.mamba_path_cap_anchor = True
+        for node in nodes[:3]:  # states only at depths 4, 5, 6
+            node.component_data[ComponentType.MAMBA].value = None
+        device_frees = defaultdict(list)
+        component._evict_excess_path_states(
+            nodes[-1], device_frees, defaultdict(list), []
+        )
+        self.assertEqual([v.item() for v in device_frees[ComponentType.MAMBA]], [3])
 
     def test_unified_cache_negative_one_disables_cap(self):
         component, nodes, core, cache = _build_unified_chain(cap=-1)

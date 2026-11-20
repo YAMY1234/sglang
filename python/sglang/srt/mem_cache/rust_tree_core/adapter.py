@@ -973,6 +973,17 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
             ) from None
         setter(enabled)
 
+    def set_mamba_path_cap_anchor(self, enabled: bool) -> None:
+        try:
+            setter = self._binding.set_mamba_path_cap_anchor
+        except AttributeError:
+            raise RuntimeError(
+                "SGLANG_MAMBA_PATH_CAP_ANCHOR needs a Rust TreeCore extension "
+                "that has set_mamba_path_cap_anchor; rebuild "
+                "rust/sglang-radix-tree or set SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND=python"
+            ) from None
+        setter(enabled)
+
     @property
     def is_host_memory_buffer_only(self) -> bool:
         return self._binding.is_host_memory_buffer_only()

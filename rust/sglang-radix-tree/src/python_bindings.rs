@@ -2157,6 +2157,10 @@ macro_rules! tree_core_methods {
                 py.detach(|| self.core().set_mamba_path_cap_counts_host(enabled));
             }
 
+            fn set_mamba_path_cap_anchor(&self, py: Python<'_>, enabled: bool) {
+                py.detach(|| self.core().set_mamba_path_cap_anchor(enabled));
+            }
+
             /// The current write-back (vs write-through) policy.
             fn is_write_back(&self, py: Python<'_>) -> bool {
                 self.core_attached(py).is_write_back()
@@ -3575,6 +3579,14 @@ macro_rules! tree_core_binding {
             fn set_mamba_path_cap_counts_host(&self, py: Python<'_>, enabled: bool) -> PyResult<()> {
                 catch_native_panic(|| {
                     self.inner.set_mamba_path_cap_counts_host(py, enabled);
+                    Ok(())
+                })
+            }
+
+            /// Make the per-path Mamba cap keep a half-depth anchor state; decided at HiCache init.
+            fn set_mamba_path_cap_anchor(&self, py: Python<'_>, enabled: bool) -> PyResult<()> {
+                catch_native_panic(|| {
+                    self.inner.set_mamba_path_cap_anchor(py, enabled);
                     Ok(())
                 })
             }

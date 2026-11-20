@@ -615,6 +615,13 @@ class UnifiedTreeCoreInterface(ABC):
             f"{type(self).__name__} does not implement SGLANG_MAMBA_PATH_CAP_COUNTS_HOST"
         )
 
+    def set_mamba_path_cap_anchor(self, enabled: bool) -> None:
+        """Make the per-path Mamba cap keep one older state at or below half
+        the tail's depth (cache init)."""
+        raise NotImplementedError(
+            f"{type(self).__name__} does not implement SGLANG_MAMBA_PATH_CAP_ANCHOR"
+        )
+
     @abstractmethod
     def insert_host(
         self,
