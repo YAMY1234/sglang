@@ -670,6 +670,9 @@ class Envs:
     # after its PDL wait, so the mega gate's prologue overlaps its tail (the gate waits before
     # reading). Scheduling only.
     SGLANG_OPT_MHC_POST_GATE_PDL_TRIGGER = EnvBool(False)
+    # The same trigger in the MXFP8-output variant, whose consumer is the wqkv_a GEMM: the PDL
+    # SM107 table kernel waits after its weight prefetch; stock FlashInfer launches without PDL.
+    SGLANG_OPT_MHC_POST_QUANT_PDL_TRIGGER = EnvBool(False)
     # Request-window commit of new SWA rows with a tile of rows per program instead of
     # one program per row. Same copies.
     SGLANG_OPT_DSV41_WINDOW_COMMIT_TILED = EnvBool(False)

@@ -21,14 +21,17 @@ SPLIT2_MAX_ROWS = 640
 
 
 @cache_once
-def _module(threads: int, split: int = 1, gate_trigger: bool = False):
-    # gate_trigger: SGLANG_OPT_MHC_POST_GATE_PDL_TRIGGER, the MegaMoE-input variant triggers the mega gate
-    trig = "true" if gate_trigger else "false"
+def _module(
+    threads: int, split: int = 1, gate_trigger: bool = False, quant_trigger: bool = False
+):
+    # SGLANG_OPT_MHC_POST_{GATE,QUANT}_PDL_TRIGGER: the MegaMoE-input / MXFP8 variant triggers its consumer
+    trig = f"{str(gate_trigger).lower()}, {str(quant_trigger).lower()}"
     return load_jit(
         "mhc_post_combine_norm_decode",
         str(threads),
         str(split),
         *(["gate_trigger"] if gate_trigger else []),
+        *(["quant_trigger"] if quant_trigger else []),
         cuda_files=["deepseek_v4/mhc_post_combine_norm_decode.cuh"],
         cuda_wrappers=[
             ("run", f"MhcPostCombineNormDecode<{threads}, {split}, {trig}>::run"),
@@ -98,7 +101,8 @@ def _mhc_post_combine_norm_decode(
     gate_trigger = (
         moe_x is not None and envs.SGLANG_OPT_MHC_POST_GATE_PDL_TRIGGER.get()
     )
-    _module(threads, split, gate_trigger).run(
+    quant_trigger = quant and envs.SGLANG_OPT_MHC_POST_QUANT_PDL_TRIGGER.get()
+    _module(threads, split, gate_trigger, quant_trigger).run(
         x,
         residual,
         post,

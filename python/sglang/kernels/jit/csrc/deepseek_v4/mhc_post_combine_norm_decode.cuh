@@ -59,7 +59,7 @@ struct MhcPostCombineNormDecodeParams {
   uint32_t moe_shared_block_m;
 };
 
-template <int Threads, int Split, bool Quant, bool MoeQuant = false, bool GateTrigger = false>
+template <int Threads, int Split, bool Quant, bool MoeQuant = false, bool Trigger = false>
 __global__ __launch_bounds__(Threads) void mhc_post_combine_norm_decode_kernel(
     const __grid_constant__ MhcPostCombineNormDecodeParams p) {
   using namespace device;
@@ -103,9 +103,9 @@ __global__ __launch_bounds__(Threads) void mhc_post_combine_norm_decode_kernel(
   __builtin_assume(__isGlobal(pre_ptr));
 
   PDLWaitPrimary<true>();
-  // The MegaMoE-input variant feeds the mega gate, which waits (griddepcontrol.wait) after
-  // its prologue; triggering here lets that prologue overlap this kernel's tail.
-  if constexpr (GateTrigger) PDLTriggerSecondary<true>();
+  // The MegaMoE-input variant feeds the mega gate and the MXFP8 variant the PDL wqkv_a GEMM;
+  // both wait (griddepcontrol.wait) after their prologue, which this trigger overlaps with our tail.
+  if constexpr (Trigger) PDLTriggerSecondary<true>();
   float comb[16], post[4], pre[4];
 #pragma unroll
   for (int i = 0; i < 16; ++i)
@@ -288,7 +288,7 @@ __global__ __launch_bounds__(Threads) void mhc_post_combine_norm_decode_kernel(
   }
 }
 
-template <int Threads, int Split, bool GateTrigger = false>
+template <int Threads, int Split, bool GateTrigger = false, bool QuantTrigger = false>
 struct MhcPostCombineNormDecode {
   static int64_t max_active_ctas(bool quant) {
     int ctas = 0;
@@ -383,7 +383,7 @@ struct MhcPostCombineNormDecode {
       return;
     }
     if (quant)
-      launch.launch(mhc_post_combine_norm_decode_kernel<Threads, Split, true>, params);
+      launch.launch(mhc_post_combine_norm_decode_kernel<Threads, Split, true, false, QuantTrigger>, params);
     else
       launch.launch(mhc_post_combine_norm_decode_kernel<Threads, Split, false>, params);
   }
