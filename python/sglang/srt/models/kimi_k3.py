@@ -2499,6 +2499,7 @@ class KimiK3DeltaAttention(nn.Module):
         self.attn.lower_bound = config.linear_attn_config.get("gate_lower_bound", None)
         # Set by _prepare_fused_decode() once weights are loaded.
         self._kda_fused_decode_ready = False
+        self._kda_onorm_fold_ready = False
         self._kda_hip_fused_decode_ready = False
         if _overlaps_sp_o_proj_rs(config, sp_moe):
             k3_sp_rs_overlap.wrap_o_proj(self.o_proj)
@@ -2717,6 +2718,14 @@ class KimiK3DeltaAttention(nn.Module):
                 f"A_log {None if layer.A_log is None else tuple(layer.A_log.shape)}, "
                 f"dt_bias {None if layer.dt_bias is None else tuple(layer.dt_bias.shape)})"
             )
+            if envs.SGLANG_K31_KDA_ONORM_FOLD_ANY_HEADS.get():
+                # The verify kernel's norm fold is per head (one block owns a head's 128 value rows).
+                layer._k3_onorm_fold_args = (
+                    self.o_norm.weight.data.float().contiguous(),
+                    float(self.o_norm.eps),
+                )
+                self._kda_onorm_fold_ready = True
+                rank0_log("K3 KDA onorm fold for target verify on (SGLANG_K31_KDA_ONORM_FOLD_ANY_HEADS)")
             return
         # Conv weights/bias stay fp32 (checkpoint dtype; the kernel loads
         # them as fp32, matching the triton chain's precision exactly).
@@ -2853,6 +2862,9 @@ class KimiK3DeltaAttention(nn.Module):
         fused_onorm = (self._kda_fused_decode_ready or defer_f_b) and (
             forward_batch.forward_mode.is_decode()
             or forward_batch.forward_mode.is_target_verify()
+        )
+        fused_onorm = fused_onorm or (
+            self._kda_onorm_fold_ready and forward_batch.forward_mode.is_target_verify()
         )
         if fused_onorm:
             self.attn._k3_onorm_gate = g_proj_states
