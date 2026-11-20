@@ -4,7 +4,6 @@ pages are byte-identical: attention CP (interleave PCP) and attention TP
 holds both kinds at once, so the choice is per pool: KV, indexer and an MLA
 draft are shared, while TP-sharded KDA state keeps its own rank namespace."""
 
-import queue
 import random
 import threading
 import unittest
