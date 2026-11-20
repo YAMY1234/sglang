@@ -660,8 +660,13 @@ class DraftBlockProposer:
             spec_algorithm=SpeculativeAlgorithm.DSPARK,
             spec_info=self._draft_block_spec_info,
             capture_hidden_mode=CaptureHiddenMode.NULL,
-            global_num_token_non_padded=_make_num_token_non_padded(
-                draft_num_tokens, device
+            # _fill_dp_moe_sync_metadata's kernel write sets it when it runs.
+            global_num_token_non_padded=(
+                None
+                if _kernel_writes_metadata(device)
+                and self._dp_moe_sync
+                and batch.global_num_tokens is not None
+                else _make_num_token_non_padded(draft_num_tokens, device)
             ),
             global_num_token_non_padded_cpu=draft_num_tokens,
         )
