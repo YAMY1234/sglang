@@ -2798,14 +2798,14 @@ def hc_mix_stats_sinkhorn_deepgemm(
 
 
 # Prefill (4096+ rows) variant of the compensated projection: the three bf16 weight parts are packed
-# K-major into one [3, K, 32] buffer so each tile load is a contiguous 64 B row, and the per-row
+# K-major into one [3, K, 32] buffer and both operands are loaded as TMA tiles, and the per-row
 # reduce/Sinkhorn runs BLOCK_M rows per program instead of one row per single-warp program.
 _HC_PACKED_COLS = 32
 _HC_PACKED_SLICES = 16
-_HC_PACKED_BLOCK_M = 128
+_HC_PACKED_BLOCK_M = 256
 _HC_PACKED_BLOCK_K = 64
-_HC_PACKED_NUM_WARPS = 4
-_HC_PACKED_NUM_STAGES = 4
+_HC_PACKED_NUM_WARPS = 8
+_HC_PACKED_NUM_STAGES = 3
 _HC_PACKED_REDUCE_BLOCK_M = 32
 
 
@@ -2823,8 +2823,8 @@ def pack_bf16_hc_weight(parts) -> torch.Tensor:
 
 @triton.jit
 def _hc_mix_stats_packed_kernel(
-    X,
-    W,
+    X_DESC,
+    W_DESC,
     MIX,
     SQ,
     M,
@@ -2834,26 +2834,26 @@ def _hc_mix_stats_packed_kernel(
     BLOCK_M: tl.constexpr,
     NUM_STAGES: tl.constexpr,
 ):
-    rows = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)
-    cols = tl.arange(0, 32)
-    kk = tl.program_id(1) * K_PER_SLICE + tl.arange(0, BLOCK_K)
-    xp = X + rows[:, None].to(tl.int64) * K + kk[None, :]
-    wp = W + kk[:, None] * 32 + cols[None, :]
-    rmask = rows[:, None] < M
+    # TMA tiles: x [BLOCK_M, BLOCK_K] (rows past M read as zero) and each weight
+    # part [BLOCK_K, 32] from the packed [3 * K, 32] view.
+    k0 = tl.program_id(1) * K_PER_SLICE
+    row0 = tl.program_id(0) * BLOCK_M
     hi = tl.zeros((BLOCK_M, 32), tl.float32)
     mid = tl.zeros((BLOCK_M, 32), tl.float32)
     lo = tl.zeros((BLOCK_M, 32), tl.float32)
     sq = tl.zeros((BLOCK_M,), tl.float32)
     for b in tl.range(0, K_PER_SLICE // BLOCK_K, num_stages=NUM_STAGES):
-        x = tl.load(xp + b * BLOCK_K, rmask, 0)
-        w = wp + b * BLOCK_K * 32
-        hi = tl.dot(x, tl.load(w), hi)
-        mid = tl.dot(x, tl.load(w + K * 32), mid)
-        lo = tl.dot(x, tl.load(w + 2 * K * 32), lo)
+        k = k0 + b * BLOCK_K
+        x = X_DESC.load([row0, k])
+        hi = tl.dot(x, W_DESC.load([k, 0]), hi)
+        mid = tl.dot(x, W_DESC.load([K + k, 0]), mid)
+        lo = tl.dot(x, W_DESC.load([2 * K + k, 0]), lo)
         xf = x.to(tl.float32)
         sq += tl.sum(xf * xf, 1)
+    rows = row0 + tl.arange(0, BLOCK_M)
+    cols = tl.arange(0, 32)
     offsets = (tl.program_id(1) * M + rows[:, None]) * 32 + cols[None, :]
-    tl.store(MIX + offsets, (hi + mid) + lo, rmask)
+    tl.store(MIX + offsets, (hi + mid) + lo, rows[:, None] < M)
     tl.store(SQ + tl.program_id(1) * M + rows, sq, rows < M)
 
 
@@ -2930,9 +2930,13 @@ def hc_mix_stats_sinkhorn_packed(
     comb = torch.empty((m, hc_mult, hc_mult), device=x.device, dtype=torch.float32)
     if m == 0:
         return pre, post, comb
+    from triton.tools.tensor_descriptor import TensorDescriptor
+
     _hc_mix_stats_packed_kernel[(triton.cdiv(m, _HC_PACKED_BLOCK_M), slices)](
-        x,
-        packed,
+        TensorDescriptor.from_tensor(x, [_HC_PACKED_BLOCK_M, _HC_PACKED_BLOCK_K]),
+        TensorDescriptor.from_tensor(
+            packed.view(3 * k, _HC_PACKED_COLS), [_HC_PACKED_BLOCK_K, _HC_PACKED_COLS]
+        ),
         part_mix,
         sq,
         m,
