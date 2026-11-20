@@ -323,6 +323,7 @@ def forward_mega_moe(
             moe, hidden_states, forward_batch, input_ids_global
         )
 
+    _dec_b136_dump_weights(moe)
     num_tokens = hidden_states.shape[0]
     fused_shared = moe.mega_shared_l1_weights is not None
     fork_mega_moe = (
@@ -1088,3 +1089,27 @@ def _transform_mega_moe_shared_sf(linear) -> torch.Tensor:
         num_groups=1,
         disable_ue8m0_cast=False,
     ).squeeze(0)
+
+
+def _dec_b136_dump_weights(moe) -> None:
+    """dec-b136 rig-only: save one routed layer's kernel-ready weights on EP rank 0, once, outside capture."""
+    spec = os.environ.get("SGLANG_DEC_B136_DUMP_MOE")  # DIR:LAYER
+    if not spec or getattr(moe, "_ab_dumped", False) or torch.cuda.is_current_stream_capturing():
+        return
+    from sglang.srt.runtime_context import get_parallel
+
+    d, l = spec.rsplit(":", 1)
+    moe._ab_dumped = True
+    if moe.layer_id != int(l) or get_parallel().moe_ep_group.device_group.rank() != 0:
+        return
+    cpu = lambda ts: tuple(t.detach().cpu() for t in ts)  # noqa: E731
+    out = {
+        "names": {n: p.detach().cpu() for n, p in moe.experts.named_parameters(recurse=False)},
+        "localized": getattr(moe.experts, "_mega_moe_weights_localized", False),
+        "l1": cpu(moe.experts.mega_l1_weights),
+        "l2": cpu(moe.experts.mega_l2_weights),
+    }
+    if moe.mega_shared_l1_weights is not None:
+        out["sl1"], out["sl2"] = cpu(moe.mega_shared_l1_weights), cpu(moe.mega_shared_l2_weights)
+    torch.save(out, f"{d}/sglang-layer{l}.pt")
+    logger.warning("dec-b136 dumped MegaMoE layer %s weights to %s", l, d)
