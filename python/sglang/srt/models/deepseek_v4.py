@@ -1181,6 +1181,13 @@ class _EngramPrefetch:
         engrams = [l.engram for l in layers if getattr(l, "engram", None) is not None]
         if not engrams or not all(e.can_prefetch() for e in engrams):
             return None
+        if not cls._streams:
+            logger.info(
+                "Engram prefetch on a side stream: mode %d, lookahead %d, %d rows",
+                mode,
+                envs.SGLANG_OPT_DSV41_ENGRAM_PREFETCH_LOOKAHEAD.get(),
+                hash_ids.shape[0],
+            )
         return cls(
             layers,
             hash_ids,
