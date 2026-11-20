@@ -881,16 +881,16 @@ __global__ __launch_bounds__(kSelectThreads) void fstk_select_kernel(const Selec
   if (s_bad) return;
   const uint32_t n = s_off[kNumMathWarps];
   uint64_t k_or = 0, k_and = ~0ull;
-#pragma unroll 1
-  for (uint32_t w = 0; w < kNumMathWarps; ++w) {
-    const uint64_t* src = p.cand_key + (static_cast<uint64_t>(row) * kNumMathWarps + w) * p.cand_sub_cap;
-    const uint32_t c = s_off[w + 1] - s_off[w];
-    for (uint32_t t = tx; t < c; t += kSelectThreads) {
-      const uint64_t k = src[t];
-      keys[s_off[w] + t] = k;
-      k_or |= k;
-      k_and &= k;
-    }
+  // One flat pass over all sub-lists, so every thread's loads are in flight together.
+  const uint64_t* row_keys = p.cand_key + static_cast<uint64_t>(row) * kNumMathWarps * p.cand_sub_cap;
+  for (uint32_t t = tx; t < n; t += kSelectThreads) {
+    uint32_t w = 0;
+#pragma unroll
+    for (uint32_t v = 1; v < kNumMathWarps; ++v) w += t >= s_off[v];
+    const uint64_t k = row_keys[w * p.cand_sub_cap + (t - s_off[w])];
+    keys[t] = k;
+    k_or |= k;
+    k_and &= k;
   }
   // Bits set in some key and clear in another: the radix steps start at the highest one.
 #pragma unroll
