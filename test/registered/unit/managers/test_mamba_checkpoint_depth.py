@@ -26,6 +26,8 @@ from sglang.srt.managers.schedule_policy import (
     mamba_prefill_chunk_grid,
 )
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.mem_cache.base_prefix_cache import MatchResult
+from sglang.srt.mem_cache.common import match_kv_cache
 from sglang.srt.runtime_context import get_context, mamba_track_grid
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import (
@@ -252,6 +254,63 @@ class TestBranchTrackSplit(unittest.TestCase):
             self.assertFalse(MambaComponent._skip_chunk_checkpoint(req, 20480))
             # a forward that tracked its own end is a chunk state: skipped
             self.assertTrue(MambaComponent._skip_chunk_checkpoint(req, 32768))
+
+
+class TestBranchTrackMinTokens(unittest.TestCase):
+    # SGLANG_MAMBA_BRANCH_TRACK_MIN_TOKENS: a branching point shallower than the
+    # threshold (the 64-token first page every prompt shares) gets no state; the
+    # shared system prompt (23808) and fork depths (12224..48640) keep theirs.
+    def _matched_branching(self, branching):
+        req = Req(
+            rid="req",
+            origin_input_text="",
+            origin_input_ids=array("q", [1] * 60000),
+            sampling_params=SamplingParams(max_new_tokens=1),
+            vocab_size=128,
+        )
+        tree_cache = SimpleNamespace(
+            swa_reprefill_tail_tokens=lambda req: 0,
+            match_prefix=lambda params: MatchResult(
+                device_prefix_len=0,
+                last_device_node=None,
+                last_host_node=None,
+                best_match_node=None,
+                mamba_branching_seqlen=branching,
+            ),
+        )
+        match_kv_cache(req, tree_cache, req.origin_input_ids)
+        return req.mamba_branching_seqlen
+
+    def test_default_keeps_every_branching_point(self):
+        for k in (64, 4032, 23808):
+            self.assertEqual(self._matched_branching(k), k)
+
+    def test_shallow_branching_points_are_dropped(self):
+        with envs.SGLANG_MAMBA_BRANCH_TRACK_MIN_TOKENS.override(4096):
+            for k in (64, 4032):
+                self.assertIsNone(self._matched_branching(k))
+            for k in (4096, 12224, 23808, 48640):
+                self.assertEqual(self._matched_branching(k), k)
+
+    def test_a_dropped_branching_point_gets_no_cut_and_no_tracked_state(self):
+        # The split, the tracker and the chunk skip all read the matched field.
+        with envs.SGLANG_MAMBA_BRANCH_TRACK_MIN_TOKENS.override(4096):
+            branching = self._matched_branching(64)
+        adder = object.__new__(PrefillAdder)
+        adder.page_size, adder.new_chunked_req = CHUNK, None
+        with (
+            envs.SGLANG_MAMBA_BRANCH_TRACK_SPLIT.override(True),
+            get_context().override_server_args(_mamba_cache_chunk_size=CHUNK),
+        ):
+            for k, cut in ((64, 64), (branching, None)):
+                req = SimpleNamespace(
+                    mamba_branching_seqlen=k, full_untruncated_fill_ids=[1] * 4000
+                )
+                self.assertEqual(adder._branch_split_len(req, 0, 4000, False), cut)
+        # an earlier forward tracks a kept branching point, else its own end
+        args = dict(tree_page=CHUNK, prefix_len=0, extend_len=4000, input_len=40000)
+        self.assertEqual(_track_seqlen(**args, branching=64), 64)
+        self.assertEqual(_track_seqlen(**args, branching=branching), 3968)
 
 
 class TestChunkedPrefillStaysOnTheChunkGrid(unittest.TestCase):
