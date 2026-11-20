@@ -385,7 +385,9 @@ def init(pp_rank: int, event_factory, chunk_budget: int) -> Optional[PPBubbleDia
         if fwd_dir and hz > 0 and str(pp_rank) in ranks:
             path = os.path.join(fwd_dir, f"stacks-pp{pp_rank}-{os.getpid()}.txt")
             _diag.stack_sampler = _StackSampler(_diag, threading.get_ident(), hz, path)
-            logger.info("PP stack sampler on, rank %d, %.1f Hz -> %s", pp_rank, hz, path)
+            logger.info(
+                "PP stack sampler on, rank %d, %.1f Hz -> %s", pp_rank, hz, path
+            )
     return _diag
 
 
