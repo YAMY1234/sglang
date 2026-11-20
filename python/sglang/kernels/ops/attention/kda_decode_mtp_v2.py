@@ -191,6 +191,38 @@ def _copy16_g2s_sync(smem_ptr, gmem_ptr):
     )
 
 
+def _clock():
+    i64 = ir.IntegerType.get_signless(64)
+    return cutlass.Int64(
+        llvm.inline_asm(
+            i64,
+            [],
+            "mov.u64 $0, %clock64;",
+            "=l",
+            has_side_effects=True,
+            is_align_stack=False,
+            asm_dialect=0,
+        )
+    )
+
+
+def _smid():
+    i32 = ir.IntegerType.get_signless(32)
+    return cutlass.Int64(
+        cutlass.Int32(
+            llvm.inline_asm(
+                i32,
+                [],
+                "mov.u32 $0, %smid;",
+                "=r",
+                has_side_effects=True,
+                is_align_stack=False,
+                asm_dialect=0,
+            )
+        )
+    )
+
+
 def _ld_in(async_p1, invariant, x, coord, s, scoord):
     """A phase-1 input element: from its smem stage (ASYNC_P1) or straight from global."""
     if async_p1:
@@ -240,6 +272,9 @@ def kda_decode_mtp_kernel(
     APPLY_ONORM: cutlass.Constexpr[bool],
     onorm_eps: cutlass.Constexpr[float],
     ASYNC_P1: cutlass.Constexpr[bool],
+    P2_VLDS: cutlass.Constexpr[bool],
+    prof: cute.Tensor,
+    PROF: cutlass.Constexpr[bool],
 ):
     """KDA MTP decode — SMEM pre-compute + register-resident state.
 
@@ -393,6 +428,16 @@ def kda_decode_mtp_kernel(
 
     # int64: `slot * stride` overflows int32 on envelope-strided pools.
     slot = cutlass.Int64(slot)
+    prof_row = (cutlass.Int64(i_n) * cute.arch.grid_dim()[0] + i_hv) * 8
+    if cutlass.const_expr(PROF):
+        if tidx == 0:
+            prof[prof_row + 0] = _clock()
+            prof[prof_row + 7] = _smid()
+    if cutlass.const_expr(ASYNC_P1):
+        # Batch metadata predates this layer's kernels; load it with the slot.
+        bos_pre = cu_seqlens[i_n]
+        eos_pre = cu_seqlens[i_n + 1]
+        scratch_pre = intermediate_state_indices[i_n]
 
     # q/k/g each run on P1_JOB_WARPS warps split by token parity and the v-conv
     # takes the rest. Each token's conv is an independent window over globals,
@@ -512,11 +557,21 @@ def kda_decode_mtp_kernel(
         )
 
     cute.arch.griddepcontrol_wait()
+    if cutlass.const_expr(PROF):
+        if tidx == 0:
+            prof[prof_row + 1] = _clock()
 
-    bos = cu_seqlens[i_n]
-    eos = cu_seqlens[i_n + 1]
+    if cutlass.const_expr(ASYNC_P1):
+        bos = bos_pre
+        eos = eos_pre
+    else:
+        bos = cu_seqlens[i_n]
+        eos = cu_seqlens[i_n + 1]
     n_tok = eos - bos
-    scratch_row = intermediate_state_indices[i_n]
+    if cutlass.const_expr(ASYNC_P1):
+        scratch_row = scratch_pre
+    else:
+        scratch_row = intermediate_state_indices[i_n]
     r_exp_A = cutlass.Float32(0.0)
 
     if cutlass.const_expr(ASYNC_P1):
@@ -563,6 +618,9 @@ def kda_decode_mtp_kernel(
         # The window / weight group (committed before the state's) has landed.
         cute.arch.cp_async_wait_group(STATE_STAGES)
         cute.arch.barrier()
+        if cutlass.const_expr(PROF):
+            if tidx == 0:
+                prof[prof_row + 2] = _clock()
         if warp_idx < P1_QKG_WARPS:
             if p1_job == 0:
                 for i in range(VEC_SIZE):
@@ -1010,6 +1068,9 @@ def kda_decode_mtp_kernel(
                 cute.arch.barrier()
             # Every global read this block makes has now landed in registers.
             cute.arch.griddepcontrol_launch_dependents()
+            if cutlass.const_expr(PROF):
+                if tidx == 0:
+                    prof[prof_row + 3] = _clock()
 
         for i_t in cutlass.range(T_LOOP):
             if cutlass.const_expr(STREAM_STATE):
@@ -1029,7 +1090,7 @@ def kda_decode_mtp_kernel(
                             r_decay[jv * 4 + c] = r_v4g[c]
             else:
                 r_beta_val = sBeta[i_t]
-                if cutlass.const_expr(ASYNC_P1):
+                if cutlass.const_expr(P2_VLDS):
                     # Lane-major sQ/sK/sG: a lane's P2_VEC channels are
                     # contiguous, so each loads as P2_VEC // 4 128-bit vectors
                     # straight into the operand registers (no staging).
@@ -1119,6 +1180,9 @@ def kda_decode_mtp_kernel(
                                 j * P2_LANES_K + k_grp,
                             ] = r_state[_st + j]
 
+    if cutlass.const_expr(PROF):
+        if tidx == 0:
+            prof[prof_row + 4] = _clock()
     if cutlass.const_expr(APPLY_ONORM):
         cute.arch.barrier()
         for i_t in cutlass.range(warp_idx, T_LOOP, NUM_WARPS):
@@ -1142,6 +1206,10 @@ def kda_decode_mtp_kernel(
                     o[0, bos + i_t, i_hv, v_idx] = cutlass.BFloat16(
                         raw_o * rms * weight * gate
                     )
+    if cutlass.const_expr(PROF):
+        cute.arch.barrier()
+        if tidx == 0:
+            prof[prof_row + 5] = _clock()
 
 
 @cute.jit
@@ -1174,6 +1242,7 @@ def _run_kda_decode_mtp_dspark(
     ring_beta: cute.Tensor,
     onorm_g: cute.Tensor,
     onorm_weight: cute.Tensor,
+    prof: cute.Tensor,
     scale: cutlass.Constexpr[float],
     H: cutlass.Constexpr[int],
     N: cutlass.Constexpr[int],
@@ -1184,6 +1253,8 @@ def _run_kda_decode_mtp_dspark(
     APPLY_ONORM: cutlass.Constexpr[bool],
     onorm_eps: cutlass.Constexpr[float],
     ASYNC_P1: cutlass.Constexpr[bool],
+    P2_VLDS: cutlass.Constexpr[bool],
+    PROF: cutlass.Constexpr[bool],
     stream: cuda.CUstream,
 ):
     """Launch the fixed Kimi-K3/DSpARK bonus + NUM_SPEC-draft specialization."""
@@ -1191,7 +1262,7 @@ def _run_kda_decode_mtp_dspark(
     p2_vec = TILE_K // p2_lanes
     # (token, lane row, vector, element within vector); see _qk_smem.
     qk_stride, qk_elems = _qk_smem(
-        block_threads=BLOCK_THREADS, num_spec=NUM_SPEC, async_p1=ASYNC_P1
+        block_threads=BLOCK_THREADS, num_spec=NUM_SPEC, async_p1=P2_VLDS
     )
     smem_qk_layout = cute.make_layout(
         (1 + NUM_SPEC, p2_lanes, p2_vec // 4, 4), stride=qk_stride
@@ -1288,6 +1359,9 @@ def _run_kda_decode_mtp_dspark(
         APPLY_ONORM,
         onorm_eps,
         ASYNC_P1,
+        P2_VLDS,
+        prof,
+        PROF,
     ).launch(
         grid=(H, N, 1),
         block=[BLOCK_THREADS, 1, 1],
@@ -1413,6 +1487,7 @@ def fused_kda_decode_mtp_dspark(
     onorm_gate=None,
     onorm_weight=None,
     onorm_eps=None,
+    prof_buf=None,
 ):
     """Run Kimi-K3 KDA verify while preserving DSpARK rollback semantics.
 
@@ -1521,6 +1596,10 @@ def fused_kda_decode_mtp_dspark(
     block_threads = _block_threads(H=H, N=N)
     # The register-resident verify only (num_spec >= 1); see the kernel.
     async_p1 = num_spec >= 1 and _async_p1_enabled()
+    import os
+
+    p2_vlds = async_p1 and os.environ.get("SGLANG_KDA_VERIFY_P2_VLDS", "0") == "1"
+    prof = prof_buf is not None
     out = torch.empty_like(x_v)
     args = (
         recurrent_state,
@@ -1552,6 +1631,7 @@ def fused_kda_decode_mtp_dspark(
         replayssm_beta if cache_ring else intermediate_conv_q[..., 0],
         onorm_gate if apply_onorm else x_v,
         onorm_weight if apply_onorm else dt_bias,
+        prof_buf if prof else cu_seqlens,
     )
     fits_32bit = tuple(_fits_32bit_stride(tensor) for tensor in args)
     key = (
@@ -1564,6 +1644,8 @@ def fused_kda_decode_mtp_dspark(
         apply_onorm,
         float(onorm_eps) if apply_onorm else 0.0,
         async_p1,
+        p2_vlds,
+        prof,
         float(scale),
         float(lower_bound),
         *(_tensor_layout_key(tensor, fits) for tensor, fits in zip(args, fits_32bit)),
@@ -1588,6 +1670,8 @@ def fused_kda_decode_mtp_dspark(
             APPLY_ONORM=apply_onorm,
             onorm_eps=float(onorm_eps) if apply_onorm else 0.0,
             ASYNC_P1=async_p1,
+            P2_VLDS=p2_vlds,
+            PROF=prof,
             stream=stream,
         )
         _DSPARK_COMPILED[key] = compiled
