@@ -754,6 +754,7 @@ class PrefillAdder:
         self.rem_input_tokens = rem_input_tokens - num_mixed_decode_tokens
         self.rem_chunk_tokens = rem_chunk_tokens
         self.context_cost_per_token = envs.SGLANG_PREFILL_CONTEXT_COST_PER_TOKEN.get()
+        self.context_cost_per_new_token = envs.SGLANG_PREFILL_CONTEXT_COST_PER_NEW_TOKEN.get()
         self.chunked_req_limit: Optional[int] = None
         # Shortest-prefill-first admits requests beside a truncated chunk, and
         # their KV stays locked until it is sent. Hold the chunk's uncomputed
@@ -1115,11 +1116,28 @@ class PrefillAdder:
             self.reprocessed_log_hit_tokens += prefix_len
             self.reprocessed_log_input_tokens += raw_extend_input_len
 
-    def _context_charge(self, prefix_len: int) -> int:
-        """Chunk-budget tokens a request's cached prefix costs (attention over it)."""
-        if not self.context_cost_per_token or self.rem_chunk_tokens is None:
+    def _context_cost_on(self) -> bool:
+        return self.rem_chunk_tokens is not None and bool(
+            self.context_cost_per_token or self.context_cost_per_new_token
+        )
+
+    def _context_charge(self, prefix_len: int, extend_len: int) -> int:
+        """Chunk-budget tokens beyond the extend that attention over the cached prefix costs."""
+        if not self._context_cost_on():
             return 0
-        return self.ceil_paged_tokens(int(prefix_len * self.context_cost_per_token))
+        return self.ceil_paged_tokens(
+            int(
+                prefix_len * self.context_cost_per_token
+                + prefix_len * extend_len * self.context_cost_per_new_token
+            )
+        )
+
+    def _context_chunk_limit(self, limit: int, prefix_len: int) -> int:
+        """New tokens of a request with this prefix that fit in `limit` budget units."""
+        if not self._context_cost_on():
+            return limit
+        fixed = self.ceil_paged_tokens(int(prefix_len * self.context_cost_per_token))
+        return int((limit - fixed) / (1 + prefix_len * self.context_cost_per_new_token))
 
     def _replay_len(self, req: Req, prefix_len: int) -> int:
         if (
@@ -1309,18 +1327,18 @@ class PrefillAdder:
 
     def add_chunked_req(self, req: Req):
         context_charge = 0
+        charged = False
         if self.dllm_config is not None:
             _rem_tokens = self._get_dllm_remain_tokens(req)
         else:
             # A continuation opens its batch; never let the charge block its progress.
-            context_charge = self._context_charge(req.prefix_len)
-            if context_charge and context_charge >= self.rem_chunk_tokens:
-                context_charge = 0
-            _rem_tokens = self.memory_budget.available_chunk_tokens(
-                self.rem_chunk_tokens - context_charge
-                if context_charge
-                else self.rem_chunk_tokens
-            )
+            charged = self._context_cost_on()
+            limit = self.rem_chunk_tokens
+            if charged:
+                limit = self._context_chunk_limit(limit, req.prefix_len)
+                if limit < self.page_size:
+                    limit, charged = self.rem_chunk_tokens, False
+            _rem_tokens = self.memory_budget.available_chunk_tokens(limit)
             if _rem_tokens is None:
                 self._reserve_chunked_tail(req, req.prefix_len)
                 return req
@@ -1397,6 +1415,8 @@ class PrefillAdder:
             raise RuntimeError("chunked request exceeds the sharded assembly scratch")
         req.extend_end = req.prefix_len + new_len
         self.can_run_list.append(req)
+        if charged:
+            context_charge = self._context_charge(req.prefix_len, new_len)
         self._update_prefill_budget(
             0,
             req.extend_len,
@@ -1810,8 +1830,8 @@ class PrefillAdder:
             chunk_limit -= replay_len
             if chunk_limit <= 0:
                 return AddReqResult.OTHER
-        if chunk_limit is not None and (charge := self._context_charge(prefix_len)):
-            chunk_limit -= charge
+        if chunk_limit is not None and self._context_cost_on():
+            chunk_limit = self._context_chunk_limit(chunk_limit, prefix_len)
             if chunk_limit <= 0:
                 return AddReqResult.OTHER
         can_admit, chunk_tokens_limit = self._check_prefill_budget(
@@ -1901,7 +1921,9 @@ class PrefillAdder:
                 req, extend_input_len=admission.extend_len
             ),
             replay_len=admission.replay_len,
-            context_charge=self._context_charge(admission.prefix_len),
+            context_charge=self._context_charge(
+                admission.prefix_len, admission.extend_len
+            ),
         )
         if admission.is_chunked:
             self._reserve_chunked_tail(req, req.extend_end)

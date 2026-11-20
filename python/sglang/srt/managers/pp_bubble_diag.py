@@ -32,7 +32,7 @@ TICKET_CALLER = "_check_pp_prefetch_progress"
 _MAX_PENDING_FORWARDS = 256
 # A forward counts as full when it carries this share of the chunk budget.
 _FULL_SHARE = 0.95
-FWD_CSV_HEADER = "wall_s,fwd_ms,gap_cpu_ms,gap_dep_ms,new_tokens,cached_tokens,has_load,queue_len\n"
+FWD_CSV_HEADER = "wall_s,fwd_ms,gap_cpu_ms,gap_dep_ms,new_tokens,cached_tokens,has_load,queue_len,new_x_prefix_m\n"
 _NULL = nullcontext()
 
 
@@ -203,7 +203,14 @@ class PPBubbleDiag:
         return event
 
     def on_forward(
-        self, pre, start, end, new_tokens: int, cached_tokens: int, has_load: bool
+        self,
+        pre,
+        start,
+        end,
+        new_tokens: int,
+        cached_tokens: int,
+        has_load: bool,
+        new_x_prefix: int = 0,
     ) -> None:
         """pre: before the forward's stream waits; start: after them; end: after
         the forward. Gaps are read only once the later event has completed."""
@@ -220,6 +227,7 @@ class PPBubbleDiag:
                 cached_tokens,
                 has_load,
                 time.time(),
+                new_x_prefix,
             )
         )
         self._prev_end = end
@@ -227,7 +235,7 @@ class PPBubbleDiag:
 
     def _drain_events(self) -> None:
         while self._pending and self._pending[0][3].query():
-            prev_end, pre, start, end, q, new, cached, has_load, wall = (
+            prev_end, pre, start, end, q, new, cached, has_load, wall, nxp = (
                 self._pending.popleft()
             )
             fwd = start.elapsed_time(end)
@@ -256,7 +264,7 @@ class PPBubbleDiag:
             if self._fwd_file is not None:
                 self._fwd_file.write(
                     f"{wall:.3f},{fwd:.3f},{cpu:.3f},{dep:.3f},{new},{cached},"
-                    f"{int(has_load)},{q}\n"
+                    f"{int(has_load)},{q},{nxp / 1e6:.3f}\n"
                 )
 
     # ---- interval log ----

@@ -1943,6 +1943,12 @@ class SchedulerPPMixin:
                         new_tokens=cur_batch.extend_num_tokens or 0,
                         cached_tokens=sum(cur_batch.prefix_lens or ()),
                         has_load=cur_batch.hicache_consumer_index >= 0,
+                        new_x_prefix=sum(
+                            e * p
+                            for e, p in zip(
+                                cur_batch.extend_lens or (), cur_batch.prefix_lens or ()
+                            )
+                        ),
                     )
                 if self.pp_group.is_last_rank:
                     tensor_dict = self._pp_prepare_tensor_dict(result, cur_batch)
