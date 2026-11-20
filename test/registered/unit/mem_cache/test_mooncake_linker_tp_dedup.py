@@ -710,7 +710,7 @@ class TestOffloadAccounting(CustomTestCase):
         linker.object_bytes = {PoolName.KV: 100, PoolName.MAMBA: 5000}
         linker.write_bytes, linker.lookup_counts = Counter(), Counter()
         linker.stats, linker.stats_logged_at = {"offload": 0}, 0.0
-        linker.offload_queue, linker.offload_results = queue.Queue(), queue.Queue()
+        linker._init_offload_queue()
         expanded = [
             PoolTransfer(name=PoolName.KV, keys=["p1", "p2", "p3"]),
             PoolTransfer(name=PoolName.MAMBA, keys=["p3"]),

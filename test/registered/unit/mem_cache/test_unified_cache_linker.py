@@ -1,5 +1,4 @@
 from collections import deque
-import queue
 import sys
 from concurrent.futures import Future
 from typing import NamedTuple
@@ -3114,8 +3113,7 @@ class TestOffloadReadyEvents(CustomTestCase):
         order.storage.last_put_objects = {}
         order.storage.last_exist_skipped = 0
         linker.stats = {"offload": 1}
-        linker.offload_results = queue.Queue()
-        linker.offload_queue = queue.Queue()
+        linker._init_offload_queue()
         linker.object_bytes, linker.write_bytes = {PoolName.KV: 1}, Counter()
         linker.stats_logged_at = time.monotonic()
         transfer = PoolTransfer(name=PoolName.KV, keys=[])
@@ -3136,6 +3134,65 @@ class TestOffloadReadyEvents(CustomTestCase):
             ],
         )
         self.assertTrue(linker.offload_results.get_nowait())
+
+    def _threaded_linker(self, delays, log):
+        """Two offload threads over a store whose put of key k sleeps delays[k]."""
+        linker = MooncakeDirectLinker.__new__(MooncakeDirectLinker)
+
+        def batch_set_v2(transfers, extra_info):
+            key = transfers[0].keys[0]
+            log.append(("put", key))
+            time.sleep(delays[key])
+            log.append(("landed", key))
+            return {t.name: [key != "bad"] * len(t.keys) for t in transfers}
+
+        def remove(key):
+            log.append(("remove", key))
+            return 0
+
+        linker.storage = SimpleNamespace(
+            batch_set_v2=batch_set_v2, last_put_objects={}, last_exist_skipped=0,
+            store=SimpleNamespace(remove=remove),
+        )
+        linker.stats, linker.stats_logged_at = {"offload": 1}, time.monotonic()
+        linker.object_bytes, linker.write_bytes = {PoolName.KV: 1}, Counter()
+        linker.store_tree = SimpleNamespace(is_recalled=lambda page, decided: False)
+        linker.page_remove_retries, linker.page_remove_counts = deque(), Counter()
+        linker._init_offload_queue()
+        return linker
+
+    def _run_threads(self, linker, tasks, threads=2):
+        for task in tasks:
+            linker.offload_queue.put(task)
+        for _ in range(threads):
+            linker.offload_queue.put(None)
+        workers = [threading.Thread(target=linker.offload_thread_func) for _ in range(threads)]
+        for w in workers:
+            w.start()
+        for w in workers:
+            w.join(timeout=10)
+        return [linker.offload_results.get_nowait() for _ in range(linker.offload_results.qsize())]
+
+    def test_offload_threads_hand_results_on_in_queue_order(self):
+        # SGLANG_LINKER_OFFLOAD_THREADS=2: a slow first put lands after a fast
+        # second one, and the results still leave in queue order.
+        log = []
+        linker = self._threaded_linker({"slow": 0.2, "bad": 0.0}, log)
+        put = lambda key: ([PoolTransfer(name=PoolName.KV, keys=[key])], 1, [], None, [])
+        results = self._run_threads(linker, [put("slow"), put("bad")])
+        self.assertLess(log.index(("landed", "bad")), log.index(("landed", "slow")))
+        self.assertEqual(results, [True, False])
+
+    def test_offload_threads_remove_only_after_the_puts_queued_before(self):
+        # A removal waits for every task queued before it, here a slow put that
+        # may write the same objects, even though another thread is free.
+        log = []
+        linker = self._threaded_linker({"slow": 0.2}, log)
+        put = ([PoolTransfer(name=PoolName.KV, keys=["slow"])], 1, [], None, [])
+        results = self._run_threads(linker, [put, ("remove", ["slow_k"], ["slow"], 0)])
+        self.assertLess(log.index(("landed", "slow")), log.index(("remove", "slow_k")))
+        self.assertEqual(results, [True])
+        self.assertEqual(linker.page_remove_counts["removed"], 1)
 
 
 # ---- prefetch mode (SGLANG_LINKER_LOAD_MODE=prefetch, GLM's model) ----
