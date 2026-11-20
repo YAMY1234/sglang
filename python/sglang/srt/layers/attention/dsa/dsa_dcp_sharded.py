@@ -186,9 +186,21 @@ _CANDIDATE_CLUSTER_FLOOR = 16384
 # workloads (32K and 100K contexts, all 24 DSA layers), a rank held at most 339
 # of a row's global top-2048 keys under DCP8, so 384 needs no fallback there.
 _DCP_MERGE_CAND_K = 384
-# DCP4 (push mode only): 768 keeps the union at 3072 >= 2048 keys, as 8 x 384,
-# so no rank can certify fewer than the global top-2048 it holds.
-_DCP_MERGE_CAND_K_BY_WORLD = {4: 768}
+# DCP4 (push mode only): SGLANG_DCP4_PUSH_CAND_K, default 768, which keeps the
+# union at 3072 >= 2048 keys, as 8 x 384, so no rank can certify fewer than the
+# global top-2048 it holds.
+
+
+def _merge_cand_k(world: int, topk: int) -> int:
+    if world != 4:
+        return _DCP_MERGE_CAND_K
+    cand_k = envs.SGLANG_DCP4_PUSH_CAND_K.get()
+    if cand_k % 32 or not (topk <= world * cand_k and cand_k <= topk):
+        raise ValueError(
+            f"SGLANG_DCP4_PUSH_CAND_K must be a multiple of 32 in "
+            f"[{topk // world}, {topk}], got {cand_k}"
+        )
+    return cand_k
 
 
 class DcpTopKMerge:
@@ -235,7 +247,7 @@ class DcpTopKMerge:
         worlds = (8, 16) if split or megakernel_enabled() else (8,)
         if self.push:
             worlds += (4,)
-        self.cand_k = _DCP_MERGE_CAND_K_BY_WORLD.get(world, _DCP_MERGE_CAND_K)
+        self.cand_k = _merge_cand_k(world, topk)
         if world not in worlds or topk != 2048:
             print_info_once(
                 "DSA DCP top-k merge off: it needs 8 or 16 ranks and top-k 2048"
