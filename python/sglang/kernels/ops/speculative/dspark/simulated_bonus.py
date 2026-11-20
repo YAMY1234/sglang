@@ -42,6 +42,120 @@ def _simulated_bonus_row_partial_kernel(
 
 
 @triton.jit
+def _residual_lse_kernel(
+    logits_ptr,
+    logits_stride,
+    temperatures_ptr,
+    correct_len_ptr,
+    correct_len_stride,
+    draft_ptr,
+    draft_stride0,
+    draft_stride1,
+    draft_temperatures_ptr,
+    lse_t_ptr,
+    lse_d_ptr,
+    vocab,
+    width,
+    ROWS: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    # Per request: logsumexp of the target row at correct_len (x / T) and of the
+    # draft step row that proposed the stop token (d / T_d).
+    req = tl.program_id(0)
+    c = tl.load(correct_len_ptr + req * correct_len_stride)
+    row = req * ROWS + c
+    t = tl.maximum(tl.load(temperatures_ptr + req).to(tl.float32), 1e-5)
+    td = tl.maximum(tl.load(draft_temperatures_ptr + req).to(tl.float32), 1e-5)
+    dc = tl.minimum(c, ROWS - 2)
+    m_t = float("-inf")
+    s_t = 0.0
+    m_d = float("-inf")
+    s_d = 0.0
+    for start in range(0, vocab, BLOCK):
+        offs = start + tl.arange(0, BLOCK)
+        x = tl.load(
+            logits_ptr + row.to(tl.int64) * logits_stride + offs,
+            mask=offs < vocab,
+            other=float("-inf"),
+        ).to(tl.float32) / t
+        nm = tl.maximum(m_t, tl.max(x, axis=0))
+        s_t = s_t * tl.exp(m_t - nm) + tl.sum(tl.exp(x - nm), axis=0)
+        m_t = nm
+        d = tl.load(
+            draft_ptr + req.to(tl.int64) * draft_stride0 + dc * draft_stride1 + offs,
+            mask=offs < width,
+            other=float("-inf"),
+        ).to(tl.float32) / td
+        nmd = tl.maximum(m_d, tl.max(d, axis=0))
+        s_d = s_d * tl.exp(m_d - nmd) + tl.sum(tl.exp(d - nmd), axis=0)
+        m_d = nmd
+    tl.store(lse_t_ptr + req, m_t + tl.log(s_t))
+    tl.store(lse_d_ptr + req, m_d + tl.log(s_d))
+
+
+@triton.jit
+def _residual_bonus_row_partial_kernel(
+    logits_ptr,
+    logits_stride,
+    temperatures_ptr,
+    correct_len_ptr,
+    correct_len_stride,
+    seed_ptr,
+    draft_ptr,
+    draft_stride0,
+    draft_stride1,
+    draft_temperatures_ptr,
+    lse_t_ptr,
+    lse_d_ptr,
+    part_val_ptr,
+    part_idx_ptr,
+    vocab,
+    width,
+    ROWS: tl.constexpr,
+    NSPLIT: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    # Gumbel-max over log(max(p - q, 0)) at a stop row (correct_len < gamma), as a
+    # rejection's resample would draw; the all-accepted row and argmax rows keep the
+    # plain target draw. A zero residual (p == q) falls back to p, ranked below any r > 0.
+    req = tl.program_id(0)
+    split = tl.program_id(1)
+    c = tl.load(correct_len_ptr + req * correct_len_stride)
+    row = req * ROWS + c
+    t = tl.load(temperatures_ptr + req).to(tl.float32)
+    td = tl.load(draft_temperatures_ptr + req).to(tl.float32)
+    offs = split * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < vocab
+    x = tl.load(
+        logits_ptr + row.to(tl.int64) * logits_stride + offs,
+        mask=mask,
+        other=float("-inf"),
+    ).to(tl.float32)
+    seed = tl.load(seed_ptr)
+    u = tl.rand(seed, req * vocab + offs)
+    g = -tl.log(-tl.log(u))
+    ts = tl.maximum(t, 1e-5)
+    plain = x / ts + g
+    residual_row = (c < ROWS - 1) & (td > 0.0) & (t > 0.0)
+    dc = tl.minimum(c, ROWS - 2)
+    d = tl.load(
+        draft_ptr + req.to(tl.int64) * draft_stride0 + dc * draft_stride1 + offs,
+        mask=offs < width,
+        other=float("-inf"),
+    ).to(tl.float32)
+    logp = x / ts - tl.load(lse_t_ptr + req)
+    logq = d / tl.maximum(td, 1e-5) - tl.load(lse_d_ptr + req)
+    r = tl.exp(logp) - tl.exp(logq)
+    resid = tl.where(r > 0.0, tl.log(tl.maximum(r, 1e-38)) + g, logp + g - 1.0e4)
+    v = tl.where(residual_row, resid, plain)
+    v = tl.where(mask, tl.where(t > 0.0, v, x), float("-inf"))
+    top = tl.max(v, axis=0)
+    idx = tl.min(tl.where(v == top, offs, vocab), axis=0)
+    tl.store(part_val_ptr + req * NSPLIT + split, top)
+    tl.store(part_idx_ptr + req * NSPLIT + split, idx)
+
+
+@triton.jit
 def _simulated_bonus_row_select_kernel(
     part_val_ptr,
     part_idx_ptr,
@@ -67,6 +181,8 @@ def simulated_bonus_sample_graph(
     seed: torch.Tensor,
     bs: int,
     rows_per_request: int,
+    draft_logits: torch.Tensor | None = None,
+    draft_temperatures: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Gumbel-max temperature sample of each request's row at ``correct_len``; seed
     ([1] int) and per-request temperatures ([bs] float; <= 0 means argmax) are read
@@ -78,6 +194,8 @@ def simulated_bonus_sample_graph(
         seed=seed,
         bs=bs,
         rows_per_request=rows_per_request,
+        draft_logits=draft_logits,
+        draft_temperatures=draft_temperatures,
     )
     out = torch.empty((bs,), dtype=torch.int64, device=target_logits.device)
     _simulated_bonus_row_select_kernel[(bs,)](
@@ -94,6 +212,8 @@ def simulated_bonus_partials_graph(
     seed: torch.Tensor,
     bs: int,
     rows_per_request: int,
+    draft_logits: torch.Tensor | None = None,
+    draft_temperatures: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """simulated_bonus_sample_graph's per-split (value, index) maxima, [bs, NSPLIT],
     reduced by ``simulated_bonus_select_partials``. ``correct_len`` may be stride-0."""
@@ -105,6 +225,27 @@ def simulated_bonus_partials_graph(
     nsplit = triton.next_power_of_2(triton.cdiv(vocab, block))
     part_val = torch.empty((bs, nsplit), dtype=torch.float32, device=device)
     part_idx = torch.empty((bs, nsplit), dtype=torch.int32, device=device)
+    if draft_logits is not None:
+        # SGLANG_SIMULATE_ACC_RESIDUAL_BONUS: draft_logits [bs, gamma, width] (width <= vocab),
+        # the draft step logits that proposed each verify row.
+        assert draft_logits.stride(2) == 1 and draft_logits.shape[1] == rows_per_request - 1
+        lse_t = torch.empty((bs,), dtype=torch.float32, device=device)
+        lse_d = torch.empty((bs,), dtype=torch.float32, device=device)
+        width = min(int(draft_logits.shape[2]), vocab)
+        _residual_lse_kernel[(bs,)](
+            target_logits, target_logits.stride(0), temperatures, correct_len,
+            correct_len.stride(0), draft_logits, draft_logits.stride(0),
+            draft_logits.stride(1), draft_temperatures, lse_t, lse_d, vocab, width,
+            ROWS=rows_per_request, BLOCK=block, num_warps=8,
+        )
+        _residual_bonus_row_partial_kernel[(bs, nsplit)](
+            target_logits, target_logits.stride(0), temperatures, correct_len,
+            correct_len.stride(0), seed, draft_logits, draft_logits.stride(0),
+            draft_logits.stride(1), draft_temperatures, lse_t, lse_d, part_val,
+            part_idx, vocab, width, ROWS=rows_per_request, NSPLIT=nsplit,
+            BLOCK=block, num_warps=8,
+        )
+        return part_val, part_idx
     _simulated_bonus_row_partial_kernel[(bs, nsplit)](
         target_logits,
         target_logits.stride(0),

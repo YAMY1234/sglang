@@ -72,6 +72,7 @@ from sglang.srt.speculative.spec_utils import (
     simulated_acc_len_generator,
 )
 from sglang.srt.utils import is_npu
+from sglang.srt.utils.log_utils import print_info_once, print_warning_once
 from sglang.srt.utils.invariants import Bucket, Invariant, NotNaN, expect
 
 logger = logging.getLogger(__name__)
@@ -691,6 +692,9 @@ class DsparkVerifyEpilogue:
             (self.max_bs,), dtype=torch.float32, device=device
         )
         self.sim_seed_buf = torch.zeros((1,), dtype=torch.int32, device=device)
+        # SGLANG_SIMULATE_ACC_RESIDUAL_BONUS: the draft sampler whose static step logits
+        # and temperatures the simulated stop row's residual reads (set by the worker).
+        self.residual_draft_sampler = None
         self._sim_greedy_bs: Optional[int] = None
         self.stride = int(verify_num_draft_tokens)
         self.gamma = self.stride - 1
@@ -977,6 +981,28 @@ class DsparkVerifyEpilogue:
             seed=self.sim_seed_buf,
             bs=bs,
             rows_per_request=self.stride,
+            **self._residual_args(bs),
+        )
+
+    def _residual_args(self, bs: int) -> dict:
+        sampler = self.residual_draft_sampler
+        if not envs.SGLANG_SIMULATE_ACC_RESIDUAL_BONUS.get():
+            return {}
+        if (
+            sampler is None
+            or sampler.greedy_draft
+            or sampler.step_logits is None
+            or sampler.sharded_accept
+        ):
+            print_warning_once(
+                "SGLANG_SIMULATE_ACC_RESIDUAL_BONUS: no static draft step logits here; "
+                "the simulated bonus stays a plain target draw"
+            )
+            return {}
+        print_info_once("SGLANG_SIMULATE_ACC_RESIDUAL_BONUS: residual stop token on (graph)")
+        return dict(
+            draft_logits=sampler.step_logits[:bs],
+            draft_temperatures=sampler.params.temperatures[:bs],
         )
 
     def sim_bonus(self, logits, bs: int) -> torch.Tensor:
@@ -1243,6 +1269,7 @@ def build_accept_outs(
                 bs=bs,
                 verify_num_draft_tokens=verify_num_draft_tokens,
                 seed=simulated_bonus_seed,
+                draft_block=draft_block,
             )
         elif target_logits is not None:
             # The accept's bonus is the real-length row's; take the simulated row's argmax.
@@ -1253,22 +1280,6 @@ def build_accept_outs(
                 .argmax(dim=-1)
                 .to(bonus.dtype)
                 .view_as(bonus)
-            )
-        if (
-            envs.SGLANG_SIMULATE_ACC_RESIDUAL_BONUS.get()
-            and draft_block is not None
-            and simulate_bonus_sampling_info is not None
-            and not draft_block.greedy_draft
-            and target_logits is not None
-        ):
-            bonus = _residual_stop_bonus(
-                target_logits=target_logits,
-                draft_block=draft_block,
-                correct_len=correct_len,
-                bonus=bonus,
-                temperatures=simulate_bonus_sampling_info.temperatures.reshape(-1),
-                rows_per_request=verify_num_draft_tokens,
-                gamma=gamma,
             )
         if envs.SGLANG_SIMULATE_ACC_LOG_HIST.get():
             _log_simulated_hist(correct_len, gamma)
@@ -1316,6 +1327,22 @@ def build_accept_outs(
     return accept
 
 
+def _residual_draft_args(draft_block: Optional[DraftBlockResult], bs: int) -> dict:
+    if (
+        not envs.SGLANG_SIMULATE_ACC_RESIDUAL_BONUS.get()
+        or draft_block is None
+        or draft_block.greedy_draft
+        or draft_block.corrected_logits is None
+        or getattr(draft_block, "vocab_shard", None) is not None
+    ):
+        return {}
+    print_info_once("SGLANG_SIMULATE_ACC_RESIDUAL_BONUS: residual stop token on (eager)")
+    return dict(
+        draft_logits=draft_block.corrected_logits[:bs],
+        draft_temperatures=draft_block.temperatures[:bs].reshape(-1).contiguous(),
+    )
+
+
 def sample_simulated_bonus(
     *,
     target_logits: torch.Tensor,
@@ -1325,9 +1352,12 @@ def sample_simulated_bonus(
     bs: int,
     verify_num_draft_tokens: int,
     seed: int,
+    draft_block: Optional[DraftBlockResult] = None,
 ) -> torch.Tensor:
     """The bonus token at the (simulated) correct_len row, drawn from the target
-    distribution the sampling accept uses: temperature, then top-k / top-p."""
+    distribution the sampling accept uses: temperature, then top-k / top-p. With
+    SGLANG_SIMULATE_ACC_RESIDUAL_BONUS and a sampled draft, a stop row draws from
+    max(p - q, 0) instead, as the rejection it simulates would."""
     if sampling_info.need_top_k_sampling or sampling_info.need_top_p_sampling:
         probs = build_speculative_verify_target_probs(
             next_token_logits=target_logits.index_select(
@@ -1339,6 +1369,7 @@ def sample_simulated_bonus(
         ).view(bs, -1)
         bonus = torch.multinomial(probs, num_samples=1)
     else:
+        residual = _residual_draft_args(draft_block, bs)
         bonus = simulated_bonus_sample_graph(
             target_logits=target_logits,
             correct_len=correct_len.contiguous(),
@@ -1346,6 +1377,7 @@ def sample_simulated_bonus(
             seed=torch.full((1,), seed, dtype=torch.int32, device=target_logits.device),
             bs=bs,
             rows_per_request=verify_num_draft_tokens,
+            **residual,
         )
     return bonus.to(greedy_bonus.dtype).view_as(greedy_bonus)
 
@@ -1372,31 +1404,6 @@ def _per_request_simulated_len(correct_len: torch.Tensor, gamma: int) -> torch.T
     up = torch.rand(correct_len.shape, device=correct_len.device) < frac
     acc_len = torch.clamp(lower + up.to(torch.int64), max=gamma + 1)
     return (acc_len - 1).to(correct_len.dtype)
-
-
-def _residual_stop_bonus(
-    *, target_logits, draft_block, correct_len, bonus, temperatures, rows_per_request, gamma
-) -> torch.Tensor:
-    # At a stop row (c < gamma) sample max(p - q, 0) as a rejection would; c == gamma keeps the bonus.
-    bs = correct_len.shape[0]
-    vocab = target_logits.shape[-1]
-    c = correct_len.long().view(-1)
-    stop = c < gamma
-    if not bool(stop.any()):
-        return bonus
-    rows = _simulated_rows(correct_len.view(-1), rows_per_request)
-    t = temperatures.to(torch.float32).clamp(min=1e-5).view(-1, 1)
-    p = torch.softmax(target_logits.index_select(0, rows).float() / t, dim=-1)
-    draft = _whole_vocab_logits(draft_block, vocab)
-    d_rows = draft[torch.arange(bs, device=c.device), c.clamp(max=gamma - 1)].float()
-    td = draft_block.temperatures.to(torch.float32).clamp(min=1e-5).view(-1, 1)
-    q = torch.softmax(d_rows / td, dim=-1)
-    r = torch.clamp(p - q, min=0.0)
-    mass = r.sum(dim=-1, keepdim=True)
-    r = torch.where(mass > 0, r, p)
-    sampled = torch.multinomial(r, 1).view(-1)
-    out = torch.where(stop, sampled, bonus.view(-1).long())
-    return out.to(bonus.dtype).view_as(bonus)
 
 
 def _log_simulated_hist(correct_len: torch.Tensor, gamma: int) -> None:
