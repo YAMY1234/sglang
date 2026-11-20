@@ -315,6 +315,14 @@ class SchedulerPPMixin:
                 "PP PD prefill: linker offload commits ride the request relay "
                 "(SGLANG_LINKER_PP_COUNTS_PIGGYBACK)."
             )
+        # SGLANG_PP_RING_WAIT_WORK: host work producers queue for the ring-output wait.
+        self.pp_ring_wait_work = deque() if envs.SGLANG_PP_RING_WAIT_WORK.get() else None
+        self.tree_cache.ring_wait_work = self.pp_ring_wait_work
+        if self.pp_ring_wait_work is not None:
+            logger.info(
+                "PP PD prefill: queued host work runs while the ring output is in "
+                "flight (SGLANG_PP_RING_WAIT_WORK)."
+            )
         if early_send:
             self.disagg_prefill_early_sent_rids = set()
             self.disagg_prefill_early_send_pending = deque()
@@ -435,7 +443,7 @@ class SchedulerPPMixin:
                     with self.scheduler_stage_metrics.record(
                         SCHEDULER_STAGE_PP_OUTPUT_WAIT
                     ), pp_bubble_diag.wait("d2h"):
-                        d2h_event.synchronize()
+                        self._pp_ring_wait(d2h_event)
                     if early_send:
                         # This result must find its early sends made and ended. Forwards
                         # before the one just launched are done by now or nearly, and
@@ -449,6 +457,8 @@ class SchedulerPPMixin:
                         next_batch_result,
                     )
                     self.last_mbs[next_mb_id] = self.mbs[next_mb_id]
+                elif self.pp_ring_wait_work:
+                    self._pp_ring_wait(None)
 
                 if diag is not None:
                     diag.phase("release")
@@ -1851,6 +1861,21 @@ class SchedulerPPMixin:
             _handle_recv_dict(recv_dict)
 
         return next_pp_outputs, batch_result, d2h_event, send_output_work
+
+    def _pp_ring_wait(self: Scheduler, event) -> None:
+        """Wait for the ring output (``event``; None: no batch this slot). Queued host
+        work (SGLANG_PP_RING_WAIT_WORK) runs, one item at a time, while the event is
+        not done; what is left runs right after. So every stage has run the same
+        items, in queue order, at the same point: before this slot's result and the
+        release that follows it."""
+        work = self.pp_ring_wait_work
+        if work:
+            while work and event is not None and not event.query():
+                work.popleft()()
+        if event is not None:
+            event.synchronize()
+        while work:
+            work.popleft()()
 
     @scheduler_stage_method(SCHEDULER_STAGE_LAUNCH_BATCH)
     def _pp_launch_batch(
