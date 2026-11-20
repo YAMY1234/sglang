@@ -210,6 +210,9 @@ class TestAllocationConfiguration(CustomTestCase):
         for changed in (
             {"hicache_storage_backend": "file"},
             {"hicache_write_policy": "write_through"},
+            # Without PP a bootstrap failure releases mid-chunk, under the relaxed
+            # write_back fence; that path stays refused.
+            {"pp_size": 1},
         ):
             with self.subTest(changed=changed):
                 values = dict(base, disaggregation_decode_allocation_policy="prefill_complete")

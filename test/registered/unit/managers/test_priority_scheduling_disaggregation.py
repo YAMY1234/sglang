@@ -387,6 +387,30 @@ class TestOptimisticPrefillCacheOwnership(unittest.TestCase):
         release.assert_not_called()
         self.assertTrue(req.pending_bootstrap)
 
+    def test_pp_bootstrap_failure_waits_for_the_chunk_in_flight(self):
+        """Under PP a chunking request's bootstrap failure is not acted on mid-chunk:
+        releasing it while a forward is still writing its pages would let the relaxed
+        write_back fence copy them to host (and on to L3) before they land."""
+        req = SimpleNamespace(rid="req", pending_bootstrap=True, disagg_kv_sender=object())
+        scheduler = SimpleNamespace(
+            handle_pending_bootstrap=MagicMock(), handle_bootstrap_failure=MagicMock()
+        )
+        with (
+            patch(
+                "sglang.srt.disaggregation.prefill.get_parallel",
+                return_value=SimpleNamespace(pp_size=8),
+            ),
+            patch(
+                "sglang.srt.disaggregation.prefill.poll_and_all_reduce_attn_cp_tp_group",
+                return_value=[KVPoll.Failed],
+            ) as poll,
+        ):
+            self.assertFalse(SchedulerDisaggregationPrefillMixin.check_bootstrap(scheduler, req))
+        poll.assert_not_called()
+        scheduler.handle_pending_bootstrap.assert_not_called()
+        scheduler.handle_bootstrap_failure.assert_not_called()
+        self.assertTrue(req.pending_bootstrap)
+
     def test_write_through_pending_chunk_does_not_publish(self):
         scheduler = SimpleNamespace()
         cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
