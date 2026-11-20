@@ -65,8 +65,9 @@ constexpr uint32_t kNumMathWarps = 8;
 constexpr uint32_t kNumSubLists5 = 4;
 // kModeTau: samples kept per thread (128 threads per row).
 constexpr uint32_t kTauKeep = 8;
-// kModeTau: named barriers kTauBarrierBase + warpgroup (0 is __syncthreads and the math-warp barrier).
-constexpr uint32_t kTauBarrierBase = 8;
+// kModeTau: hardware barriers kTauBarrierBase + warpgroup. 0 is __syncthreads, 1-7 are CUTLASS's
+// reserved ids, and NamedBarrier(n, 0) at the end of the math warps is hardware barrier 8.
+constexpr uint32_t kTauBarrierBase = 12;
 
 enum Mode : int {
   kModeLogits = 0,
