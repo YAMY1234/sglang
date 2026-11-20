@@ -34,7 +34,7 @@
 #ifndef FSTK_SERVING
 #define FSTK_SERVING 0
 #endif
-// FSTK_VARIANTS=1 (not serving) builds only the layout-5 variants 6-12.
+// FSTK_VARIANTS=1 (not serving) builds only the layout-5 variants 6-13.
 #ifndef FSTK_VARIANTS
 #define FSTK_VARIANTS 0
 #endif
@@ -147,6 +147,8 @@ struct ScoreParams {
   uint32_t keep_all;
   // Windows are [ceil(ks / ks_div), ceil(ke / ks_div)) (the sample pass: ks_div = sample stride).
   uint32_t ks_div;
+  // Lean layout (13): the KV scales, read from global memory by the math warps.
+  const float* kv_scale;
 };
 
 // Score layouts. All three issue the same UMMA (kind::f8f6f4, M128, K32 x 4, A = 128 keys,
@@ -167,13 +169,17 @@ struct ScoreParams {
 template <int kLayout>
 struct LayoutTraits {
   static constexpr int kBase = kLayout == 3 ? 0 : (kLayout == 4 ? 2 : (kLayout >= 6 ? 5 : kLayout));
-  static constexpr bool kWarpArrive = kLayout >= 6;
-  static constexpr bool kSplitVote = kLayout == 7 or kLayout == 9 or kLayout == 10 or kLayout == 12;
+  static constexpr bool kWarpArrive = kLayout >= 6 and kLayout != 13;
+  static constexpr bool kSplitVote = kLayout == 7 or kLayout == 9 or kLayout == 10 or kLayout == 12 or kLayout == 13;
   static constexpr bool kStagger = kLayout == 8 or kLayout == 9;
   static constexpr bool kPairHalves = kLayout == 10;
   // 11, 12: TMEM loads of 16 heads, the next one in flight while the current one is reduced
   // (12: with the per-split vote of 7).
   static constexpr bool kPipelined = kLayout == 11 or kLayout == 12;
+  // 13: lean split loop: the UMMA warp frees each KV stage (commit), the math warps read the KV
+  // scales from global memory one split ahead and never touch the KV ring; TMEM stage and phase
+  // kept as two bits (a split always starts on stage 0 or 2); one vote per split.
+  static constexpr bool kLean = kLayout == 13;
   static constexpr bool kPairLoads = kLayout == 3 or kLayout == 4;
   static constexpr uint32_t kBlockQ = kBase == 2 ? 8 : 4;
   static constexpr uint32_t kSplitKV = kBase == 2 ? 128 : 256;
@@ -409,6 +415,9 @@ __global__ __launch_bounds__(LayoutTraits<kLayout>::kNumThreads, 1) void fstk_sc
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
   constexpr int kMode = math_mode(kLaunchMode);
   using Traits = LayoutTraits<kLayout>;
+  // The lean split loop serves these modes; other modes of layout 13 take the variant loop.
+  constexpr bool kLeanRun =
+      Traits::kLean and (kMode == kModeFilter or kMode == kModeNoStore or kMode == kModeLogits);
   using qk_dtype_t = cutlass::float_e4m3_t;
   using reduce_dtype_t = float;
   using Scheduler = OrderedScheduler<Traits::kBlockQ, Traits::kSplitKV>;
@@ -471,7 +480,7 @@ __global__ __launch_bounds__(LayoutTraits<kLayout>::kNumThreads, 1) void fstk_sc
 #pragma unroll
     for (uint32_t i = 0; i < kNumKVStagesL; ++i) {
       smem.full_kv_barriers[i].init(1);
-      smem.empty_kv_barriers[i].init(Traits::kWarpArrive ? kNumMathThreads / 32 : kNumMathThreads);
+      smem.empty_kv_barriers[i].init(kLeanRun ? 1 : (Traits::kWarpArrive ? kNumMathThreads / 32 : kNumMathThreads));
     }
 #pragma unroll
     for (uint32_t i = 0; i < kNumTmemStages; ++i) {
@@ -594,6 +603,8 @@ __global__ __launch_bounds__(LayoutTraits<kLayout>::kNumThreads, 1) void fstk_sc
             }
             ptx::umma_arrive_no_elect(smem.full_tmem_barriers[tmem_stage_idx]);
           }
+          // Lean layout: the KV stage is free once the split's UMMAs complete (nobody else reads it).
+          if constexpr (kLeanRun) ptx::umma_arrive_no_elect(smem.empty_kv_barriers[kv_stage_idx]);
         }
         __syncwarp();
       }
@@ -811,6 +822,8 @@ __global__ __launch_bounds__(LayoutTraits<kLayout>::kNumThreads, 1) void fstk_sc
         return s[0] + s[1] + s[2] + s[3];
       };
 
+      // Lean layout: the TMEM ring position (0 or 2: a split takes two stages) and its phase.
+      uint32_t lean_base = 0, lean_phase = 0;
       Scheduler scheduler(params);
       uint32_t q_block_idx, kv_base, num_kv_splits;
       while (scheduler.template next_q_block<kWindowed>(q_block_idx, kv_base, num_kv_splits, seq_k_start, seq_k_end)) {
@@ -1004,7 +1017,45 @@ __global__ __launch_bounds__(LayoutTraits<kLayout>::kNumThreads, 1) void fstk_sc
           };
           constexpr bool kPipelinedPath =
               Traits::kPipelined and (kMode == kModeFilter or kMode == kModeNoStore or kMode == kModeLogits);
-          if constexpr (kPipelinedPath) {
+          if constexpr (kLeanRun) {
+            static_assert(kMmaPerSplit == 2 and kNumTmemStages == 4);
+            // Per-row values stay in registers (no per-split rematerialization).
+            asm volatile("" : "+r"(win_start), "+r"(win_len));
+            asm volatile("" : "+f"(row_tau));
+            const uint32_t last_kv = params.num_kv_tokens - 1;
+            const auto load_scale = [&](const uint32_t offset) {
+              return __ldg(params.kv_scale + cute::min(offset, last_kv));
+            };
+            float sc0 = 0.0f, sc1 = 0.0f;
+            if (num_kv_splits > 0) {
+              sc0 = load_scale(kv_base + lane_key);
+              sc1 = load_scale(kv_base + UMMA_M + lane_key);
+            }
+            const auto score_stage = [&](const uint32_t stage, const float scale) -> float {
+              smem.full_tmem_barriers[stage].wait(lean_phase);
+              ptx::tcgen05_after_thread_sync();
+              ptx::tmem_load_32dp32b<kNumHeads>(stage * UMMA_N + my_row * kNumHeads, reinterpret_cast<uint32_t*>(accum));
+              cutlass::arch::fence_view_async_tmem_load();
+              ptx::tcgen05_before_thread_sync();
+              smem.empty_tmem_barriers[stage].arrive();
+              return dg_reduce<kAluHeads>(accum, weights) * scale;
+            };
+            for (uint32_t kv_split_idx = 0; kv_split_idx < num_kv_splits; ++kv_split_idx) {
+              const uint32_t next = kv_base + (kv_split_idx + 1) * kSplitKV + lane_key;
+              float nx0 = 0.0f, nx1 = 0.0f;
+              if (kv_split_idx + 1 < num_kv_splits) {
+                nx0 = load_scale(next);
+                nx1 = load_scale(next + UMMA_M);
+              }
+              const float r0 = score_stage(lean_base, sc0);
+              const float r1 = score_stage(lean_base + 1, sc1);
+              lean_base ^= 2;
+              lean_phase ^= lean_base == 0 ? 1u : 0u;
+              emit_split(kv_split_idx, r0, r1);
+              sc0 = nx0;
+              sc1 = nx1;
+            }
+          } else if constexpr (kPipelinedPath) {
             // Every TMEM stage is read as two 16-head loads; each load is issued before the previous
             // one is reduced, so its latency hides behind that reduction (tcgen05.wait::ld waits for
             // all of a thread's loads, so the in-flight one is always the one waited on next). The
@@ -1737,6 +1788,7 @@ inline void score_impl(
   params.ks = static_cast<const uint32_t*>(ks.data_ptr());
   params.ke = static_cast<const uint32_t*>(ke.data_ptr());
   params.ks_div = static_cast<uint32_t>(x.ks_div);
+  params.kv_scale = static_cast<const float*>(kv_scale.data_ptr());
   RuntimeCheck(x.ks_div >= 1, "fstk: ks_div must be >= 1");
   params.order = order.size(0) > 0 ? static_cast<const int32_t*>(order.data_ptr()) : nullptr;
   if (params.order != nullptr) RuntimeCheck(order.size(0) == params.num_q_blocks, "fstk: order must list every q-block");
@@ -1889,7 +1941,7 @@ struct FusedIndexerTopK {
 #elif FSTK_VARIANTS
     // The layout-5 variants only (a build of its own).
     sglang::host::RuntimeCheck(alu_heads == 0 or alu_heads == 16, "fstk: alu_heads must be 0 or 16");
-    sglang::host::RuntimeCheck(layout >= 6 and layout <= 12, "fstk variants: layout must be 6..12");
+    sglang::host::RuntimeCheck(layout >= 6 and layout <= 13, "fstk variants: layout must be 6..13");
     if (layout == 6) {
       if (alu_heads) FSTK_DISPATCH(6, 16);
       FSTK_DISPATCH(6, 0);
@@ -1913,6 +1965,10 @@ struct FusedIndexerTopK {
     if (layout == 12) {
       if (alu_heads) FSTK_DISPATCH(12, 16);
       FSTK_DISPATCH(12, 0);
+    }
+    if (layout == 13) {
+      if (alu_heads) FSTK_DISPATCH(13, 16);
+      FSTK_DISPATCH(13, 0);
     }
     if (alu_heads) FSTK_DISPATCH(9, 16);
     FSTK_DISPATCH(9, 0);
