@@ -69,6 +69,22 @@ def _rows(kind: str, seed: int) -> list[torch.Tensor]:
         return [torch.randn(131072, generator=g)]
     if kind == "random2":  # two rows, as the skewed kinds
         return [torch.randn(65536, generator=g), torch.randn(65532, generator=g)]
+    if kind.startswith("stale"):
+        # stale{1,2}_{old,new}: ranks 1 (and 2) hold 900 keys at 30+U(0,1) (old) or at 10.3+U
+        # (10.6+U for two ranks; new), the others 600 at 10+U. Both fail on ranks 1 (and 2), and
+        # the merged threshold, so the other ranks' share, differs between old and new.
+        two, new = kind[5] == "2", kind.endswith("new")
+        rows = []
+        for shift in (0, 4):
+            x = torch.randn(65536, generator=g)
+            pos = torch.arange(65536)
+            for r in range(4):
+                hot = r == 1 or (two and r == 2)
+                n_hot, base = (900, (10.6 if two else 10.3) if new else 30.0) if hot else (600, 10.0)
+                at = pos[pos % 4 == r][torch.randperm(16384, generator=g)[:n_hot]]
+                x[at] = base + torch.rand(n_hot, generator=g)
+            rows.append(x[shift:])
+        return rows
     if kind == "dense_top":
         # many distinct scores near the global threshold: overflows the v2
         # merge's 10-bit threshold bin, not the local 12-bit ones
@@ -315,10 +331,11 @@ def test_dcp4_topk_merge_pushed(kind: str, cand_k: int) -> None:
         assert int(total) == n_fail * case.rows, (int(total), n_fail, case.rows)
 
 
+@pytest.mark.parametrize("failing", ["stale1", "stale2"])
 @torch.inference_mode()
-def test_dcp4_topk_merge_pushed_stale_slot() -> None:
+def test_dcp4_topk_merge_pushed_stale_slot(failing: str) -> None:
     """A rank's full slot is written only when it fails; the next failure of the same
-    rank on the same row slot 510 calls later (same buffer parity and 8-bit tag) must
+    rank(s) on the same row slot 510 calls later (same buffer parity and 8-bit tag) must
     not let the other ranks read the old call's keys."""
     _init_once()
     world, rank = ps._WORLD.world_size, ps._WORLD.rank_in_group
@@ -329,16 +346,20 @@ def test_dcp4_topk_merge_pushed_stale_slot() -> None:
         pytest.skip("multimem multicast unavailable")
     span = PAGE_SIZE * world
     first, idle, again = (_Case(k, seed, rank, world, span) for k, seed in
-                          (("skew", 1234), ("random2", 1235), ("skew", 1236)))
+                          ((f"{failing}_old", 1234), ("random2", 1235), (f"{failing}_new", 1236)))
     assert first.rows == idle.rows == again.rows
     calls = int(merge.counters[0])
     first.run_pushed(merge, span)
     while int(merge.counters[0]) < calls + 510:
         idle.run_pushed(merge, span)
+    published = int(merge.stats[1])
     again.run_pushed(merge, span)
     torch.cuda.synchronize()
     bad = again.pushed_failures(rank, world)
     assert _all_ranks_ok(not bad), bad or "failed on another rank"
+    total = torch.tensor([int(merge.stats[1]) - published])
+    dist.all_reduce(total)
+    assert int(total) == (2 if failing == "stale2" else 1) * again.rows, int(total)
 
 
 if __name__ == "__main__":
