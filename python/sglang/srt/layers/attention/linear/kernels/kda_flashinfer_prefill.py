@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import functools
 import importlib.util
+import itertools
 import logging
+import weakref
 from itertools import accumulate
 from pathlib import Path
 from typing import TYPE_CHECKING, Optional
@@ -149,6 +151,18 @@ class FlashInferKDAPrefillKernel(LinearAttnKernelBase):
             kda_prefill_cute._SUPPORTED_COMPUTE_CAPABILITIES.add((10, 7))
 
         self._recurrent_kda = kda.recurrent_kda
+        # FlashInfer reads cu_seqlens back once per tensor to plan its workspace,
+        # a stream sync inside the forward; its contents memo can be filled from host.
+        self._seed_mode = envs.SGLANG_K31_KDA_SEED_CU_SEQLENS.get()
+        self._cu_contents_memo = None
+        if self._seed_mode:
+            module = importlib.import_module(_BT16)
+            self._cu_contents_memo = getattr(module, "_CU_CONTENTS_MEMO", None)
+            logger.info(
+                "KDA prefill cu_seqlens seeded from host (SGLANG_K31_KDA_SEED_CU_SEQLENS=%d): %s",
+                self._seed_mode,
+                "on" if self._cu_contents_memo is not None else f"no memo in {_BT16}, off",
+            )
         # Older FlashInfer installations retain the eager BCG break.
         self.prefill_graph_wrapper_cls = getattr(
             kda, "RecurrentKDAPrefillWrapper", None
@@ -156,6 +170,29 @@ class FlashInferKDAPrefillKernel(LinearAttnKernelBase):
 
     def decode(self, *args, **kwargs):
         raise NotImplementedError("FlashInferKDAPrefillKernel is prefill-only")
+
+    def seed_query_start_loc(
+        self, query_start_loc_i64: torch.Tensor, extend_seq_lens_cpu
+    ) -> None:
+        if self._cu_contents_memo is None:
+            return
+        contents = (0, *itertools.accumulate(int(n) for n in extend_seq_lens_cpu))
+        if len(contents) != query_start_loc_i64.numel():
+            return
+        if self._seed_mode >= 2 and tuple(query_start_loc_i64.tolist()) != contents:
+            raise AssertionError(
+                f"query_start_loc {query_start_loc_i64.tolist()} != host {contents}"
+            )
+        try:
+            version = query_start_loc_i64._version
+        except RuntimeError:  # inference tensors track no version counter
+            version = None
+        # Same entry layout FlashInfer's _cu_seqlens_contents writes.
+        self._cu_contents_memo[query_start_loc_i64.data_ptr()] = (
+            weakref.ref(query_start_loc_i64),
+            version,
+            contents,
+        )
 
     def extend(
         self,
