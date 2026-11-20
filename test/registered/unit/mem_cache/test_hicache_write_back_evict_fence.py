@@ -1158,7 +1158,7 @@ class TestDeviceWriteAhead(CustomTestCase):
         cache._wa_peak_evicted = 0.0
         cache._wa_ready_count = 0
         cache._wa_preevict_tokens = 0
-        cache._hostcomp_last = (0, 0, 0, 0)
+        cache._hostcomp_last = (0,) * 10
         cache.tree_core.peek_device_eviction_candidates.return_value = list(tail)
         cache.tree_core.build_backup_spec.side_effect = lambda n: (
             torch.arange(4) + 10 * n,
@@ -1176,6 +1176,7 @@ class TestDeviceWriteAhead(CustomTestCase):
         cache.buffer_pipeline = None
         cache.enable_storage = False
         cc.mem_pool_host = SimpleNamespace(
+            size=100,
             available_size=lambda: 3,
             anchor_entry=SimpleNamespace(
                 host_pool=SimpleNamespace(shared_allocation_domain=None),
@@ -1241,15 +1242,20 @@ class TestDeviceWriteAhead(CustomTestCase):
         comp = cache.tree_core.host_composition
         comp.return_value = (40, 20, 30, [5, 6, 1])
         cache._wa_preevict_tokens = 7
+        cache._backup_alloc = (2, 64, 1, 32, 1, 32)
         self.assertEqual(
             cache.host_composition_line(),
-            "PMICRO_HOSTCOMP host_free=3 dup=40 dup_wa_tail=20 host_only=30 | "
-            "evict_dup=5 evict_leaf=6 evict_leaf_mamba=1 wa_preevict=7",
+            "PMICRO_HOSTCOMP host_free=3 host_size=100 dup=40 dup_wa_tail=20 "
+            "host_only=30 | evict_dup=5 evict_leaf=6 evict_leaf_mamba=1 "
+            "wa_preevict=7 | backup_evict_retry=2/64 backup_alloc_fail=1/32 "
+            "wb_backup_skip=1/32",
         )
         comp.return_value = (41, 20, 29, [9, 6, 1])
+        cache._count_backup_alloc(0, 16)
         self.assertTrue(
             cache.host_composition_line().endswith(
-                "evict_dup=4 evict_leaf=0 evict_leaf_mamba=0 wa_preevict=0"
+                "evict_dup=4 evict_leaf=0 evict_leaf_mamba=0 wa_preevict=0 | "
+                "backup_evict_retry=1/16 backup_alloc_fail=0/0 wb_backup_skip=0/0"
             )
         )
 
