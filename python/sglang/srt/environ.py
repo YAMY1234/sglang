@@ -1053,6 +1053,10 @@ class Envs:
     # PP PD prefill: producers may queue host work that runs while the ring output
     # is in flight; whatever is left runs right after it, before that result.
     SGLANG_PP_RING_WAIT_WORK = EnvBool(False)
+    # With SGLANG_PP_RING_WAIT_WORK: every PP stage applies the linker's relayed
+    # prefetch/offload actions in its ring-output wait (before that round's
+    # result) instead of at ingest; admission sees them one round later.
+    SGLANG_LINKER_PP_DEFER_ACTIONS = EnvBool(False)
     # Prefetch mode (GLM names): a published read keeps its prefix locked until
     # its request is admitted, the held prefixes under this share of the Full
     # device pool (0 releases at publish; PP requires > 0).

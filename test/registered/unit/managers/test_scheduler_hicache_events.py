@@ -159,6 +159,38 @@ class TestLinkerVerdictsRideTheRequestRelay(unittest.TestCase):
         s.process_input_requests.assert_called_once_with(["req"])
         self.assertEqual(forwarded, ["req", verdicts])
 
+    def _actions_scheduler(self, work):
+        from sglang.srt.mem_cache.unified_cache.pp_linker_relay import PPLinkerActions
+
+        actions = PPLinkerActions(actions=[("e", 1, "h", 1, "load", 2)])
+        s = self._scheduler(received=["req", actions])
+        s.tree_cache.ring_wait_work = work
+        return s, actions
+
+    def test_actions_apply_at_ingest_by_default(self):
+        s, actions = self._actions_scheduler(work=None)
+        forwarded = self._ingest(s, pp_rank=3)
+        s.tree_cache.linker_apply_actions.assert_called_once_with([actions])
+        self.assertEqual(forwarded, ["req", actions])
+
+    def test_deferred_actions_wait_for_the_ring_wait_and_still_ride_on(self):
+        # SGLANG_LINKER_PP_DEFER_ACTIONS: the stage forwards them as before but
+        # applies them from the ring-wait queue, after this round's requests.
+        from collections import deque
+
+        from sglang.srt.environ import envs
+
+        work = deque()
+        s, actions = self._actions_scheduler(work)
+        with envs.SGLANG_LINKER_PP_DEFER_ACTIONS.override(True):
+            forwarded = self._ingest(s, pp_rank=3)
+        s.tree_cache.linker_apply_actions.assert_not_called()
+        s.process_input_requests.assert_called_once_with(["req"])
+        self.assertEqual(forwarded, ["req", actions])
+        self.assertEqual(len(work), 1)
+        work.popleft()()
+        s.tree_cache.linker_apply_actions.assert_called_once_with([actions])
+
     def test_a_later_stage_applies_and_forwards_without_processing_them(self):
         from sglang.srt.mem_cache.unified_cache.unified_cache_linker import (
             LinkerAdmissionVerdicts,
