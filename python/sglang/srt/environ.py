@@ -1845,6 +1845,9 @@ class Envs:
     # KDA CuTe DSpARK/DFLASH verify: the phase-1-hoisted kernel (backport of
     # #49135, bit-identical outputs); off by default.
     SGLANG_OPT_KDA_MTP_VERIFY_P1_HOIST = EnvBool(False)
+    # On top of P1_HOIST: stage every phase-1 input in smem up front (cp.async /
+    # 128-bit loads) and read q/k/decay as 128-bit vectors; bit-identical.
+    SGLANG_OPT_KDA_MTP_VERIFY_ASYNC_P1 = EnvBool(False)
     SGLANG_ENABLE_LILICORR_SAMPLING = EnvBool(False)
     SGLANG_LILICORR_REQUIRE_SAMPLING = EnvBool(False)
     SGLANG_RAGGED_VERIFY_MODE = EnvStr("static")
