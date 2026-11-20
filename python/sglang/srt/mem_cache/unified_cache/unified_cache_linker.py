@@ -467,6 +467,14 @@ class UnifiedCacheLinkerWrapper:
         )
         if self.vectorized_restorable_mask:
             logger.info("External linker: vectorized restorable-prefix mask on")
+        # Queued request -> (start, anchor hash, page hashes from start, key length).
+        self._hash_cache: Optional[collections.OrderedDict] = (
+            collections.OrderedDict()
+            if envs.SGLANG_EXTERNAL_LINKER_REQUERY_HASH_CACHE.get()
+            else None
+        )
+        if self._hash_cache is not None:
+            logger.info("External linker: re-query page-hash cache on")
         self._lookup_stats = dict.fromkeys(
             (
                 "issued",
@@ -623,7 +631,7 @@ class UnifiedCacheLinkerWrapper:
         if start and last_hash is None:
             self._lookup_stats["skipped_no_hash"] += 1
             return
-        hashes = get_storage_hash_str(key[start:], last_hash, page_size=page)
+        hashes = self._storage_hashes(request, key, start, last_hash, page)
         lookups = [
             c.build_external_linker_transfer(LinkerTransferPhase.LOOKUP, None, hashes)
             for c in self._components
@@ -676,6 +684,44 @@ class UnifiedCacheLinkerWrapper:
         )
         if timed:
             self._phase_s[kind]["load"] += time.perf_counter() - t2
+
+    def _storage_hashes(
+        self,
+        request: CacheRequestHandle,
+        key: RadixKey,
+        start: int,
+        last_hash: Optional[str],
+        page: int,
+    ) -> list[str]:
+        """Storage hashes of ``key[start:]``; with the cache on, reuse the pages an
+        earlier lookup of this request hashed (a chain hash depends only on the
+        tokens up to its page, so the reused part is checked at its anchor)."""
+        cache = self._hash_cache
+        if cache is None:
+            return get_storage_hash_str(key[start:], last_hash, page_size=page)
+        old = cache.get(request)
+        hashes = None
+        if old is not None:
+            old_start, old_anchor, old_hashes, old_len = old
+            if old_len == len(key) and (start - old_start) % page == 0:
+                if start >= old_start:
+                    skip = (start - old_start) // page
+                    anchor = old_anchor if skip == 0 else old_hashes[skip - 1]
+                    if anchor == last_hash and skip <= len(old_hashes):
+                        hashes = old_hashes[skip:]
+                else:
+                    head = get_storage_hash_str(
+                        key[start:old_start], last_hash, page_size=page
+                    )
+                    if head and head[-1] == old_anchor:
+                        hashes = head + old_hashes
+        if hashes is None:
+            hashes = get_storage_hash_str(key[start:], last_hash, page_size=page)
+        cache[request] = (start, last_hash, hashes, len(key))
+        cache.move_to_end(request)
+        while len(cache) > 1024:
+            cache.popitem(last=False)
+        return hashes
 
     def _refresh_leases(self, node: NodeId) -> None:
         """Queue the device-matched path's stale pages for an L3 lease renewal.
@@ -1602,6 +1648,8 @@ class UnifiedCacheLinkerWrapper:
         self._qlock_empty.clear()
         self._qlock_short.clear()
         self._input_len.clear()
+        if self._hash_cache is not None:
+            self._hash_cache.clear()
         self._window.clear()
         self._window_full = False
         self.unheld.clear()
@@ -1624,6 +1672,8 @@ class UnifiedCacheLinkerWrapper:
         rid = request.rid
         self.hit_markers.pop(rid, None)
         self._pending_requeries.pop(request, None)
+        if self._hash_cache is not None:
+            self._hash_cache.pop(request, None)
         self._requery_started.pop(request, None)
         self._cancel_prefetch(request)
         self.release_hold(request, admitted=False)
