@@ -26,6 +26,7 @@ from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.distributed.communication_tags import P2PTag
 from sglang.srt.distributed.parallel_state import GroupCoordinator
 from sglang.srt.environ import envs
+from sglang.srt.managers import pp_bubble_diag
 from sglang.srt.runtime_context import (
     get_disagg,
     get_parallel,
