@@ -74,8 +74,11 @@ from sglang.srt.layers.attention.dsa.dsa_dcp import (
     localize_dcp_page_table,
 )
 from sglang.srt.layers.attention.dsa.dsa_dcp_sharded import (
+    dcp_fused_gather_rows,
+    dcp_fused_gather_supported,
     dcp_gather_request_rows,
     dcp_localize_compact,
+    dcp_row_gather_plan,
     init_dcp_candidate_all_gather,
     init_dcp_topk_merge,
 )
@@ -1313,6 +1316,15 @@ class DeepseekSparseAttnBackend(
         # DCP prefill: the batch's KV rows from all ranks, request after request
         # in position order, padded to whole pages (the ragged top-k layout)
         rows = kv_cache.view(torch.uint8).view(-1, self.kv_cache_dim)
+        if dcp_fused_gather_supported(self.kv_cache_dim):
+            plan = dcp_row_gather_plan(forward_batch.seq_lens_cpu, rows.device)
+            gathered = rows.new_empty(
+                (plan.total + (-plan.total % self.physical_page_size), rows.shape[1])
+            )
+            dcp_fused_gather_rows(
+                [(rows, metadata.dcp_local_kv_rows)], plan, [gathered]
+            )
+            return gathered.view(kv_cache.dtype)
         gathered = dcp_gather_request_rows(
             rows[metadata.dcp_local_kv_rows], forward_batch.seq_lens_cpu
         )
@@ -4516,7 +4528,13 @@ class DeepseekSparseAttnBackend(
             **attention_kwargs,
         )
         if kernel_heads != layer.tp_q_head_num:
-            out = out[..., : layer.tp_q_head_num, :].contiguous()
+            out = out[..., : layer.tp_q_head_num, :]
+            if not (
+                is_prefill
+                and getattr(layer, "mla_strided_out_ok", False)
+                and envs.SGLANG_DSA_MLA_PREFILL_STRIDED_OUT.get()
+            ):
+                out = out.contiguous()
         return _restore_trtllm_decode_dp_padding(out, num_decode_padding_rows)
 
     def _forward_prims_ts(
