@@ -204,14 +204,16 @@ SGL_DEVICE void select_at_least(const uint64_t (&keys)[kN], uint64_t t, bool (&s
 // load of a round is in flight together.
 template <int kPer>
 SGL_DEVICE void poll_tagged(const uint64_t* src, int step, uint64_t tag, uint64_t (&v)[kPer]) {
-  unsigned pending = (1u << kPer) - 1;
+  // 64-bit mask: the pushed merge polls kCandK / 32 = 64 entries per lane at 2048 candidates
+  static_assert(kPer >= 1 && kPer <= 64);
+  uint64_t pending = kPer == 64 ? ~uint64_t{0} : (uint64_t{1} << kPer) - 1;
   while (pending) {
 #pragma unroll
     for (int j = 0; j < kPer; ++j)
       if (pending >> j & 1) v[j] = device::ptx::load_relaxed_sys(src + j * step);
 #pragma unroll
     for (int j = 0; j < kPer; ++j)
-      if ((v[j] & 255) == tag) pending &= ~(1u << j);
+      if ((v[j] & 255) == tag) pending &= ~(uint64_t{1} << j);
   }
 }
 
