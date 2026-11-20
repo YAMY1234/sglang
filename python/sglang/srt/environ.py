@@ -793,7 +793,8 @@ class Envs:
     # (transfer queue, the "pre-allocated usage" log field) at this fraction of
     # the pool; 0 disables. One reservation is always allowed.
     SGLANG_DISAGG_DECODE_PREALLOC_CAP = EnvFloat(0.0)
-    # Decode batch log: pop_preallocated passes per stop reason (metadata, cap, kv_fit, ...).
+    # 60 s decode log line: pop_preallocated passes per stop reason (metadata, cap, kv_fit, ...)
+    # and the ready entries each stop left behind (head-of-line blocking).
     SGLANG_DISAGG_DECODE_PREALLOC_BREAK_DIAG = EnvBool(False)
     # PD DCP sends: build Mooncake descriptors from NumPy runs instead of per-run
     # Python lists (same descriptors; cost no longer grows with Python objects).

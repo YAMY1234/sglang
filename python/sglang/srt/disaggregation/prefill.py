@@ -1641,16 +1641,21 @@ class SchedulerDisaggregationPrefillMixin:
         early = len(req.origin_input_ids) - req.num_matched_prefix_tokens < threshold
         if early:
             req.disagg_kv_sender.mark_prefill_complete()
-        # [early readiness sent, requests decided, window start]
+        # [early readiness sent, requests decided, window start, late requests' uncached work]
         counts = getattr(self, "_early_ready_counts", None)
         if counts is None:
-            counts = self._early_ready_counts = [0, 0, time.monotonic()]
+            counts = self._early_ready_counts = [0, 0, time.monotonic(), []]
         counts[0] += early
         counts[1] += 1
+        if not early:
+            counts[3].append(len(req.origin_input_ids) - req.num_matched_prefix_tokens)
         if time.monotonic() - counts[2] >= 60:
+            late = sorted(counts[3]) or [0]
             logger.info(
-                "PD prefill early readiness (MIN_WORK_TOKENS %d): %d of %d requests in %.0f s",
+                "PD prefill early readiness (MIN_WORK_TOKENS %d): %d of %d requests in %.0f s; "
+                "late uncached work p50 %d p90 %d max %d",
                 threshold, counts[0], counts[1], time.monotonic() - counts[2],
+                late[len(late) // 2], late[9 * len(late) // 10], late[-1],
             )
             self._early_ready_counts = None
 

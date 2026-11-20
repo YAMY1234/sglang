@@ -399,8 +399,10 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
     Store the requests that are preallocating.
     """
 
-    # SGLANG_DISAGG_DECODE_PREALLOC_BREAK_DIAG: pop_preallocated passes per stop reason
+    # SGLANG_DISAGG_DECODE_PREALLOC_BREAK_DIAG: pop_preallocated passes per stop reason, ready
+    # entries left behind each stop (head-of-line), logged every 60 s
     prealloc_break_counts: Optional[Counter] = None
+    _prealloc_break_t: Optional[float] = None
 
     def __init__(
         self,
@@ -1894,8 +1896,27 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             if self.scheduler.enable_lora:
                 running_loras.add(decode_req.req.lora_id)
 
-        if stop is not None and self.prealloc_break_counts is not None:
-            self.prealloc_break_counts[stop] += 1
+        counts = self.prealloc_break_counts
+        if counts is not None:
+            counts["passes"] += 1
+            if stop is not None:
+                counts[stop] += 1
+                counts["blocked_ready"] += sum(
+                    1
+                    for j in range(i + 1, len(self.queue))
+                    if j not in indices_to_remove and self.queue[j].waiting_for_input
+                )
+            now = time.monotonic()
+            if self._prealloc_break_t is None:
+                self._prealloc_break_t = now
+            elif now - self._prealloc_break_t >= 60:
+                logger.info(
+                    "PD decode prealloc stops in %.0f s: %s",
+                    now - self._prealloc_break_t,
+                    " ".join(f"{k}={v}" for k, v in sorted(counts.items())),
+                )
+                counts.clear()
+                self._prealloc_break_t = now
 
         if failed_reqs:
             failed_ids = {id(r) for r in failed_reqs}
