@@ -1902,6 +1902,13 @@ class UnifiedCacheLinkerWrapper:
             if copy_event is not None:
                 # Staged load: the forward (or a reuse of freed slots) runs after the scatter.
                 torch.cuda.current_stream().wait_event(copy_event)
+        if publish and state.future is None:
+            # Never submitted here (no private slots at load apply). Every stage refuses
+            # at the same relay position and PP0's vote then aborts the read, so this
+            # means the stages diverged: abort here, loudly, rather than publish nothing.
+            logger.error("Linker load of %s was never submitted on this stage; not publishing it", request.rid)
+            state.abort_reason = "publish_unsubmitted"
+            publish = False
         end = len(state.key)
         try:
             if not publish:

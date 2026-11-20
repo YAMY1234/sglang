@@ -3375,6 +3375,29 @@ def test_prefetch_cancel_records_its_reason(full_linker_component):
     assert wrapper._abort_reasons == {"timeout": 1}
 
 
+def test_prefetch_publish_of_an_unsubmitted_load_aborts_here(full_linker_component):
+    # No private KV slots at load apply: the read is never submitted. A publish
+    # from the relay (stages diverged) aborts it here instead of a KeyError.
+    full = full_linker_component
+    build = full.build_external_linker_transfer.side_effect
+    full.build_external_linker_transfer.side_effect = lambda phase, node, keys: (
+        None if phase == LinkerTransferPhase.LOAD else build(phase, node, keys)
+    )
+    insert = MagicMock()
+    wrapper = _prefetch_wrapper(
+        [full, _state_component([])], _PrefetchLinker(), insert=insert,
+        prefetch_loaded_tokens_by_reqid={}, prefetch_loaded_storage_start_by_reqid={},
+    )
+    handle = _Handle("a")
+    wrapper._draining_lookups = True  # as the relay's load apply
+    wrapper._start_prefetch_load(handle, _KEY, ["h1", "h2", "h3"], 0, 0, "lock", [2], 1.0)
+    assert wrapper.prefetches[handle].future is None
+    wrapper._finish_prefetch(handle, publish=True)
+    insert.assert_not_called()
+    assert wrapper._abort_reasons == {"publish_unsubmitted": 1}
+    assert handle not in wrapper.prefetches and handle not in wrapper.cache.prefetch_loaded_tokens_by_reqid
+
+
 def _failed_staged_load(fallback_results):
     wrapper = UnifiedCacheLinkerWrapper.__new__(UnifiedCacheLinkerWrapper)
     future = Future()
@@ -3642,6 +3665,10 @@ def test_pp_early_read_failure_falls_back_to_the_stage_read_and_its_vote():
     assert [w.finished for _, w in stages] == [[], []]
     w1.prefetches[handle].future.set_result(True)
     _relay_round(stages)
+    # PP0's early vote never stands in for its own read.
+    assert [w.finished for _, w in stages] == [[], []]
+    w0.prefetches[handle].future.set_result(True)
+    _relay_round(stages)
     assert [w.finished for _, w in stages] == [[(handle, True)]] * 2
 
 
@@ -3669,6 +3696,51 @@ def test_pp_early_stop_and_reset_drop_staging_and_votes():
     for relay, w in stages:
         relay.reset()
         assert w.early.epoch == 1
+
+
+class _RefusingWrapper(_RelayWrapper):
+    """Private slots run out at load apply on every stage (the same tree and
+    allocator at the same relay position): no read is submitted."""
+
+    def _refuse(self, handle, restorable, *staged):
+        self.started.append((handle, restorable, *staged))
+        self.prefetches[handle] = SimpleNamespace(future=None, discard=True, abort_reason="not_submitted")
+
+    def _start_prefetch_load(self, handle, *args):
+        self._refuse(handle, args[-2])
+
+    def _start_prefetch_from_staging(self, handle, *args, staged):
+        self._refuse(handle, args[-2], "staged", staged)
+
+
+@pytest.mark.parametrize("pp0_voted_early", [False, True])
+def test_pp_early_votes_never_publish_a_load_no_stage_submitted(pp0_voted_early):
+    """Early reads land and are voted, then every stage's private slots run out at
+    load apply. Applying loads at ingest, PP0 takes its staging before it reports;
+    deferring them (earlyab25), its early vote was posted first and the read was
+    published unfilled (PP0's KeyError). Either way it finishes unpublished."""
+    stages = _early_stages()
+    for i, (relay, w) in enumerate(stages):
+        refusing = _RefusingWrapper(w.pp_rank, w.pp_size)
+        refusing.early = w.early
+        relay.w = refusing
+        stages[i] = (relay, refusing)
+    (pp0, w0), (pp1, w1) = stages
+    handle = _Handle("a")
+    _queue_lookup(stages, handle, [3])
+    for relay, _ in reversed(stages):
+        relay.poll()
+    load = pp0.take_actions()
+    w1.early.land(0, 1, 3)  # a later stage's read lands before its load arrives
+    if pp0_voted_early:
+        w0.early.land(0, 1, 3)
+    for relay, _ in reversed(stages):
+        relay.poll()  # early votes go out; the load is still on its way
+    for relay, _ in stages:
+        relay.receive(load.actions)
+    assert w1.started == [(handle, [3], "staged", "slab-1")]
+    _relay_round(stages)
+    assert [w.finished for _, w in stages] == [[(handle, False)]] * 2
 
 
 def _early_read_stages(size):
