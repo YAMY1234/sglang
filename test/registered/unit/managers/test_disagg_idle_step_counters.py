@@ -700,7 +700,11 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
 
     def prepare_pp_scheduler(self, scheduler):
         enter_scope(self, get_parallel().override(pp_size=2, pp_rank=0))
-        scheduler.pp_group = SimpleNamespace(is_last_rank=True)
+        scheduler.pp_group = SimpleNamespace(is_last_rank=True, is_first_rank=True)
+        scheduler.chunked_prefill_size = 8192
+        scheduler.scheduler_stage_metrics = SchedulerStageMetricsRecorder(False)
+        scheduler.enable_staging = False
+        scheduler._pp_pd_early_send_enabled = lambda: False
         scheduler.forward_stream_ctx = nullcontext()
         scheduler.forward_stream = Mock()
         scheduler.schedule_stream = Mock()
@@ -734,6 +738,7 @@ class TestPPLaunchWriteBackEvictionFence(CustomTestCase):
         order = Mock()
         scheduler = Scheduler.__new__(Scheduler)
         scheduler.scheduler_stage_metrics = None
+        scheduler.pp_bubble_diag = None
         scheduler._hicache_fence_controller = order.controller
         scheduler.forward_stream = SimpleNamespace(record_event=lambda: "fwd-start")
         scheduler.schedule_stream = SimpleNamespace(record_event=lambda: "barrier")
