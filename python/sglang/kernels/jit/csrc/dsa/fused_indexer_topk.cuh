@@ -811,8 +811,11 @@ CUTLASS_DEVICE void radix_pick_bin(const uint32_t* hist, uint32_t remaining, uin
   }
 }
 
-constexpr uint32_t kSelectThreads = 512;
+constexpr uint32_t kSelectThreads = 256;
 constexpr uint32_t kSelectWarps = kSelectThreads / 32;
+// Keys a row may hold in the select kernel's shared memory (64 KiB: several CTAs per SM);
+// a row with more candidates takes the fallback path.
+constexpr uint32_t kSelectMaxKeys = 8192;
 
 struct SelectParams {
   const uint64_t* cand_key;
@@ -874,7 +877,7 @@ __global__ __launch_bounds__(kSelectThreads) void fstk_select_kernel(const Selec
       acc += c;
     }
     s_off[kNumMathWarps] = acc;
-    s_bad = bad or acc < p.topk;
+    s_bad = bad or acc < p.topk or acc > kSelectMaxKeys;
     if (s_bad) p.fallback[atomicAdd(p.num_fallback, 1)] = static_cast<int32_t>(row);
   }
   __syncthreads();
@@ -1230,7 +1233,7 @@ struct FusedIndexerTopK {
     RuntimeCheck(page_size > 0 and (page_size & (page_size - 1)) == 0, "fstk: page_size must be a power of two");
     p.page_bits = static_cast<uint32_t>(__builtin_ctzll(static_cast<unsigned long long>(page_size)));
     if (p.num_rows == 0) return;
-    const size_t smem = static_cast<size_t>(p.cand_sub_cap) * kNumMathWarps * sizeof(uint64_t);
+    const size_t smem = static_cast<size_t>(kSelectMaxKeys) * sizeof(uint64_t);
     const DLDevice device = out.device();
     runtime::init_per_device(device, [=] { runtime::set_max_dynamic_smem(fstk_select_kernel, smem); });
     LaunchKernel(p.num_rows, kSelectThreads, device, smem)(fstk_select_kernel, p);
