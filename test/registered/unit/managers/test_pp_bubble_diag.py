@@ -274,6 +274,21 @@ class TestModuleHooks(unittest.TestCase):
         # Frames above the loop are cut; the loop frame keeps its line number.
         self.assertRegex(admit[0], r"^host\.admit;event_loop_fake@test_pp_bubble_diag\.py:\d+")
 
+    def test_gc_timer_counts_collections_and_logs_long_ones(self):
+        import gc
+
+        timer = pp_bubble_diag._GCTimer(0, long_ms=0.0)
+        try:
+            with self.assertLogs(pp_bubble_diag.logger, level="INFO") as cm:
+                gc.collect(1)
+            stats = timer.snapshot()
+        finally:
+            gc.callbacks.remove(timer._callback)
+        self.assertGreaterEqual(stats["n"][1], 1)
+        self.assertGreater(stats["ms"][1], 0.0)
+        self.assertTrue(any("PP GC long rank 0: gen=1" in line for line in cm.output))
+        self.assertEqual(timer.snapshot()["n"], [0, 0, 0])
+
     def test_stack_sampler_stays_off_on_other_ranks(self):
         import tempfile
 
@@ -284,6 +299,7 @@ class TestModuleHooks(unittest.TestCase):
         ), envs.SGLANG_PP_STACK_SAMPLE_HZ.override(20.0):
             d = pp_bubble_diag.init(3, None, 16384)
             self.assertIsNone(d.stack_sampler)
+            self.assertIsNone(d.gc_timer)
             d._fwd_file.close()
 
 

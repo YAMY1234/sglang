@@ -11,6 +11,7 @@ SGLANG_PP_BUBBLE_DIAG_FWD_DIR set, each forward is also appended to a per-rank C
 
 from __future__ import annotations
 
+import gc
 import json
 import logging
 import os
@@ -110,6 +111,64 @@ class _StackSampler:
         self._file.flush()
 
 
+class _GCTimer:
+    """gc.callbacks timer: per-generation collections, total and max ms per interval, and
+    one log line (with wall time) for every collection over long_ms."""
+
+    def __init__(self, pp_rank: int, long_ms: float = 50.0):
+        self._pp_rank = pp_rank
+        self._long_ms = long_ms
+        self._t0 = 0.0
+        self._reset()
+        logger.info(
+            "PP GC rank %d: enabled=%s threshold=%s freeze_count=%d counts=%s",
+            pp_rank,
+            gc.isenabled(),
+            gc.get_threshold(),
+            gc.get_freeze_count(),
+            gc.get_count(),
+        )
+        gc.callbacks.append(self._callback)
+
+    def _reset(self) -> None:
+        self.n = [0, 0, 0]
+        self.ms = [0.0, 0.0, 0.0]
+        self.max_ms = [0.0, 0.0, 0.0]
+        self.collected = [0, 0, 0]
+
+    def _callback(self, phase: str, info: dict) -> None:
+        if phase == "start":
+            self._t0 = time.perf_counter()
+            return
+        ms = (time.perf_counter() - self._t0) * 1e3
+        gen = info.get("generation", 0)
+        self.n[gen] += 1
+        self.ms[gen] += ms
+        self.max_ms[gen] = max(self.max_ms[gen], ms)
+        self.collected[gen] += info.get("collected", 0)
+        if ms > self._long_ms:
+            logger.info(
+                "PP GC long rank %d: gen=%d ms=%.1f wall=%.3f collected=%d uncollectable=%d",
+                self._pp_rank,
+                gen,
+                ms,
+                time.time(),
+                info.get("collected", 0),
+                info.get("uncollectable", 0),
+            )
+
+    def snapshot(self) -> dict:
+        stats = {
+            "n": self.n,
+            "ms": [round(x, 1) for x in self.ms],
+            "max_ms": [round(x, 1) for x in self.max_ms],
+            "collected": self.collected,
+            "freeze_count": gc.get_freeze_count(),
+        }
+        self._reset()
+        return stats
+
+
 class PPBubbleDiag:
     """Scheduler-thread accumulator for one PP rank."""
 
@@ -136,6 +195,7 @@ class PPBubbleDiag:
         self._pass_skips = 0
         self._pass_relay0 = (0, 0, 0)
         self.stack_sampler: Optional[_StackSampler] = None
+        self.gc_timer: Optional[_GCTimer] = None
         self._reset()
 
     def _reset(self) -> None:
@@ -340,6 +400,8 @@ class PPBubbleDiag:
             "bin_vote_calls": self.bin_vote_calls,
             "bin_ticket_ms": [r(x) for x in self.bin_ticket_ms],
         }
+        if self.gc_timer is not None:
+            stats["gc"] = self.gc_timer.snapshot()
         return stats
 
     def maybe_log(self, now: Optional[float] = None) -> Optional[dict]:
@@ -385,6 +447,7 @@ def init(pp_rank: int, event_factory, chunk_budget: int) -> Optional[PPBubbleDia
         if fwd_dir and hz > 0 and str(pp_rank) in ranks:
             path = os.path.join(fwd_dir, f"stacks-pp{pp_rank}-{os.getpid()}.txt")
             _diag.stack_sampler = _StackSampler(_diag, threading.get_ident(), hz, path)
+            _diag.gc_timer = _GCTimer(pp_rank)
             logger.info(
                 "PP stack sampler on, rank %d, %.1f Hz -> %s", pp_rank, hz, path
             )
