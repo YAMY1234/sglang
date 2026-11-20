@@ -102,7 +102,6 @@ from sglang.srt.managers.io_struct import (
     ScaleElasticEPReqOutput,
     SessionParams,
     ShutdownReq,
-    SubagentKeepaliveReqInput,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
     UpdateWeightFromDiskReqInput,
@@ -209,13 +208,6 @@ asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 _REQUEST_STATE_WAIT_TIMEOUT = envs.SGLANG_REQUEST_STATE_WAIT_TIMEOUT.get()
 
 logger = logging.getLogger(__name__)
-
-# aria-op H113 S3b (run k31-vr200-sglang-1029; default off): a request that carries
-# parent_session_id sends the scheduler a keepalive for its parent session
-# (sgl-project/sglang#41865, head be58fdfd: _maybe_send_subagent_keepalive). The
-# runner sets it on the PD prefill role only; the cache refuses it elsewhere.
-_K31_SESSION_KEEPALIVE = os.environ.get("SGLANG_K31_SESSION_KEEPALIVE", "0") == "1"
-
 
 # aria-op H683 (run k31-vr200-sglang-1029; default off): cyclic GC in the process
 # that serves generate_request (the PD decode's Dynamo main process). Dynamo serves
@@ -1080,9 +1072,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             # Log the request
             self.request_logger.log_received_request(obj, self.tokenizer, request)
 
-            if _K31_SESSION_KEEPALIVE:
-                self._k31_maybe_send_subagent_keepalive(obj)
-
             async with self.is_pause_cond:
                 await self.is_pause_cond.wait_for(lambda: not self.is_pause)
 
@@ -1113,20 +1102,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             # cleanup.
             self._release_req_states_on_failure(request_states)
             raise
-
-    def _k31_maybe_send_subagent_keepalive(
-        self, obj: Union[GenerateReqInput, EmbeddingReqInput]
-    ) -> None:
-        """aria-op H113 S3b: as #41865's _maybe_send_subagent_keepalive, stamped
-        with this process's clock so every rank applies one TTL decision."""
-        if not isinstance(obj, GenerateReqInput):
-            return
-        parent = getattr(obj, "parent_session_id", None)
-        if not parent or parent == obj.session_id:
-            return
-        self._dispatch_to_scheduler(
-            SubagentKeepaliveReqInput(session_id=parent, sent_at=time.time())
-        )
 
     def _detect_input_format(
         self, texts: Union[str, List[str]], is_cross_encoder: bool
