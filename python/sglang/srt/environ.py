@@ -2158,6 +2158,9 @@ class Envs:
     SGLANG_OPT_DSV41_MEGA_MHC_LOCALITY = EnvBool(False)
     SGLANG_OPT_EXACT_CHUNK_BUDGET = EnvBool(False)
     SGLANG_OPT_DSV41_MEGA_MHC_LOCALITY_MAX_TOKENS = EnvInt(32768)
+    # With LOCALITY: one pool slot whose residual is updated in place (the first layer's broadcast writes into it),
+    # reserved before the KV cache is sized and charged to the runtime slack instead of the KV budget.
+    SGLANG_OPT_DSV41_MEGA_MHC_LOCALITY_INPLACE = EnvBool(False)
     # Deprecated for --engram-config "replication".
     SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT = EnvStr("per_rank")
     # Scheduler-side staging of shared host-table rows on GPUs without ATS
