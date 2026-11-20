@@ -206,18 +206,28 @@ def _validate_prefill_complete(server_args: ServerArgs) -> None:
     # The peer's attention TP and DCP must then equal this role's; decode
     # checks that per prefill server (CommonKVReceiver.init).
     matched_tp_dcp = envs.SGLANG_PREFILL_COMPLETE_ALLOW_MATCHED_TP_DCP.get()
-    if cfg.attn_cp_size != 1 or (cfg.dcp_size != 1 and not matched_tp_dcp):
+    # Decode only: its attention TP groups (and DCP) may be wider than the TP1
+    # prefill's; decode checks the peer per prefill server, as above.
+    wide_decode = (
+        envs.SGLANG_PREFILL_COMPLETE_ALLOW_MULTI_ENDPOINT.get()
+        and cfg.disaggregation_mode == "decode"
+    )
+    if cfg.attn_cp_size != 1 or (
+        cfg.dcp_size != 1 and not (matched_tp_dcp or wide_decode)
+    ):
         unsupported.append("attention context parallelism")
     if cfg.disaggregation_mode == "decode" and cfg.pp_size != 1:
         unsupported.append("decode pipeline parallelism")
     # Compared as a product, not divided: the validators that reject
     # non-positive or non-dividing widths run after this hook.
-    if cfg.tp_size != cfg.attn_dp_size * cfg.attn_cp_size and not matched_tp_dcp:
+    if cfg.tp_size != cfg.attn_dp_size * cfg.attn_cp_size and not (
+        matched_tp_dcp or wide_decode
+    ):
         unsupported.append(
             "attention tensor parallelism other than one "
             "(tp_size must equal attn_dp_size * attn_cp_size)"
         )
-    if matched_tp_dcp and cfg.enable_kv_cache_sharding:
+    if (matched_tp_dcp or wide_decode) and cfg.enable_kv_cache_sharding:
         # Sharded MLA KV pairs each decode rank with every prefill TP rank.
         unsupported.append("KV cache sharding")
     if cfg.enable_pdmux or cfg.decoupled_spec_role != "null":

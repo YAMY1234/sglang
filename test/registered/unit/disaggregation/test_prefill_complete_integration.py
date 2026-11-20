@@ -1,5 +1,7 @@
 """Exercise the allocation policy through production transport and queue methods."""
 
+import asyncio
+import json
 import threading
 import time
 import unittest
@@ -15,6 +17,7 @@ from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.disaggregation.base.conn import StateType
 from sglang.srt.disaggregation.common.bootstrap import DeferredBootstrap
 from sglang.srt.disaggregation.common.conn import (
+    CommonKVBootstrapServer,
     CommonKVReceiver,
     KVTransferError,
     PrefillServerInfo,
@@ -58,6 +61,10 @@ register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 # The decode manager's control endpoint in TestAllocationIntegration.
 DECODE = ("decode", 2)
+
+
+async def _done(value):
+    return value
 
 
 class _BroadcastGroup:
@@ -155,6 +162,33 @@ class TestAllocationConfiguration(CustomTestCase):
                 with self.assertRaisesRegex(ValueError, "attention"):
                     handle_pd_disaggregation(ServerArgs(**values))
 
+    def test_multi_endpoint_flag_admits_only_a_wider_decode(self):
+        # Route (a): PP8 x TP1 prefill, TP16 attn-DP4 DCP4 decode.
+        base = dict(
+            model_path="dummy",
+            disaggregation_decode_allocation_policy="prefill_complete",
+        )
+        prefill = dict(base, disaggregation_mode="prefill", pp_size=8)
+        decode = dict(
+            base, disaggregation_mode="decode", tp_size=16, dcp_size=4, attn_dp_size=4
+        )
+        with envs.SGLANG_PREFILL_COMPLETE_ALLOW_MULTI_ENDPOINT.override(True):
+            for values in (prefill, decode):
+                with self.subTest(values=values):
+                    handle_pd_disaggregation(ServerArgs(**values))
+            for values, changed in (
+                (dict(base, disaggregation_mode="prefill", tp_size=4), {}),
+                (dict(base, disaggregation_mode="prefill", dcp_size=4), {}),
+                (decode, {"attn_cp_size": 2}),
+                (decode, {"enable_kv_cache_sharding": True}),
+                (decode, {"disaggregation_decode_enable_radix_cache": True}),
+            ):
+                with self.subTest(values=values, changed=changed):
+                    with self.assertRaisesRegex(ValueError, "prefill_complete"):
+                        handle_pd_disaggregation(ServerArgs(**values, **changed))
+        with self.assertRaisesRegex(ValueError, "attention"):
+            handle_pd_disaggregation(ServerArgs(**decode))
+
     def test_request_state_pools_need_their_flag(self):
         kimi_states = [
             StateType.MAMBA,
@@ -225,11 +259,11 @@ class TestAllocationIntegration(CustomTestCase):
             endpoint, msg = self.wire.popleft()
             ip, port = endpoint.removeprefix("tcp://").split(":")
             mgr = self.endpoints[(ip, int(port))]
-            if mgr is not self.decode:
+            if mgr.deferred_bootstrap is not None:
                 mgr._handle_bootstrap_message(msg)
                 continue
-            room, status, rank, reason = self.decode.parse_kv_status_message(msg)
-            self.decode.apply_prefill_status(
+            room, status, rank, reason = mgr.parse_kv_status_message(msg)
+            mgr.apply_prefill_status(
                 bootstrap_room=room,
                 status=status,
                 prefill_rank=rank,
@@ -396,6 +430,222 @@ class TestAllocationIntegration(CustomTestCase):
         self.assertEqual(receiver.conclude_state, KVPoll.Failed)
         self.assertIn("policy mismatch", self.decode.failure_records[1])
         setup.assert_not_called()
+
+    def wide_decode_group(self, stages, room=1, size=4, **peer):
+        """Receivers of one decode attention TP group (TP and DCP ``size``) for a
+        TP1 prefill's stages (route (a))."""
+        managers, receivers = [], []
+        info = dict(
+            attn_tp_size=1,
+            attn_cp_size=1,
+            dp_size=1,
+            pp_size=len(stages),
+            page_size=1,
+            kv_cache_dtype=None,
+            follow_bootstrap_room=True,
+            decode_allocation_policy="prefill_complete",
+            pc_room_endpoints=64,
+            target_tp_rank=0,
+            target_tp_ranks=[0],
+            target_cp_ranks=[0],
+            target_pp_ranks=list(range(len(stages))),
+            required_dst_info_num=size,
+            required_prefill_response_num=len(stages),
+        )
+        info.update(peer)
+
+        def connect(info):
+            endpoint = f"tcp://{info['rank_ip']}:{info['rank_port']}"
+            sock = SimpleNamespace(
+                send_multipart=lambda msg: self.wire.append((endpoint, msg))
+            )
+            return sock, threading.Lock()
+
+        for rank in range(size):
+            port = 20 + 10 * room + rank
+            mgr = self.manager("decode", port)
+            mgr.attn_tp_size, mgr.dcp_size = size, size
+            self.endpoints[("decode", port)] = mgr
+            receiver = MooncakeKVReceiver(mgr, "prefill:8998", room)
+            receiver.bootstrap_infos = [
+                {"rank_ip": stage.local_ip, "rank_port": stage.rank_port}
+                for stage in stages
+            ]
+            mgr.prefill_info_table = {
+                receiver.bootstrap_addr: PrefillServerInfo(**info)
+            }
+            receiver._connect_to_bootstrap_server = Mock(side_effect=connect)
+            with patch.object(receiver, "_setup_bootstrap_infos"):
+                receiver.init(0)
+            managers.append(mgr)
+            receivers.append(receiver)
+        return managers, receivers
+
+    def take_wire(self):
+        msgs = list(self.wire)
+        self.wire.clear()
+        return msgs
+
+    def test_wide_decode_group_shares_each_stage_room(self):
+        stages = self.pp_stages(2)
+        senders = [MooncakeKVSender(mgr, "prefill:8998", 1) for mgr in stages]
+        with envs.SGLANG_PREFILL_COMPLETE_ALLOW_MULTI_ENDPOINT.override(True):
+            managers, receivers = self.wide_decode_group(stages)
+        frames = [msg for _, msg in self.wire]
+        self.assertEqual(len(frames), 4 * 2)
+        self.assertTrue(all(msg[0] == b"BOOTSTRAP" and msg[4:] == [b"4"] for msg in frames))
+        self.flush()
+        self.assertEqual([r.poll() for r in receivers], [KVPoll.Bootstrapping] * 4)
+        decode_endpoints = {f"tcp://decode:{mgr.rank_port}" for mgr in managers}
+        # Either stage's readiness admits every rank; each stage tells all four once.
+        for stage, sender in ((1, senders[1]), (0, senders[0])):
+            sender.mark_prefill_complete()
+            sent = self.take_wire()
+            self.assertEqual({endpoint for endpoint, _ in sent}, decode_endpoints)
+            self.assertEqual(len(sent), 4)
+            self.wire.extend(sent)
+            self.flush()
+            self.assertEqual(
+                [r.poll() for r in receivers], [KVPoll.WaitingForInput] * 4
+            )
+        # A fifth endpoint fails alone; the room keeps its four.
+        stages[0]._handle_bootstrap_message([b"BOOTSTRAP", b"1", b"decode", b"99", b"4"])
+        sent = self.take_wire()
+        self.assertEqual([endpoint for endpoint, _ in sent], ["tcp://decode:99"])
+        self.assertEqual(len(stages[0].deferred_bootstrap.rooms[1].endpoints), 4)
+        targets = [("decode", mgr.rank_port) for mgr in managers]
+        for mgr in stages:
+            mgr.conclude_transfer(bootstrap_room=1, status=KVPoll.Success, targets=targets)
+        self.flush()
+        self.assertEqual([r.poll() for r in receivers], [KVPoll.Success] * 4)
+        for sender in senders:
+            sender.clear()
+        for mgr in stages:
+            self.assertNotIn(1, mgr.deferred_bootstrap.rooms)
+
+    def test_wide_decode_group_failure_reaches_every_rank(self):
+        for before_complete in (True, False):
+            with self.subTest(before_complete=before_complete):
+                room = 2 if before_complete else 3
+                sender = self.sender(room=room)
+                with envs.SGLANG_PREFILL_COMPLETE_ALLOW_MULTI_ENDPOINT.override(True):
+                    _, receivers = self.wide_decode_group([self.prefill], room=room)
+                self.flush()
+                if not before_complete:
+                    sender.mark_prefill_complete()
+                    self.flush()
+                sender.abort()
+                self.flush()
+                self.assertEqual([r.poll() for r in receivers], [KVPoll.Failed] * 4)
+
+    def test_multi_endpoint_peer_needs_flag_and_capability(self):
+        cases = [
+            # (multi-endpoint flag, matched-layout flag, peer, admitted)
+            (True, False, {}, True),
+            (False, True, {}, False),
+            (True, False, {"pc_room_endpoints": 1}, False),
+            (True, False, {"pc_room_endpoints": 2}, False),
+            (True, False, {"dcp_size": 4}, False),
+            (True, False, {"enable_kv_cache_sharding": True}, False),
+            (True, False, {"attn_tp_size": 2, "required_dst_info_num": 2}, False),
+        ]
+        for room, (multi, matched, peer, admitted) in enumerate(cases, start=10):
+            with self.subTest(multi=multi, matched=matched, peer=peer):
+                with (
+                    envs.SGLANG_PREFILL_COMPLETE_ALLOW_MULTI_ENDPOINT.override(multi),
+                    envs.SGLANG_PREFILL_COMPLETE_ALLOW_MATCHED_TP_DCP.override(matched),
+                ):
+                    managers, receivers = self.wide_decode_group(
+                        [self.prefill], room=room, **peer
+                    )
+                sent = self.take_wire()
+                if admitted:
+                    self.assertEqual(len(sent), 4)
+                    self.assertEqual(
+                        [r.poll() for r in receivers], [KVPoll.Bootstrapping] * 4
+                    )
+                else:
+                    self.assertEqual(sent, [])
+                    for mgr, r in zip(managers, receivers):
+                        self.assertEqual(r.conclude_state, KVPoll.Failed)
+                        self.assertIn("peer attention", mgr.failure_records[room])
+
+    def test_one_endpoint_frames_stay_unchanged(self):
+        sender, receiver = self.sender(), self.receiver()
+        with envs.SGLANG_PREFILL_COMPLETE_ALLOW_MULTI_ENDPOINT.override(True):
+            receiver2 = self.receiver(room=2)
+        frames = [msg for _, msg in self.wire]
+        self.assertEqual(len(frames), 2)
+        self.assertTrue(all(len(msg) == 4 for msg in frames))
+        self.flush()
+        self.assertEqual(receiver.poll(), KVPoll.Bootstrapping)
+        self.assertEqual(receiver2.poll(), KVPoll.Bootstrapping)
+        self.assertEqual(self.prefill.deferred_bootstrap.rooms[1].expected, 1)
+        sender.mark_prefill_complete()
+        self.flush()
+        self.assertEqual(receiver.poll(), KVPoll.WaitingForInput)
+
+    def test_room_endpoints_capability_is_omitted_when_one(self):
+        put = dict(
+            attn_tp_size=1, attn_tp_rank=0, attn_cp_size=1, attn_cp_rank=0,
+            attn_dp_size=1, attn_dp_rank=0, pp_size=1, pp_rank=0,
+            system_dp_size=1, system_dp_rank=0, rank_ip="prefill", rank_port=1,
+            page_size=1, kv_cache_dtype=None,
+            decode_allocation_policy="prefill_complete",
+        )
+        get = SimpleNamespace(
+            query=dict(
+                prefill_dp_rank="-1",
+                prefill_cp_rank="-1",
+                target_tp_rank="-1",
+                target_pp_rank="-1",
+            )
+        )
+        for advertised in (None, 64):
+            with self.subTest(advertised=advertised):
+                server = CommonKVBootstrapServer("127.0.0.1", 0)
+                data = dict(put)
+                if advertised is not None:
+                    data["pc_room_endpoints"] = advertised
+                request = SimpleNamespace(json=Mock(side_effect=lambda d=data: _done(d)))
+                asyncio.run(server._handle_route_put(request))
+                response = asyncio.run(server._handle_route_get(get))
+                payload = json.loads(response.text)
+                self.assertEqual("pc_room_endpoints" in payload, advertised is not None)
+                info = PrefillServerInfo(**payload)
+                self.assertEqual(info.pc_room_endpoints, advertised or 1)
+
+    def test_release_relay_leaves_parked_requests_to_the_bootstrap_poll(self):
+        sender = self.sender()
+        self.receiver()
+        self.flush()
+        sender.mark_prefill_complete()
+        self.flush()
+        self.prefill.update_status(1, KVPoll.WaitingForInput)
+        req = SimpleNamespace(
+            rid="parked",
+            disagg_kv_sender=sender,
+            pending_bootstrap=True,
+            prefill_attempt_count=1,
+            skip_radix_cache_insert=False,
+        )
+        scheduler = self.inflight_scheduler([req])
+        scheduler.req_to_token_pool = SimpleNamespace(available_size=lambda: 0)
+        scheduler.waiting_queue = []
+        scheduler.disagg_prefill_bootstrap_queue = SimpleNamespace(
+            finalize_bootstrap=Mock(return_value=True)
+        )
+        # Under PP only pop_bootstrapped_and_resolve_parked_pp may resolve it.
+        self.assertEqual(
+            scheduler.process_disagg_prefill_inflight_queue(
+                pp_consensus_polls=[KVPoll.WaitingForInput]
+            ),
+            [],
+        )
+        self.assertEqual(scheduler.disagg_prefill_inflight_queue, [req])
+        self.assertTrue(req.pending_bootstrap)
+        scheduler.disagg_prefill_bootstrap_queue.finalize_bootstrap.assert_not_called()
+        scheduler.send_kv_chunk.assert_not_called()
 
     def test_matched_tp_dcp_peer_needs_flag_and_equal_layout(self):
         # Decode attention TP8 + DCP8; one prefill rank per decode rank only

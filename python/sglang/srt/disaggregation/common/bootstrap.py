@@ -9,25 +9,38 @@ from __future__ import annotations
 
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
-BootstrapNotification = tuple[tuple[str, int], bool] | None
+Endpoint = tuple[str, int]
+# One (endpoint, failed) message; a list of them for a room that expects more
+# than one decode endpoint (decode attention TP over prefill attention TP).
+BootstrapNotification = (
+    tuple[Endpoint, bool] | list[tuple[Endpoint, bool]] | None
+)
 
 
 @dataclass
 class BootstrapRoom:
     owner: object | None = None
-    endpoint: tuple[str, int] | None = None
+    endpoints: list[Endpoint] = field(default_factory=list)
+    # Decode endpoints the room's request registers.
+    expected: int = 1
     ready: bool = False
-    ready_notified: bool = False
+    # Endpoints that were sent this room's readiness.
+    notified: set[Endpoint] = field(default_factory=set)
     failed: bool = False
     expires_at: float = 0.0
     # The transfer succeeded and decode has been told; the owner has not
     # released the room yet.
     concluded: bool = False
-    # Decode's registration of the room's next request, which arrived while
+    # Decode's registrations of the room's next request, which arrived while
     # this one was concluded but not released.
-    next_endpoint: tuple[str, int] | None = None
+    next_endpoints: list[Endpoint] = field(default_factory=list)
+    next_expected: int = 1
+
+    @property
+    def endpoint(self) -> Endpoint | None:
+        return self.endpoints[0] if self.endpoints else None
 
 
 class DeferredBootstrap:
@@ -51,17 +64,26 @@ class DeferredBootstrap:
         return self.rooms.setdefault(room, BootstrapRoom(expires_at=now + self.timeout))
 
     @staticmethod
-    def _notification(state: BootstrapRoom) -> BootstrapNotification:
-        if state.endpoint is not None:
+    def _notification(
+        state: BootstrapRoom, endpoints: list[Endpoint] | None = None
+    ) -> BootstrapNotification:
+        notes = []
+        for endpoint in state.endpoints if endpoints is None else endpoints:
             if state.failed:
-                return state.endpoint, True
-            if state.ready and not state.ready_notified:
-                # One readiness message per transfer and PP stage, sent before
-                # that stage's Success; so none can trail the room's Success
-                # and accidentally admit the next transfer using this room.
-                state.ready_notified = True
-                return state.endpoint, False
-        return None
+                notes.append((endpoint, True))
+            elif state.ready and endpoint not in state.notified:
+                # One readiness message per endpoint, transfer and PP stage, sent
+                # before that stage's Success; so none can trail the room's
+                # Success and accidentally admit the next transfer using this room.
+                state.notified.add(endpoint)
+                notes.append((endpoint, False))
+        return DeferredBootstrap._out(state.expected, notes)
+
+    @staticmethod
+    def _out(expected: int, notes: list) -> BootstrapNotification:
+        if not notes:
+            return None
+        return notes if expected > 1 else notes[0]
 
     def open(self, room: int, owner: object) -> BootstrapRoom | None:
         with self.lock:
@@ -71,21 +93,36 @@ class DeferredBootstrap:
             state.owner = owner
             return state
 
-    def register(self, room: int, endpoint: tuple[str, int]) -> BootstrapNotification:
+    def register(
+        self, room: int, endpoint: Endpoint, expected: int = 1
+    ) -> BootstrapNotification:
+        """``expected``: the decode endpoints of the room's request (every rank of
+        one decode attention TP group registers when prefill's is smaller)."""
         with self.lock:
             state = self._room(room)
             if state.concluded:
                 # Decode heard Success, so this registers the room's next
                 # request; it applies once this one is released.
-                if state.next_endpoint is None:
-                    state.next_endpoint = endpoint
+                if not state.next_endpoints:
+                    state.next_expected = expected
+                if (
+                    endpoint not in state.next_endpoints
+                    and len(state.next_endpoints) < state.next_expected
+                ):
+                    state.next_endpoints.append(endpoint)
                 return None
-            if state.endpoint is not None and state.endpoint != endpoint:
+            if endpoint in state.endpoints:
+                return self._notification(state, [endpoint])
+            if state.endpoints and (
+                expected != state.expected or len(state.endpoints) >= state.expected
+            ):
                 # A room identifies one request, not a reusable allocation slot.
-                # Reject another receiver without replacing the first endpoint.
-                return endpoint, True
-            state.endpoint = endpoint
-            return self._notification(state)
+                # Reject another receiver without replacing the registered ones.
+                return self._out(max(expected, state.expected), [(endpoint, True)])
+            if not state.endpoints:
+                state.expected = expected
+            state.endpoints.append(endpoint)
+            return self._notification(state, [endpoint])
 
     def complete(self, room: int, owner: object) -> BootstrapNotification:
         with self.lock:
@@ -135,13 +172,14 @@ class DeferredBootstrap:
             if state is None or state.owner is not owner:
                 return None
             if not state.failed and (success or state.concluded):
-                # The transfer worker already told decode. A registration of the
-                # room's next request that arrived since starts that room.
-                if state.next_endpoint is None:
+                # The transfer worker already told decode. Registrations of the
+                # room's next request that arrived since start that room.
+                if not state.next_endpoints:
                     del self.rooms[room]
                 else:
                     self.rooms[room] = BootstrapRoom(
-                        endpoint=state.next_endpoint,
+                        endpoints=list(state.next_endpoints),
+                        expected=state.next_expected,
                         expires_at=time.monotonic() + self.timeout,
                     )
                 return None
