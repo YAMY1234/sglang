@@ -533,31 +533,39 @@ struct TopKRadixBase : TopKConfig {
     }
   }
 
-  /// for_each_input (N == 1) with kUnroll 16-byte loads in flight per thread instead of one: the same
-  /// elements reach `fn` in the same per-thread order; a decode row of ~49k scores is otherwise bound by
-  /// one load latency per 4096 scores.
-  template <uint32_t kUnroll, typename F>
-  SGL_DEVICE static void for_each_input_mlp(const float* __restrict__ in, uint32_t seq_len, F&& fn) {
+  /// for_each_input (N == 1) with kUnroll 16-byte loads in flight per thread, by whole vectors: `vec_fn(v, index
+  /// of v.x)` per full vector, `fn(value, index)` per element of the partial tail, in for_each_input's per-thread
+  /// order. kFilter: vectors (and steps of kUnroll vectors) whose largest score is below `floor` are skipped, for
+  /// callers that ignore such scores.
+  template <uint32_t kUnroll, bool kFilter, typename V, typename F>
+  SGL_DEVICE static void
+  for_each_vec_mlp(const float* __restrict__ in, uint32_t seq_len, float floor, V&& vec_fn, F&& fn) {
     static_assert(kUnroll >= 2);
     const auto vin = reinterpret_cast<const float4*>(in);
     const auto num_full = seq_len / kVecSize;
-    const auto emit4 = [&](const float4& v, uint32_t base) {
-      fn(v.x, base + 0);
-      fn(v.y, base + 1);
-      fn(v.z, base + 2);
-      fn(v.w, base + 3);
-    };
+    const auto vmax = [](const float4& v) { return fmaxf(fmaxf(v.x, v.y), fmaxf(v.z, v.w)); };
     uint32_t vi = threadIdx.x;
 #pragma unroll 1
     for (; vi + (kUnroll - 1) * kBlockSize < num_full; vi += kUnroll * kBlockSize) {
       float4 v[kUnroll];
 #pragma unroll
       for (uint32_t u = 0; u < kUnroll; ++u) v[u] = __ldcg(vin + vi + u * kBlockSize);
+      if constexpr (kFilter) {
+        float m = vmax(v[0]);
 #pragma unroll
-      for (uint32_t u = 0; u < kUnroll; ++u) emit4(v[u], (vi + u * kBlockSize) * kVecSize);
+        for (uint32_t u = 1; u < kUnroll; ++u) m = fmaxf(m, vmax(v[u]));
+        if (!(m >= floor)) continue;
+      }
+#pragma unroll
+      for (uint32_t u = 0; u < kUnroll; ++u) {
+        if (!kFilter || vmax(v[u]) >= floor) vec_fn(v[u], (vi + u * kBlockSize) * kVecSize);
+      }
     }
 #pragma unroll 1
-    for (; vi < num_full; vi += kBlockSize) emit4(__ldcg(vin + vi), vi * kVecSize);
+    for (; vi < num_full; vi += kBlockSize) {
+      const float4 v = __ldcg(vin + vi);
+      if (!kFilter || vmax(v) >= floor) vec_fn(v, vi * kVecSize);
+    }
     if (vi == num_full) {
       const auto base = vi * kVecSize;
       if (base == seq_len) return;
@@ -570,13 +578,27 @@ struct TopKRadixBase : TopKConfig {
     }
   }
 
-  /// One pass over the input: for_each_input<1>, or for_each_input_mlp when kUnroll > 0.
-  template <uint32_t kUnroll, typename F>
-  SGL_DEVICE static void scan_input(const float* __restrict__ in, uint32_t seq_len, F&& fn) {
+  /// for_each_input (N == 1) with kUnroll loads in flight per thread (for_each_vec_mlp), one element at a time.
+  template <uint32_t kUnroll, bool kFilter = false, typename F>
+  SGL_DEVICE static void
+  for_each_input_mlp(const float* __restrict__ in, uint32_t seq_len, F&& fn, float floor = 0.0f) {
+    const auto emit4 = [&](const float4& v, uint32_t base) {
+      fn(v.x, base + 0);
+      fn(v.y, base + 1);
+      fn(v.z, base + 2);
+      fn(v.w, base + 3);
+    };
+    for_each_vec_mlp<kUnroll, kFilter>(in, seq_len, floor, emit4, fn);
+  }
+
+  /// One pass over the input: for_each_input<1>, or for_each_input_mlp when kUnroll > 0 (skipping vectors below
+  /// `floor` when kFilter: `fn` must ignore scores below it).
+  template <uint32_t kUnroll, bool kFilter = false, typename F>
+  SGL_DEVICE static void scan_input(const float* __restrict__ in, uint32_t seq_len, F&& fn, float floor = 0.0f) {
     if constexpr (kUnroll == 0) {
       for_each_input(in, seq_len, fn);
     } else {
-      for_each_input_mlp<kUnroll>(in, seq_len, fn);
+      for_each_input_mlp<kUnroll, kFilter>(in, seq_len, fn, floor);
     }
   }
 
@@ -659,7 +681,7 @@ struct TopKRadixBase : TopKConfig {
     // cold scan shares no load address (hence no registers) with the fast path.
     const auto scan = [&](auto&& fn) {
       if constexpr (kUnroll != 0) {
-        return for_each_input_mlp<kUnroll>(problem.in, problem.seq_len, fn);
+        return for_each_input_mlp<kUnroll, true>(problem.in, problem.seq_len, fn, v_lo);
       }
       const auto seq_len = problem.seq_len;
       const auto num_vec = (seq_len + kVecSize - 1) / kVecSize;
@@ -892,10 +914,31 @@ struct TopKStreamingT : TopKRadixBase<12> {
     PDLWaitPrimary<kUsePDL>();
 
     // Phase 1: Load and build histogram
-    scan_input<kUnroll>(problem.in, problem.seq_len, [&](float val, uint32_t) {
+    const auto add_bin = [&](float val, uint32_t) {
       const auto bin = extract_coarse_bin<kHistBits>(val);
       atomicAdd(&smem->histogram[bin], 1);
-    });
+    };
+    if constexpr (kUnroll == 0) {
+      for_each_input(problem.in, problem.seq_len, add_bin);
+    } else {
+      // extract_coarse_bin for two scores per conversion (cvt.rn.f16x2.f32 rounds each lane as __float2half_rn)
+      const auto add_pair = [&](float a, float b) {
+        const __half2 h = __floats2half2_rn(a, b);
+        uint32_t k = *reinterpret_cast<const uint32_t*>(&h);
+        k ^= 0x80008000u ^ (((k >> 15) & 0x00010001u) * 0x7FFFu);  // per half: ordered fp16 key
+        atomicAdd(&smem->histogram[(k & 0xFFFFu) >> (16 - kHistBits)], 1);
+        atomicAdd(&smem->histogram[k >> (32 - kHistBits)], 1);
+      };
+      for_each_vec_mlp<kUnroll, false>(
+          problem.in,
+          problem.seq_len,
+          0.0f,
+          [&](const float4& v, uint32_t) {
+            add_pair(v.x, v.y);
+            add_pair(v.z, v.w);
+          },
+          add_bin);
+    }
     const auto num_padding = problem.input_start;
     if (tx == 0 && num_padding != 0) {
       atomicSub(&smem->histogram[extract_coarse_bin<kHistBits>(padding_value())], num_padding);
@@ -924,7 +967,8 @@ struct TopKStreamingT : TopKRadixBase<12> {
       __syncthreads();
     }
     uint32_t key_min = ~0u, key_max = 0u;
-    scan_input<kUnroll>(problem.in, problem.seq_len, [&](float val, uint32_t idx) {
+    // scores below v_lo do nothing here, so the unrolled scan skips whole vectors of them
+    scan_input<kUnroll, kUnroll != 0>(problem.in, problem.seq_len, [&](float val, uint32_t idx) {
       if (val >= v_hi) {
         const auto pos = atomicAdd(&smem->count_gt, 1);
         if (pos < topk) [[likely]] {
@@ -941,7 +985,7 @@ struct TopKStreamingT : TopKRadixBase<12> {
           key_max = max(key_max, extract_exact_bin(val));
         }
       }
-    });
+    }, v_lo);
     if constexpr (kRangeSkip) {
       key_min = __reduce_min_sync(0xFFFFFFFFu, key_min);
       key_max = __reduce_max_sync(0xFFFFFFFFu, key_max);
