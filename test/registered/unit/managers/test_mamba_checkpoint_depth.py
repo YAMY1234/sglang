@@ -237,9 +237,21 @@ class TestBranchTrackSplit(unittest.TestCase):
             origin_input_ids=[1] * 8096, extend_end=6144, mamba_branching_seqlen=6144
         )
         with envs.SGLANG_MAMBA_CHUNK_CKPT.override("none"):
-            self.assertFalse(MambaComponent._skip_chunk_checkpoint(req))
+            self.assertFalse(MambaComponent._skip_chunk_checkpoint(req, 6144))
             req.mamba_branching_seqlen = None
-            self.assertTrue(MambaComponent._skip_chunk_checkpoint(req))
+            self.assertTrue(MambaComponent._skip_chunk_checkpoint(req, 6144))
+
+    def test_chunk_skip_keeps_a_fork_tracked_inside_an_earlier_forward(self):
+        from sglang.srt.mem_cache.unified_cache.components.mamba import MambaComponent
+
+        # forward [16384, 32768) of a 40000-token input tracked the branch at 20480
+        req = SimpleNamespace(
+            origin_input_ids=[1] * 40000, extend_end=32768, mamba_branching_seqlen=20480
+        )
+        with envs.SGLANG_MAMBA_CHUNK_CKPT.override("none"):
+            self.assertFalse(MambaComponent._skip_chunk_checkpoint(req, 20480))
+            # a forward that tracked its own end is a chunk state: skipped
+            self.assertTrue(MambaComponent._skip_chunk_checkpoint(req, 32768))
 
 
 class TestChunkedPrefillStaysOnTheChunkGrid(unittest.TestCase):

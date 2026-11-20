@@ -262,7 +262,8 @@ class TestMambaPathStateCap(unittest.TestCase):
                     ),
                 ):
                     self.assertEqual(
-                        MambaComponent._skip_chunk_checkpoint(req), not keep
+                        MambaComponent._skip_chunk_checkpoint(req, req.extend_end),
+                        not keep,
                     )
 
     def test_unified_cache_anchor_falls_back_without_a_shallow_state(self):
