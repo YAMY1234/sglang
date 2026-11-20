@@ -282,6 +282,7 @@ class TargetVerifyExecutor:
             simulate_bonus_sampling_info=simulate_bonus_sampling_info,
             simulated_bonus_seed=self._simulated_bonus_seed,
             forced_rows=forced_rows,
+            draft_block=draft_block,
         )
 
     def accepts_blockwise(self, *, sampling_info, draft_block: DraftBlockResult) -> bool:
@@ -1214,6 +1215,7 @@ def build_accept_outs(
     forced_rows: Optional[torch.Tensor] = None,
     out: Optional[AcceptOuts] = None,
     block_accept_lens_out: Optional[torch.Tensor] = None,
+    draft_block: Optional[DraftBlockResult] = None,
 ) -> AcceptOuts:
     """``out``: static buffers (the in-graph accept's) to copy the results into;
     ``block_accept_lens_out`` (with ``out``) gets commit_lens + cap_trim_lens.
@@ -1229,6 +1231,8 @@ def build_accept_outs(
         served_correct_len, served_bonus = correct_len, bonus
         # The accept runs as served; only its length is replaced.
         correct_len = simulated_correct_len.repeat(bs).to(correct_len.dtype)
+        if envs.SGLANG_SIMULATE_ACC_PER_REQUEST_LEN.get():
+            correct_len = _per_request_simulated_len(correct_len, gamma)
         if simulate_bonus_sampling_info is not None:
             assert target_logits is not None and simulated_bonus_seed is not None
             bonus = sample_simulated_bonus(
@@ -1250,6 +1254,24 @@ def build_accept_outs(
                 .to(bonus.dtype)
                 .view_as(bonus)
             )
+        if (
+            envs.SGLANG_SIMULATE_ACC_RESIDUAL_BONUS.get()
+            and draft_block is not None
+            and simulate_bonus_sampling_info is not None
+            and not draft_block.greedy_draft
+            and target_logits is not None
+        ):
+            bonus = _residual_stop_bonus(
+                target_logits=target_logits,
+                draft_block=draft_block,
+                correct_len=correct_len,
+                bonus=bonus,
+                temperatures=simulate_bonus_sampling_info.temperatures.reshape(-1),
+                rows_per_request=verify_num_draft_tokens,
+                gamma=gamma,
+            )
+        if envs.SGLANG_SIMULATE_ACC_LOG_HIST.get():
+            _log_simulated_hist(correct_len, gamma)
         if forced_rows is not None:
             correct_len = torch.where(forced_rows, served_correct_len, correct_len)
             bonus = torch.where(
@@ -1335,6 +1357,60 @@ def widen_verify_logits(logits_output: LogitsProcessorOutput) -> None:
         return
     out = torch.empty(logits.shape, dtype=torch.float32, device=logits.device)
     logits_output.next_token_logits = cast_to_float32_logits(logits, out)
+
+
+_SIM_HIST = [None, 0]
+
+
+def _per_request_simulated_len(correct_len: torch.Tensor, gamma: int) -> torch.Tensor:
+    # match-expected per request: floor or ceil of SGLANG_SIMULATE_ACC_LEN, same mean.
+    from sglang.srt.speculative.spec_utils import SIMULATE_ACC_LEN
+
+    acc = max(1.0, min(float(gamma + 1), float(SIMULATE_ACC_LEN)))
+    lower = int(acc)
+    frac = acc - lower
+    up = torch.rand(correct_len.shape, device=correct_len.device) < frac
+    acc_len = torch.clamp(lower + up.to(torch.int64), max=gamma + 1)
+    return (acc_len - 1).to(correct_len.dtype)
+
+
+def _residual_stop_bonus(
+    *, target_logits, draft_block, correct_len, bonus, temperatures, rows_per_request, gamma
+) -> torch.Tensor:
+    # At a stop row (c < gamma) sample max(p - q, 0) as a rejection would; c == gamma keeps the bonus.
+    bs = correct_len.shape[0]
+    vocab = target_logits.shape[-1]
+    c = correct_len.long().view(-1)
+    stop = c < gamma
+    if not bool(stop.any()):
+        return bonus
+    rows = _simulated_rows(correct_len.view(-1), rows_per_request)
+    t = temperatures.to(torch.float32).clamp(min=1e-5).view(-1, 1)
+    p = torch.softmax(target_logits.index_select(0, rows).float() / t, dim=-1)
+    draft = _whole_vocab_logits(draft_block, vocab)
+    d_rows = draft[torch.arange(bs, device=c.device), c.clamp(max=gamma - 1)].float()
+    td = draft_block.temperatures.to(torch.float32).clamp(min=1e-5).view(-1, 1)
+    q = torch.softmax(d_rows / td, dim=-1)
+    r = torch.clamp(p - q, min=0.0)
+    mass = r.sum(dim=-1, keepdim=True)
+    r = torch.where(mass > 0, r, p)
+    sampled = torch.multinomial(r, 1).view(-1)
+    out = torch.where(stop, sampled, bonus.view(-1).long())
+    return out.to(bonus.dtype).view_as(bonus)
+
+
+def _log_simulated_hist(correct_len: torch.Tensor, gamma: int) -> None:
+    h = torch.bincount(correct_len.view(-1).long(), minlength=gamma + 1).cpu()
+    _SIM_HIST[0] = h if _SIM_HIST[0] is None else _SIM_HIST[0] + h
+    _SIM_HIST[1] += 1
+    if _SIM_HIST[1] % 500 == 0:
+        tot = int(_SIM_HIST[0].sum())
+        logger.info(
+            "dec-b136 simulated correct_len histogram (n=%d): %s mean_acc_len=%.4f",
+            tot,
+            [round(int(x) / tot, 4) for x in _SIM_HIST[0]],
+            1.0 + float((_SIM_HIST[0] * torch.arange(gamma + 1)).sum()) / tot,
+        )
 
 
 def _simulated_rows(correct_len: torch.Tensor, rows_per_request: int) -> torch.Tensor:

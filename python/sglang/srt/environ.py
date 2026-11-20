@@ -655,6 +655,10 @@ class Envs:
     # slots and lengths, indexer block tables, SWA write locations) in single Triton
     # launches instead of torch-op chains. Bitwise equal outputs.
     SGLANG_OPT_DSV4_FUSED_ATTN_METADATA = EnvBool(False)
+    # dec-b136 rig experiment, eager accept only: residual stop token / per-request simulated length.
+    SGLANG_SIMULATE_ACC_RESIDUAL_BONUS = EnvBool(False)
+    SGLANG_SIMULATE_ACC_PER_REQUEST_LEN = EnvBool(False)
+    SGLANG_SIMULATE_ACC_LOG_HIST = EnvBool(False)
     # Request-window commit of new SWA rows with a tile of rows per program instead of
     # one program per row. Same copies.
     SGLANG_OPT_DSV41_WINDOW_COMMIT_TILED = EnvBool(False)
