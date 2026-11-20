@@ -3011,7 +3011,7 @@ class UnifiedRadixCache(BasePrefixCache):
         full_tokens: int,
         full_node_id: Optional[NodeId],
         matched_node_id: Optional[NodeId],
-        on_complete: Callable[[], None],
+        on_complete: Optional[Callable[[], None]],
         extra_key: Optional[str] = None,
         cache_salt: Optional[str] = None,
     ) -> bool:
@@ -3032,6 +3032,12 @@ class UnifiedRadixCache(BasePrefixCache):
             pending = self._mamba_state_restores = {}
         if request in pending:
             return True
+        lane = self.state_restore_lane_enabled()
+        if lane and full_tokens - matched_tokens < (
+            envs.SGLANG_HICACHE_L3_WITHIN_TREE_MIN_GAP.get()
+        ):
+            # Rank-replicated inputs (as prefetch_from_storage's): every rank skips alike.
+            return False
         key = RadixKey(
             array("q", token_ids),
             extra_key=extra_key,
@@ -3068,8 +3074,27 @@ class UnifiedRadixCache(BasePrefixCache):
                 stats.get("within_tree_alloc_failed", 0) + 1
             )
         pending[request] = operation
-        self.cache_controller.prefetch_queue.put(operation)
+        cc = self.cache_controller
+        (cc.state_restore_queue if lane else cc.prefetch_queue).put(operation)
         return True
+
+    def state_restore_lane_enabled(self) -> bool:
+        """SGLANG_HICACHE_L3_WITHIN_TREE_NONBLOCKING: the controller runs state
+        restores on their own lane (the same on every rank)."""
+        cc = self.cache_controller
+        return cc is not None and getattr(cc, "state_restore_lane", False)
+
+    def _drain_state_restores(self, n: Optional[int]) -> None:
+        """Finish the rank-agreed count of lane restores (all of them when n is None)."""
+        done = self.cache_controller.state_restore_done_queue
+        if n is None:
+            while not done.empty():
+                self._finish_mamba_state_restore(done.get())
+            return
+        for _ in range(n):
+            # PP>0 drains PP0's count; its lane finishes the same op right after
+            # the op's MIN votes, so this rarely blocks.
+            self._finish_mamba_state_restore(done.get())
 
     def _cancel_mamba_state_restore(self, request: CacheRequestHandle) -> None:
         operation = getattr(self, "_mamba_state_restores", {}).get(request)
@@ -3081,7 +3106,8 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def _finish_mamba_state_restore(self, operation) -> None:
         pending = getattr(self, "_mamba_state_restores", {})
-        pending.pop(operation.handle, None)
+        if pending.get(operation.handle) is operation:
+            pending.pop(operation.handle)
         indices = operation.state_host_indices
         attached = False
         try:
@@ -3500,8 +3526,28 @@ class UnifiedRadixCache(BasePrefixCache):
 
     @rank_consensus(same_params=True, same_results=True)
     def check_prefetch_progress(self, request: CacheRequestHandle) -> bool:
-        if request in getattr(self, "_mamba_state_restores", {}):
-            return False
+        restores = getattr(self, "_mamba_state_restores", {})
+        if request in restores:
+            if not self.state_restore_lane_enabled():
+                return False
+            restore = restores[request]
+            # Skip this request (the batch fills with others) a bounded number of
+            # passes; the count advances alike on every rank.
+            restore.admission_skips += 1
+            stats = self._prefetch_outcome_stats
+            if (
+                restore.admission_skips
+                <= envs.SGLANG_HICACHE_L3_WITHIN_TREE_DEADLINE_SKIPS.get()
+            ):
+                stats["within_tree_admission_skips"] = (
+                    stats.get("within_tree_admission_skips", 0) + 1
+                )
+                return False
+            # Deadline: admit as READ_WITHIN_TREE_KV=0 would. The read still lands
+            # and attaches the state for later requests; its pins drop then.
+            restores.pop(request)
+            restore.on_complete = None
+            stats["within_tree_expired"] = stats.get("within_tree_expired", 0) + 1
         if (
             self.cache_controller is not None
             and self.cache_controller.pp_prefetch_decisions.get(request.rid)
@@ -4226,6 +4272,8 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def prefetch_outcome_stats_snapshot(self) -> dict:
         stats = self._prefetch_outcome_stats.copy()
+        if self.state_restore_lane_enabled():
+            stats.update(self.cache_controller.state_sync_stats)
         if self._l3_write_on_host_evict:
             stats.update(self._l3_tier_stats)
             stats["wb_inflight_tokens"] = sum(self._write_behind_inflight.values())
@@ -4725,12 +4773,16 @@ class UnifiedRadixCache(BasePrefixCache):
                 for pool_name in extra_pool_names
             ],
         ]
+        lane = self.state_restore_lane_enabled()
+        if lane:
+            local_qsize_list.append(cc.state_restore_done_queue.qsize())
         qsizes = torch.tensor(
             local_qsize_list,
             dtype=torch.int,
         )
         self._all_reduce(qsizes, torch.distributed.ReduceOp.MIN)
         qsize_list = list(map(int, qsizes.tolist()))
+        n_state_restores = qsize_list.pop() if lane else 0
         n_storage_hit, n_ack_prefetch, n_backup, n_release = qsize_list[:4]
         extra_release_counts = {
             pool_name: count
@@ -4744,6 +4796,8 @@ class UnifiedRadixCache(BasePrefixCache):
             extra_release_counts=extra_release_counts,
             log_metrics=True,
         )
+        if n_state_restores:
+            self._drain_state_restores(n_state_restores)
 
     def drain_storage_control_queues_local(self) -> None:
         """Drain the storage control queues without cross-rank synchronization.
@@ -4768,6 +4822,9 @@ class UnifiedRadixCache(BasePrefixCache):
             },
             log_metrics=False,
         )
+        if self.state_restore_lane_enabled():
+            # Pins and staging slots go back with the restores that already landed.
+            self._drain_state_restores(None)
         self._reset_ack_lag()
 
     # ---- HiCache: Storage backend lifecycle (delegated) ----
@@ -4888,7 +4945,9 @@ class UnifiedRadixCache(BasePrefixCache):
             # received tensor back in place, so all ranks must build the same
             # length or PP1+ would recv into a mismatched buffer.
             storage_queue_sizes = (
-                (0,) * (4 + len(extra_pool_names)) if self.enable_storage else ()
+                (0,) * (4 + len(extra_pool_names) + self.state_restore_lane_enabled())
+                if self.enable_storage
+                else ()
             )
         else:
             write_acks = self._count_ready_acks(cc.ack_write_queue)
@@ -4903,6 +4962,11 @@ class UnifiedRadixCache(BasePrefixCache):
                     cc.ack_backup_queue.qsize(),
                     cc.host_mem_release_queue.qsize(),
                     *(extra_release_queues[name].qsize() for name in extra_pool_names),
+                    *(
+                        (cc.state_restore_done_queue.qsize(),)
+                        if self.state_restore_lane_enabled()
+                        else ()
+                    ),
                 )
                 if self.enable_storage
                 else ()
@@ -5467,6 +5531,10 @@ class UnifiedRadixCache(BasePrefixCache):
             self._write_ahead_commit(self._wa_ready_count)
 
         if self.enable_storage and storage_queue_sizes:
+            n_state_restores = None
+            if self.state_restore_lane_enabled():
+                n_state_restores = storage_queue_sizes[-1]
+                storage_queue_sizes = storage_queue_sizes[:-1]
             n_storage_hit, n_ack_prefetch, n_backup, n_release = storage_queue_sizes[:4]
             extra_release_counts = {
                 pool_name: count
@@ -5480,6 +5548,8 @@ class UnifiedRadixCache(BasePrefixCache):
                 extra_release_counts=extra_release_counts,
                 log_metrics=True,
             )
+            if n_state_restores:
+                self._drain_state_restores(n_state_restores)
         if self._device_write_ahead:
             self._write_ahead_device_tail()
         if self._l3_write_on_host_evict:

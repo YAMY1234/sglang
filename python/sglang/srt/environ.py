@@ -1031,6 +1031,11 @@ class Envs:
     SGLANG_HICACHE_L3_SAVED_TOKEN_THRESHOLD = EnvBool(False)
     # Recover checkpoints inside the resident KV span, beyond the deepest live state.
     SGLANG_HICACHE_L3_READ_WITHIN_TREE_KV = EnvBool(False)
+    # Within-tree restore off the bulk prefetch FIFO: its own lane, only for >= MIN_GAP stateless tree-KV tokens,
+    # not chained ahead of the KV prefetch, admitted without the state after DEADLINE_SKIPS admission skips.
+    SGLANG_HICACHE_L3_WITHIN_TREE_NONBLOCKING = EnvBool(False)
+    SGLANG_HICACHE_L3_WITHIN_TREE_MIN_GAP = EnvInt(8192)
+    SGLANG_HICACHE_L3_WITHIN_TREE_DEADLINE_SKIPS = EnvInt(2)
     # Keyed PP0 lifetime evidence; the output directory must be explicitly provided.
     SGLANG_HICACHE_L3_LIFETIME_LEDGER = EnvBool(False)
     SGLANG_HICACHE_L3_LIFETIME_LEDGER_DIR = EnvStr(None)

@@ -1,6 +1,7 @@
 """State-only L3 recovery with real CPU radix nodes and mocked storage IO."""
 
 import threading
+import time
 import unittest
 from array import array
 from hashlib import sha256
@@ -237,6 +238,201 @@ class TestWithinTreeRestore(UnifiedRadixCacheFixtures, unittest.TestCase):
             worker.join(2)
             self.assertFalse(worker.is_alive())
             cache._finish_mamba_state_restore(op)
+
+
+class TestNonBlockingStateRestoreLane(UnifiedRadixCacheFixtures, unittest.TestCase):
+    """SGLANG_HICACHE_L3_WITHIN_TREE_NONBLOCKING: own lane, gate, no chaining, deadline."""
+
+    cfg = TestWithinTreeRestore.cfg
+    setUp = TestWithinTreeRestore.setUp
+    fixture = TestWithinTreeRestore.fixture
+    start = TestWithinTreeRestore.start
+
+    def lane_fixture(self, min_gap=4, deadline=2):
+        cache, allocator, pool, cc, tokens = self.fixture()
+        cc.state_restore_lane = True
+        cc.state_restore_queue = Queue()
+        cc.state_restore_done_queue = Queue()
+        cc.state_sync_groups = ["state"]
+        cc.prefetch_hits_sync_groups = ["bulk"]
+        cc.pp_prefetch_decisions = {}
+        for patcher in (
+            envs.SGLANG_HICACHE_L3_READ_WITHIN_TREE_KV.override(True),
+            envs.SGLANG_HICACHE_L3_WITHIN_TREE_NONBLOCKING.override(True),
+            envs.SGLANG_HICACHE_L3_WITHIN_TREE_MIN_GAP.override(min_gap),
+            envs.SGLANG_HICACHE_L3_WITHIN_TREE_DEADLINE_SKIPS.override(deadline),
+        ):
+            patcher.__enter__()
+            self.addCleanup(patcher.__exit__, None, None, None)
+        return cache, allocator, pool, cc, tokens
+
+    def test_gate_skips_short_stateless_span(self):
+        cache, _, pool, cc, tokens = self.lane_fixture(min_gap=12)
+        self.assertFalse(self.start(cache, tokens))  # 12 - 4 = 8 < 12
+        self.assertTrue(cc.state_restore_queue.empty())
+        self.assertTrue(cc.prefetch_queue.empty())
+        self.assertEqual(pool.available_size(), 16)
+
+    def test_restore_runs_on_lane_groups_and_drains_from_done_queue(self):
+        cache, _, pool, cc, tokens = self.lane_fixture()
+        self.assertTrue(self.start(cache, tokens, None))
+        self.assertTrue(cc.prefetch_queue.empty())
+        op = cc.state_restore_queue.get_nowait()
+        cc.run_state_restore(op)
+        groups = {call.args[2][0] for call in cc._all_reduce.call_args_list}
+        self.assertEqual(groups, {"state"})
+        self.assertEqual(cc.state_sync_stats["state_bitmap_n"], 1)
+        self.assertEqual(cc.state_sync_stats["state_done_n"], 1)
+        cache._drain_state_restores(cc.state_restore_done_queue.qsize())
+        self.assertEqual(op.state_end_tokens, 8)
+        self.assertEqual(cache.mamba_storage_match_length(tokens), 8)
+        self.assertEqual(pool.available_size(), 15)
+        self.assertFalse(cache._mamba_state_restores)
+
+    def test_deadline_admits_without_state_then_late_read_still_attaches(self):
+        cache, _, pool, cc, tokens = self.lane_fixture(deadline=2)
+        request = CacheRequestHandle("within-tree", 0)
+        self.assertTrue(self.start(cache, tokens, None))
+        self.assertFalse(cache.check_prefetch_progress(request))
+        self.assertFalse(cache.check_prefetch_progress(request))
+        self.assertTrue(cache.check_prefetch_progress(request))  # third pass: expired
+        stats = cache._prefetch_outcome_stats
+        self.assertEqual(stats["within_tree_admission_skips"], 2)
+        self.assertEqual(stats["within_tree_expired"], 1)
+        self.assertNotIn(request, cache._mamba_state_restores)
+        self.assertEqual(pool.available_size(), 15)  # the worker still owns the slot
+        op = cc.state_restore_queue.get_nowait()
+        cc.run_state_restore(op)
+        cache._drain_state_restores(1)
+        self.assertEqual(cache.mamba_storage_match_length(tokens), 8)
+        self.assertEqual(op.restore_locks, [])
+
+    def test_late_restore_does_not_drop_a_newer_pending_entry(self):
+        cache, _, _, cc, tokens = self.lane_fixture(deadline=0)
+        request = CacheRequestHandle("within-tree", 0)
+        self.assertTrue(self.start(cache, tokens, None))
+        self.assertTrue(cache.check_prefetch_progress(request))  # expires at once
+        old = cc.state_restore_queue.get_nowait()
+        self.assertTrue(self.start(cache, tokens, None))  # e.g. a retracted re-queue
+        newer = cache._mamba_state_restores[request]
+        self.assertIsNot(old, newer)
+        cc.run_state_restore(old)
+        cache._drain_state_restores(1)
+        self.assertIs(cache._mamba_state_restores[request], newer)
+
+
+class TestStateLaneCollectiveOrder(unittest.TestCase):
+    """Two fake ranks enqueue state and bulk ops in different interleavings. Each
+    gloo group must see its ops in the same order on both ranks, as a real
+    collective pairs the k-th call of one rank with the k-th call of the other."""
+
+    class PairedGroups:
+        def __init__(self):
+            self.cond = threading.Condition()
+            self.posted = {}  # (group, k) -> {rank: tensor}
+            self.calls = {}  # (rank, group) -> count
+            self.mismatch = []
+
+        def all_reduce(self, rank, tensor, op, groups):
+            group = groups[0]
+            with self.cond:
+                k = self.calls.get((rank, group), 0)
+                self.calls[(rank, group)] = k + 1
+                slot = self.posted.setdefault((group, k), {})
+                slot[rank] = tensor.clone()
+                self.cond.notify_all()
+                if not self.cond.wait_for(lambda: len(slot) == 2, timeout=5):
+                    raise AssertionError(f"rank {rank} waited alone on {group}[{k}]")
+                a, b = slot[0], slot[1]
+                if a.shape != b.shape or a.reshape(-1)[0] != b.reshape(-1)[0]:
+                    self.mismatch.append((group, k))
+                    return
+                tensor.copy_(torch.minimum(a, b))
+
+    def controller(self, rank, comm):
+        cc = HybridCacheController.__new__(HybridCacheController)
+        cc.page_size = 64
+        cc.state_restore_lane = True
+        cc.state_restore_queue = Queue()
+        cc.state_restore_done_queue = Queue()
+        cc.state_sync_groups = ["state"]
+        cc.prefetch_hits_sync_groups = ["bulk"]
+        cc.storage_stop_event = threading.Event()
+        cc._all_reduce = lambda tensor, op, groups: comm.all_reduce(rank, tensor, op, groups)
+        cc.query_mamba_states = lambda hashes: [False] * len(hashes)
+        cc.load_mamba_state = mock.Mock(return_value=True)
+        cc.bulk_queue = Queue()
+        return cc
+
+    def state_op(self, marker):
+        # matched_tokens doubles as the op's identity in the packed bitmap's head.
+        op = MambaStateRestoreOperation(
+            CacheRequestHandle(f"s{marker}", 0),
+            RadixKey(array("q", range(256))),
+            64 * marker,
+            256,
+            torch.tensor([1]),
+            1,
+        )
+        op.state_hashes = [str(i) for i in range(4)]
+        op.state_exists = [False, False, False, True]
+        return op
+
+    def test_lane_order_is_independent_of_interleaving_with_bulk_ops(self):
+        comm = self.PairedGroups()
+        ranks = [self.controller(0, comm), self.controller(1, comm)]
+        interleavings = (["s1", "b1", "s2", "b2", "s3"], ["b1", "b2", "s1", "s2", "s3"])
+        for cc, order in zip(ranks, interleavings):
+            for item in order:
+                if item.startswith("s"):
+                    cc.state_restore_queue.put(self.state_op(int(item[1:])))
+                else:
+                    cc.bulk_queue.put(int(item[1:]))
+
+        def bulk_worker(cc):
+            while not cc.bulk_queue.empty():
+                marker = cc.bulk_queue.get_nowait()
+                cc._all_reduce(torch.tensor([marker, 7]), None, cc.prefetch_hits_sync_groups)
+
+        with mock.patch.object(
+            HybridCacheController, "_storage_hit_query", lambda self, op: None
+        ):
+            threads = []
+            for cc in ranks:
+                threads.append(threading.Thread(target=cc.state_restore_thread_func))
+                threads.append(threading.Thread(target=bulk_worker, args=(cc,)))
+            for t in threads:
+                t.start()
+            for cc in ranks:
+                deadline = time.monotonic() + 5
+                while cc.state_restore_done_queue.qsize() < 3 and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                cc.storage_stop_event.set()
+            for t in threads:
+                t.join(5)
+                self.assertFalse(t.is_alive())
+        self.assertEqual(comm.mismatch, [])
+        for cc in ranks:
+            done = [cc.state_restore_done_queue.get_nowait().matched_tokens for _ in range(3)]
+            self.assertEqual(done, [64, 128, 192])
+        self.assertEqual(comm.calls[(0, "state")], comm.calls[(1, "state")])
+        self.assertEqual(comm.calls[(0, "bulk")], 2)
+
+    def test_control_one_fifo_with_rank_local_interleaving_misorders(self):
+        # The hazard the lane avoids: one queue/group, items in each rank's own order.
+        comm = self.PairedGroups()
+        interleavings = ([101, 1, 102, 2], [1, 2, 101, 102])
+
+        def worker(rank, items):
+            for marker in items:
+                comm.all_reduce(rank, torch.tensor([marker, 7]), None, ["bulk"])
+
+        threads = [threading.Thread(target=worker, args=(r, o)) for r, o in enumerate(interleavings)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(5)
+        self.assertNotEqual(comm.mismatch, [])
 
 
 class TestStateOnlyQueryAndConsensus(unittest.TestCase):

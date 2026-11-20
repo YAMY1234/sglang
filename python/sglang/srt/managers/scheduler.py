@@ -3596,6 +3596,8 @@ class Scheduler(
                 matched_len = tree_cache.mamba_storage_match_length(
                     state_query_tokens, extra_key=req.extra_key, cache_salt=req.cache_salt
                 )
+            # On the state-restore lane the KV prefetch below is not chained behind it.
+            chained = within_tree and not tree_cache.state_restore_lane_enabled()
             if (
                 not within_tree_done
                 and within_tree
@@ -3606,12 +3608,17 @@ class Scheduler(
                     req.full_kv_hit_length,
                     req.full_kv_end_node,
                     req.last_host_node,
-                    lambda: self._prefetch_kvcache(
-                        req, storage_hit_end, within_tree_done=True
-                    ),
+                    (
+                        lambda: self._prefetch_kvcache(
+                            req, storage_hit_end, within_tree_done=True
+                        )
+                    )
+                    if chained
+                    else None,
                     extra_key=req.extra_key,
                     cache_salt=req.cache_salt,
                 )
+                and chained
             ):
                 return
             last_host_node = req.last_host_node

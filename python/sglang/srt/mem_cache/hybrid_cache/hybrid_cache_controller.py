@@ -222,6 +222,16 @@ class MambaStateRestoreOperation(PrefetchOperation):
         self.restore_locks = []
         self.on_complete = None
         self.cancelled = False
+        self.admission_skips = 0
+
+
+def _state_sync_stats() -> dict[str, int]:
+    """Counters of the state-restore steps: bitmap vote, state get, success vote."""
+    return {
+        f"state_{step}_{kind}": 0
+        for step in ("bitmap", "get", "done")
+        for kind in ("n", "us", "max_us")
+    }
 
 
 @dataclass(frozen=True)
@@ -260,6 +270,14 @@ class HybridCacheController(BaseHiCacheController):
         self.extra_host_mem_release_queues: dict[PoolName, Queue[torch.Tensor]] = {}
         self.pp_prefetch_command_group = None
         self.pp_prefetch_command_thread = None
+        # SGLANG_HICACHE_L3_WITHIN_TREE_NONBLOCKING: within-tree state restores on their own
+        # FIFO, thread and gloo groups (see state_restore_thread_func).
+        self.state_restore_lane = False
+        self.state_restore_queue: Optional[Queue] = None
+        self.state_restore_done_queue: Optional[Queue] = None
+        self.state_restore_thread: Optional[threading.Thread] = None
+        self.state_sync_groups: List[torch.distributed.ProcessGroup] = []
+        self.state_sync_stats = _state_sync_stats()
         self.pp_prefetch_command_queue: Queue[Optional[PPPrefetchTicket]] = Queue()
         self.pp_prefetch_state_lock = threading.Lock()
         self.pp_prefetch_states: dict[str, PPPrefetchState] = {}
@@ -304,6 +322,20 @@ class HybridCacheController(BaseHiCacheController):
     def _start_storage_threads(self):
         super()._start_storage_threads()
         self._init_extra_host_mem_release_queues()
+        self.state_restore_lane = bool(
+            envs.SGLANG_HICACHE_L3_WITHIN_TREE_NONBLOCKING.get()
+            and envs.SGLANG_HICACHE_L3_READ_WITHIN_TREE_KV.get()
+        )
+        if self.state_restore_lane:
+            self.state_restore_queue = Queue()
+            self.state_restore_done_queue = Queue()
+            if not self.state_sync_groups:
+                # Collective group creation: every rank reaches this in the same order.
+                self.state_sync_groups = self._create_sync_groups()
+            self.state_restore_thread = threading.Thread(
+                target=self.state_restore_thread_func, daemon=True
+            )
+            self.state_restore_thread.start()
         if self.pp_prefetch_command_group is not None:
             self.pp_prefetch_command_queue = Queue()
             self.pp_prefetch_command_thread = threading.Thread(
@@ -325,6 +357,12 @@ class HybridCacheController(BaseHiCacheController):
     def _stop_storage_threads(self):
         self._stop_pp_prefetch_thread()
         super()._stop_storage_threads()
+        thread = self.state_restore_thread
+        if thread is not None:
+            thread.join(timeout=10)
+            if thread.is_alive():
+                raise RuntimeError("Failed to stop the HiCache state-restore thread cleanly.")
+            self.state_restore_thread = None
 
     @staticmethod
     def supports_page_envelope_host(storage_backend: str | None) -> bool:
@@ -385,6 +423,9 @@ class HybridCacheController(BaseHiCacheController):
 
     def detach_storage_backend(self):
         super().detach_storage_backend()
+        if self.state_sync_groups:
+            self._destroy_sync_groups(self.state_sync_groups)
+            self.state_sync_groups = []
         if self.pp_prefetch_command_group is not None:
             torch.distributed.destroy_process_group(self.pp_prefetch_command_group)
             self.pp_prefetch_command_group = None
@@ -1589,17 +1630,58 @@ class HybridCacheController(BaseHiCacheController):
         restorable = reduced[: len(hits)]
         return max(i for i, ok in enumerate(restorable) if ok) * self.page_size
 
-    def _sync_mamba_state_restore(self, operation: MambaStateRestoreOperation) -> int:
+    def state_restore_thread_func(self) -> None:
+        """Within-tree state restores on their own FIFO and gloo groups. The bulk
+        prefetch thread consumes a queue that the scheduler interleaves differently
+        on each rank, so running state ops there out of FIFO order (or sharing its
+        groups from another thread) would misorder the per-op collectives."""
+        while (
+            not self.storage_stop_event.is_set() or not self.state_restore_queue.empty()
+        ):
+            try:
+                operation = self.state_restore_queue.get(block=True, timeout=1)
+            except Empty:
+                continue
+            if operation is not None:
+                self.run_state_restore(operation)
+
+    def run_state_restore(self, operation: MambaStateRestoreOperation) -> None:
+        try:
+            self._storage_hit_query(operation)
+        except Exception:
+            logger.exception(
+                "HiCache state-only query failed for %s", operation.request_id
+            )
+            operation.state_exists = []
+        self._sync_mamba_state_restore(operation, self.state_sync_groups)
+        self.state_restore_done_queue.put(operation)
+
+    def _note_state_sync(self, name: str, seconds: float) -> None:
+        """Diagnostics: count, total and max microseconds of a state-restore step."""
+        stats, us = getattr(self, "state_sync_stats", None), int(seconds * 1e6)
+        if stats is None:
+            stats = self.state_sync_stats = _state_sync_stats()
+        # Keys are fixed at init: the scheduler thread copies this dict while we write.
+        stats[f"state_{name}_n"] += 1
+        stats[f"state_{name}_us"] += us
+        stats[f"state_{name}_max_us"] = max(stats[f"state_{name}_max_us"], us)
+
+    def _sync_mamba_state_restore(
+        self,
+        operation: MambaStateRestoreOperation,
+        groups: Optional[List[torch.distributed.ProcessGroup]] = None,
+    ) -> int:
         # Every intake enqueues an operation, even with no local slot or Full
         # coverage. Keep the collective shape independent of local tree state.
+        groups = self.prefetch_hits_sync_groups if groups is None else groups
         count = len(operation.token_ids) // self.page_size
         local = operation.state_exists or [False] * count
         packed = torch.tensor(
             [-operation.matched_tokens] + local, dtype=torch.int
         )
-        self._all_reduce(
-            packed, torch.distributed.ReduceOp.MIN, self.prefetch_hits_sync_groups
-        )
+        t0 = time.perf_counter()
+        self._all_reduce(packed, torch.distributed.ReduceOp.MIN, groups)
+        self._note_state_sync("bitmap", time.perf_counter() - t0)
         agreed = packed.tolist()
         matched = -agreed[0]
         end = max(
@@ -1613,6 +1695,7 @@ class HybridCacheController(BaseHiCacheController):
             operation.state_outcome = "threshold_rejected"
             return 0
         success = False
+        t0 = time.perf_counter()
         try:
             success = self.load_mamba_state(
                 operation.state_hashes[end // self.page_size - 1],
@@ -1620,10 +1703,11 @@ class HybridCacheController(BaseHiCacheController):
             )
         except Exception:
             logger.exception("HiCache state-only get failed for %s", operation.request_id)
+        self._note_state_sync("get", time.perf_counter() - t0)
         done = torch.tensor(int(success), dtype=torch.int)
-        self._all_reduce(
-            done, torch.distributed.ReduceOp.MIN, self.prefetch_hits_sync_groups
-        )
+        t0 = time.perf_counter()
+        self._all_reduce(done, torch.distributed.ReduceOp.MIN, groups)
+        self._note_state_sync("done", time.perf_counter() - t0)
         if done.item():
             operation.state_end_tokens = end
             operation.state_saved_tokens = saved
