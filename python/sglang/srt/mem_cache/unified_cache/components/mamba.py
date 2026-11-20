@@ -643,12 +643,16 @@ class MambaComponent(TreeComponent):
         return previous_cache_len, pool.get_mamba_ping_pong_other_idx(keep_idx)
 
     @staticmethod
-    def _skip_chunk_checkpoint(req: Req) -> bool:
+    def _skip_chunk_checkpoint(req: Req, cache_len: int) -> bool:
         """SGLANG_MAMBA_CHUNK_CKPT: none skips every mid-prefill chunk state, last
-        keeps only the one whose remaining input fits in one more chunk."""
+        keeps only the one whose remaining input fits in one more chunk. A state the
+        forward tracked at the branching point is a fork checkpoint, not a chunk
+        state, and is always kept."""
         mode = envs.SGLANG_MAMBA_CHUNK_CKPT.get()
         remaining = len(req.origin_input_ids) - req.extend_end
         if mode == "all" or remaining <= 0:  # the input end or a decode checkpoint
+            return False
+        if cache_len == req.mamba_branching_seqlen:
             return False
         if mode == "none":
             return True
@@ -699,7 +703,7 @@ class MambaComponent(TreeComponent):
                 insert_params.mamba_value = active_value
             return cache_len
         else:
-            if cache_len is None or self._skip_chunk_checkpoint(req):
+            if cache_len is None or self._skip_chunk_checkpoint(req, cache_len):
                 return 0
             # Donate the mamba index to the radix cache instead of copying.
             if self.int8_ckpt_pool is not None:

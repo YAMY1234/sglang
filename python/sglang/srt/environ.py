@@ -972,6 +972,12 @@ class Envs:
     # forward that ends the input, track the input end instead, so the request's
     # own end state and tail KV reach the tree; off tracks the branching point.
     SGLANG_MAMBA_BRANCH_TRACK_PREFER_END = EnvBool(False)
+    # Cut a prefill forward that would end the input at the branching point, so
+    # that forward tracks the branching-point state and the next one the input end.
+    SGLANG_MAMBA_BRANCH_TRACK_SPLIT = EnvBool(False)
+    # A branching point shallower than this many tokens gets no branch-point state
+    # (no split cut, no fork checkpoint); 0 (default) keeps every branching point.
+    SGLANG_MAMBA_BRANCH_TRACK_MIN_TOKENS = EnvInt(0)
     # Scales the hierarchical Mamba host pool's share of --hicache-size (the KV
     # host pools take the rest); unset (default) splits it as the device pools are.
     SGLANG_HICACHE_MAMBA_HOST_SCALE = EnvFloat(None)

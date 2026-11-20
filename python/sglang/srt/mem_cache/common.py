@@ -255,6 +255,14 @@ def match_kv_cache(
         match_result = zero_match_result(
             tree_cache, match_result, extra_key=req.extra_key
         )
+    # Every branch-point state (split cut, tracked fork checkpoint) keys off this
+    # field, so dropping a shallow one here drops all of them.
+    branching_seqlen = match_result.mamba_branching_seqlen
+    if (
+        branching_seqlen is not None
+        and branching_seqlen < envs.SGLANG_MAMBA_BRANCH_TRACK_MIN_TOKENS.get()
+    ):
+        match_result = match_result._replace(mamba_branching_seqlen=None)
     req.prefix_len = match_result.device_prefix_len
     (
         req.last_node,
