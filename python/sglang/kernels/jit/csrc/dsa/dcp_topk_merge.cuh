@@ -677,9 +677,10 @@ publish_local_topk(const PushedParams& p, int row, int64_t full_off, uint64_t ta
     }
   };
   uint64_t* const dst = p.buffer + full_off;
-  // this rank's keys >= t into dst in round order, the first kTopK of them; returns their count.
-  // The next round's loads are issued before this round's compaction (latency bound in one CTA).
-  const auto write_at_least = [&](uint64_t t) {
+  // this rank's keys >= t into dst in round order, the first kTopK of them; returns their count,
+  // or stops once it passes kTopK when `probe`. The next round's loads are issued before this
+  // round's compaction (latency bound in one CTA).
+  const auto write_at_least = [&](uint64_t t, bool probe) {
     int written = 0;
     int32_t next[kTile];
     load(0, next);
@@ -708,10 +709,11 @@ publish_local_topk(const PushedParams& p, int row, int64_t full_off, uint64_t ta
         }
       }
       written += total;
+      if (probe && written > kTopK) break;  // block-uniform: the select follows
     }
     return written;
   };
-  int written = write_at_least(t_lo);
+  int written = write_at_least(t_lo, true);
   const bool select = written > kTopK;
   if (select) {
     const auto visit = [&](auto f) {
@@ -720,7 +722,7 @@ publish_local_topk(const PushedParams& p, int row, int64_t full_off, uint64_t ta
         f(k >= t_lo ? k : uint64_t{0});
       }
     };
-    written = write_at_least(select_kth_adaptive(visit, kTopK, s));
+    written = write_at_least(select_kth_adaptive(visit, kTopK, s), false);
   }
   for (int e = written + tid; e < kTopK; e += kThreads)
     device::ptx::store_relaxed_sys(dst + e, pack_entry(0, -1, tag));
