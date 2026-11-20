@@ -2436,7 +2436,13 @@ class Scheduler(
             self.metrics_reporter.record_scheduler_active(recv_start_ns)
         self.process_input_requests(recv_reqs)
         if linker_actions:
-            self.tree_cache.linker_apply_actions(linker_actions)
+            work = getattr(self.tree_cache, "ring_wait_work", None)
+            if work is not None and envs.SGLANG_LINKER_PP_DEFER_ACTIONS.get():
+                # Every stage applies them in its ring-output wait, before this
+                # round's result (SGLANG_PP_RING_WAIT_WORK), instead of before admission.
+                work.append(lambda: self.tree_cache.linker_apply_actions(linker_actions))
+            else:
+                self.tree_cache.linker_apply_actions(linker_actions)
         return [*recv_reqs, *verdicts, *linker_actions]
 
     @scheduler_stage_method(SCHEDULER_STAGE_PROCESS_REQUESTS)
