@@ -1761,7 +1761,14 @@ class SchedulerDisaggregationPrefillMixin:
                 digest = computer.compute(page_indices_gpu, state_indices)
                 signature = self.disagg_prefill_bootstrap_queue.kv_checksum_signature
             self.disagg_metadata_buffers.set_kv_checksum(req, digest, signature)
-        self._send_kv_chunk(req, last_chunk=last_chunk, end_idx=end_idx)
+        # PD local result: an earlier stage holds a placeholder token; the last
+        # stage alone writes decode's aux.
+        self._send_kv_chunk(
+            req,
+            last_chunk=last_chunk,
+            end_idx=end_idx,
+            send_aux=not self._pp_pd_local_placeholder,
+        )
 
     def _send_kv_chunk(
         self: Scheduler,

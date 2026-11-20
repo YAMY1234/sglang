@@ -863,6 +863,9 @@ class Envs:
     # PP diagnostics: per-rank host / wait / forward-gap partition and admission
     # counts, logged every INTERVAL_S; FWD_DIR also writes one CSV row per forward.
     SGLANG_PP_BUBBLE_DIAG = EnvBool(False)
+    # PP PD prefill (Mooncake): no output ring. Earlier stages process a host
+    # placeholder; the last stage processes its own output and alone sends aux.
+    SGLANG_PP_PD_LOCAL_RESULT = EnvBool(False)
     SGLANG_PP_BUBBLE_DIAG_INTERVAL_S = EnvFloat(60.0)
     SGLANG_PP_BUBBLE_DIAG_FWD_DIR = EnvStr(None)
     # With the diag and its FWD_DIR on: sample the scheduler thread's Python stack at
