@@ -1823,7 +1823,12 @@ class SchedulerPPMixin:
                     "set_run_batch_cpu_start_time",
                     trace_only=True,
                 )
+                if diag is not None:
+                    diag.begin_forward()
+                    diag.phase("fwd_host")
                 result = self.run_batch(cur_batch, pp_proxy_tensors)
+                if diag is not None:
+                    diag.phase("launch")
                 set_time_batch(
                     cur_batch.reqs,
                     "set_run_batch_cpu_end_time",

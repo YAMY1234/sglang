@@ -91,6 +91,17 @@ class TestWallPartition(unittest.TestCase):
         self.assertGreaterEqual(ms["wait.d2h"], 4)
         self.assertNotIn("host.release", ms)
 
+    def test_first_kda_call_per_forward_is_split_out(self):
+        d, _ = _diag()
+        for _ in range(2):
+            d.begin_forward()
+            for _ in range(3):
+                with d.kda_span():
+                    pass
+        calls = d.snapshot(1.0)["calls"]
+        self.assertEqual(calls["wait.kda_first"], 2)
+        self.assertEqual(calls["wait.kda"], 4)
+
     def test_span_in_phase_labels_by_current_phase(self):
         d, _ = _diag()
         d.phase("ingest")
