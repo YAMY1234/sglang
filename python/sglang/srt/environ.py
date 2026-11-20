@@ -1047,6 +1047,9 @@ class Envs:
     # Direct linker: remove the store-budget and state-cap victims with Mooncake's
     # batch_remove (4096 keys per call) instead of one remove() call per key.
     SGLANG_LINKER_BATCH_REMOVE = EnvBool(False)
+    # Direct linker: offload puts on this many threads (results still in queue order;
+    # a removal waits for every task queued before it).
+    SGLANG_LINKER_OFFLOAD_THREADS = EnvInt(1)
     # Prefetch mode (GLM names): a published read keeps its prefix locked until
     # its request is admitted, the held prefixes under this share of the Full
     # device pool (0 releases at publish; PP requires > 0).

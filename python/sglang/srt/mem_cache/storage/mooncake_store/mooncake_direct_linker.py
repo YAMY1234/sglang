@@ -934,10 +934,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         self.load_queue: Queue[
             tuple[int, dict[str, list[PoolTransfer]], object, dict[str, float]] | None
         ] = Queue()
-        self.offload_queue: Queue[
-            tuple[list[PoolTransfer], int, list[object], str | None] | None
-        ] = Queue()
-        self.offload_results: Queue[bool] = Queue()
+        self._init_offload_queue()
         self.stats = {"lookup": 0, "load": 0, "offload": 0, "load_overlapped": 0}
         self.load_threads = [
             threading.Thread(
@@ -958,12 +955,17 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             else None
         )
         self.prefetch_futures: set = set()
-        self.offload_thread = threading.Thread(
-            target=self.offload_thread_func,
-            daemon=True,
-            name=f"mooncake-offload-tp{tp_rank}",
-        )
-        self.offload_thread.start()
+        self.offload_threads = [
+            threading.Thread(
+                target=self.offload_thread_func,
+                daemon=True,
+                name=f"mooncake-offload-tp{tp_rank}" + (f"-{i}" if i else ""),
+            )
+            for i in range(max(1, envs.SGLANG_LINKER_OFFLOAD_THREADS.get()))
+        ]
+        self.offload_thread = self.offload_threads[0]
+        for thread in self.offload_threads:
+            thread.start()
 
     def _buffer_ranges(self) -> list[tuple[int, int]]:
         """(ptr, nbytes) of every distinct storage behind the linker's pools."""
@@ -2380,9 +2382,38 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             self.state_parent[kept] = node
         return victims
 
+    def _init_offload_queue(self) -> None:
+        """SGLANG_LINKER_OFFLOAD_THREADS: puts run on that many threads; tasks take a
+        sequence number as they are dequeued, results leave in that order, and a
+        removal waits until every task queued before it has finished."""
+        self.offload_queue: Queue[
+            tuple[list[PoolTransfer], int, list[object], str | None] | None
+        ] = Queue()
+        self.offload_results: Queue[bool] = Queue()
+        self._offload_take = threading.Lock()
+        self._offload_order = threading.Condition()
+        self._remove_lock = threading.Lock()
+        self._offload_seq = self._offload_head = 0
+        self._offload_done: dict[int, bool | None] = {}
+
+    def _offload_finished(self, seq: int, result: bool | None) -> None:
+        """Hand on results in dequeue order (None: a task without one)."""
+        with self._offload_order:
+            self._offload_done[seq] = result
+            while self._offload_head in self._offload_done:
+                done = self._offload_done.pop(self._offload_head)
+                if done is not None:
+                    self.offload_results.put(done)
+                self._offload_head += 1
+            self._offload_order.notify_all()
+
     def offload_thread_func(self) -> None:
         while True:
-            task = self.offload_queue.get()
+            with self._offload_take:
+                task = self.offload_queue.get()
+                seq = self._offload_seq
+                self._offload_seq += 1
+            result = None
             if self.offload_busy is None:
                 self.offload_busy = Counter()
             busy = self.offload_busy
@@ -2396,7 +2427,11 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 if task is None:
                     return
                 if task[0] == "remove":
-                    self._remove_pages(task[1], task[2], task[3])
+                    # After the puts queued before it (one of them may write these objects).
+                    with self._offload_order:
+                        self._offload_order.wait_for(lambda: self._offload_head >= seq)
+                    with self._remove_lock:
+                        self._remove_pages(task[1], task[2], task[3])
                     self._maybe_log_stats()
                     continue
                 expanded, tokens, ready_events, session_id, victims = task
@@ -2441,19 +2476,23 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                     self.write_bytes["states"] += put.get(PoolName.MAMBA, 0)
                     if self.state_path_cap:
                         t = time.perf_counter()
-                        self._remove_states(victims)
+                        with self._remove_lock:
+                            self._remove_states(victims)
                         busy["states_s"] += time.perf_counter() - t
                 if self.store_tree is not None and self.page_remove_retries:
                     t = time.perf_counter()
-                    self._remove_pages([])
+                    with self._remove_lock:
+                        self._remove_pages([])
                     busy["retries_s"] += time.perf_counter() - t
-                self.offload_results.put(success)
+                result = success
                 self._maybe_log_stats()
             except BaseException:
                 logger.exception("Mooncake offload failed")
-                self.offload_results.put(False)
+                if result is None:  # failed before its outcome was known
+                    result = False
             finally:
                 busy[f"{kind}_s"] += time.perf_counter() - started
+                self._offload_finished(seq, None if task is None or task[0] == "remove" else result)
                 self.offload_queue.task_done()
 
     _REMOVE_RETRIES = 6
@@ -2824,10 +2863,12 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         self.reset()
         for _ in self.load_threads:
             self.load_queue.put(None)
-        self.offload_queue.put(None)
+        for _ in self.offload_threads:
+            self.offload_queue.put(None)
         for thread in self.load_threads:
             thread.join()
-        self.offload_thread.join()
+        for thread in self.offload_threads:
+            thread.join()
         if self.prefetch_executor is not None:
             self.prefetch_executor.shutdown(wait=True)
         if self.helper is not None:
