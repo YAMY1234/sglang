@@ -628,6 +628,7 @@ class TestAllocationIntegration(CustomTestCase):
                             to_finish=None,
                             extend_end=32,
                             prefix_len=16,
+                            disagg_settle_deferred=False,
                         )
                         scheduler = SimpleNamespace(
                             chunked_req=req,
