@@ -42,6 +42,7 @@ from sglang.kernels.ops.attention.dsa.dcp_topk_merge import (
     DCP_TOPK_MERGE_NUM_STATS,
     dcp_topk_merge,
     dcp_topk_merge_buffer_numel,
+    dcp_topk_merge_row_slot,
     dcp_topk_merge_pushed,
 )
 from sglang.kernels.ops.attention.dsv4.topk import (
@@ -260,7 +261,7 @@ class DcpTopKMerge:
         ):
             return
         buffer = symm_mem.empty(
-            dcp_topk_merge_buffer_numel(world, max_rows, topk, self.cand_k),
+            dcp_topk_merge_buffer_numel(world, max_rows, topk, self.cand_k, self.push),
             dtype=torch.int64,
             device=group.device,
         )
@@ -345,7 +346,7 @@ class DcpTopKMerge:
             world=self.world,
             rank=self.rank,
             cand_k=self.cand_k,
-            slot=self.world * self.cand_k + out.shape[1],
+            slot=dcp_topk_merge_row_slot(self.world, out.shape[1], self.cand_k, push=True),
             cluster_size=candidates_cluster_size(rows),
             cluster_floor=_CANDIDATE_CLUSTER_FLOOR,
         )
