@@ -1033,6 +1033,12 @@ class SchedulerMetricsReporter:
             if get_disagg().disaggregation_decode_host_receive_threshold < 1:
                 msg += f"#host-receive-req: {self.stats.num_decode_host_receive_queue_reqs.total}, "
             msg += f"#retracted-req: {len(self.scheduler.disagg_decode_prealloc_queue.retracted_queue)}, "
+            stops = self.scheduler.disagg_decode_prealloc_queue.prealloc_break_counts
+            if stops is not None:
+                msg += "prealloc-stop: " + (
+                    " ".join(f"{k}={v}" for k, v in sorted(stops.items())) or "none"
+                ) + ", "
+                stops.clear()
 
         if (
             get_disagg().language_only

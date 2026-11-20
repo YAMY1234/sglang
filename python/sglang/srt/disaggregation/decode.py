@@ -25,7 +25,7 @@ import hashlib
 import logging
 import random
 import time
-from collections import deque
+from collections import Counter, deque
 from concurrent.futures import Future
 from dataclasses import dataclass
 from http import HTTPStatus
@@ -399,6 +399,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
     Store the requests that are preallocating.
     """
 
+    # SGLANG_DISAGG_DECODE_PREALLOC_BREAK_DIAG: pop_preallocated passes per stop reason
+    prealloc_break_counts: Optional[Counter] = None
+
     def __init__(
         self,
         req_to_token_pool: ReqToTokenPool,
@@ -485,6 +488,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 envs.SGLANG_DISAGG_DECODE_PREALLOC_CAP.get(),
                 self.max_total_num_tokens,
             )
+        if envs.SGLANG_DISAGG_DECODE_PREALLOC_BREAK_DIAG.get():
+            self.prealloc_break_counts = Counter()
 
         enable_kv_checksum = get_disagg().disaggregation_enable_kv_checksum
         self.kv_checksum_signature = 0
@@ -1479,6 +1484,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         )
 
         # Then, preallocate the remaining requests if possible
+        stop = None
         for i, decode_req in enumerate(self.queue):
             if rids_to_check is not None and decode_req.req.rid not in rids_to_check:
                 continue
@@ -1490,6 +1496,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 continue
 
             if self.req_to_metadata_buffer_idx_allocator.available_size() <= 0:
+                stop = "metadata"
                 break
 
             if self.scheduler.enable_lora and not self.scheduler.can_schedule_lora_req(
@@ -1506,6 +1513,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 >= get_disagg().disaggregation_decode_host_receive_threshold
             ):
                 if not self._pre_alloc_host(decode_req):
+                    stop = "host"
                     break
                 preallocated_reqs.append(decode_req)
                 indices_to_remove.add(i)
@@ -1514,12 +1522,14 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 continue
 
             if self.req_to_token_pool.available_size() <= 0:
+                stop = "req_slots"
                 break
 
             reserve_len = self._pre_alloc_fill_len(decode_req.req)
             if prealloc_cap_tokens is not None and not prealloc_cap_fits(
                 reserved_tokens, reserve_len, prealloc_cap_tokens
             ):
+                stop = "cap"
                 break
 
             # Reserve enough Mamba capacity for radix COW and tracking buffers
@@ -1527,9 +1537,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             if not ensure_mamba_capacity(
                 self.req_to_token_pool, [decode_req.req], self.tree_cache
             ):
+                stop = "mamba"
                 break
 
             if hisparse_req_budget <= 0:
+                stop = "hisparse"
                 break
 
             # Memory estimation: don't add if the projected memory cannot be met
@@ -1618,6 +1630,12 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 if prefix_match is not None and prefix_match.l1_prefix_len > 0:
                     self.tree_cache.unlock(decode_req.req.lock)
                     decode_req.req.lock = None
+                # the budget counts radix-evictable tokens only with the decode radix
+                stop = (
+                    "kv_fit_radix"
+                    if get_disagg().disaggregation_decode_enable_radix_cache
+                    else "kv_fit"
+                )
                 break
 
             if swa_allocatable_tokens is not None:
@@ -1875,6 +1893,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             indices_to_remove.add(i)
             if self.scheduler.enable_lora:
                 running_loras.add(decode_req.req.lora_id)
+
+        if stop is not None and self.prealloc_break_counts is not None:
+            self.prealloc_break_counts[stop] += 1
 
         if failed_reqs:
             failed_ids = {id(r) for r in failed_reqs}
