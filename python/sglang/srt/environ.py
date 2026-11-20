@@ -808,6 +808,9 @@ class Envs:
     # Shard prefill KV transfer chunks by destination session set, round-robin over the transfer queues on
     # first sight, so each decode DP group gets its own worker (default off; ignored with SHARD_BY_ROOM).
     SGLANG_DISAGG_TRANSFER_SHARD_BY_DST_RR = EnvBool(False)
+    # Seconds between "PD transfer time" lines on prefill (0 = off): per request, first chunk enqueued -> last
+    # chunk sent; per chunk, queue wait and dequeue -> sent; on every send path (chunk-packed included).
+    SGLANG_DISAGG_TRANSFER_TIME_STATS_INTERVAL = EnvFloat(0.0)
     # Run each KV transfer worker thread on its own device stream, so the DCP pack gather's
     # producer edge orders only after that worker's own work, not the legacy default stream (default off).
     SGLANG_DISAGG_TRANSFER_WORKER_STREAM = EnvBool(False)
