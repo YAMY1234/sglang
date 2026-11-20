@@ -20,7 +20,7 @@ from torch.distributed import ReduceOp, all_reduce, barrier
 from sglang.srt.disaggregation.utils import prepare_abort
 from sglang.srt.distributed.communication_op import attn_cp_tp_broadcast_pyobj
 from sglang.srt.environ import envs
-from sglang.srt.managers import pp_bubble_diag
+from sglang.srt.managers import pp_bubble_diag, pp_decouple
 from sglang.srt.managers.io_struct import (
     AbortReq,
     BatchTokenizedEmbeddingReqInput,
@@ -155,15 +155,19 @@ class SchedulerRequestReceiver:
                     * get_parallel().attn_cp_size
                     * get_parallel().attn_tp_size
                 )
+                inbox = pp_decouple.relay_inbox()
                 with pp_bubble_diag.wait("req_relay_recv"):
-                    recv_reqs = point_to_point_pyobj(
-                        [],
-                        get_parallel().pp_rank * get_parallel().tp_size + dp_offset,
-                        get_parallel().world_group.cpu_group,
-                        (get_parallel().pp_rank - 1) * get_parallel().tp_size
-                        + dp_offset,
-                        get_parallel().pp_rank * get_parallel().tp_size + dp_offset,
-                    )
+                    if inbox is not None:
+                        recv_reqs = inbox.pop()
+                    else:
+                        recv_reqs = point_to_point_pyobj(
+                            [],
+                            get_parallel().pp_rank * get_parallel().tp_size + dp_offset,
+                            get_parallel().world_group.cpu_group,
+                            (get_parallel().pp_rank - 1) * get_parallel().tp_size
+                            + dp_offset,
+                            get_parallel().pp_rank * get_parallel().tp_size + dp_offset,
+                        )
             else:
                 recv_reqs = None
         return recv_reqs

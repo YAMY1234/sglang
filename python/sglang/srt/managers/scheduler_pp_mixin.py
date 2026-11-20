@@ -4,6 +4,7 @@ import logging
 from collections import defaultdict, deque
 from contextlib import nullcontext
 from dataclasses import dataclass
+from functools import partial
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 import torch
@@ -35,7 +36,8 @@ from sglang.srt.model_executor.forward_batch_info import (
     PPProxyTensors,
 )
 from sglang.srt.observability.req_time_stats import set_time_batch
-from sglang.srt.managers import pp_bubble_diag
+from sglang.srt.managers import pp_bubble_diag, pp_decouple
+from sglang.srt.managers.pp_decouple import PPRecvInbox, PPSendWindow, PPSendWindows
 from sglang.srt.observability.scheduler_stage_metrics import (
     SCHEDULER_STAGE_BUILD_BATCH,
     SCHEDULER_STAGE_DISAGG_BOOKKEEPING,
@@ -125,6 +127,9 @@ class SchedulerPPMixin:
     _pp_pd_local_result_enabled: bool = False
     # True while an earlier stage processes a local-result placeholder: no aux.
     _pp_pd_local_placeholder: bool = False
+    # SGLANG_PP_DECOUPLE_HOST; the PD prefill loop replaces both when it is on.
+    pp_send_windows: PPSendWindows = PPSendWindows()
+    _pp_dict_inbox: Optional[PPRecvInbox] = None
 
     @DynamicGradMode()
     def event_loop_pp(self: Scheduler):
@@ -300,6 +305,13 @@ class SchedulerPPMixin:
                 "own forward of it completes; the last stage sends the first-token "
                 "metadata (SGLANG_PP_PD_PREFILL_EARLY_SEND)."
             )
+        decoupled = self._pp_maybe_init_decouple()
+        overlap_input_wait = (
+            decoupled and early_send and not self.pp_group.is_first_rank
+        )
+        windows = self.pp_send_windows
+        digest_every = self._pp_state_digest_interval()
+        epoch = 0
 
         diag = self.pp_bubble_diag
         while True:
@@ -320,10 +332,12 @@ class SchedulerPPMixin:
                 if diag is not None:
                     diag.maybe_log()
                     diag.phase("ingest")
+                if overlap_input_wait:
+                    self._pp_overlap_input_wait(pp_decouple.relay_inbox())
                 recv_reqs = self.ingest_requests()
 
                 if not self.pp_group.is_last_rank:
-                    self._pp_commit_comm_work(self.send_req_work)
+                    self._pp_commit_comm_work(self.send_req_work, window=windows.req)
 
                 if diag is not None:
                     diag.phase("bootstrap")
@@ -331,7 +345,9 @@ class SchedulerPPMixin:
 
                 if not release_relay:
                     transferred_rids = self._pp_pd_get_prefill_transferred_ids()
-                    self._pp_commit_comm_work(send_transfer_work)
+                    self._pp_commit_comm_work(
+                        send_transfer_work, window=windows.transfer
+                    )
                     tmbs[mb_id] = transferred_rids
 
                 # The pipeline loop builds its own batch instead of calling
@@ -362,6 +378,8 @@ class SchedulerPPMixin:
                     diag.phase("launch")
                 if cur_batch:
                     server_is_idle = False
+                    if overlap_input_wait:
+                        self._pp_overlap_input_wait(self._pp_dict_inbox)
                     pp_proxy_tensors = self._pp_recv_proxy_tensors()
 
                 if get_parallel().pp_async_batch_depth > 0:
@@ -405,7 +423,7 @@ class SchedulerPPMixin:
 
                 if tmbs[next_mb_id] is not None:
                     next_release_rids = self._pp_recv_pyobj_from_prev_stage()
-                self._pp_commit_comm_work(send_release_work)
+                self._pp_commit_comm_work(send_release_work, window=windows.release)
                 # post-process the coming microbatch
                 if self.mbs[next_mb_id] is not None:
                     with self.scheduler_stage_metrics.record(
@@ -458,6 +476,10 @@ class SchedulerPPMixin:
                 release_rids = next_release_rids
 
                 self.running_batch.batch_is_full = False
+                if digest_every:
+                    epoch += 1
+                    if epoch % digest_every == 0:
+                        self._pp_log_state_digest(epoch)
 
             # When the server is idle, self-check and re-init some states
             if server_is_idle:
@@ -734,6 +756,106 @@ class SchedulerPPMixin:
         ] = defaultdict(deque)
         self.pp_release_sync_work_list: List[P2PWork] = []
 
+    def _pp_maybe_init_decouple(self: Scheduler) -> bool:
+        """SGLANG_PP_DECOUPLE_HOST (PD prefill): window the sends and receive the
+        host relays of the previous stage on background threads."""
+        if not (
+            envs.SGLANG_PP_DECOUPLE_HOST.get()
+            and get_parallel().pp_size > 1
+            # NPU PP2 exchanges outputs with batch_isend_irecv, which receives
+            # the metadata itself.
+            and not _is_npu
+        ):
+            return False
+        bound = envs.SGLANG_PP_DECOUPLE_SEND_WINDOW.get() or self.pp_loop_size
+        self.pp_send_windows = PPSendWindows.create(bound)
+        pp_rank = get_parallel().pp_rank
+        # Proxy and output dicts from the previous stage (PP0: outputs from the last);
+        # the thread takes their CPU-group part, the loop the device tensors.
+        self._pp_dict_inbox = PPRecvInbox(
+            recv_one=partial(
+                self.pp_group.recv_tensor_dict_host_part,
+                src=(self.pp_group.rank_in_group - 1) % self.pp_group.world_size,
+                all_gather_group=self.attn_tp_group,
+            ),
+            depth=bound,
+            name=f"pp{pp_rank}-dict-recv",
+        )
+        if (
+            not self.pp_group.is_first_rank
+            and get_parallel().attn_tp_rank == 0
+            and get_parallel().attn_cp_rank == 0
+        ):
+            dp_offset = (
+                get_parallel().attn_dp_rank
+                * get_parallel().attn_cp_size
+                * get_parallel().attn_tp_size
+            )
+            own_rank = pp_rank * get_parallel().tp_size + dp_offset
+            # Request relay and two-pass transfer / release rids share this channel.
+            pp_decouple.set_relay_inbox(
+                PPRecvInbox(
+                    recv_one=partial(
+                        point_to_point_pyobj,
+                        data=[],
+                        rank=own_rank,
+                        group=self.world_group.cpu_group,
+                        src=(pp_rank - 1) * get_parallel().tp_size + dp_offset,
+                        dst=own_rank,
+                    ),
+                    depth=bound,
+                    name=f"pp{pp_rank}-relay-recv",
+                )
+            )
+        logger.info(
+            "PP PD prefill: stages decoupled (SGLANG_PP_DECOUPLE_HOST); %d send "
+            "rounds per channel un-waited, relay window %d.",
+            bound,
+            pp_sync_window(),
+        )
+        return True
+
+    def _pp_overlap_input_wait(self: Scheduler, inbox: Optional[PPRecvInbox]) -> None:
+        """While the next input is still upstream, send the early KV chunks whose
+        forward finished; this changes no state that scheduling reads."""
+        if inbox is not None and not inbox.ready():
+            self._pp_pd_flush_early_sends()
+
+    def _pp_state_digest_interval(self: Scheduler) -> int:
+        """SGLANG_DEBUG_PP_STATE_DIGEST_EVERY, or 0 where it cannot be computed."""
+        every = envs.SGLANG_DEBUG_PP_STATE_DIGEST_EVERY.get()
+        # Attention TP / CP ranks hold the same state; one line per stage and DP rank.
+        if (
+            not every
+            or get_parallel().attn_tp_rank != 0
+            or get_parallel().attn_cp_rank != 0
+        ):
+            return 0
+        from sglang.srt.mem_cache.radix_cache import RadixCache
+        from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+
+        if not isinstance(self.tree_cache, (RadixCache, UnifiedRadixCache)):
+            logger.warning(
+                "SGLANG_DEBUG_PP_STATE_DIGEST_EVERY needs a radix tree cache, not %s.",
+                type(self.tree_cache).__name__,
+            )
+            return 0
+        return every
+
+    def _pp_log_state_digest(self: Scheduler, epoch: int) -> None:
+        sizes, tensors = pp_decouple.collect_pp_state(
+            token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+            req_to_token_pool=self.req_to_token_pool,
+            tree_cache=self.tree_cache,
+        )
+        record = pp_decouple.PPStateDigest(
+            pp_rank=get_parallel().pp_rank,
+            dp_rank=get_parallel().attn_dp_rank,
+            epoch=epoch,
+            digest=pp_decouple.pp_state_digest(sizes=sizes, tensors=tensors),
+        )
+        logger.info(pp_decouple.format_digest_line(record))
+
     @scheduler_stage_method(SCHEDULER_STAGE_DISAGG_BOOKKEEPING)
     def _pp_pd_local_result(self: Scheduler, batch: ScheduleBatch) -> bool:
         """Whether this PD prefill batch skips the output ring: its results feed
@@ -900,10 +1022,15 @@ class SchedulerPPMixin:
         self: Scheduler,
         work: List[P2PWork],
         fence_next_forward: bool = False,
+        window: Optional[PPSendWindow] = None,
     ) -> None:
+        """Wait for `work`; with a window, only for rounds that fall out of it."""
         with self.pp_comm_stream_ctx, pp_bubble_diag.wait_in_phase("send_commit"):
-            for p2p_work in work:
-                p2p_work.work.wait()
+            if window is not None:
+                window.push(works=work)
+            else:
+                for p2p_work in work:
+                    p2p_work.work.wait()
         if fence_next_forward and work:
             # CUDA Graph outputs are views of replay-owned static buffers. Do not
             # replay the next forward until NCCL has stopped reading the previous
@@ -913,9 +1040,12 @@ class SchedulerPPMixin:
 
     @scheduler_stage_method(SCHEDULER_STAGE_PP_COMM_WAIT)
     def _pp_commit_proxy_send_work(self: Scheduler) -> None:
+        fence = self.send_proxy_requires_forward_fence
         self._pp_commit_comm_work(
             self.send_proxy_work,
-            fence_next_forward=self.send_proxy_requires_forward_fence,
+            fence_next_forward=fence,
+            # A fenced send is waited now; earlier rounds are ahead of it on its stream.
+            window=None if fence else self.pp_send_windows.proxy,
         )
         self.send_proxy_requires_forward_fence = False
 
@@ -938,7 +1068,9 @@ class SchedulerPPMixin:
         Optional[GenerationBatchResult],
         Optional[torch.Event],
     ]:
-        self._pp_commit_comm_work(work=self.send_output_work)
+        self._pp_commit_comm_work(
+            work=self.send_output_work, window=self.pp_send_windows.output
+        )
         (
             next_pp_outputs,
             next_batch_result,
@@ -983,16 +1115,20 @@ class SchedulerPPMixin:
                 * get_parallel().attn_cp_size
                 * get_parallel().attn_tp_size
             )
+            inbox = pp_decouple.relay_inbox()
             with pp_bubble_diag.wait_in_phase("pyobj_recv"):
-                data = point_to_point_pyobj(
-                    [],
-                    get_parallel().pp_rank * get_parallel().tp_size + dp_offset,
-                    self.world_group.cpu_group,
-                    ((get_parallel().pp_rank - 1) % get_parallel().pp_size)
-                    * get_parallel().tp_size
-                    + dp_offset,
-                    get_parallel().pp_rank * get_parallel().tp_size + dp_offset,
-                )
+                if inbox is not None:
+                    data = inbox.pop()
+                else:
+                    data = point_to_point_pyobj(
+                        [],
+                        get_parallel().pp_rank * get_parallel().tp_size + dp_offset,
+                        self.world_group.cpu_group,
+                        ((get_parallel().pp_rank - 1) % get_parallel().pp_size)
+                        * get_parallel().tp_size
+                        + dp_offset,
+                        get_parallel().pp_rank * get_parallel().tp_size + dp_offset,
+                    )
         else:
             data = None
 
@@ -1119,8 +1255,14 @@ class SchedulerPPMixin:
         while True:
             with self.pp_comm_stream_ctx:
                 with pp_bubble_diag.wait("dict_recv." + expected_kind):
+                    host_part = None
+                    if self._pp_dict_inbox is not None:
+                        # The inbox thread sliced CPU tensors for this group's all-gather.
+                        assert all_gather_group is self.attn_tp_group
+                        host_part = self._pp_dict_inbox.pop()
                     tensor_dict = self.pp_group.recv_tensor_dict(
-                        all_gather_group=all_gather_group
+                        all_gather_group=all_gather_group,
+                        host_part=host_part,
                     )
                 recv_event = self._pp_record_comm_event()
             received_kind = tensor_dict.get("__msg_type__", "default")

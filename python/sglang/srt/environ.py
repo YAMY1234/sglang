@@ -872,6 +872,16 @@ class Envs:
     # PP: leave pp_size + pp_async_batch_depth rounds of HiCache, PD bootstrap and
     # PD release relay sends un-waited, not one (a gloo send completes on the recv).
     SGLANG_PP_SYNC_WINDOW = EnvBool(False)
+    # PP PD prefill: stages stop waiting on each other's host progress every micro-batch.
+    # Sends stay un-waited up to a window, relay receives run on background threads,
+    # and the relay window above is implied.
+    SGLANG_PP_DECOUPLE_HOST = EnvBool(False)
+    # Under SGLANG_PP_DECOUPLE_HOST: send rounds per channel left un-waited, and messages
+    # per relay channel received ahead (0 = pp_size + pp_async_batch_depth).
+    SGLANG_PP_DECOUPLE_SEND_WINDOW = EnvInt(0)
+    # PP PD prefill: log a digest of allocator and radix tree state every N loop
+    # epochs (0 = off); every stage must log the same digest at the same epoch.
+    SGLANG_DEBUG_PP_STATE_DIGEST_EVERY = EnvInt(0)
     # PP diagnostics: per-rank host / wait / forward-gap partition and admission
     # counts, logged every INTERVAL_S; FWD_DIR also writes one CSV row per forward.
     SGLANG_PP_BUBBLE_DIAG = EnvBool(False)
