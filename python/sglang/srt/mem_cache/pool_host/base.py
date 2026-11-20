@@ -105,6 +105,10 @@ def host_memory_budget_bytes(
         available_host_memory_bytes(allow_cgroup_fallback=not auto_size)
         - HICACHE_HOST_MEMORY_RESERVE_BYTES
     )
+    # Checking an explicit request: free is sampled now, after sibling ranks' pools,
+    # so splitting it again would count them twice. Sizing calls keep the split.
+    if requested_bytes > 0 and not auto_size:
+        return free
     return free // ranks_per_host()
 
 
