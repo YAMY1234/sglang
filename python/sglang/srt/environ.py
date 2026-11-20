@@ -1122,6 +1122,9 @@ class Envs:
     # least MIN_TOKENS rows (prefill chunks), one line per call; 0 off (moe/expert_count_log.py).
     SGLANG_K31_MOE_EXPERT_COUNT_LOG_INTERVAL = EnvInt(0)
     SGLANG_K31_MOE_EXPERT_COUNT_MIN_TOKENS = EnvInt(1024)
+    # MXFP4 trtllm-gen MoE (SM107, prefill servers): routed experts run as CuTe DSL grouped GEMMs (permute pass,
+    # FC1 with fused SiTU + MXFP8, FC2) instead of the trtllm-gen body; weights take that layout at load, EP 1 only.
+    SGLANG_K31_PREFILL_MOE_CUTE_FC1 = EnvBool(False)
     # Manual MoE input row limit (EPv1 and EPv2); 0 leaves it to SGLANG_MORI_RECV_BOUND.
     SGLANG_MORI_MOE_MAX_INPUT_TOKENS = EnvInt(0)
 

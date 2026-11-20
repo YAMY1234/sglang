@@ -889,6 +889,21 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             w13_bias = layer.w13_weight_bias.data.to(torch.float32)
             w2_bias = layer.w2_weight_bias.data.to(torch.float32)
 
+            if (
+                self._fi_kernel == "trtllm_sm100"
+                and envs.SGLANG_K31_PREFILL_MOE_CUTE_FC1.get()
+            ):
+                self._process_weights_for_cute_prefill_moe(
+                    layer,
+                    w13_weight=w13_weight,
+                    w13_weight_scale=w13_weight_scale,
+                    w2_weight=w2_weight,
+                    w2_weight_scale=w2_weight_scale,
+                    beta=_alpha,
+                    lbeta=_limit,
+                )
+                return
+
             # Swap w1 and w3 as the definition of
             # swiglu is different in the trtllm-gen
             def swap_every_two_rows(x, axis=-1):
@@ -1224,6 +1239,26 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             layer.w13_weight = Parameter(w13_weight.data, requires_grad=False)
             layer.w2_weight = Parameter(w2_weight.data, requires_grad=False)
         torch.cuda.empty_cache()
+
+    def _process_weights_for_cute_prefill_moe(
+        self, layer, *, w13_weight, w13_weight_scale, w2_weight, w2_weight_scale, beta, lbeta
+    ):
+        from sglang.srt.layers.moe.moe_runner.cute_prefill_moe import runner as cute_moe
+
+        # The FC1 reorder takes gate rows [0, I) and up rows [I, 2I) (K3 Latent MoE).
+        if getattr(layer.moe_runner_config, "gate_up_interleaved", True):
+            raise NotImplementedError(
+                "SGLANG_K31_PREFILL_MOE_CUTE_FC1 needs non-interleaved gate/up rows"
+            )
+        weights = cute_moe.prepare_weights(
+            w13_weight, w13_weight_scale, w2_weight, w2_weight_scale, beta=beta, lbeta=lbeta
+        )
+        # One copy per layer: the params now hold this path's layout (no trtllm-gen layout is built).
+        layer.w13_weight = Parameter(weights.w13, requires_grad=False)
+        layer.w13_weight_scale = Parameter(weights.s13, requires_grad=False)
+        layer.w2_weight = Parameter(weights.w2, requires_grad=False)
+        layer.w2_weight_scale = Parameter(weights.s2, requires_grad=False)
+        layer.cute_prefill_moe = weights
 
     def _process_weights_for_sm90_cutlass(self, layer):
         """De-interleave + pad + halving-swap + byte-interleave MXFP4 weights
@@ -1680,6 +1715,11 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             hidden_size=self.hidden_size,
             flashinfer_mxfp4_moe_precision=self.flashinfer_mxfp4_moe_precision,
             routing_bias=routing_bias,
+            cute_prefill_moe=(
+                layer.cute_prefill_moe
+                if envs.SGLANG_K31_PREFILL_MOE_CUTE_FC1.get()
+                else None
+            ),
         )
         return self.runner.run(dispatch_output, quant_info)
 
