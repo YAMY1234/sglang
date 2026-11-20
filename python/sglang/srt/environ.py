@@ -1989,6 +1989,9 @@ class Envs:
     # contiguous planes instead of one token-major tensor the kernel copies three
     # times (backport of #46738).
     SGLANG_KDA_PREFILL_CONV_QKV_PLANES = EnvBool(False)
+    # Prefill causal conv (width 4, no block table): 64 tokens x 512 channels per
+    # program, four token loads in flight per step; bitwise equal to the default.
+    SGLANG_K31_CONV1D_FWD_WIDE = EnvBool(False)
     # DSA prefill under sharded DCP: gather the KV and index-K rows with one pack
     # kernel into the all-gather buffer and one reorder kernel out of it, instead
     # of the cat / pad / transpose / split copies around the all-gather.
