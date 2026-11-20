@@ -64,7 +64,8 @@ def compare(layer_id: int, ref: torch.Tensor, new: torch.Tensor, lens2d: torch.T
     r, c = first // cols, first % cols
     pad_rows = ((neq.any(dim=1)) & (last <= 1)).sum()  # graph-padded requests (fill 1)
     is_first = (st[1] == 0) & (n > 0)
-    info = torch.stack([r, c, lens[r], last[r], pad_rows])
+    ri = r.view(1)  # index_select: tensor indexing would sync on the bounds check (not capturable)
+    info = torch.stack([r, c, lens.index_select(0, ri)[0], last.index_select(0, ri)[0], pad_rows])
     st[0] += 1
     st[1] += n
     st[2] += in_len.sum()
