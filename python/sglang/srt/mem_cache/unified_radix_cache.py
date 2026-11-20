@@ -25,6 +25,7 @@ import torch
 
 from sglang.srt.distributed.communication_tags import P2PTag
 from sglang.srt.environ import envs
+from sglang.srt.managers import pp_bubble_diag
 from sglang.srt.managers.cache_controller import CacheOperation
 from sglang.srt.managers.scheduler_components.shm_tag_exchange import (
     ShmTagExchange,
@@ -1632,7 +1633,8 @@ class UnifiedRadixCache(BasePrefixCache):
                 self.token_to_kv_pool_allocator.free_full_segment(indices, start_pos=0)
         elif isinstance(action, BackupKV):
             if self.linker is not None:
-                self.linker.offload_nodes(action.node_ids)
+                with pp_bubble_diag.wait("linker.offload_submit"):
+                    self.linker.offload_nodes(action.node_ids)
             else:
                 self._execute_and_commit_kv_backup(action)
         else:
@@ -4263,9 +4265,12 @@ class UnifiedRadixCache(BasePrefixCache):
     def check_hicache_events(self) -> None:
         """Called per scheduler step to poll async HiCache events."""
         if self.linker_prefetch_mode:
-            self.linker.check_prefetch_events()
+            # SGLANG_PP_BUBBLE_DIAG: linker host work, split from the loop phase it runs in.
+            with pp_bubble_diag.wait("linker.prefetch_events"):
+                self.linker.check_prefetch_events()
         if self.linker is not None and self.pp_size > 1:
-            self._check_linker_events_pp()
+            with pp_bubble_diag.wait("linker.offload_events"):
+                self._check_linker_events_pp()
             return
         if self.linker is not None:
             finish_counts = torch.tensor(
