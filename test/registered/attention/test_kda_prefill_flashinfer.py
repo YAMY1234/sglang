@@ -1,6 +1,7 @@
 """FlashInfer KDA prefill integration against SGLang's Triton reference."""
 
 import os
+import warnings
 from itertools import accumulate
 from types import SimpleNamespace
 
@@ -254,19 +255,17 @@ def test_kda_backend_prefill_dispatch_and_tracked_state(extend_lens):
         torch.testing.assert_close(cache.conv[0], triton_conv, atol=0, rtol=0)
 
 
-def _sync_detected(fn):
-    """True if fn issued a host-synchronizing CUDA call."""
+def _run_counting_syncs(fn):
+    """fn's result, and whether it issued a host-synchronizing CUDA call."""
     torch.cuda.synchronize()
-    torch.cuda.set_sync_debug_mode("error")
-    try:
-        fn()
-    except RuntimeError as e:
-        if "synchroniz" not in str(e):
-            raise
-        return True
-    finally:
-        torch.cuda.set_sync_debug_mode("default")
-    return False
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        torch.cuda.set_sync_debug_mode("warn")
+        try:
+            out = fn()
+        finally:
+            torch.cuda.set_sync_debug_mode("default")
+    return out, any("synchroniz" in str(w.message) for w in caught)
 
 
 @pytest.mark.parametrize("kernel", ["flashinfer", "triton"])
@@ -313,9 +312,9 @@ def test_kda_seeded_cu_seqlens_exact_and_sync_free(kernel):
                 calls = []
 
                 def extend(*args, **kwargs):
-                    out = []
-                    calls.append(_sync_detected(lambda: out.append(inner(*args, **kwargs))))
-                    return out[0]
+                    out, synced = _run_counting_syncs(lambda: inner(*args, **kwargs))
+                    calls.append(synced)
+                    return out
 
                 dispatcher.extend = extend
                 try:
