@@ -850,8 +850,8 @@ class Envs:
     # PD release relay sends un-waited, not one (a gloo send completes on the recv).
     SGLANG_PP_SYNC_WINDOW = EnvBool(False)
     # PP PD prefill: stages stop waiting on each other's host progress every micro-batch.
-    # Sends stay un-waited up to a window, relay receives run on background threads,
-    # and the relay window above is implied.
+    # Sends stay un-waited up to a window and relay receives run on background threads;
+    # the relay window above is separate (SGLANG_PP_SYNC_WINDOW).
     SGLANG_PP_DECOUPLE_HOST = EnvBool(False)
     # Under SGLANG_PP_DECOUPLE_HOST: send rounds per channel left un-waited, and messages
     # per relay channel received ahead (0 = pp_size + pp_async_batch_depth).

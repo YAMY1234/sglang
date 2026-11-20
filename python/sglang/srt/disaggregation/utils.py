@@ -148,9 +148,8 @@ def poll_and_all_reduce_prefill_pp(
 
 
 def pp_sync_window() -> int:
-    """Rounds of PP relay sends left un-waited (SGLANG_PP_SYNC_WINDOW, implied by
-    SGLANG_PP_DECOUPLE_HOST)."""
-    if not (envs.SGLANG_PP_SYNC_WINDOW.get() or envs.SGLANG_PP_DECOUPLE_HOST.get()):
+    """Rounds of PP relay sends left un-waited (SGLANG_PP_SYNC_WINDOW)."""
+    if not envs.SGLANG_PP_SYNC_WINDOW.get():
         return 1
     return get_parallel().pp_size + get_parallel().pp_async_batch_depth
 
