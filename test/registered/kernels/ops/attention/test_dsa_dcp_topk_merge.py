@@ -254,7 +254,6 @@ _PUSH_MERGES: dict[int, DcpTopKMerge] = {}
 
 def _push_merge(cand_k: int) -> DcpTopKMerge:
     if cand_k not in _PUSH_MERGES:
-        _init_once()
         with envs.SGLANG_DCP4_PUSH_CAND_K.override(cand_k):
             _PUSH_MERGES[cand_k] = DcpTopKMerge(ps._WORLD, MAX_ROWS, TOPK, push=True)
     return _PUSH_MERGES[cand_k]
@@ -266,6 +265,7 @@ def _push_merge(cand_k: int) -> DcpTopKMerge:
 def test_dcp4_topk_merge_pushed(kind: str, cand_k: int) -> None:
     """DCP4 push merge: exact for either candidate count (SGLANG_DCP4_PUSH_CAND_K);
     a rank holding 768-1023 of the top-k fails the certificate only at 768."""
+    _init_once()
     world, rank = ps._WORLD.world_size, ps._WORLD.rank_in_group
     if world != 4:
         pytest.skip("the DCP4 push merge needs 4 ranks")
