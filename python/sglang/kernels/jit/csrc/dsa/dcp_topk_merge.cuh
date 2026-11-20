@@ -527,16 +527,14 @@ __global__ void __launch_bounds__(32 * kNumRanks, kMinBlocks) merge_kernel(const
 // ---------------------------------------------------------------------------
 
 struct PushSmem : Smem {
-  uint64_t hi, lo, t_key;
+  uint64_t hi, lo;
   int n_out;
 };
 
-// After a row slot's kTopK full-slot entries (merge_pushed_kernel): [0] the owner's stamp
-// (call + 1) once its full slot holds this call's keys, which a full slot that is written only
-// on failures needs because its 8-bit tag repeats every 510 calls; [1] t* and [2] its stamp,
-// sent by the only failing rank.
-constexpr int kPushExtra = 4;
-enum { kExtraFullStamp, kExtraTKey, kExtraTStamp };
+// After a row slot's kTopK full-slot entries (merge_pushed_kernel): the owner's stamp (call + 1)
+// once its full slot holds this call's keys. A full slot is written only when its rank fails, and
+// its 8-bit tag repeats every 510 calls, so the tag alone can pass an old failure's keys.
+constexpr int kPushExtra = 1;
 
 SGL_DEVICE void fence_acquire_sys() {
   asm volatile("fence.acq_rel.sys;" ::: "memory");
@@ -771,29 +769,18 @@ __global__ void __launch_bounds__(32 * kNumRanks, kNumRanks == 8 ? 4 : 1)
   }
   // kCandK == kTopK never fails (above): no fallback code, and none of its registers
   constexpr bool kCanFail = kCandK < kTopK;
-  const auto extra = [&](int q) {  // rank q's entries after its full slot of this row slot
-    return reinterpret_cast<uint64_t*>(p.peer_ptrs[q]) + full_off + kTopK;
+  const auto extra = [&](int q) {  // rank q's stamp after its full slot of this row slot
+    return reinterpret_cast<const uint64_t*>(p.peer_ptrs[q]) + full_off + kTopK;
   };
   const uint64_t stamp = static_cast<uint64_t>(c) + 1;
   const bool failed = fail >> p.rank & 1;
-  if (kCanFail && fail && __popc(fail) == 1 && !failed) {
-    // one rank failed: it selects t* over every candidate and its own keys, and sends it here
-    if (tid == 0) {
-      const uint64_t* const mine = p.buffer + full_off + kTopK;
-      while (device::ptx::load_relaxed_sys(mine + kExtraTStamp) != stamp) {
-      }
-      fence_acquire_sys();
-      s.t_key = device::ptx::load_relaxed_sys(mine + kExtraTKey);
-    }
-    __syncthreads();
-    t = s.t_key;
-  } else if (kCanFail && fail) {
+  if (kCanFail && fail) {
     if (failed) {
       const bool selected = publish_local_topk<kNumRanks, kTopK>(p, row, full_off, tag, t, s);
       __syncthreads();
       if (tid == 0) {
         device::ptx::fence_release_sys();
-        device::ptx::store_relaxed_sys(p.buffer + full_off + kTopK + kExtraFullStamp, stamp);
+        device::ptx::store_relaxed_sys(p.buffer + full_off + kTopK, stamp);
         atomicAdd(&p.stats[kStatPublished], 1ull);
         if (selected) atomicAdd(&p.stats[kStatSelected], 1ull);
       }
@@ -808,7 +795,7 @@ __global__ void __launch_bounds__(32 * kNumRanks, kNumRanks == 8 ? 4 : 1)
     for (int q = 0; q < kNumRanks; ++q) {
       if (fail >> q & 1) {
         if (tid == 0) {
-          while (device::ptx::load_relaxed_sys(extra(q) + kExtraFullStamp) != stamp) {
+          while (device::ptx::load_relaxed_sys(extra(q)) != stamp) {
           }
           fence_acquire_sys();
         }
@@ -851,15 +838,6 @@ __global__ void __launch_bounds__(32 * kNumRanks, kNumRanks == 8 ? 4 : 1)
     visit([&](uint64_t k) { mine += k != 0; });
     block_exclusive_sum<kNumRanks>(mine, n_union, s);
     t = select_kth_adaptive(visit, min(n_union, kTopK), s);
-    if (__popc(fail) == 1 && tid == 0) {  // this is the only failed rank: send t* to the others
-#pragma unroll 1
-      for (int q = 0; q < kNumRanks; ++q)
-        if (q != p.rank) device::ptx::store_relaxed_sys(extra(q) + kExtraTKey, t);
-      device::ptx::fence_release_sys();
-#pragma unroll 1
-      for (int q = 0; q < kNumRanks; ++q)
-        if (q != p.rank) device::ptx::store_relaxed_sys(extra(q) + kExtraTStamp, stamp);
-    }
   }
 
   // ---- this rank's keys >= t*, compacted ----
