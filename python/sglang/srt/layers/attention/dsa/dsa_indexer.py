@@ -211,6 +211,86 @@ _PER_WINDOW_VERIFY_PLANS = 4
 
 
 @functools.lru_cache(maxsize=1)
+@functools.lru_cache(maxsize=1)
+def _fused_topk_precompile() -> bool:
+    """Builds the fused indexer top-k at model load; any failure keeps the unfused path."""
+    try:
+        from sglang.kernels.ops.attention.dsa.fused_indexer_topk import _jit_module
+
+        _jit_module(serving=True)
+        return True
+    except Exception:
+        logger.warning(
+            "SGLANG_DSA_FUSED_INDEXER_TOPK: build failed, using the unfused path",
+            exc_info=True,
+        )
+        return False
+
+
+_FUSED_TOPK_STATS = None
+
+
+class _IndexerTopkTimer:
+    """Debug: GPU time of the prefill top-k (scores + selection) from CUDA events, read
+    once they complete (no host sync), logged every ``interval`` calls."""
+
+    def __init__(self, interval: int):
+        self.interval = interval
+        self.pending = []
+        self.window = [0, 0, 0.0]  # calls, rows, ms
+        self.total = [0, 0, 0.0]
+
+    def start(self) -> torch.cuda.Event:
+        event = torch.cuda.Event(enable_timing=True)
+        event.record()
+        return event
+
+    def stop(self, start: torch.cuda.Event, rows: int) -> None:
+        end = torch.cuda.Event(enable_timing=True)
+        end.record()
+        self.pending.append((start, end, rows))
+        while self.pending and self.pending[0][1].query():
+            s, e, n = self.pending.pop(0)
+            ms = s.elapsed_time(e)
+            for acc in (self.window, self.total):
+                acc[0] += 1
+                acc[1] += n
+                acc[2] += ms
+            if self.window[0] >= self.interval:
+                c, r, t = self.window
+                logger.info(
+                    "IDXT window calls=%d rows=%d ms=%.3f ms_per_call=%.4f "
+                    "total calls=%d rows=%d ms=%.1f",
+                    c, r, t, t / c, *self.total,
+                )
+                self.window = [0, 0, 0.0]
+
+
+_INDEXER_TOPK_TIMER: Any = False
+
+
+def _indexer_topk_timer() -> Optional[_IndexerTopkTimer]:
+    global _INDEXER_TOPK_TIMER
+    if _INDEXER_TOPK_TIMER is False:
+        interval = envs.SGLANG_DSA_INDEXER_TOPK_TIMING_INTERVAL.get()
+        _INDEXER_TOPK_TIMER = _IndexerTopkTimer(interval) if interval > 0 else None
+    return _INDEXER_TOPK_TIMER
+
+
+def _fused_topk_stats():
+    global _FUSED_TOPK_STATS
+    if _FUSED_TOPK_STATS is None:
+        from sglang.kernels.ops.attention.dsa.fused_indexer_topk import (
+            FusedTopKStats,
+        )
+
+        _FUSED_TOPK_STATS = FusedTopKStats(
+            envs.SGLANG_DSA_FUSED_INDEXER_TOPK_LOG_INTERVAL.get(),
+            envs.SGLANG_DSA_FUSED_INDEXER_TOPK_CHECK_INTERVAL.get(),
+        )
+    return _FUSED_TOPK_STATS
+
+
 def _per_window_logits_requested() -> bool:
     on = os.environ.get(_PER_WINDOW_LOGITS_ENV, "0").strip().lower() in (
         "1",
@@ -551,6 +631,11 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 "DSA with --dcp-size > 1 does not support index_init_tokens / "
                 "index_local_tokens."
             )
+        self._fused_topk_ready = (
+            _is_cuda
+            and envs.SGLANG_DSA_FUSED_INDEXER_TOPK.get()
+            and _fused_topk_precompile()
+        )
 
         self.paged_mqa_logits_backend = DSAPagedMQALogitsBackend.resolve(
             get_exec().kernel.dsa_paged_mqa_logits_backend
@@ -1728,6 +1813,29 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         metadata: BaseIndexerMetadata,
         topk_result: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        args = (enable_dual_stream, forward_batch, layer_id, q_fp8, weights, metadata)
+        timer = _indexer_topk_timer()
+        if (
+            timer is None
+            or get_is_capture_mode()
+            or torch.cuda.is_current_stream_capturing()
+        ):
+            return self._get_topk_ragged_impl(*args, topk_result)
+        start = timer.start()
+        topk_result = self._get_topk_ragged_impl(*args, topk_result)
+        timer.stop(start, rows=q_fp8.shape[0])
+        return topk_result
+
+    def _get_topk_ragged_impl(
+        self,
+        enable_dual_stream: bool,
+        forward_batch: ForwardBatch,
+        layer_id: int,
+        q_fp8: torch.Tensor,
+        weights: torch.Tensor,
+        metadata: BaseIndexerMetadata,
+        topk_result: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         if TYPE_CHECKING:
             assert isinstance(get_token_to_kv_pool(), DSATokenToKVPool)
 
@@ -1817,6 +1925,26 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             forward_batch=forward_batch, q_offset=q_offset
         )
         row_lo, row_hi = (0, q_offset) if tp_split is None else tp_split[1:3]
+        if (
+            tp_split is None
+            and self._fused_topk_applies(metadata, q_fp8, k_fp8)
+            and self._fused_topk_pays(
+                indexer_seq_lens_cpu, forward_batch.extend_seq_lens_cpu, q_offset
+            )
+        ):
+            return self._get_topk_fused(
+                device_index=device_index,
+                metadata=metadata,
+                q_fp8=q_fp8[:q_offset],
+                weights=weights[:q_offset],
+                k_fp8=k_fp8,
+                k_scale=k_scale,
+                ks=ks,
+                ke=ke,
+                lengths=seq_lens_expanded,
+                row_to_batch=token_to_batch_idx,
+                topk_result=topk_result,
+            )
         need_chunk, logits_budget_bytes = mqa_logits_should_chunk(
             num_rows=row_hi - row_lo,
             num_cols=k_offset,
@@ -2008,6 +2136,253 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             group, _, _, sizes = tp_split
             group.all_gatherv(dst, sizes=sizes, output=topk_result[:q_offset])
         return topk_result
+
+    def _fused_topk_applies(
+        self, metadata: BaseIndexerMetadata, q_fp8: torch.Tensor, k_fp8: torch.Tensor
+    ) -> bool:
+        if not self._fused_topk_ready:
+            return False
+        from sglang.srt.layers.attention.dsa.dsa_indexer_metadata import (
+            DSAIndexerMetadata,
+        )
+        from sglang.srt.layers.attention.dsa.dsa_topk_backend import (
+            TopkTransformMethod,
+        )
+
+        # The fused kernel is DeepGEMM's 32-head FP8 scorer; its output contract is
+        # the v2 packed PAGED top-k's (an exact set, physical slots).
+        return (
+            isinstance(metadata, DSAIndexerMetadata)
+            and metadata.packed_extend_topk
+            and not metadata.force_unfused_topk
+            and metadata.topk_transform_method == TopkTransformMethod.PAGED
+            and metadata.topk_backend.should_use_topk_v2()
+            and envs.SGLANG_DSA_FUSE_TOPK.get()
+            and 0 < self.index_topk <= 2048
+            and self.num_init_tokens == 0
+            and self.num_local_tokens == 0
+            and q_fp8.shape[1:] == (32, 128)
+            and k_fp8.dtype == torch.float8_e4m3fn
+            and not get_is_capture_mode()
+            and not torch.cuda.is_current_stream_capturing()
+        )
+
+    @staticmethod
+    def _fused_topk_pays(
+        seq_lens_cpu: torch.Tensor, extend_lens: List[int], rows: int
+    ) -> bool:
+        """Host-only gate: the fused path's fixed costs (threshold, select, one sync)
+        pay off once the mean row window reaches SGLANG_DSA_FUSED_INDEXER_TOPK_MIN_MEAN_KEYS."""
+        min_keys = envs.SGLANG_DSA_FUSED_INDEXER_TOPK_MIN_MEAN_KEYS.get()
+        if min_keys <= 0:
+            return True
+        seq = seq_lens_cpu.tolist()
+        if len(seq) != len(extend_lens) or rows <= 0:
+            return False
+        # Row p of a request with prefix L sees L + p + 1 keys.
+        keys = sum(e * (s - e) + e * (e + 1) // 2 for s, e in zip(seq, extend_lens))
+        if keys >= min_keys * rows:
+            return True
+        _fused_topk_stats().record_gated(rows)
+        return False
+
+    def _get_topk_fused(
+        self,
+        *,
+        device_index: int,
+        metadata: BaseIndexerMetadata,
+        q_fp8: torch.Tensor,
+        weights: torch.Tensor,
+        k_fp8: torch.Tensor,
+        k_scale: torch.Tensor,
+        ks: torch.Tensor,
+        ke: torch.Tensor,
+        lengths: torch.Tensor,
+        row_to_batch: torch.Tensor,
+        topk_result: torch.Tensor,
+    ) -> torch.Tensor:
+        from sglang.kernels.ops.attention.dsa.fused_indexer_topk import (
+            fused_indexer_topk,
+            scratch_bytes_per_row,
+        )
+
+        attn_metadata = metadata.attn_metadata
+        rows, num_kv = q_fp8.shape[0], k_fp8.shape[0]
+        lengths = lengths.to(torch.int32)
+        row_to_batch = row_to_batch.to(torch.int32)
+        weights = weights.float()
+        # Row chunks keep the scratch within the unfused path's logits budget.
+        budget = self._get_mqa_logits_budget_bytes(device_index)
+        chunk = max(64, min(rows, budget // scratch_bytes_per_row(num_kv)))
+        nums, fbs = [], []
+        for r0 in range(0, rows, chunk):
+            r1 = min(rows, r0 + chunk)
+            res = fused_indexer_topk(
+                q_fp8[r0:r1],
+                k_fp8,
+                k_scale,
+                weights[r0:r1],
+                ks[r0:r1],
+                ke[r0:r1],
+                lengths[r0:r1],
+                row_to_batch[r0:r1],
+                attn_metadata.real_page_table,
+                attn_metadata.page_size,
+                self.index_topk,
+                out=topk_result[r0:r1],
+                serving=True,
+            )
+            nums.append(res.num_fallback)
+            fbs.append(res.fallback_rows if r0 == 0 else res.fallback_rows + r0)
+        long_rows = (lengths > self.index_topk).sum(dtype=torch.int32).view(1)
+        # The one host sync: rows whose sampled threshold missed (expected none) are
+        # rescored in full and selected by the packed v2 top-k.
+        counts = torch.cat(nums + [long_rows]).tolist()
+        num_fallback = sum(counts[:-1])
+        if num_fallback:
+            fb = torch.cat([f[:n] for f, n in zip(fbs, counts[:-1]) if n]).long()
+            self._topk_rows_unfused(
+                fb,
+                budget=budget,
+                q_fp8=q_fp8,
+                weights=weights,
+                k_fp8=k_fp8,
+                k_scale=k_scale,
+                ks=ks,
+                ke=ke,
+                lengths=lengths,
+                row_to_batch=row_to_batch,
+                attn_metadata=attn_metadata,
+                out=topk_result,
+            )
+        stats = _fused_topk_stats()
+        if stats.record(
+            rows=rows,
+            long_rows=counts[-1],
+            fallback_rows=num_fallback,
+            chunks=len(nums),
+            budget=budget,
+        ):
+            self._fused_topk_check(
+                budget=budget,
+                q_fp8=q_fp8,
+                weights=weights,
+                k_fp8=k_fp8,
+                k_scale=k_scale,
+                ks=ks,
+                ke=ke,
+                lengths=lengths,
+                row_to_batch=row_to_batch,
+                attn_metadata=attn_metadata,
+                fused=topk_result[:rows],
+                stats=stats,
+            )
+        return topk_result
+
+    def _topk_rows_unfused(
+        self,
+        rows: torch.Tensor,
+        *,
+        budget: int,
+        q_fp8: torch.Tensor,
+        weights: torch.Tensor,
+        k_fp8: torch.Tensor,
+        k_scale: torch.Tensor,
+        ks: torch.Tensor,
+        ke: torch.Tensor,
+        lengths: torch.Tensor,
+        row_to_batch: torch.Tensor,
+        attn_metadata,
+        out: torch.Tensor,
+    ) -> None:
+        """Stock DeepGEMM scores + packed v2 top-k of the given rows, in budget-sized chunks."""
+        from sglang.srt.layers.attention.dsa.dsa_topk_backend import (
+            _topk_transform_v2_packed,
+        )
+
+        step = max(1, budget // (k_fp8.shape[0] * MQA_LOGITS_BYTES_PER_ELEM))
+        for i in range(0, rows.shape[0], step):
+            r = rows[i : i + step]
+            q_pad, w_pad, _ = self._pad_heads_for_deep_gemm(q_fp8[r], weights[r])
+            with self._with_real_sm_count():
+                logits = resolve_fp8_mqa_logits_fn()(
+                    q_pad, (k_fp8, k_scale), w_pad, ks[r], ke[r], clean_logits=False
+                )
+            out[r] = _topk_transform_v2_packed(
+                logits,
+                lengths[r],
+                self.index_topk,
+                attn_metadata,
+                row_starts=ks[r],
+                row_to_batch=row_to_batch[r],
+            )
+            del logits
+
+    def _fused_topk_check(
+        self,
+        *,
+        budget: int,
+        q_fp8: torch.Tensor,
+        weights: torch.Tensor,
+        k_fp8: torch.Tensor,
+        k_scale: torch.Tensor,
+        ks: torch.Tensor,
+        ke: torch.Tensor,
+        lengths: torch.Tensor,
+        row_to_batch: torch.Tensor,
+        attn_metadata,
+        fused: torch.Tensor,
+        stats,
+    ) -> None:
+        """Debug (SGLANG_DSA_FUSED_INDEXER_TOPK_CHECK_INTERVAL): compares up to 256
+        evenly spaced rows with the stock path; a differing row counts as a tie when
+        every index outside the common set scores exactly the k-th score."""
+        from sglang.srt.layers.attention.dsa.dsa_topk_backend import (
+            _topk_transform_v2_packed,
+        )
+
+        rows, num_kv, topk = fused.shape[0], k_fp8.shape[0], self.index_topk
+        n = max(1, min(256, rows, budget // (num_kv * MQA_LOGITS_BYTES_PER_ELEM)))
+        idx = torch.arange(n, device=fused.device) * rows // n
+        q_pad, w_pad, _ = self._pad_heads_for_deep_gemm(q_fp8[idx], weights[idx])
+        with self._with_real_sm_count():
+            logits = resolve_fp8_mqa_logits_fn()(
+                q_pad, (k_fp8, k_scale), w_pad, ks[idx], ke[idx], clean_logits=False
+            )
+        # The transform masks only columns ahead of each window; window scores stay.
+        ref = _topk_transform_v2_packed(
+            logits,
+            lengths[idx],
+            topk,
+            attn_metadata,
+            row_starts=ks[idx],
+            row_to_batch=row_to_batch[idx],
+        )
+        got = fused[idx]
+        differ = (got.sort(1).values != ref.sort(1).values).any(1)
+        differ_rows = differ.nonzero().flatten().tolist()
+        page_table, page_size = attn_metadata.real_page_table, attn_metadata.page_size
+        tie = 0
+        for i in differ_rows[:8]:
+            r = int(idx[i])
+            start, length = int(ks[r]), int(lengths[r])
+            scores = logits[i, start : start + length]
+            pos = torch.arange(length, device=fused.device)
+            slots = (
+                page_table[int(row_to_batch[r])][pos // page_size].long() * page_size
+                + pos % page_size
+            )
+            a, b = got[i][got[i] >= 0].long(), ref[i][ref[i] >= 0].long()
+            extra = torch.cat([a[~torch.isin(a, b)], b[~torch.isin(b, a)]])
+            kth = scores.topk(min(topk, length)).values[-1]
+            hit = scores[torch.isin(slots, extra)]
+            tie += int(hit.numel() == extra.numel() and bool((hit == kth).all()))
+        stats.record_check(
+            rows=n,
+            differ=len(differ_rows),
+            tie_explained=tie,
+            tie_checked=min(8, len(differ_rows)),
+        )
 
     @staticmethod
     def _per_window_widths(
