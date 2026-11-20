@@ -19,6 +19,7 @@ import torch
 
 from sglang.kernels.ops.attention.dsv4 import (
     fused_k_norm_rope_flashmla,
+    fused_qkv_norm_flashmla,
     fused_store_cache,
 )
 from sglang.kernels.ops.attention.dsv4.kv_layout import (
@@ -2427,6 +2428,38 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             page_size=self.swa_page_size,
             layout=self.kv_layout,
             q=q,
+        )
+
+    def set_swa_key_buffer_radix_fused_qkv_norm(
+        self,
+        layer_id: int,
+        swa_loc: torch.Tensor,
+        kv: torch.Tensor,
+        kv_weight: torch.Tensor,
+        eps: float,
+        freqs_cis: torch.Tensor,
+        positions: torch.Tensor,
+        q_lora: torch.Tensor,
+        q_weight: torch.Tensor,
+        q_eps: float,
+    ):
+        """``set_swa_key_buffer_radix_fused_norm_rope`` plus ``rmsnorm_mxfp8(q_lora)``
+        in one launch; None where that kernel does not apply."""
+        if self.uniform_fp8 or self.kv_layout is KVLayout.V4 or kv.shape[0] >= 2048:
+            return None
+        return fused_qkv_norm_flashmla(
+            q_lora,
+            q_weight,
+            q_eps,
+            kv,
+            kv_weight,
+            eps,
+            freqs_cis,
+            positions,
+            swa_loc,
+            self.get_swa_raw_buffer(layer_id),
+            self.swa_page_size,
+            self.kv_layout,
         )
 
     def set_unified_key_buffer_radix_fused_norm_rope(

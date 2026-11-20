@@ -23,6 +23,7 @@ from sglang.kernels.ops.attention.dsv4.dequant_k_cache import (
 from sglang.kernels.ops.attention.dsv4.kv_layout import KVLayout
 from sglang.kernels.ops.attention.dsv4.norm_rope import (
     fused_k_norm_rope_flashmla,
+    fused_qkv_norm_flashmla,
     fused_rope_inplace,
 )
 from sglang.kernels.ops.attention.dsv4.rope import set_batched_rope
@@ -698,6 +699,74 @@ class TestFusedKNormRopeFlashMLA(CustomTestCase):
                 )
                 self.assertTrue(torch.equal(got, expected))
                 self.assertTrue(torch.equal(cache_q, cache))
+
+
+@unittest.skipUnless(
+    torch.cuda.is_available()
+    and not is_hip()
+    and torch.cuda.get_device_capability()[0] >= 10,
+    "the fused q/kv norm launch is SM100 only",
+)
+class TestFusedQKVNormFlashMLA(CustomTestCase):
+    def test_bitwise_equal_to_the_two_launches(self):
+        """q_lora RMSNorm + MXFP8 (y, q, swizzled scales incl. padding) and the K store
+        are bitwise the rmsnorm_mxfp8 + fused_k_norm_rope_flashmla pair, on the strided
+        halves of one wqkv_a output."""
+        from sglang.kernels.ops.layernorm.rmsnorm_mxfp8 import rmsnorm_mxfp8
+
+        g = torch.Generator(device="cuda").manual_seed(5)
+        angles = torch.rand(8192, ROPE_DIM // 2, generator=g, device="cuda") * 6.3
+        freqs_cis = torch.polar(torch.ones_like(angles), angles)
+        q_w = (torch.randn(1280, generator=g, device="cuda") * 0.3 + 1).to(
+            torch.bfloat16
+        )
+        kv_w = (torch.randn(HEAD_DIM, generator=g, device="cuda") * 0.3 + 1).to(
+            torch.bfloat16
+        )
+        for n, layout, pos_dtype in (
+            (4, KVLayout.V41, torch.int64),
+            (7, KVLayout.V41_FP4, torch.int32),
+            (136, KVLayout.V41_NEW, torch.int64),
+            (129, KVLayout.V41, torch.int64),
+            (544, KVLayout.V41_FP4_NEW, torch.int64),
+            (1100, KVLayout.V41, torch.int32),
+        ):
+            with self.subTest(tokens=n, layout=layout.name):
+                num_pages = n // PAGE_SIZE + 2
+                scale = torch.exp2(
+                    torch.randint(-8, 8, (n, 1), generator=g, device="cuda").float()
+                )
+                qkv_a = (
+                    torch.randn(n, 1280 + HEAD_DIM, generator=g, device="cuda") * scale
+                ).to(torch.bfloat16)
+                qkv_a[0, :640] = 0
+                positions = torch.randint(
+                    0, 8192, (n,), generator=g, device="cuda"
+                ).to(pos_dtype)
+                out_loc = torch.randperm(
+                    num_pages * PAGE_SIZE, generator=g, device="cuda"
+                )[:n].to(torch.int32)
+                out_loc[1] = -1
+                q, kv = qkv_a[:, :1280], qkv_a[:, 1280:]
+                cache_ref = torch.zeros(
+                    num_pages,
+                    layout.page_bytes(PAGE_SIZE),
+                    dtype=torch.uint8,
+                    device="cuda",
+                )
+                cache = cache_ref.clone()
+                ref = rmsnorm_mxfp8(q, q_w, 1e-6)
+                fused_k_norm_rope_flashmla(
+                    kv, kv_w, 1e-6, freqs_cis, positions, out_loc, cache_ref,
+                    PAGE_SIZE, layout=layout,
+                )
+                got = fused_qkv_norm_flashmla(
+                    q, q_w, 1e-6, kv, kv_w, 1e-6, freqs_cis, positions, out_loc,
+                    cache, PAGE_SIZE, layout,
+                )
+                for a, b in zip(got, ref):
+                    self.assertTrue(torch.equal(a.view(torch.uint8), b.view(torch.uint8)))
+                self.assertTrue(torch.equal(cache, cache_ref))
 
 
 if __name__ == "__main__":

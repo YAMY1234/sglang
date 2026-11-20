@@ -655,6 +655,9 @@ class Envs:
     # slots and lengths, indexer block tables, SWA write locations) in single Triton
     # launches instead of torch-op chains. Bitwise equal outputs.
     SGLANG_OPT_DSV4_FUSED_ATTN_METADATA = EnvBool(False)
+    # Decode/verify: the q_lora RMSNorm + MXFP8 (rmsnorm_mxfp8) and the kv RMSNorm + RoPE +
+    # V4.1 SWA cache store in one launch before wq_b, instead of two. Bitwise equal outputs.
+    SGLANG_OPT_DSV4_FUSED_QKV_NORM = EnvBool(False)
     # Request-window commit of new SWA rows with a tile of rows per program instead of
     # one program per row. Same copies.
     SGLANG_OPT_DSV41_WINDOW_COMMIT_TILED = EnvBool(False)

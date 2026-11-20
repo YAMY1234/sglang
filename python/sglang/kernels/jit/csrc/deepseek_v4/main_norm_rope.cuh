@@ -301,7 +301,7 @@ template <
     deepseek_v4::KVLayout kLayout,
     bool kUsePDL,
     bool kRopeQ = false>
-K_KERNEL void fused_k_norm_rope_flashmla(const __grid_constant__ FusedKNormRopeFlashMLAParams params) {
+SGL_DEVICE void k_norm_rope_flashmla_row(const FusedKNormRopeFlashMLAParams& params, const uint32_t work_id) {
   using namespace device;
 
   constexpr int64_t kVecSize = 2;
@@ -316,8 +316,6 @@ K_KERNEL void fused_k_norm_rope_flashmla(const __grid_constant__ FusedKNormRopeF
   const auto tx = threadIdx.x;
   const auto warp_id = tx / kWarpThreads;
   const auto lane_id = tx % kWarpThreads;
-  const auto work_id = blockIdx.x;
-  if (work_id >= params.batch_size) return;
 
   const auto input_ptr = static_cast<const DType*>(params.kv) + work_id * params.kv_stride_batch;
   const auto position = static_cast<int32_t>(static_cast<const PosT*>(params.positions)[work_id]);
@@ -437,6 +435,149 @@ K_KERNEL void fused_k_norm_rope_flashmla(const __grid_constant__ FusedKNormRopeF
     reinterpret_cast<fp8x2_e4m3_t*>(value_ptr)[tx] = result;
     if (lane_id == 0) static_cast<uint8_t*>(scale_ptr)[warp_id] = scale_ue8m0;
   }
+}
+
+template <
+    typename DType,
+    int64_t kHeadDim,
+    int64_t kRopeDim,
+    typename PosT,
+    int32_t kPageBits,
+    deepseek_v4::KVLayout kLayout,
+    bool kUsePDL,
+    bool kRopeQ = false>
+K_KERNEL void fused_k_norm_rope_flashmla(const __grid_constant__ FusedKNormRopeFlashMLAParams params) {
+  if (blockIdx.x >= params.batch_size) return;
+  k_norm_rope_flashmla_row<DType, kHeadDim, kRopeDim, PosT, kPageBits, kLayout, kUsePDL, kRopeQ>(params, blockIdx.x);
+}
+
+// q_lora RMSNorm + MXFP8 (rmsnorm_mxfp8.py) for the CTAs after the K rows of the launch below.
+struct QNormMxfp8Params {
+  const bf16_t* __restrict__ x;  // (M, kQDim), row stride x_stride
+  const bf16_t* __restrict__ weight;
+  bf16_t* __restrict__ y;      // (M, kQDim)
+  fp8_e4m3_t* __restrict__ q;  // (M, kQDim)
+  uint8_t* __restrict__ sf;    // 128x4-swizzled UE8M0, rows padded to 128
+  int64_t x_stride;
+  uint32_t rows;
+  float eps;
+};
+
+constexpr uint32_t kQNormDim = 1280;
+constexpr uint32_t kQNormGroups = kQNormDim / 32;
+constexpr uint32_t kQNormPadCTAs = kQNormGroups * 128 / 512;
+
+// Triton's fp32 `/` (rmsnorm_mxfp8 divides the sum of squares by K with it).
+SGL_DEVICE float div_full(float a, float b) {
+  float r;
+  asm("div.full.f32 %0, %1, %2;" : "=f"(r) : "f"(a), "f"(b));
+  return r;
+}
+
+// Bitwise `_rmsnorm_mxfp8_kernel` (8 warps, 8 contiguous elements per thread, no fma) with
+// `mxfp8_epilogue`; CTAs past the rows zero the padding scale rows as its extra programs do.
+template <bool kUsePDL>
+SGL_DEVICE void q_norm_mxfp8_row(const QNormMxfp8Params& p, const uint32_t row) {
+  using namespace device;
+  static_assert(kFusedKBlockSize * 8 >= kQNormDim && kFusedKNumWarps == 8);
+  using Vec = AlignedVector<bf16x2_t, 4>;
+  const auto tx = threadIdx.x;
+  const auto lane_id = tx % kWarpThreads;
+  if (row >= p.rows) {
+    PDLWaitPrimary<kUsePDL>();
+    const uint32_t last = (div_ceil(p.rows, 128u) - 1) * 128;
+#pragma unroll
+    for (uint32_t i = 0; i < 2; ++i) {
+      const uint32_t local = (row - p.rows) * 512 + 2 * tx + i;
+      const uint32_t pad_row = last + ((local / 4) % 4) * 32 + (local / 16) % 32;
+      if (local < kQNormGroups * 128 && pad_row >= p.rows) p.sf[last * kQNormGroups + local] = 0;
+    }
+    return;
+  }
+  const bool active = tx * 8 < kQNormDim;
+  Vec w_vec, x_vec;
+  if (active) w_vec.load(p.weight, tx);
+  PDLWaitPrimary<kUsePDL>();
+  float v[8] = {}, w[8];
+  if (active) {
+    x_vec.load(p.x + row * p.x_stride, tx);
+#pragma unroll
+    for (uint32_t i = 0; i < 4; ++i) {
+      const auto xv = cast<fp32x2_t>(x_vec[i]), wv = cast<fp32x2_t>(w_vec[i]);
+      v[2 * i] = xv.x, v[2 * i + 1] = xv.y, w[2 * i] = wv.x, w[2 * i + 1] = wv.y;
+    }
+  }
+  PDLTriggerSecondary<kUsePDL>();
+  float sq[8];
+#pragma unroll
+  for (uint32_t i = 0; i < 8; ++i)
+    sq[i] = __fmul_rn(v[i], v[i]);
+  // element bits 2, 4, 1; lane bits 16..1; warp bits 4, 2, 1
+  float ss = __fadd_rn(
+      __fadd_rn(__fadd_rn(sq[0], sq[2]), __fadd_rn(sq[4], sq[6])),
+      __fadd_rn(__fadd_rn(sq[1], sq[3]), __fadd_rn(sq[5], sq[7])));
+#pragma unroll
+  for (uint32_t mask = 16; mask >= 1; mask >>= 1)
+    ss = __fadd_rn(ss, __shfl_xor_sync(0xffffffffu, ss, mask));
+  __shared__ float warp_sums[kFusedKNumWarps];
+  if (lane_id == 0) warp_sums[tx / kWarpThreads] = ss;
+  __syncthreads();
+  const auto* ws = warp_sums;
+  ss = __fadd_rn(
+      __fadd_rn(__fadd_rn(ws[0], ws[4]), __fadd_rn(ws[2], ws[6])),
+      __fadd_rn(__fadd_rn(ws[1], ws[5]), __fadd_rn(ws[3], ws[7])));
+  if (!active) return;
+  const float inv = rsqrtf(__fadd_rn(div_full(ss, static_cast<float>(kQNormDim)), p.eps));
+  Vec y_vec;
+  float amax = 0.0f;
+#pragma unroll
+  for (uint32_t i = 0; i < 4; ++i) {
+    y_vec[i] = cast<bf16x2_t>(fp32x2_t{
+        __fmul_rn(__fmul_rn(v[2 * i], inv), w[2 * i]), __fmul_rn(__fmul_rn(v[2 * i + 1], inv), w[2 * i + 1])});
+    const auto yv = cast<fp32x2_t>(y_vec[i]);
+    v[2 * i] = yv.x, v[2 * i + 1] = yv.y;
+    amax = fmaxf(amax, fmaxf(fabsf(yv.x), fabsf(yv.y)));
+  }
+  y_vec.store(p.y + row * kQNormDim, tx);
+  // 32-element group = 4 lanes; FlashInfer's positive-rounding UE8M0 (mxfp8_epilogue.ue8m0_scale)
+  amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 1));
+  amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 2));
+  const float normalized = __fmul_rn(amax, static_cast<float>(1.0 / 448.0));
+  const auto bits = __float_as_uint(normalized);
+  const uint32_t exponent = (bits >> 23) & 255, mantissa = bits & 0x7FFFFF;
+  const bool bump = mantissa != 0 && !(exponent == 0 && mantissa <= 0x400000);
+  const uint32_t sf = normalized <= 0.0f ? 0 : min(exponent + bump, 254u);
+  const float scale = sf == 0 ? 0.0f : __uint_as_float((254 - sf) << 23);
+  AlignedVector<fp8x2_e4m3_t, 4> q_vec;
+#pragma unroll
+  for (uint32_t i = 0; i < 4; ++i)
+    q_vec[i] = fp8x2_e4m3_t{fp32x2_t{
+        fminf(fmaxf(__fmul_rn(v[2 * i], scale), -448.0f), 448.0f),
+        fminf(fmaxf(__fmul_rn(v[2 * i + 1], scale), -448.0f), 448.0f)}};
+  q_vec.store(p.q + row * kQNormDim, tx);
+  if (tx % 4 == 0) {
+    const uint32_t g = tx / 4;
+    const uint32_t off = (row / 128) * (div_ceil(kQNormGroups, 4u) * 512) + (g / 4) * 512 +
+                         ((row % 32) * 4 + (row / 32) % 4) * 4 + g % 4;
+    p.sf[off] = static_cast<uint8_t>(sf);
+  }
+}
+
+// One launch: CTA b < B is K row b (fused_k_norm_rope_flashmla), then the q_lora rows, then
+// the q padding-scale CTAs.
+template <
+    typename DType,
+    int64_t kHeadDim,
+    int64_t kRopeDim,
+    typename PosT,
+    int32_t kPageBits,
+    deepseek_v4::KVLayout kLayout,
+    bool kUsePDL>
+K_KERNEL void fused_qkv_norm_flashmla(
+    const __grid_constant__ FusedKNormRopeFlashMLAParams params, const __grid_constant__ QNormMxfp8Params q_params) {
+  if (blockIdx.x < params.batch_size)
+    return k_norm_rope_flashmla_row<DType, kHeadDim, kRopeDim, PosT, kPageBits, kLayout, kUsePDL>(params, blockIdx.x);
+  q_norm_mxfp8_row<kUsePDL>(q_params, blockIdx.x - params.batch_size);
 }
 
 // The sum of squares is added in the order of `fused_k_norm_rope_flashmla` (its thread t is
@@ -696,6 +837,88 @@ struct FusedKNormRopeFlashMLAKernel {
     const auto k = pos_dtype.is_type<int32_t>() ? k_int32 : k_int64;
     LaunchKernel(batch_size, kFusedKBlockSize, device_.unwrap())  //
         .enable_pdl(kUsePDL)(k, params);
+  }
+};
+
+/// `FusedKNormRopeFlashMLAKernel::forward` and `rmsnorm_mxfp8` of the q_lora rows in one launch.
+template <
+    typename DType,
+    int64_t kHeadDim,
+    int64_t kRopeDim,
+    uint32_t kPageSize,
+    deepseek_v4::KVLayout kLayout,
+    bool kUsePDL>
+struct FusedQKVNormFlashMLAKernel {
+  static constexpr int32_t kLogPageSize = std::countr_zero(kPageSize);
+  static constexpr int64_t kPageBytes = deepseek_v4::kv_page_bytes<kLayout>(kPageSize);
+  static_assert(kLayout != deepseek_v4::KVLayout::V4 && std::is_same_v<DType, bf16_t>);
+  static_assert(kHeadDim == 512 && kRopeDim == 64, "FlashMLA layout requires (512, 64)");
+  template <typename PosT>
+  static constexpr auto kernel =
+      fused_qkv_norm_flashmla<DType, kHeadDim, kRopeDim, PosT, kLogPageSize, kLayout, kUsePDL>;
+
+  static void forward(
+      const tvm::ffi::TensorView kv,
+      const tvm::ffi::TensorView kv_weight,
+      const tvm::ffi::TensorView freqs_cis,
+      const tvm::ffi::TensorView positions,
+      const tvm::ffi::TensorView out_loc,
+      const tvm::ffi::TensorView kvcache,
+      float eps,
+      const tvm::ffi::TensorView q_lora,
+      const tvm::ffi::TensorView q_weight,
+      float q_eps,
+      const tvm::ffi::TensorView y,
+      const tvm::ffi::TensorView q,
+      const tvm::ffi::TensorView sf) {
+    using namespace host;
+
+    auto B = SymbolicSize{"batch_size"};
+    auto M = SymbolicSize{"q_rows"};
+    auto device_ = SymbolicDevice{};
+    device_.set_options<kDLGPU>();
+    TensorMatcher({B, kHeadDim}).with_strides({-1, 1}).with_dtype<DType>().with_device(device_).verify(kv);
+    TensorMatcher({kHeadDim}).with_dtype<DType>().with_device(device_).verify(kv_weight);
+    TensorMatcher({-1, kRopeDim}).with_dtype<float>().with_device(device_).verify(freqs_cis);
+    auto pos_dtype = SymbolicDType{};
+    TensorMatcher({B}).with_dtype<int32_t, int64_t>(pos_dtype).with_device(device_).verify(positions);
+    TensorMatcher({B}).with_dtype<int32_t>().with_device(device_).verify(out_loc);
+    TensorMatcher({-1, -1}).with_strides({kPageBytes, 1}).with_dtype<uint8_t>().with_device(device_).verify(kvcache);
+    TensorMatcher({M, kQNormDim}).with_strides({-1, 1}).with_dtype<DType>().with_device(device_).verify(q_lora);
+    TensorMatcher({kQNormDim}).with_dtype<DType>().with_device(device_).verify(q_weight);
+    TensorMatcher({M, kQNormDim}).with_strides({kQNormDim, 1}).with_dtype<DType>().with_device(device_).verify(y);
+    TensorMatcher({M, kQNormDim}).with_strides({kQNormDim, 1}).with_dtype<fp8_e4m3_t>().with_device(device_).verify(q);
+    TensorMatcher({-1}).with_dtype<uint8_t>().with_device(device_).verify(sf);
+
+    const auto batch_size = static_cast<uint32_t>(B.unwrap());
+    const auto rows = static_cast<uint32_t>(M.unwrap());
+    RuntimeCheck(batch_size < kFusedKV41MinTokens && rows > 0, "fused q/kv norm: decode-sized batches only");
+    RuntimeCheck(q_lora.stride(0) % 8 == 0, "q_lora rows are read as 16-byte packs");
+    RuntimeCheck(sf.size(0) == int64_t(kQNormGroups) * div_ceil(rows, 128u) * 128, "scale buffer size");
+    const auto params = FusedKNormRopeFlashMLAParams{
+        .kv = kv.data_ptr(),
+        .kv_weight = kv_weight.data_ptr(),
+        .freqs_cis = static_cast<const float*>(freqs_cis.data_ptr()),
+        .positions = positions.data_ptr(),
+        .out_loc = static_cast<const int32_t*>(out_loc.data_ptr()),
+        .kvcache = static_cast<uint8_t*>(kvcache.data_ptr()),
+        .kv_stride_batch = kv.stride(0),
+        .batch_size = batch_size,
+        .eps = eps,
+    };
+    const auto q_params = QNormMxfp8Params{
+        .x = static_cast<const bf16_t*>(q_lora.data_ptr()),
+        .weight = static_cast<const bf16_t*>(q_weight.data_ptr()),
+        .y = static_cast<bf16_t*>(y.data_ptr()),
+        .q = static_cast<fp8_e4m3_t*>(q.data_ptr()),
+        .sf = static_cast<uint8_t*>(sf.data_ptr()),
+        .x_stride = q_lora.stride(0),
+        .rows = rows,
+        .eps = q_eps,
+    };
+    const auto k = pos_dtype.is_type<int32_t>() ? kernel<int32_t> : kernel<int64_t>;
+    LaunchKernel(batch_size + rows + kQNormPadCTAs, kFusedKBlockSize, device_.unwrap())  //
+        .enable_pdl(kUsePDL)(k, params, q_params);
   }
 };
 

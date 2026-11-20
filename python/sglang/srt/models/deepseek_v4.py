@@ -1861,6 +1861,17 @@ class MqaAttentionBase(nn.Module):
         # The indexer needs the BF16 normalized row; wq_b needs the quantized one.
         if _is_hip:
             return _hip.q_norm_for_wq_b(self, q)
+        if self._q_norm_mxfp8_ok(q):
+            from sglang.kernels.ops.layernorm.rmsnorm_mxfp8 import rmsnorm_mxfp8
+
+            y, quant, scale = rmsnorm_mxfp8(
+                q, self.q_norm.weight, self.q_norm.variance_epsilon
+            )
+            return y, Mxfp8SwizzledInput(quant, scale)
+        q = self.q_norm(q)
+        return q, q
+
+    def _q_norm_mxfp8_ok(self, q: torch.Tensor) -> bool:
         method = self.wq_b.quant_method
         if (
             _is_cuda
@@ -1881,18 +1892,42 @@ class MqaAttentionBase(nn.Module):
             from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
             from sglang.srt.runtime_context import get_exec
 
-            if not (
+            return not (
                 is_batch_invariant_mode_enabled()
                 or get_exec().deterministic.enable_deterministic_inference
-            ):
-                from sglang.kernels.ops.layernorm.rmsnorm_mxfp8 import rmsnorm_mxfp8
+            )
+        return False
 
-                y, quant, scale = rmsnorm_mxfp8(
-                    q, self.q_norm.weight, self.q_norm.variance_epsilon
-                )
-                return y, Mxfp8SwizzledInput(quant, scale)
-        q = self.q_norm(q)
-        return q, q
+    def _fused_qkv_norm_to_cache(
+        self, qkv_a, positions, forward_batch, attn_backend
+    ) -> Optional[Tuple[torch.Tensor, Mxfp8SwizzledInput]]:
+        """The rmsnorm_mxfp8 q_lora path and _compute_kv_to_cache in one launch."""
+        if (
+            not envs.SGLANG_OPT_DSV4_FUSED_QKV_NORM.get()
+            or qkv_a is None
+            or envs.SGLANG_DSV4_USE_BF16_KV_QUANT_SOURCE.get()
+        ):
+            return None
+        q = qkv_a[..., : self.q_lora_rank]
+        if not self._q_norm_mxfp8_ok(q):
+            return None
+        out = get_token_to_kv_pool().set_swa_key_buffer_radix_fused_qkv_norm(
+            layer_id=self.layer_id,
+            swa_loc=attn_backend.get_swa_out_cache_loc(forward_batch),
+            kv=qkv_a[..., self.q_lora_rank :],
+            kv_weight=self.kv_norm.weight.data,
+            eps=self.eps,
+            freqs_cis=self.freqs_cis,
+            positions=positions,
+            q_lora=q,
+            q_weight=self.q_norm.weight,
+            q_eps=self.q_norm.variance_epsilon,
+        )
+        if out is None:
+            return None
+        print_info_once("DSV4 fused q/kv norm: on")
+        y, quant, scale = out
+        return y, Mxfp8SwizzledInput(quant, scale)
 
 
 
@@ -2871,7 +2906,17 @@ class MQALayer(MqaAttentionBase):
             if q_out is not None:
                 q_out.copy_(q)
         else:
-            q_lora, q_for_wqb = self._normalize_q_lora(q_lora)
+            fused_qkv = (
+                None
+                if _is_hip or unified or use_cp or in_replay_tail_graph()
+                else self._fused_qkv_norm_to_cache(
+                    qkv_a, positions, forward_batch, attn_backend
+                )
+            )
+            if fused_qkv is not None:
+                q_lora, q_for_wqb = fused_qkv
+            else:
+                q_lora, q_for_wqb = self._normalize_q_lora(q_lora)
             if _is_hip:
                 q, q_lora, fuse_q_rope = _hip.compute_q_b(
                     self, q_lora, q_for_wqb, positions, q_out, unified, use_cp
@@ -2932,6 +2977,8 @@ class MQALayer(MqaAttentionBase):
             elif in_replay_tail_graph():
                 assert not fuse_q_rope
                 bcg_tail_kv_store(self, x_linear, positions, qkv_a)
+                kv = None
+            elif fused_qkv is not None:
                 kv = None
             else:
                 self._compute_kv_to_cache(
