@@ -855,6 +855,9 @@ class Envs:
     # PP PD prefill (Mooncake): no output ring. Earlier stages process a host
     # placeholder; the last stage processes its own output and alone sends aux.
     SGLANG_PP_PD_LOCAL_RESULT = EnvBool(False)
+    # Prefill: chunk-budget tokens charged per cached prefix token of an admitted request, so a
+    # long-context batch takes fewer new tokens and every batch costs about the same (0 = off).
+    SGLANG_PREFILL_CONTEXT_COST_PER_TOKEN = EnvFloat(0.0)
     SGLANG_PP_BUBBLE_DIAG_INTERVAL_S = EnvFloat(60.0)
     SGLANG_PP_BUBBLE_DIAG_FWD_DIR = EnvStr(None)
     # PP PD prefill (Mooncake): each stage sends a request's last KV chunk when its

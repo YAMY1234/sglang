@@ -753,6 +753,7 @@ class PrefillAdder:
         self.new_token_ratio = new_token_ratio
         self.rem_input_tokens = rem_input_tokens - num_mixed_decode_tokens
         self.rem_chunk_tokens = rem_chunk_tokens
+        self.context_cost_per_token = envs.SGLANG_PREFILL_CONTEXT_COST_PER_TOKEN.get()
         self.chunked_req_limit: Optional[int] = None
         # Shortest-prefill-first admits requests beside a truncated chunk, and
         # their KV stays locked until it is sent. Hold the chunk's uncomputed
@@ -1063,6 +1064,7 @@ class PrefillAdder:
         request_slot_reserve: int = 0,
         is_chunked_continuation: bool = False,
         replay_len: int = 0,
+        context_charge: int = 0,
     ):
         """Charge one admitted request against the prefill budgets.
 
@@ -1096,6 +1098,7 @@ class PrefillAdder:
         # Debit every reserved state slot, including the load-back checkpoint.
         if mamba_gap_reserve and self.rem_mamba_slots is not None:
             self.rem_mamba_slots -= mamba_gap_reserve // self._mamba_slot_cost
+        compute_charge += context_charge
         self.rem_input_tokens -= compute_charge
 
         if self.dllm_config is not None:
@@ -1111,6 +1114,12 @@ class PrefillAdder:
         if retracted_stain:
             self.reprocessed_log_hit_tokens += prefix_len
             self.reprocessed_log_input_tokens += raw_extend_input_len
+
+    def _context_charge(self, prefix_len: int) -> int:
+        """Chunk-budget tokens a request's cached prefix costs (attention over it)."""
+        if not self.context_cost_per_token or self.rem_chunk_tokens is None:
+            return 0
+        return self.ceil_paged_tokens(int(prefix_len * self.context_cost_per_token))
 
     def _replay_len(self, req: Req, prefix_len: int) -> int:
         if (
@@ -1299,11 +1308,18 @@ class PrefillAdder:
         )
 
     def add_chunked_req(self, req: Req):
+        context_charge = 0
         if self.dllm_config is not None:
             _rem_tokens = self._get_dllm_remain_tokens(req)
         else:
+            # A continuation opens its batch; never let the charge block its progress.
+            context_charge = self._context_charge(req.prefix_len)
+            if context_charge and context_charge >= self.rem_chunk_tokens:
+                context_charge = 0
             _rem_tokens = self.memory_budget.available_chunk_tokens(
-                self.rem_chunk_tokens
+                self.rem_chunk_tokens - context_charge
+                if context_charge
+                else self.rem_chunk_tokens
             )
             if _rem_tokens is None:
                 self._reserve_chunked_tail(req, req.prefix_len)
@@ -1393,6 +1409,7 @@ class PrefillAdder:
             mamba_gap_reserve=self._mamba_gap_budget_for_req(req),
             request_slot_reserve=request_slot_reserve,
             is_chunked_continuation=True,
+            context_charge=context_charge,
         )
         if truncated:
             self._reserve_chunked_tail(req, req.extend_end)
@@ -1793,6 +1810,10 @@ class PrefillAdder:
             chunk_limit -= replay_len
             if chunk_limit <= 0:
                 return AddReqResult.OTHER
+        if chunk_limit is not None and (charge := self._context_charge(prefix_len)):
+            chunk_limit -= charge
+            if chunk_limit <= 0:
+                return AddReqResult.OTHER
         can_admit, chunk_tokens_limit = self._check_prefill_budget(
             req,
             extend_input_len=extend_len,
@@ -1880,6 +1901,7 @@ class PrefillAdder:
                 req, extend_input_len=admission.extend_len
             ),
             replay_len=admission.replay_len,
+            context_charge=self._context_charge(admission.prefix_len),
         )
         if admission.is_chunked:
             self._reserve_chunked_tail(req, req.extend_end)
