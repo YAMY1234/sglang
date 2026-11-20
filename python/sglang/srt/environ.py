@@ -849,6 +849,11 @@ class Envs:
     # PP: leave pp_size + pp_async_batch_depth rounds of HiCache, PD bootstrap and
     # PD release relay sends un-waited, not one (a gloo send completes on the recv).
     SGLANG_PP_SYNC_WINDOW = EnvBool(False)
+    # PP diagnostics: per-rank host / wait / forward-gap partition and admission
+    # counts, logged every INTERVAL_S; FWD_DIR also writes one CSV row per forward.
+    SGLANG_PP_BUBBLE_DIAG = EnvBool(False)
+    SGLANG_PP_BUBBLE_DIAG_INTERVAL_S = EnvFloat(60.0)
+    SGLANG_PP_BUBBLE_DIAG_FWD_DIR = EnvStr(None)
     # PP PD prefill (Mooncake): each stage sends a request's last KV chunk when its
     # own forward of that chunk completes, not when the result returns pp_size - 1
     # micro-batches later; only the last stage, which samples the first token, sends
