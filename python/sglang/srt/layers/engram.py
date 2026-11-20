@@ -1835,6 +1835,7 @@ def engram_gate(
     clamp_value: float,
     input_ids: Optional[torch.Tensor] = None,
     image_token_id: Optional[int] = None,
+    out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """x [T, hc_mult, dim]; kv [T, (hc_mult + 1) * dim] holds one key per hc copy
     followed by the shared value. Adds the gated value to every copy, except in rows
@@ -1851,7 +1852,15 @@ def engram_gate(
         and all(t.is_contiguous() for t in (x, kv, q_weight, k_weight))
     ):
         return fused_engram_gate(
-            x, kv, q_weight, k_weight, eps, clamp_value, input_ids, image_token_id
+            x,
+            kv,
+            q_weight,
+            k_weight,
+            eps,
+            clamp_value,
+            input_ids,
+            image_token_id,
+            out=out,
         )
     hc_mult, dim = x.shape[-2:]
     key, value = kv.split([hc_mult * dim, dim], dim=-1)
@@ -1936,6 +1945,8 @@ class Engram(nn.Module):
             return x
         kv, _ = self.wkv(emb.flatten(-2))
         image_ids = input_ids if self.image_token_id is not None else None
+        from sglang.kernels.ops.layernorm.mhc_mega import locality_inplace_out
+
         return engram_gate(
             x,
             kv,
@@ -1945,6 +1956,7 @@ class Engram(nn.Module):
             self.clamp_value,
             image_ids,
             self.image_token_id,
+            out=locality_inplace_out(x),
         )
 
     def embed_rows(

@@ -624,8 +624,15 @@ def _combine(
             quantized.append(Mxfp8SwizzledInput(y_q, y_sf))
             return y
         from sglang.kernels.ops.layernorm.hc_combine_norm import hc_combine_norm
+        from sglang.kernels.ops.layernorm.mhc_mega import locality_normed_rows
 
-        return hc_combine_norm(x_flat, apply_pre, norm.weight, norm.variance_epsilon)
+        return hc_combine_norm(
+            x_flat,
+            apply_pre,
+            norm.weight,
+            norm.variance_epsilon,
+            out=locality_normed_rows(x_flat.shape[0]),
+        )
     return norm(mhc_combine(x_flat, apply_pre, cfg.mult, x.dtype))
 
 
@@ -640,6 +647,7 @@ def post(
     residual: torch.Tensor,
     post_mix: torch.Tensor,
     comb: torch.Tensor,
+    out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """``R'[i] = post[i] * x + sum_j comb[j][i] * R[j]``, by whichever kernel fits."""
     if x.shape[0] == 0:
@@ -697,7 +705,7 @@ def post(
 
         from sglang.kernels.ops.layernorm.mhc import mhc_post
 
-        return mhc_post(x, residual, post_mix, comb)
+        return mhc_post(x, residual, post_mix, comb, out=out)
 
     if _is_hip:
         from aiter.ops.mhc import mhc_post
@@ -890,7 +898,14 @@ def _post_fusion(
             next.norm.variance_epsilon,
         )
         return HcState(updated, pre, HcNormed(normalized))
-    return HcState(post(cfg, y, residual, post_mix, comb), pre)
+    # A closed seam (Engram, capture, tail start) keeps the stream in the locality slot; the final post does not,
+    # its residual outlives the forward.
+    out = None
+    if next is not None:
+        from sglang.kernels.ops.layernorm.mhc_mega import locality_inplace_out
+
+        out = locality_inplace_out(residual)
+    return HcState(post(cfg, y, residual, post_mix, comb, out=out), pre)
 
 
 def run_attn_post(

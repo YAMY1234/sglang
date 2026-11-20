@@ -1,5 +1,7 @@
 """Collapse the hyper-connection streams and normalize the sublayer input."""
 
+from typing import Optional
+
 import torch
 import triton
 import triton.language as tl
@@ -65,7 +67,11 @@ def _hc_combine_norm_prefill(
 
 
 def hc_combine_norm(
-    x: torch.Tensor, pre: torch.Tensor, weight: torch.Tensor, eps: float
+    x: torch.Tensor,
+    pre: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Fuse four-stream combine and RMSNorm for BF16 batches of width 5120.
 
@@ -76,7 +82,7 @@ def hc_combine_norm(
     assert pre.shape == (m, 4) and pre.stride(1) == 1
     assert weight.shape == (5120,) and weight.is_contiguous()
     assert x.dtype == weight.dtype == torch.bfloat16 and x.stride(1) == 1
-    y = torch.empty((m, 5120), dtype=x.dtype, device=x.device)
+    y = torch.empty((m, 5120), dtype=x.dtype, device=x.device) if out is None else out
     if m >= 4096:
         _hc_combine_norm_prefill[(m,)](
             x, pre, weight, y, x.stride(0), pre.stride(0), eps, num_warps=4

@@ -1348,13 +1348,16 @@ def mhc_post(
     residual: torch.Tensor,
     post_layer_mix: torch.Tensor,
     comb_res_mix: torch.Tensor,
+    out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
+    """``out`` may be ``residual``: each CTA loads a token's (routes, hidden block) tile before storing it."""
     if is_dsa_prefill_cp_interleave():
         x = strict_contiguous(x)
         residual = strict_contiguous(residual)
         post_layer_mix = strict_contiguous(post_layer_mix)
         comb_res_mix = strict_contiguous(comb_res_mix)
-    out = torch.empty_like(residual)
+    if out is None:
+        out = torch.empty_like(residual)
     hidden_size = residual.shape[-1]
     # Small batches need more parallelism than one CTA per token.
     num_h_blocks = (

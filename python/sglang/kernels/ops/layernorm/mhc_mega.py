@@ -151,8 +151,7 @@ def locality_pool_reserved_bytes() -> int:
     return 0 if _reserved_pool is None else _reserved_pool.nbytes
 
 
-def locality_residual_rows(rows: int) -> Optional[torch.Tensor]:
-    """The reserved slot's residual rows for a fresh residual stream (the first layer's broadcast), or None."""
+def _reserved_for(rows: int):
     pool = _reserved_pool
     if (
         pool is None
@@ -161,7 +160,33 @@ def locality_residual_rows(rows: int) -> Optional[torch.Tensor]:
         or torch.cuda.is_current_stream_capturing()
     ):
         return None
-    return pool.residual_rows(rows)
+    return pool
+
+
+def locality_residual_rows(rows: int) -> Optional[torch.Tensor]:
+    """The reserved slot's residual rows for a fresh residual stream (the first layer's broadcast), or None."""
+    pool = _reserved_for(rows)
+    return None if pool is None else pool.residual_rows(rows)
+
+
+def locality_inplace_out(residual: torch.Tensor) -> Optional[torch.Tensor]:
+    """``residual`` itself when it is the reserved slot's rows, so a row-local post can update it in place."""
+    pool = _reserved_for(residual.shape[0])
+    if pool is None:
+        return None
+    out = pool.residual_rows(residual.shape[0])
+    if residual.data_ptr() != out.data_ptr() or residual.shape != out.shape or residual.stride() != out.stride():
+        return None
+    return residual
+
+
+def locality_normed_rows(rows: int) -> Optional[torch.Tensor]:
+    """The reserved normed slot's rows for a sublayer input built outside the Mega mHC boundary, or None."""
+    pool = _reserved_for(rows)
+    if pool is None:
+        return None
+    offset = _stripe_offset(rows)
+    return pool.ys[0][offset : offset + rows]
 
 
 def mhc_mega_boundary(
