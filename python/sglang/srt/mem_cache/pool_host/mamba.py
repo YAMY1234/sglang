@@ -38,6 +38,7 @@ if _is_cuda or _is_hip:
     )
 if _is_cuda or _is_hip:
     from sglang.kernels.ops.mamba.transfer_mamba import (
+        precompile_transfer_mamba,
         transfer_kv_mamba_lf_pf,
         transfer_kv_mamba_pf_lf,
     )
@@ -114,6 +115,11 @@ class MambaPoolHost(HostKVCache):
                 "(--enable-hierarchical-cache, "
                 "--disaggregation-decode-retraction-backup=host_pool)."
             )
+
+        if (_is_cuda or _is_hip) and envs.SGLANG_HICACHE_PRECOMPILE_TRANSFER_MAMBA.get():
+            # Built lazily, the first host transfer stalls its stage for seconds,
+            # which can push PP stages out of phase.
+            precompile_transfer_mamba()
 
         self.layout = layout
         self.pin_memory = pin_memory

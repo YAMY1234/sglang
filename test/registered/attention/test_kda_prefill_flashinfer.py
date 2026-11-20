@@ -1,5 +1,6 @@
 """FlashInfer KDA prefill integration against SGLang's Triton reference."""
 
+import os
 from itertools import accumulate
 from types import SimpleNamespace
 
@@ -12,11 +13,17 @@ from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=180, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
 
+_FI_SM107 = os.environ.get("SGLANG_K31_KDA_PREFILL_FI_SM107", "0") in ("1", "true")
 if not torch.cuda.is_available() or torch.cuda.get_device_capability() not in (
     (10, 0),
     (10, 3),
+    *([(10, 7)] if _FI_SM107 else []),
 ):
-    pytest.skip("FlashInfer KDA prefill requires B200/B300", allow_module_level=True)
+    pytest.skip(
+        "FlashInfer KDA prefill requires B200/B300 (Rubin with "
+        "SGLANG_K31_KDA_PREFILL_FI_SM107=1)",
+        allow_module_level=True,
+    )
 
 flashinfer = pytest.importorskip("flashinfer")
 pytest.importorskip("flashinfer.kda")
@@ -245,6 +252,83 @@ def test_kda_backend_prefill_dispatch_and_tracked_state(extend_lens):
             cache.temporal.float(), triton_state.float(), atol=3e-2, rtol=3e-2
         )
         torch.testing.assert_close(cache.conv[0], triton_conv, atol=0, rtol=0)
+
+
+def _sync_detected(fn):
+    """True if fn issued a host-synchronizing CUDA call."""
+    torch.cuda.synchronize()
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        fn()
+    except RuntimeError as e:
+        if "synchroniz" not in str(e):
+            raise
+        return True
+    finally:
+        torch.cuda.set_sync_debug_mode("default")
+    return False
+
+
+@pytest.mark.parametrize("kernel", ["flashinfer", "triton"])
+def test_kda_seeded_cu_seqlens_exact_and_sync_free(kernel):
+    """Seeding FlashInfer's cu_seqlens memo from host lengths changes no output
+    bit, and leaves the FlashInfer prefill call without a host sync."""
+    from sglang.srt.environ import envs
+
+    extend_lens = (130, 128, 257)
+    with get_parallel().override(attn_dcp_rank=0, attn_dcp_size=1):
+        case = KDAAttentionCase(
+            name="kda_seeded_cu_seqlens",
+            backend="triton",
+            forward_mode=ForwardMode.EXTEND,
+            num_k_heads=2,
+            num_v_heads=2,
+            page_size=16,
+            prefix_lens=(0,) * len(extend_lens),
+            extend_lens=extend_lens,
+        )
+        fixture = build_kda_attention_fixture(
+            CustomTestCase(),
+            case,
+            head_k_dim=128,
+            head_v_dim=128,
+            max_context_len=512,
+            runner_batch_size=6,
+        )
+        fixture.actual_module.attn.lower_bound = -5.0
+        cache = fixture.runner.req_to_token_pool.mamba2_layer_cache(0)
+        initial_conv, initial_ssm = cache.conv[0].clone(), cache.temporal.clone()
+        backend = fixture.backend.linear_attn_backend
+        results, syncs = {}, {}
+        for seed in (0, 1):
+            cache.conv[0].copy_(initial_conv)
+            cache.temporal.copy_(initial_ssm)
+            with envs.SGLANG_K31_KDA_PREFILL_FI_SM107.override(
+                torch.cuda.get_device_capability() == (10, 7)
+            ), envs.SGLANG_K31_KDA_SEED_CU_SEQLENS.override(seed):
+                if kernel == "flashinfer":
+                    backend.kernel_dispatcher = flashinfer_dispatcher()
+                dispatcher = backend.kernel_dispatcher
+                inner = dispatcher.extend
+                calls = []
+
+                def extend(*args, **kwargs):
+                    out = []
+                    calls.append(_sync_detected(lambda: out.append(inner(*args, **kwargs))))
+                    return out[0]
+
+                dispatcher.extend = extend
+                try:
+                    output = run_kda_fixture_eager(fixture)
+                finally:
+                    dispatcher.extend = inner
+            results[seed] = (output.clone(), cache.temporal.clone(), cache.conv[0].clone())
+            syncs[seed] = any(calls)
+        for got, want in zip(results[1], results[0]):
+            torch.testing.assert_close(got, want, atol=0, rtol=0)
+        if kernel == "flashinfer":
+            assert syncs[0], "unseeded FlashInfer prefill should read cu_seqlens back"
+            assert not syncs[1], "seeded FlashInfer prefill still synchronizes"
 
 
 if __name__ == "__main__":

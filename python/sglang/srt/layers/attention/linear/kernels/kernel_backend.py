@@ -25,6 +25,11 @@ class LinearAttnKernelBase(ABC):
     # tracked batches loudly (NotImplementedError) keep the default False.
     supports_track_state_snapshot: bool = False
 
+    def seed_query_start_loc(
+        self, query_start_loc_i64: torch.Tensor, extend_seq_lens_cpu
+    ) -> None:
+        """Hand the kernel query_start_loc_i64's host contents (no-op by default)."""
+
     @abstractmethod
     def decode(
         self,

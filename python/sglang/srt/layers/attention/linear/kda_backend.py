@@ -754,6 +754,17 @@ class KDAAttnBackend(MambaAttnBackendBase):
             self.forward_metadata.query_start_loc_i64 = (
                 self.forward_metadata.query_start_loc.to(torch.int64)
             )
+            # Host lengths describe query_start_loc only under the condition
+            # HybridLinearAttnBackend uses to trust them for the token count.
+            if (
+                forward_batch.extend_seq_lens_cpu is not None
+                and len(forward_batch.extend_seq_lens_cpu) == forward_batch.batch_size
+                and forward_batch.tbo_parent_token_range is None
+            ):
+                self.kernel_dispatcher.extend_kernel.seed_query_start_loc(
+                    self.forward_metadata.query_start_loc_i64,
+                    forward_batch.extend_seq_lens_cpu,
+                )
         if self.forward_metadata.has_mamba_track_mask:
             if self.forward_metadata.mamba_track_mask_indices is None:
                 self.forward_metadata.mamba_track_mask_indices = (
