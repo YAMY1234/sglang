@@ -241,6 +241,9 @@ class UnifiedRadixCache(BasePrefixCache):
     # SGLANG_HICACHE_DEVICE_WRITE_AHEAD under write_back (init_hicache); see
     # _write_ahead_device_tail.
     _device_write_ahead: bool = False
+    # Host KV backup allocation, cumulative (count, tokens) x (host evicted to
+    # retry, still failed, write_back backup skipped); host composition log.
+    _backup_alloc: tuple[int, ...] = (0,) * 6
     _l3_ack_removed: int = 0
 
     def __init__(
@@ -614,7 +617,8 @@ class UnifiedRadixCache(BasePrefixCache):
         self._wa_peak_evicted = 0.0
         self._wa_ready_count = 0
         self._wa_preevict_tokens = 0
-        self._hostcomp_last = (0, 0, 0, 0)
+        self._backup_alloc = (0,) * 6
+        self._hostcomp_last = (0,) * 10
         self.ongoing_load_back: dict[int, _OngoingLoadBack] = {}
         self.enable_storage = False
         self.prefetch_loaded_tokens_by_reqid: dict[CacheRequestHandle, int] = {}
@@ -2352,6 +2356,8 @@ class UnifiedRadixCache(BasePrefixCache):
                     pmicro_hoststats.HOST_EVICT_CALLS[0] != host_evicts,
                 )
             if host_indices is None:
+                if write_back:
+                    self._count_backup_alloc(2, len(device_value))
                 return 0
             if pmicro_hoststats.ON:
                 pmicro_hoststats.note_backup(node_id, len(host_indices))
@@ -2404,7 +2410,9 @@ class UnifiedRadixCache(BasePrefixCache):
             host_avail = self.cache_controller.mem_pool_host.available_size()
             if host_avail < kv_tokens:
                 needed = kv_tokens - host_avail
+                self._count_backup_alloc(0, needed)
                 if self.evict_host(needed) < needed:
+                    self._count_backup_alloc(1, kv_tokens)
                     return None
         aux_xfers = [x for xfers in comp_xfers.values() for x in xfers]
         aux_xfers.extend(sidecar_xfers)
@@ -2412,13 +2420,22 @@ class UnifiedRadixCache(BasePrefixCache):
         start_owner = self.tree_core.rotation_phase_of(node_id)
         shard_kwargs = {} if start_owner is None else {"start_owner": start_owner}
         # Defer submission so the next flush can merge pending node backups.
-        return self.cache_controller.write(
+        host_indices = self.cache_controller.write(
             device_value,
             node_id=node_id,
             extra_pools=aux_xfers or None,
             flush=False,
             **shard_kwargs,
         )
+        if host_indices is None:
+            self._count_backup_alloc(1, kv_tokens)
+        return host_indices
+
+    def _count_backup_alloc(self, kind: int, tokens: int) -> None:
+        counts = list(self._backup_alloc)
+        counts[2 * kind] += 1
+        counts[2 * kind + 1] += tokens
+        self._backup_alloc = tuple(counts)
 
     def _track_write_through_node(
         self,
@@ -2863,13 +2880,16 @@ class UnifiedRadixCache(BasePrefixCache):
         kind now, and Full host tokens freed by kind since the previous line
         (wa_preevict: freed by the write-ahead walk's batch eviction, any kind)."""
         dup, spared, host_only, evicted = self.tree_core.host_composition()
-        now = (*evicted, self._wa_preevict_tokens)
+        now = (*evicted, self._wa_preevict_tokens, *self._backup_alloc)
         d = [a - b for a, b in zip(now, self._hostcomp_last)]
         self._hostcomp_last = now
+        pool = self.cache_controller.mem_pool_host
         return (
-            f"PMICRO_HOSTCOMP host_free={self.cache_controller.mem_pool_host.available_size()} "
+            f"PMICRO_HOSTCOMP host_free={pool.available_size()} host_size={pool.size} "
             f"dup={dup} dup_wa_tail={spared} host_only={host_only} | evict_dup={d[0]} "
-            f"evict_leaf={d[1]} evict_leaf_mamba={d[2]} wa_preevict={d[3]}"
+            f"evict_leaf={d[1]} evict_leaf_mamba={d[2]} wa_preevict={d[3]} | "
+            f"backup_evict_retry={d[4]}/{d[5]} backup_alloc_fail={d[6]}/{d[7]} "
+            f"wb_backup_skip={d[8]}/{d[9]}"
         )
 
     def _write_ahead_stream(self) -> torch.Stream:
