@@ -189,6 +189,34 @@ class TestAllocationConfiguration(CustomTestCase):
         with self.assertRaisesRegex(ValueError, "attention"):
             handle_pd_disaggregation(ServerArgs(**decode))
 
+    def test_prefill_complete_keeps_optimistic_prefill_with_nixl_dram_write_back(self):
+        base = dict(
+            model_path="dummy",
+            disaggregation_mode="prefill",
+            pp_size=8,
+            enable_hierarchical_cache=True,
+            hicache_write_policy="write_back",
+            hicache_storage_backend="nixl_dram",
+        )
+        args = ServerArgs(**base, disaggregation_decode_allocation_policy="prefill_complete")
+        handle_pd_disaggregation(args)
+        handle_other_validations(args)
+        self.assertEqual(resolving_view(args).optimistic_prefill_attempts, 1)
+        # Early keeps its PP rule (no optimistic prefill); other L3 setups stay refused.
+        args = ServerArgs(**base, disaggregation_decode_allocation_policy="early", optimistic_prefill_attempts=1)
+        handle_pd_disaggregation(args)
+        handle_other_validations(args)
+        self.assertEqual(resolving_view(args).optimistic_prefill_attempts, 0)
+        for changed in (
+            {"hicache_storage_backend": "file"},
+            {"hicache_write_policy": "write_through"},
+        ):
+            with self.subTest(changed=changed):
+                values = dict(base, disaggregation_decode_allocation_policy="prefill_complete")
+                values.update(changed)
+                with self.assertRaisesRegex(ValueError, "prefill_complete"):
+                    handle_pd_disaggregation(ServerArgs(**values))
+
     def test_request_state_pools_need_their_flag(self):
         kimi_states = [
             StateType.MAMBA,
