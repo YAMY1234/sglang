@@ -467,10 +467,15 @@ constexpr uint32_t kQNormDim = 1280;
 constexpr uint32_t kQNormGroups = kQNormDim / 32;
 constexpr uint32_t kQNormPadCTAs = kQNormGroups * 128 / 512;
 
-// Triton's fp32 `/` (rmsnorm_mxfp8 divides the sum of squares by K with it).
-SGL_DEVICE float div_full(float a, float b) {
+// The instructions Triton emits for rmsnorm_mxfp8's `ss / K` and `tl.rsqrt` (read off its PTX).
+SGL_DEVICE float triton_div(float a, float b) {
   float r;
-  asm("div.full.f32 %0, %1, %2;" : "=f"(r) : "f"(a), "f"(b));
+  asm("div.approx.f32 %0, %1, %2;" : "=f"(r) : "f"(a), "f"(b));
+  return r;
+}
+SGL_DEVICE float triton_rsqrt(float a) {
+  float r;
+  asm("rsqrt.approx.ftz.f32 %0, %1;" : "=f"(r) : "f"(a));
   return r;
 }
 
@@ -527,7 +532,7 @@ SGL_DEVICE void q_norm_mxfp8_row(const QNormMxfp8Params& p, const uint32_t row) 
       __fadd_rn(__fadd_rn(ws[0], ws[4]), __fadd_rn(ws[2], ws[6])),
       __fadd_rn(__fadd_rn(ws[1], ws[5]), __fadd_rn(ws[3], ws[7])));
   if (!active) return;
-  const float inv = rsqrtf(__fadd_rn(div_full(ss, static_cast<float>(kQNormDim)), p.eps));
+  const float inv = triton_rsqrt(__fadd_rn(triton_div(ss, static_cast<float>(kQNormDim)), p.eps));
   Vec y_vec;
   float amax = 0.0f;
 #pragma unroll
