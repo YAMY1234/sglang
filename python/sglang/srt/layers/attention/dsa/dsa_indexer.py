@@ -138,8 +138,9 @@ else:
     deepgemm_paged_mqa_logits_split = None
 
 if _is_cuda:
-    from sglang.kernels.ops.attention.dsa import pick_dsl_expand
+    from sglang.kernels.ops.attention.dsa import paged_mqa_logits_1blk, pick_dsl_expand
 else:
+    paged_mqa_logits_1blk = None
     pick_dsl_expand = None
 
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
@@ -1648,8 +1649,14 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 get_paged_mqa_logits_metadata_fn=resolve_paged_mqa_logits_metadata_fn(),
             )
         elif use_dg_native:
+            mqa_fn = _chunked_fp8_paged_mqa_logits
+            if (
+                envs.SGLANG_K31_DSA_PAGED_MQA_ONEBLOCK.get()
+                and paged_mqa_logits_1blk.supports(next_n, *q_fp8.shape[1:])
+            ):
+                mqa_fn = paged_mqa_logits_1blk.fp8_paged_mqa_logits_1blk
             logits = deepgemm_paged_mqa_logits_native(
-                _chunked_fp8_paged_mqa_logits,
+                mqa_fn,
                 q_fp8,
                 kv_cache_fp8,
                 weights,
