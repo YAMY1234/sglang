@@ -4430,8 +4430,8 @@ def configure_gc_warning(warn_threshold_secs):
 class BatchCountGCFreezer:
     """gc.freeze() once a process has run `after` batches, then every `every` batches
     (0: once). A full collection walks every tracked object; frozen ones are skipped,
-    so the long-lived heap built so far stops costing collections. Cyclic garbage among
-    frozen objects is never reclaimed."""
+    so the long-lived heap built so far stops costing collections. Each freeze first
+    collects the young generations, so their cyclic garbage is not frozen for good."""
 
     def __init__(
         self,
@@ -4458,6 +4458,7 @@ class BatchCountGCFreezer:
         if not self.next_at or count < self.next_at:
             return False
         t0 = time.perf_counter()
+        gc.collect(1)
         gc.freeze()
         self.next_at = count + self.every if self.every else 0
         logger.info(
