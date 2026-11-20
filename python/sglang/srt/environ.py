@@ -779,6 +779,10 @@ class Envs:
     SGLANG_DISAGGREGATION_HEARTBEAT_INTERVAL = EnvFloat(5.0)
     SGLANG_DISAGGREGATION_HEARTBEAT_MAX_FAILURE = EnvInt(2)
     SGLANG_DISAGGREGATION_WAITING_TIMEOUT = EnvInt(300)
+    # Prefill: fail a room still WaitingForInput / Transferring this many seconds
+    # after its last chunk was enqueued, and bound the transfer workers' CUDA waits
+    # by it; the release consensus then frees its KV on every stage. 0 = off.
+    SGLANG_DISAGGREGATION_TRANSFER_TIMEOUT = EnvFloat(0.0)
     # Decode: dispatch to the DP rank --load-balance-method picks, ignoring the router's routed_dp_rank.
     SGLANG_DISAGG_DECODE_IGNORE_ROUTED_DP_RANK = EnvBool(False)
     # A wedged RDMA stack fails startup here instead of at the scheduler watchdog.

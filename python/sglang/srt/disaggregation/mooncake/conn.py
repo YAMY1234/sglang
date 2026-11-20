@@ -118,6 +118,25 @@ def _mix_room_id(room: int) -> int:
     return (mixed ^ (mixed >> 31)) & _UINT64_MASK
 
 
+def _wait_cuda_bounded(kv_mgr, work, room: int, label: str) -> None:
+    """wait_cuda, bounded by SGLANG_DISAGGREGATION_TRANSFER_TIMEOUT: past it the room
+    is failed and the status check after the wait drops the chunk, so one stuck room
+    no longer holds every room queued behind it on this transfer worker."""
+    timeout = getattr(kv_mgr, "transfer_timeout", 0)
+    if timeout <= 0:
+        wait_cuda(work)
+        return
+    start = time.perf_counter()
+    while not work.query():
+        if room in kv_mgr.request_status and kv_mgr.check_status(room) == KVPoll.Failed:
+            return
+        waited = time.perf_counter() - start
+        if waited >= timeout:
+            kv_mgr.fail_room_on_timeout(room, f"transfer worker {label}", waited)
+            return
+        time.sleep(1e-4)
+
+
 # decode
 @dataclasses.dataclass
 class TransferInfo:
@@ -3134,10 +3153,14 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                         kv_chunk.room in self.request_status
                         and self.check_status(kv_chunk.room) != KVPoll.Failed
                     ):
-                        wait_cuda(kv_chunk.wait_event)
+                        _wait_cuda_bounded(
+                            self, kv_chunk.wait_event, kv_chunk.room, "wait_event"
+                        )
                     kv_chunk.wait_event = None
                 if kv_chunk.indices_event is not None:
-                    wait_cuda(kv_chunk.indices_event)
+                    _wait_cuda_bounded(
+                        self, kv_chunk.indices_event, kv_chunk.room, "indices_event"
+                    )
                     kv_chunk.indices_event = None
                 if isinstance(kv_chunk.prefill_kv_indices, torch.Tensor):
                     kv_chunk.prefill_kv_indices = kv_chunk.prefill_kv_indices.numpy()
