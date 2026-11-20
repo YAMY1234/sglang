@@ -2346,6 +2346,18 @@ class Envs:
     SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD = EnvInt(2048)
     SGLANG_DSA_HIP_DISABLE_PRESHUFFLE = EnvBool(False)
     SGLANG_DSA_MQA_LOGITS_FREE_MEM_FRACTION = EnvFloat(0.2)
+    # Packed PAGED prefill top-k from a fused scorer that never writes the score
+    # matrix (kernels/ops/attention/dsa/fused_indexer_topk.py); exact, no host sync.
+    SGLANG_DSA_FUSED_INDEXER_TOPK = EnvBool(False)
+    # Log the fused path's row, repair and compaction counters every N calls (0 = off).
+    SGLANG_DSA_FUSED_INDEXER_TOPK_LOG_INTERVAL = EnvInt(64)
+    # Use the fused path only when the batch's mean row window has at least this many keys
+    # (1-GPU crossover: 0.90x at 48k, 1.02x at 64k, 1.30x at 128k keys per row; 0 = always).
+    SGLANG_DSA_FUSED_INDEXER_TOPK_MIN_MEAN_KEYS = EnvInt(65536)
+    # Debug: every N calls, compare 256 rows with the unfused path and log (0 = off).
+    SGLANG_DSA_FUSED_INDEXER_TOPK_CHECK_INTERVAL = EnvInt(0)
+    # Debug: log the GPU time of the prefill top-k (CUDA events) every N calls (0 = off).
+    SGLANG_DSA_INDEXER_TOPK_TIMING_INTERVAL = EnvInt(0)
     # Requires a DeepGEMM paged-MQA scheduler supporting batches > SM count
     # (0.2.3 does); set to 0 for an older DeepGEMM.
     SGLANG_DSA_FULL_BATCH_MQA = EnvBool(True)
