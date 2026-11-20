@@ -283,6 +283,9 @@ class DeferredAbortAckState(msgspec.Struct):
     prefill_ranks: Set[int]
 
 
+_KV_POLL_NAMES = {v: k for k, v in vars(KVPoll).items() if isinstance(v, int)}
+
+
 class CommonKVManager(BaseKVManager):
     defer_decode_allocation: bool = False
     deferred_bootstrap: Optional[DeferredBootstrap] = None
@@ -410,6 +413,10 @@ class CommonKVManager(BaseKVManager):
         self._socket_lock = threading.Lock()
         self.failure_records: Dict[int, str] = {}
         self.failure_lock = threading.Lock()
+        # SGLANG_DISAGGREGATION_TRANSFER_TIMEOUT (0 = off); rid per room for its log.
+        self.transfer_timeout = envs.SGLANG_DISAGGREGATION_TRANSFER_TIMEOUT.get()
+        self.room_rids: Dict[int, str] = {}
+        self._timed_out_rooms: Set[int] = set()
         self._staging_outstanding: Dict[int, int] = defaultdict(int)
         self._deferred_ack_targets: Dict[int, Dict[Tuple[str, int], AckTarget]] = {}
         # A poisoned room has a permanently outstanding transfer whose backend
@@ -670,6 +677,9 @@ class CommonKVManager(BaseKVManager):
                 self._deferred_ack_targets.pop(bootstrap_room, None)
                 self._deferred_ack_poisoned_rooms.discard(bootstrap_room)
                 self._staging_outstanding.pop(bootstrap_room, None)
+                timed_out = getattr(self, "_timed_out_rooms", None)
+                if timed_out:
+                    timed_out.discard(bootstrap_room)
                 self.request_status[bootstrap_room] = status
             return
         if status == KVPoll.Failed:
@@ -1086,6 +1096,35 @@ class CommonKVManager(BaseKVManager):
         targets = dict(self._deferred_ack_targets.get(room, ()))
         targets[(target.ip, target.port)] = target
         self._deferred_ack_targets[room] = targets
+
+    def fail_room_on_timeout(
+        self, bootstrap_room: int, stuck_in: str, seconds: float
+    ) -> None:
+        """SGLANG_DISAGGREGATION_TRANSFER_TIMEOUT: fail one stuck room, once. Its status
+        becomes Failed here; the release consensus (MIN over stages) frees its KV on
+        every stage through the scheduler's Failed path."""
+        with self.failure_lock:
+            if bootstrap_room in self._timed_out_rooms:
+                return
+            self._timed_out_rooms.add(bootstrap_room)
+        logger.error(
+            "PD transfer timeout: room %d rid %s stage %d stuck in %s for %.1f s; "
+            "failing the room",
+            bootstrap_room,
+            self.room_rids.get(bootstrap_room),
+            self.pp_rank,
+            stuck_in,
+            seconds,
+        )
+        if self.enable_deferred_decode_kv_release:
+            # A worker may still be writing decode's pages: decode keeps them until its
+            # release timeout instead of on the drain ack.
+            self.poison_deferred_ack_room(bootstrap_room)
+        self.conclude_failure(
+            bootstrap_room=bootstrap_room,
+            failure_reason=f"transfer timed out after {seconds:.1f} s in {stuck_in} "
+            f"(PP stage {self.pp_rank})",
+        )
 
     def poison_deferred_ack_room(self, room: int) -> None:
         """Drop an ACK target when the backend cannot prove the room drained."""
@@ -2116,6 +2155,9 @@ class CommonKVManager(BaseKVManager):
 
 
 class CommonKVSender(BaseKVSender):
+    # Last chunk's enqueue time; SGLANG_DISAGGREGATION_TRANSFER_TIMEOUT counts from it.
+    _last_chunk_time: Optional[float] = None
+
     def __init__(
         self,
         mgr: CommonKVManager,
@@ -2332,6 +2374,8 @@ class CommonKVSender(BaseKVSender):
             return
 
         state_indices = self.kv_mgr.prepare_send_state_indices(state_indices)
+        if is_last_chunk and self._last_chunk_time is None:
+            self._last_chunk_time = time.perf_counter()
         if self._transfer_start_time is None and (
             len(kv_indices) > 0 or state_indices is not None
         ):
@@ -2388,6 +2432,10 @@ class CommonKVSender(BaseKVSender):
             timeout_status = self._check_bootstrap_timeout()
             if timeout_status is not None:
                 status = timeout_status
+        elif status in (KVPoll.WaitingForInput, KVPoll.Transferring):
+            timeout_status = self._check_transfer_timeout(status, check_status)
+            if timeout_status is not None:
+                status = timeout_status
         if status in (KVPoll.Success, KVPoll.Failed):
             self.conclude_state = status
             if (
@@ -2400,6 +2448,32 @@ class CommonKVSender(BaseKVSender):
                 )
             self.trace_ctx.trace_req_finish()
         return status
+
+    def _check_transfer_timeout(self, status: KVPoll, check_status) -> Optional[KVPoll]:
+        """SGLANG_DISAGGREGATION_TRANSFER_TIMEOUT, from the last chunk's enqueue. Under
+        with the release relay this runs on PP0's consensus poll and is relayed."""
+        timeout = getattr(self.kv_mgr, "transfer_timeout", 0)
+        if timeout <= 0 or self._last_chunk_time is None:
+            return None
+        elapsed = time.perf_counter() - self._last_chunk_time
+        if elapsed < timeout:
+            return None
+        stuck_in = _KV_POLL_NAMES.get(status, str(status))
+        collect = getattr(self.kv_mgr.request_status, "collect", None)
+        if (
+            check_status == self.kv_mgr.check_status_pp_consensus
+            and collect is not None
+        ):
+            stages = collect(self.bootstrap_room)
+            stuck_in += (
+                " (stage statuses "
+                + ",".join(
+                    "-" if s is None else _KV_POLL_NAMES.get(s, str(s)) for s in stages
+                )
+                + ")"
+            )
+        self.kv_mgr.fail_room_on_timeout(self.bootstrap_room, stuck_in, elapsed)
+        return KVPoll.Failed
 
     def _check_bootstrap_timeout(self) -> Optional[KVPoll]:
         start = (
@@ -2426,6 +2500,9 @@ class CommonKVSender(BaseKVSender):
         return KVPoll.Failed
 
     def clear(self) -> None:
+        room_rids = getattr(self.kv_mgr, "room_rids", None)
+        if room_rids:
+            room_rids.pop(self.bootstrap_room, None)
         notification = None
         if self.kv_mgr.deferred_bootstrap is not None:
             if not self._owns_bootstrap_room:

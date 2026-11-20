@@ -1062,6 +1062,154 @@ class TestPPPrefillReleaseRelay(CustomTestCase):
             for store in stores:
                 store.close()
 
+    def test_pp0_fails_a_room_stuck_past_the_transfer_timeout_on_every_stage(self):
+        # SGLANG_DISAGGREGATION_TRANSFER_TIMEOUT: room 2 still sends on stage 2 two
+        # minutes after its last chunk; PP0's consensus poll fails it once, the relay
+        # carries that, and every stage releases it through the Failed path once.
+        # Room 3 also still sends but its last chunk is recent: it waits.
+        ok, sending, failed = KVPoll.Success, KVPoll.Transferring, KVPoll.Failed
+        statuses = {1: (ok, ok, ok), 2: (ok, ok, sending), 3: (ok, ok, sending)}
+        pp_size = 3
+        inboxes = defaultdict(deque)
+        stores = [
+            PPConsensusStore(pp_size, k, _RelayPPGroup(k, pp_size, inboxes))
+            for k in range(pp_size)
+        ]
+        try:
+            for room, per_stage in statuses.items():
+                for stage, status in enumerate(per_stage):
+                    stores[stage][room] = status
+            deadline = time.monotonic() + 5
+            while any(
+                stores[0].collect(room) != list(per_stage)
+                for room, per_stage in statuses.items()
+            ):
+                self.assertLess(time.monotonic(), deadline)
+                time.sleep(0.01)
+
+            schedulers, managers = [], []
+            for stage in range(pp_size):
+                kv_mgr = SimpleNamespace(
+                    request_status=stores[stage],
+                    _staging_outstanding={},
+                    defer_decode_allocation=False,
+                    reports_transfer_latency=False,
+                    transfer_timeout=60.0,
+                    failure_lock=threading.Lock(),
+                    _timed_out_rooms=set(),
+                    room_rids={room: f"r{room}" for room in statuses},
+                    pp_rank=stage,
+                    enable_deferred_decode_kv_release=False,
+                    conclude_failure=Mock(),
+                )
+                for method in (
+                    "check_status",
+                    "check_status_pp_consensus",
+                    "fail_room_on_timeout",
+                ):
+                    setattr(
+                        kv_mgr,
+                        method,
+                        partial(getattr(CommonKVManager, method), kv_mgr),
+                    )
+                managers.append(kv_mgr)
+                queue = []
+                for room in statuses:
+                    sender = CommonKVSender.__new__(CommonKVSender)
+                    sender.conclude_state = None
+                    sender.bootstrap_room = room
+                    sender.kv_mgr = kv_mgr
+                    sender._last_chunk_time = time.perf_counter() - (
+                        120 if room == 2 else 1
+                    )
+                    sender.trace_ctx = Mock()
+                    sender.clear = Mock()
+                    sender.get_transfer_metric = Mock()
+                    time_stats = Mock()
+                    time_stats.compute_and_observe_kv_transfer_metrics.return_value = {}
+                    queue.append(
+                        SimpleNamespace(
+                            rid=f"r{room}",
+                            disagg_kv_sender=sender,
+                            pending_bootstrap=False,
+                            return_routed_experts=False,
+                            return_logprob=False,
+                            finished_reason=None,
+                            cache_request_handle=None,
+                            bootstrap_host="10.0.0.1",
+                            time_stats=time_stats,
+                        )
+                    )
+                scheduler = Scheduler.__new__(Scheduler)
+                scheduler.scheduler_stage_metrics = None
+                scheduler.pp_group = _RelayPPGroup(stage, pp_size, inboxes)
+                scheduler.pp_release_sync_work_list = []
+                scheduler.disagg_prefill_inflight_queue = queue
+                scheduler.tree_cache = Mock()
+                scheduler.output_streamer = Mock()
+                scheduler.handle_inflight_transfer_failure = Mock()
+                scheduler.req_to_metadata_buffer_idx_allocator = Mock()
+                schedulers.append(scheduler)
+
+            with (
+                _single_rank_gloo_group(),
+                published_topology(),
+                patch("sglang.srt.disaggregation.prefill.release_kv_cache") as release,
+                patch(
+                    "sglang.srt.disaggregation.prefill.maybe_release_metadata_buffer"
+                ),
+                self.assertLogs(
+                    "sglang.srt.disaggregation.common.conn", level="ERROR"
+                ) as logs,
+            ):
+                for scheduler in schedulers:
+                    scheduler.attn_cp_cpu_group = dist.group.WORLD
+                    scheduler.attn_tp_cpu_group = dist.group.WORLD
+                for round_ in range(2):
+                    for stage, scheduler in enumerate(schedulers):
+                        with get_parallel().override(pp_size=pp_size, pp_rank=stage):
+                            polls = scheduler._pp_pd_relay_prefill_release_polls()
+                            done = scheduler.process_disagg_prefill_inflight_queue(
+                                pp_consensus_polls=polls
+                            )
+                        if round_ == 0:
+                            self.assertEqual(polls, [ok, failed, sending])
+                            self.assertEqual([req.rid for req in done], ["r1", "r2"])
+                        else:  # released once: room 2 is not polled again
+                            self.assertEqual(polls, [sending])
+                            self.assertEqual(done, [])
+                        self.assertEqual(
+                            [
+                                req.rid
+                                for req in scheduler.disagg_prefill_inflight_queue
+                            ],
+                            ["r3"],
+                        )
+                        scheduler.handle_inflight_transfer_failure.assert_called_once()
+                        self.assertEqual(
+                            scheduler.handle_inflight_transfer_failure.call_args.args[
+                                0
+                            ].rid,
+                            "r2",
+                        )
+                self.assertEqual(
+                    [c.args[0].rid for c in release.call_args_list], ["r1"] * pp_size
+                )
+            # One line for the room, from PP0, naming what it was stuck in.
+            timeouts = [r for r in logs.output if "PD transfer timeout" in r]
+            self.assertEqual(len(timeouts), 1)
+            self.assertIn("room 2 rid r2 stage 0 stuck in Transferring", timeouts[0])
+            self.assertIn("stage statuses Success,Success,Transferring", timeouts[0])
+            managers[0].conclude_failure.assert_called_once()
+            self.assertEqual(
+                managers[0].conclude_failure.call_args.kwargs["bootstrap_room"], 2
+            )
+            for kv_mgr in managers[1:]:
+                kv_mgr.conclude_failure.assert_not_called()
+        finally:
+            for store in stores:
+                store.close()
+
     def test_relay_window_waits_only_rounds_older_than_the_window(self):
         for window in (1, 3):
             with self.subTest(window=window):

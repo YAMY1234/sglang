@@ -416,6 +416,11 @@ class PrefillBootstrapQueue:
             bootstrap_room=req.bootstrap_room,
             req_has_disagg_prefill_dp_rank=req.disagg_prefill_dp_rank is not None,
         )
+        room_rids = getattr(self.kv_manager, "room_rids", None)
+        if room_rids is not None and self.kv_manager.transfer_timeout > 0:
+            room_rids[req.bootstrap_room] = (
+                req.rid
+            )  # SGLANG_DISAGGREGATION_TRANSFER_TIMEOUT log
         self._process_req(req)
         req.pending_bootstrap = True
         return True
