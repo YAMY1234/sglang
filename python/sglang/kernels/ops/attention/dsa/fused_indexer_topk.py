@@ -22,7 +22,7 @@ from sglang.kernels.jit.utils import cache_once, cuda_stubs_dir, load_jit
 MODE_LOGITS, MODE_NO_EPI, MODE_NO_STORE, MODE_FILTER = 0, 1, 2, 3
 # layout -> (rows per q-block, keys per split); see LayoutTraits in the kernel.
 LAYOUTS = {0: (4, 256), 1: (4, 256), 2: (8, 128), 3: (4, 256), 4: (8, 128), 5: (4, 256)}
-DEFAULT_LAYOUT = 0
+DEFAULT_LAYOUT = 5  # measured fastest for the filter pass (VR, 11-20)
 MATH_WARPS = 8  # candidate sub-lists per row: one per math warp of the row's CTA
 
 
