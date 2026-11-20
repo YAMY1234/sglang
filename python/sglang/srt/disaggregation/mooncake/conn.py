@@ -306,6 +306,10 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         self._worker_threads: List[threading.Thread] = []
         self._dcp_send_stats_lock = threading.Lock()
         self._dcp_send_stats = self._new_dcp_send_stats()
+        self._xt_interval = envs.SGLANG_DISAGG_TRANSFER_TIME_STATS_INTERVAL.get()
+        self._xt_lock = threading.Lock()
+        self._xt_first: Dict[int, float] = {}
+        self._xt_stats = self._new_transfer_time_stats()
         # Checked in every role, so a bad value fails startup rather than a
         # later decode -> prefill role switch.
         self.enable_failed_session_probe = envs.SGLANG_ENABLE_FAILED_SESSION_PROBE.get()
@@ -1646,6 +1650,48 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             envs.SGLANG_DISAGG_TRANSFER_SHARD_BY_ROOM.get(),
             list(getattr(self, "_queue_puts", [])),
             envs.SGLANG_DISAGG_GATHER_STREAM_HIGH_PRIORITY.get(),
+        )
+
+    @staticmethod
+    def _new_transfer_time_stats() -> dict:
+        return dict(span=[], wait=[], send=[], workers=defaultdict(int), since=time.perf_counter())
+
+    def _record_transfer_time(self, kv_chunk: TransferKVChunk, deq_t: float, worker_index: int) -> None:
+        now = time.perf_counter()
+        with self._xt_lock:
+            st = self._xt_stats
+            st["wait"].append(deq_t - kv_chunk.enqueued_at)
+            st["send"].append(now - deq_t)
+            st["workers"][worker_index] += 1
+            if kv_chunk.is_last_chunk:
+                first = self._xt_first.pop(kv_chunk.room, None)
+                if first is not None:
+                    st["span"].append(now - first)
+            elapsed = now - st["since"]
+            if elapsed < self._xt_interval:
+                return
+            self._xt_stats = self._new_transfer_time_stats()
+            # rooms whose last chunk never came (failed / aborted) age out
+            self._xt_first = {r: t for r, t in self._xt_first.items() if now - t < 600}
+
+        def q(v: List[float], p: float) -> float:
+            return 1e3 * sorted(v)[min(len(v) - 1, int(p * len(v)))] if v else float("nan")
+
+        logger.info(
+            "PD transfer time over %.0f s: %d requests, first chunk enqueued -> last chunk sent ms "
+            "p50 %.1f p90 %.1f max %.1f; %d chunks, queue wait ms p50 %.1f p90 %.1f, dequeue -> sent ms "
+            "p50 %.1f p90 %.1f; chunks per worker %s",
+            elapsed,
+            len(st["span"]),
+            q(st["span"], 0.5),
+            q(st["span"], 0.9),
+            1e3 * max(st["span"], default=float("nan")),
+            len(st["send"]),
+            q(st["wait"], 0.5),
+            q(st["wait"], 0.9),
+            q(st["send"], 0.5),
+            q(st["send"], 0.9),
+            dict(sorted(st["workers"].items())),
         )
 
     def _send_kvcache_dcp_chunk_packed(
@@ -3055,6 +3101,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 # _stopped alone can never wake a parked worker during a role switch.
                 if kv_chunk is None:
                     break
+                deq_t = time.perf_counter() if kv_chunk.enqueued_at else 0.0
                 if self.enable_trace:
                     kv_chunk.trace_ctx.rebuild_thread_context()
                     kv_chunk.trace_ctx.trace_slice_start(
@@ -3414,6 +3461,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     self._diag_worker_end[worker_index] = time.perf_counter()
                 if staging_deferred:
                     continue
+                if kv_chunk.enqueued_at:
+                    self._record_transfer_time(kv_chunk, deq_t, worker_index)
 
                 self._staging_outstanding[kv_chunk.room] -= 1
                 if self.enable_deferred_decode_kv_release:
@@ -3718,6 +3767,11 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             if puts is None:
                 puts = self._queue_puts = [0] * len(self.transfer_queues)
             puts[shard_idx] += 1
+        enqueued_at = 0.0
+        if self._xt_interval > 0:
+            enqueued_at = time.perf_counter()
+            with self._xt_lock:
+                self._xt_first.setdefault(bootstrap_room, enqueued_at)
         self.transfer_queues[shard_idx].put(
             TransferKVChunk(
                 room=bootstrap_room,
@@ -3730,6 +3784,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 trace_ctx=trace_ctx,
                 wait_event=wait_event,
                 indices_event=indices_event,
+                enqueued_at=enqueued_at,
             )
         )
 
