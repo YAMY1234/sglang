@@ -197,6 +197,11 @@ class DataParallelController:
             LoadBalanceMethod.TOTAL_REQUESTS,
             LoadBalanceMethod.TOTAL_TOKENS,
         )
+        # Decode only: dispatch by --load-balance-method, ignoring the router's per-request DP pick.
+        self.ignore_routed_dp_rank = (
+            envs.SGLANG_DISAGG_DECODE_IGNORE_ROUTED_DP_RANK.get()
+            and get_disagg().disaggregation_mode == "decode"
+        )
 
         parallel = get_parallel()
         self.launch_dp_size: int = parallel.num_dp_ranks
@@ -863,7 +868,7 @@ class DataParallelController:
         sock_send(self.workers[slot], req)
 
     def maybe_external_dp_rank_routing(self, req: Req):
-        if req.routed_dp_rank is not None:
+        if req.routed_dp_rank is not None and not self.ignore_routed_dp_rank:
             rank = req.routed_dp_rank
             if (
                 rank < 0
