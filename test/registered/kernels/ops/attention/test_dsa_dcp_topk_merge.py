@@ -17,6 +17,7 @@ Usage::
 from __future__ import annotations
 
 import atexit
+from typing import Optional
 import logging
 import os
 
@@ -58,6 +59,9 @@ def _init_once() -> DcpTopKMerge:
     return DcpTopKMerge(ps._WORLD, MAX_ROWS, TOPK)
 
 
+_HOT = {"skew": (383, 900, 383, 382), "skew2": (124, 900, 900, 124)}
+
+
 def _rows(kind: str, seed: int) -> list[torch.Tensor]:
     """The same global score rows on every rank."""
     g = torch.Generator().manual_seed(seed)
@@ -87,16 +91,16 @@ def _rows(kind: str, seed: int) -> list[torch.Tensor]:
                 base.repeat(n // 8 + 1)[:n] + 4.0 * torch.randperm(n, generator=g) / n
             )
         return rows
-    if kind == "skew":
-        # DCP4: rank 1 holds 900 of the global top-2048, more than 768 candidates
+    if kind in _HOT:
+        # DCP4: rank r holds _HOT[kind][r] of the global top-2048 (skew: 900 on rank 1, more
+        # than 768 candidates; skew2: 900 on ranks 1 and 2)
         rows = []
         for shift in (0, 4):
             x = torch.randn(65536, generator=g)
             pos = torch.arange(65536)
-            hot = pos[pos % 4 == 1][torch.randperm(16384, generator=g)[:900]]
-            rest = pos[pos % 4 != 1][torch.randperm(49152, generator=g)[:1148]]
-            x[hot] = 10 + torch.rand(900, generator=g)
-            x[rest] = 10 + torch.rand(1148, generator=g)
+            for r, n_hot in enumerate(_HOT[kind]):
+                hot = pos[pos % 4 == r][torch.randperm(16384, generator=g)[:n_hot]]
+                x[hot] = 10 + torch.rand(n_hot, generator=g)
             rows.append(x[shift:])
         return rows
     if kind == "short":
@@ -259,13 +263,28 @@ def _push_merge(cand_k: int) -> DcpTopKMerge:
     return _PUSH_MERGES[cand_k]
 
 
-@pytest.mark.parametrize("cand_k", [768, 1024, 2048])
-@pytest.mark.parametrize("kind", ["random", "dense_top", "ties", "periodic", "skew", "short"])
+def _failed_ranks(kind: str, cand_k: int) -> Optional[int]:
+    """Ranks that fail the certificate on every row of `kind` (None: not fixed)."""
+    if cand_k == TOPK:
+        return 0
+    if 4 * cand_k == TOPK:  # every candidate is in the top-k: each rank with more keys fails
+        return None if kind == "short" else 4
+    if kind == "periodic":  # rank 3 holds the whole top-k
+        return 1
+    if kind in _HOT:
+        return sum(n > cand_k for n in _HOT[kind])
+    return 0 if kind in ("random", "short") else None
+
+
+@pytest.mark.parametrize("cand_k", [512, 768, 1024, 2048])
+@pytest.mark.parametrize(
+    "kind", ["random", "dense_top", "ties", "periodic", "skew", "skew2", "short"]
+)
 @torch.inference_mode()
 def test_dcp4_topk_merge_pushed(kind: str, cand_k: int) -> None:
-    """DCP4 push merge: exact for every candidate count (SGLANG_DCP4_PUSH_CAND_K);
-    a rank holding 768-1023 of the top-k fails the certificate only at 768, and at
-    2048 a rank holding the whole top-k (periodic) needs no fallback."""
+    """DCP4 push merge: exact for every candidate count (SGLANG_DCP4_PUSH_CAND_K)
+    with one (skew, periodic), two (skew2) or all four (512) ranks failing the
+    certificate; at 2048 a rank holding the whole top-k (periodic) needs no fallback."""
     _init_once()
     world, rank = ps._WORLD.world_size, ps._WORLD.rank_in_group
     if world != 4:
@@ -275,17 +294,47 @@ def test_dcp4_topk_merge_pushed(kind: str, cand_k: int) -> None:
         pytest.skip("multimem multicast unavailable")
     assert merge.cand_k == cand_k
     span = PAGE_SIZE * world
+    n_fail = _failed_ranks(kind, cand_k)
     for seed in SEEDS:
         case = _Case(kind, seed, rank, world, span)
+        published = int(merge.stats[1])
         case.run_pushed(merge, span)
         torch.cuda.synchronize()
         bad = case.pushed_failures(rank, world)
         assert _all_ranks_ok(not bad), bad or "failed on another rank"
+        if n_fail is None:
+            continue
         fell_back = merge.fallback[: case.rows].tolist()
-        if (kind == "periodic" and cand_k < TOPK) or (kind == "skew" and cand_k == 768):
-            assert all(fell_back), fell_back
-        elif kind in ("random", "short", "skew", "periodic"):
-            assert not any(fell_back), fell_back
+        assert all(fell_back) if n_fail else not any(fell_back), fell_back
+        total = torch.tensor([int(merge.stats[1]) - published])
+        dist.all_reduce(total)
+        assert int(total) == n_fail * case.rows, (int(total), n_fail, case.rows)
+
+
+@torch.inference_mode()
+def test_dcp4_topk_merge_pushed_stale_slot() -> None:
+    """A rank's full slot is written only when it fails; the next failure of the same
+    rank on the same row slot 510 calls later (same buffer parity and 8-bit tag) must
+    not let the other ranks read the old call's keys."""
+    _init_once()
+    world, rank = ps._WORLD.world_size, ps._WORLD.rank_in_group
+    if world != 4:
+        pytest.skip("the DCP4 push merge needs 4 ranks")
+    merge = _push_merge(768)
+    if merge.buffer is None:
+        pytest.skip("multimem multicast unavailable")
+    span = PAGE_SIZE * world
+    first, idle, again = (_Case(k, seed, rank, world, span) for k, seed in
+                          (("skew", 1234), ("random", 1235), ("skew", 1236)))
+    assert first.rows == idle.rows == again.rows
+    calls = int(merge.counters[0])
+    first.run_pushed(merge, span)
+    while int(merge.counters[0]) < calls + 510:
+        idle.run_pushed(merge, span)
+    again.run_pushed(merge, span)
+    torch.cuda.synchronize()
+    bad = again.pushed_failures(rank, world)
+    assert _all_ranks_ok(not bad), bad or "failed on another rank"
 
 
 if __name__ == "__main__":
