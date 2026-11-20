@@ -12,12 +12,15 @@ fallback path, so the output set is exact for every row.
 
 from __future__ import annotations
 
+import logging
 import os
 from typing import NamedTuple, Optional
 
 import torch
 
 from sglang.kernels.jit.utils import cache_once, cuda_stubs_dir, load_jit
+
+logger = logging.getLogger(__name__)
 
 MODE_LOGITS, MODE_NO_EPI, MODE_NO_STORE, MODE_FILTER = 0, 1, 2, 3
 # layout -> (rows per q-block, keys per split); see LayoutTraits in the kernel.
@@ -38,11 +41,13 @@ def _deep_gemm_include() -> tuple[str, bool]:
 
 
 @cache_once
-def _jit_module(cuh_path: Optional[str] = None):
+def _jit_module(cuh_path: Optional[str] = None, serving: bool = False):
+    """serving builds only what the prefill path runs (DEFAULT_LAYOUT, scores and filter)."""
     dg_root, dg_legacy = _deep_gemm_include()
     return load_jit(
         "dsa_fused_indexer_topk",
         int(dg_legacy),
+        int(serving),
         cuda_files=[cuh_path or "dsa/fused_indexer_topk.cuh"],
         cuda_wrappers=[
             ("score", "fstk::FusedIndexerTopK::score"),
@@ -56,6 +61,8 @@ def _jit_module(cuh_path: Optional[str] = None):
             "--compiler-options=-fconcepts",
             "--ptxas-options=--register-usage-level=10",
             f"-DFSTK_DG_LEGACY={int(dg_legacy)}",
+            f"-DFSTK_SERVING={int(serving)}",
+            f"-DFSTK_SERVING_LAYOUT={DEFAULT_LAYOUT}",
         ],
         extra_include_paths=[dg_root],
         extra_ldflags=[f"-L{cuda_stubs_dir()}", "-lcuda"],
@@ -102,11 +109,12 @@ def score(
     alu_heads: int = 0,
     num_ctas: Optional[int] = None,
     cuh_path: Optional[str] = None,
+    serving: bool = False,
 ) -> None:
     dev = q_fp8.device
     if num_ctas is None:
         num_ctas = torch.cuda.get_device_properties(dev).multi_processor_count
-    _jit_module(cuh_path).score(
+    _jit_module(cuh_path, serving).score(
         q_fp8,
         kv_fp8,
         kv_scale,
@@ -124,6 +132,16 @@ def score(
         alu_heads,
         num_ctas,
     )
+
+
+def _sample_stride_elems(num_samples: int) -> int:
+    return (num_samples + 512 + 255) // 256 * 256
+
+
+def scratch_bytes_per_row(num_kv: int, sample_stride: int = 16, cand_cap: int = 16384) -> int:
+    """Device scratch of fused_indexer_topk per query row (sample scores, candidates)."""
+    num_samples = (num_kv + sample_stride - 1) // sample_stride
+    return 4 * _sample_stride_elems(num_samples) + 8 * cand_cap + 4 * MATH_WARPS + 16
 
 
 class FusedTopKResult(NamedTuple):
@@ -154,7 +172,9 @@ def fused_indexer_topk(
     order: Optional[torch.Tensor] = None,
     layout: int = DEFAULT_LAYOUT,
     alu_heads: int = 0,
+    out: Optional[torch.Tensor] = None,
     cuh_path: Optional[str] = None,
+    serving: bool = False,
 ) -> FusedTopKResult:
     """Exact top-k of every packed row; rows listed in ``fallback_rows`` were not written."""
     dev = q_fp8.device
@@ -173,7 +193,7 @@ def fused_indexer_topk(
     ske = (ke + sample_stride - 1) // sample_stride
     n_s = kv_s.shape[0]
     # Room for a q-block's span past the last key and for its padded rows.
-    stride_s = (n_s + 512 + 255) // 256 * 256
+    stride_s = _sample_stride_elems(n_s)
     sample_logits = torch.empty(rows + 8, stride_s, device=dev, dtype=torch.float32)
     score(
         q_fp8,
@@ -188,9 +208,12 @@ def fused_indexer_topk(
         layout=layout,
         alu_heads=alu_heads,
         cuh_path=cuh_path,
+        serving=serving,
     )
     tau = torch.empty(rows, device=dev, dtype=torch.float32)
-    _jit_module(cuh_path).tau(sample_logits, sks, ske, lengths, tau, rank, topk, keep_all)
+    module = _jit_module(cuh_path, serving)
+    module.tau(sample_logits, sks, ske, lengths, tau, rank, topk, keep_all)
+    del sample_logits
 
     # Select keys: (order-preserving score bits << 32) | ~window column, one sub-list per
     # math warp; a warp that never sees a row leaves its zero count.
@@ -211,19 +234,60 @@ def fused_indexer_topk(
         layout=layout,
         alu_heads=alu_heads,
         cuh_path=cuh_path,
+        serving=serving,
     )
-    out = torch.empty(rows, topk, device=dev, dtype=torch.int32)
+    # The select kernel writes rows of exactly topk entries.
+    dst = out if out is not None and out.is_contiguous() else None
+    if dst is None:
+        dst = torch.empty(rows, topk, device=dev, dtype=torch.int32)
     fallback_rows = torch.empty(rows, device=dev, dtype=torch.int32)
     num_fallback = torch.zeros(1, device=dev, dtype=torch.int32)
-    _jit_module(cuh_path).select(
+    module.select(
         cand_key,
         cand_count,
         lengths,
         row_to_batch,
         page_table,
-        out,
+        dst,
         fallback_rows,
         num_fallback,
         page_size,
     )
+    if out is None:
+        out = dst
+    elif dst is not out:
+        out.copy_(dst)
     return FusedTopKResult(out, num_fallback, fallback_rows, tau, cand_count)
+
+
+class FusedTopKStats:
+    """Process-wide counters of the serving path, logged every ``log_interval`` calls."""
+
+    def __init__(self, log_interval: int, check_interval: int):
+        self.log_interval = log_interval
+        self.check_interval = check_interval
+        self.total = dict(calls=0, rows=0, long_rows=0, fallback_rows=0, max_fallback=0,
+                          check_rows=0, check_differ=0, check_tie_explained=0, check_tie_checked=0)
+        self.window = dict(self.total)
+
+    def record(self, *, rows: int, long_rows: int, fallback_rows: int) -> bool:
+        """Counts one call; True when this call should also run the stock-path check."""
+        for d in (self.total, self.window):
+            d["calls"] += 1
+            d["rows"] += rows
+            d["long_rows"] += long_rows
+            d["fallback_rows"] += fallback_rows
+            d["max_fallback"] = max(d["max_fallback"], fallback_rows)
+        calls = self.total["calls"]
+        if self.log_interval and calls % self.log_interval == 0:
+            logger.info("FSTK window %s total %s", self.window, self.total)
+            self.window = {k: 0 for k in self.window}
+        return bool(self.check_interval) and calls % self.check_interval == 0
+
+    def record_check(self, *, rows: int, differ: int, tie_explained: int, tie_checked: int) -> None:
+        for d in (self.total, self.window):
+            d["check_rows"] += rows
+            d["check_differ"] += differ
+            d["check_tie_explained"] += tie_explained
+            d["check_tie_checked"] += tie_checked
+        logger.info("FSTK check rows=%d differ=%d tie_explained=%d/%d", rows, differ, tie_explained, tie_checked)

@@ -27,6 +27,14 @@
 #include <cuda.h>
 #include <cuda_runtime.h>
 
+// FSTK_SERVING=1 builds only the layout and passes the prefill path runs.
+#ifndef FSTK_SERVING
+#define FSTK_SERVING 0
+#endif
+#ifndef FSTK_SERVING_LAYOUT
+#define FSTK_SERVING_LAYOUT 5
+#endif
+
 // DeepGEMM >= 0.2.8 keeps the original MQA logits kernel and its layout under legacy/.
 #if FSTK_DG_LEGACY
 #include <deep_gemm/legacy/impls/sm100_mqa_logits.cuh>
@@ -1140,6 +1148,12 @@ inline void score_dispatch(
     int64_t num_ctas) {
 #define FSTK_SCORE(M, R) \
   score_impl<M, R, kLayout, kAluHeads>(q, kv, kv_scale, weights, ks, ke, order, logits, tau, cand_key, cand_count, num_ctas)
+#if FSTK_SERVING
+  // The serving build instantiates only the sample scores and the filter pass.
+  sglang::host::RuntimeCheck(mode == kModeLogits or mode == kModeFilter, "fstk serving: bad mode ", mode);
+  if (mode == kModeLogits) return FSTK_SCORE(kModeLogits, false);
+  return FSTK_SCORE(kModeFilter, false);
+#else
   switch (mode) {
     case kModeLogits:
       return FSTK_SCORE(kModeLogits, false);
@@ -1153,6 +1167,7 @@ inline void score_dispatch(
     default:
       sglang::host::RuntimeCheck(false, "fstk: bad mode ", mode);
   }
+#endif
 #undef FSTK_SCORE
 }
 
@@ -1178,6 +1193,11 @@ struct FusedIndexerTopK {
       int64_t num_ctas) {
 #define FSTK_DISPATCH(LY, AH) \
   return score_dispatch<LY, AH>(q, kv, kv_scale, weights, ks, ke, order, logits, tau, cand_key, cand_count, mode, reuse_kv, num_ctas)
+#if FSTK_SERVING
+    sglang::host::RuntimeCheck(
+        layout == FSTK_SERVING_LAYOUT and alu_heads == 0, "fstk serving: only layout ", FSTK_SERVING_LAYOUT);
+    FSTK_DISPATCH(FSTK_SERVING_LAYOUT, 0);
+#else
     sglang::host::RuntimeCheck(alu_heads == 0 or alu_heads == 16, "fstk: alu_heads must be 0 or 16");
     sglang::host::RuntimeCheck(layout >= 0 and layout <= 5, "fstk: layout must be 0..5");
     if (layout == 0) {
@@ -1202,6 +1222,7 @@ struct FusedIndexerTopK {
     }
     if (alu_heads) FSTK_DISPATCH(2, 16);
     FSTK_DISPATCH(2, 0);
+#endif
 #undef FSTK_DISPATCH
   }
 
