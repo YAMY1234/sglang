@@ -204,6 +204,69 @@ def _prefetch_l2_bulk(gmem_ptr, nbytes: int):
     )
 
 
+def _f32_asm(asm: str, *args):
+    f32 = ir.F32Type.get()
+    return cutlass.Float32(
+        llvm.inline_asm(
+            f32,
+            [cutlass.Float32(a).ir_value() for a in args],
+            asm,
+            "=f" + ",f" * len(args),
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=0,
+        )
+    )
+
+
+def _f32x2_asm(op: str, a0, a1, b0, b1):
+    """(a0 op b0, a1 op b1) with one packed .rn instruction (sm_100+)."""
+    f32 = ir.F32Type.get()
+    res = llvm.inline_asm(
+        llvm.StructType.get_literal([f32, f32]),
+        [cutlass.Float32(x).ir_value() for x in (a0, a1, b0, b1)],
+        "{ .reg .b64 ra, rb, rd; mov.b64 ra, {$2, $3}; mov.b64 rb, {$4, $5}; "
+        f"{op}.rn.f32x2 rd, ra, rb; mov.b64 {{$0, $1}}, rd; }}",
+        "=f,=f,f,f,f,f",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=0,
+    )
+    return (
+        cutlass.Float32(llvm.extractvalue(f32, res, [0])),
+        cutlass.Float32(llvm.extractvalue(f32, res, [1])),
+    )
+
+
+def _fma2_scalar_b(a0, a1, b, c0, c1):
+    """(a0 * b + c0, a1 * b + c1), one fma.rn.f32x2."""
+    f32 = ir.F32Type.get()
+    res = llvm.inline_asm(
+        llvm.StructType.get_literal([f32, f32]),
+        [cutlass.Float32(x).ir_value() for x in (a0, a1, b, c0, c1)],
+        "{ .reg .b64 ra, rb, rc, rd; mov.b64 ra, {$2, $3}; mov.b64 rb, {$4, $4}; "
+        "mov.b64 rc, {$5, $6}; fma.rn.f32x2 rd, ra, rb, rc; mov.b64 {$0, $1}, rd; }",
+        "=f,=f,f,f,f,f,f",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=0,
+    )
+    return (
+        cutlass.Float32(llvm.extractvalue(f32, res, [0])),
+        cutlass.Float32(llvm.extractvalue(f32, res, [1])),
+    )
+
+
+def _add_rn(a, b):
+    return _f32_asm("add.rn.f32 $0, $1, $2;", a, b)
+
+
+def _lane_sum4(e0, e1, e2, e3):
+    """(e0 + e2) + (e1 + e3): add.f32x2 then add, the fold's in-thread order."""
+    a, b = _f32x2_asm("add", e0, e1, e2, e3)
+    return _add_rn(a, b)
+
+
 def _clock():
     i64 = ir.IntegerType.get_signless(64)
     return cutlass.Int64(
@@ -289,6 +352,8 @@ def kda_decode_mtp_kernel(
     prof: cute.Tensor,
     PROF: cutlass.Constexpr[bool],
     PF_DIST: cutlass.Constexpr[int],
+    fold_pend: cute.Tensor,
+    FOLD_PENDING: cutlass.Constexpr[bool],
 ):
     """KDA MTP decode — SMEM pre-compute + register-resident state.
 
@@ -353,6 +418,26 @@ def kda_decode_mtp_kernel(
         )
         sOnormWeight = smem.allocate_tensor(
             cutlass.Float32, cute.make_layout((HEAD_DIM,)), 16
+        )
+    # FOLD_PENDING: the ring rows of this slot's previous verify that the commit
+    # accepted but did not fold (pending count per slot), folded here before the
+    # recurrence with the commit fold's own arithmetic, then written back.
+    if cutlass.const_expr(FOLD_PENDING):
+        sPK = smem.allocate_tensor(
+            cutlass.BFloat16, cute.make_layout((T_LOOP * HEAD_DIM,)), 16
+        )
+        sPG = smem.allocate_tensor(
+            cutlass.Float32, cute.make_layout((T_LOOP * HEAD_DIM,)), 16
+        )
+        sPV = smem.allocate_tensor(
+            cutlass.BFloat16, cute.make_layout((T_LOOP * HEAD_DIM,)), 16
+        )
+        sPB = smem.allocate_tensor(cutlass.Float32, cute.make_layout((8,)), 16)
+        sKN = smem.allocate_tensor(
+            cutlass.Float32, cute.make_layout((T_LOOP * HEAD_DIM,)), 16
+        )
+        sE = smem.allocate_tensor(
+            cutlass.Float32, cute.make_layout((T_LOOP * HEAD_DIM,)), 16
         )
     # ASYNC_P1: every phase-1 input is staged in smem up front -- the conv
     # windows, conv weights and dt_bias by cp.async before the grid-dependency
@@ -561,6 +646,53 @@ def kda_decode_mtp_kernel(
                         r_wq[w * VEC_SIZE + i] = r_w4[w]
         r_A_log = cutlass.Float32(0.0)
 
+    n_pend = cutlass.Int32(0)
+    if cutlass.const_expr(FOLD_PENDING):
+        # Written by the previous step's commit (older than this layer's inputs).
+        n_pend = cutlass.min(cutlass.Int32(fold_pend[slot]), T_LOOP)
+        # Copy T_LOOP ring rows unconditionally (no dependency on n_pend), as the
+        # first commit group: rawk / g / rawv rows of 16-byte chunks, then beta.
+        RK_C = T_LOOP * (HEAD_DIM // 8)
+        RG_C = T_LOOP * (HEAD_DIM // 4)
+        RING_C = 2 * RK_C + RG_C + 2
+        for it in cutlass.range_constexpr(
+            (RING_C + BLOCK_THREADS - 1) // BLOCK_THREADS
+        ):
+            c = tidx + it * BLOCK_THREADS
+            if c < RK_C:
+                t = c // (HEAD_DIM // 8)
+                ch = (c % (HEAD_DIM // 8)) * 8
+                _cp_async16(
+                    sPK.iterator + t * HEAD_DIM + ch,
+                    ring_rawk.iterator
+                    + cute.crd2idx((slot, i_hv, t, ch), ring_rawk.layout),
+                )
+            elif c < RK_C + RG_C:
+                cg = c - RK_C
+                t = cg // (HEAD_DIM // 4)
+                ch = (cg % (HEAD_DIM // 4)) * 4
+                _cp_async16(
+                    sPG.iterator + t * HEAD_DIM + ch,
+                    ring_g.iterator + cute.crd2idx((slot, i_hv, t, ch), ring_g.layout),
+                )
+            elif c < 2 * RK_C + RG_C:
+                cv = c - RK_C - RG_C
+                t = cv // (HEAD_DIM // 8)
+                ch = (cv % (HEAD_DIM // 8)) * 8
+                _cp_async16(
+                    sPV.iterator + t * HEAD_DIM + ch,
+                    ring_rawv.iterator
+                    + cute.crd2idx((slot, i_hv, t, ch), ring_rawv.layout),
+                )
+            elif c < RING_C:
+                cb = (c - 2 * RK_C - RG_C) * 4
+                _cp_async16(
+                    sPB.iterator + cb,
+                    ring_beta.iterator
+                    + cute.crd2idx((slot, i_hv, cb), ring_beta.layout),
+                )
+        cute.arch.cp_async_commit_group()
+
     # The 128-bit copy atom maps each thread to coalesced K vectors.
     gState = h0[(slot, i_hv, None, None)]
     gStateTiles = cute.local_tile(gState, (TILE_V, TILE_K), (None, 0))
@@ -589,6 +721,12 @@ def kda_decode_mtp_kernel(
     if cutlass.const_expr(PROF):
         if tidx == 0:
             prof[prof_row + 1] = _clock()
+    if cutlass.const_expr(FOLD_PENDING):
+        if n_pend > 0:
+            # Phase 1 rewrites ring rows 0..T_LOOP-1 of this slot: the pending rows
+            # (the first commit group) must have landed in every thread first.
+            cute.arch.cp_async_wait_group(STATE_STAGES)
+            cute.arch.barrier()
 
     if cutlass.const_expr(ASYNC_P1):
         bos = bos_pre
@@ -1053,6 +1191,130 @@ def kda_decode_mtp_kernel(
     k_grp = in_warp_tid % P2_LANES_K
     row_grp = in_warp_tid // P2_LANES_K
 
+    if cutlass.const_expr(FOLD_PENDING):
+        if n_pend > 0:
+            cute.arch.cp_async_wait_group(0)
+            cute.arch.barrier()
+            # Keys: warp t normalizes pending token t (lane l owns 4l..4l+3) and
+            # takes its decay, exactly as the commit fold's stage_key.
+            if warp_idx < n_pend:
+                kb = warp_idx * HEAD_DIM + 4 * in_warp_tid
+                k0 = cutlass.Float32(sPK[kb + 0])
+                k1 = cutlass.Float32(sPK[kb + 1])
+                k2 = cutlass.Float32(sPK[kb + 2])
+                k3 = cutlass.Float32(sPK[kb + 3])
+                sq0, sq1 = _f32x2_asm("mul", k0, k1, k0, k1)
+                sq2, sq3 = _f32x2_asm("mul", k2, k3, k2, k3)
+                ss = _lane_sum4(sq0, sq1, sq2, sq3)
+                for off in [16, 8, 4, 2, 1]:
+                    ss = _add_rn(
+                        ss,
+                        cute.arch.shuffle_sync_bfly(
+                            ss, offset=off, mask=-1, mask_and_clamp=31
+                        ),
+                    )
+                den = _f32_asm(
+                    "sqrt.approx.ftz.f32 $0, $1;",
+                    _add_rn(ss, cutlass.Float32(1e-6)),
+                )
+                for cc, kv in ((0, k0), (1, k1), (2, k2), (3, k3)):
+                    sKN[kb + cc] = _f32_asm("div.full.f32 $0, $1, $2;", kv, den)
+                    sE[kb + cc] = _f32_asm(
+                        "ex2.approx.f32 $0, $1;",
+                        _f32_asm(
+                            "mul.rn.f32 $0, $1, $2;",
+                            sPG[kb + cc],
+                            cutlass.Float32(1.44269502),
+                        ),
+                    )
+            cute.arch.barrier()
+            # Rows: eight lanes per row, lane fj owns columns b*32 + 4*fj + c
+            # (Triton lanes fj, fj+8, fj+16, fj+24), FOLD_RPT rows per thread.
+            FOLD_RPP = BLOCK_THREADS // 8
+            FOLD_RPT = HEAD_DIM // FOLD_RPP
+            fj = tidx % 8
+            frg = tidx // 8
+            r_fs = cute.make_rmem_tensor(
+                cute.make_layout((FOLD_RPT * 16,), stride=(1,)), cutlass.Float32
+            )
+            for r in cutlass.range_constexpr(FOLD_RPT):
+                f_stage = (r * FOLD_RPP) // TILE_V
+                f_row = (r * FOLD_RPP) % TILE_V + frg
+                for b in cutlass.range_constexpr(4):
+                    for cc in cutlass.range_constexpr(4):
+                        r_fs[(r * 4 + b) * 4 + cc] = sState[
+                            f_row, b * 32 + 4 * fj + cc, f_stage
+                        ]
+            for t in cutlass.range_constexpr(T_LOOP):
+                if t < n_pend:
+                    bt = sPB[t]
+                    for r in cutlass.range_constexpr(FOLD_RPT):
+                        blk = []
+                        for b in cutlass.range_constexpr(4):
+                            i0 = (r * 4 + b) * 4
+                            kc = t * HEAD_DIM + b * 32 + 4 * fj
+                            h0_, h1_ = _f32x2_asm(
+                                "mul", r_fs[i0], r_fs[i0 + 1], sE[kc], sE[kc + 1]
+                            )
+                            h2_, h3_ = _f32x2_asm(
+                                "mul",
+                                r_fs[i0 + 2],
+                                r_fs[i0 + 3],
+                                sE[kc + 2],
+                                sE[kc + 3],
+                            )
+                            r_fs[i0] = h0_
+                            r_fs[i0 + 1] = h1_
+                            r_fs[i0 + 2] = h2_
+                            r_fs[i0 + 3] = h3_
+                            p0, p1 = _f32x2_asm("mul", h0_, h1_, sKN[kc], sKN[kc + 1])
+                            p2, p3 = _f32x2_asm(
+                                "mul", h2_, h3_, sKN[kc + 2], sKN[kc + 3]
+                            )
+                            blk.append(_lane_sum4(p0, p1, p2, p3))
+                        sr = _add_rn(_add_rn(blk[0], blk[2]), _add_rn(blk[1], blk[3]))
+                        for off in [4, 2, 1]:
+                            sr = _add_rn(
+                                sr,
+                                cute.arch.shuffle_sync_bfly(
+                                    sr, offset=off, mask=-1, mask_and_clamp=31
+                                ),
+                            )
+                        vv = cutlass.Float32(sPV[t * HEAD_DIM + r * FOLD_RPP + frg])
+                        uu = _f32_asm(
+                            "mul.rn.f32 $0, $1, $2;",
+                            _f32_asm("sub.rn.f32 $0, $1, $2;", vv, sr),
+                            bt,
+                        )
+                        for b in cutlass.range_constexpr(4):
+                            i0 = (r * 4 + b) * 4
+                            kc = t * HEAD_DIM + b * 32 + 4 * fj
+                            r_fs[i0], r_fs[i0 + 1] = _fma2_scalar_b(
+                                sKN[kc], sKN[kc + 1], uu, r_fs[i0], r_fs[i0 + 1]
+                            )
+                            r_fs[i0 + 2], r_fs[i0 + 3] = _fma2_scalar_b(
+                                sKN[kc + 2], sKN[kc + 3], uu, r_fs[i0 + 2], r_fs[i0 + 3]
+                            )
+            # Back to smem (this verify's initial state) and to the pool (the
+            # committed state the eager fold would have left).
+            gState_f = h0[(slot, i_hv, None, None)]
+            for r in cutlass.range_constexpr(FOLD_RPT):
+                f_stage = (r * FOLD_RPP) // TILE_V
+                f_row = (r * FOLD_RPP) % TILE_V + frg
+                g_row = r * FOLD_RPP + frg
+                for b in cutlass.range_constexpr(4):
+                    for cc in cutlass.range_constexpr(4):
+                        sState[f_row, b * 32 + 4 * fj + cc, f_stage] = r_fs[
+                            (r * 4 + b) * 4 + cc
+                        ]
+                    cute.autovec_copy(
+                        cute.make_tensor(
+                            r_fs.iterator + (r * 4 + b) * 4, cute.make_layout((4,))
+                        ),
+                        cute.local_tile(gState_f[(g_row, None)], (4,), (b * 8 + fj,)),
+                    )
+            cute.arch.barrier()
+
     staged = cutlass.const_expr(STATE_STAGES < NUM_V_TILES)
     if cutlass.const_expr(not staged):
         # State-copy writers and consumers belong to the same warp.
@@ -1275,6 +1537,7 @@ def _run_kda_decode_mtp_dspark(
     onorm_g: cute.Tensor,
     onorm_weight: cute.Tensor,
     prof: cute.Tensor,
+    fold_pend: cute.Tensor,
     scale: cutlass.Constexpr[float],
     H: cutlass.Constexpr[int],
     N: cutlass.Constexpr[int],
@@ -1288,6 +1551,7 @@ def _run_kda_decode_mtp_dspark(
     P2_VW: cutlass.Constexpr[int],
     PROF: cutlass.Constexpr[bool],
     PF_DIST: cutlass.Constexpr[int],
+    FOLD_PENDING: cutlass.Constexpr[bool],
     stream: cuda.CUstream,
 ):
     """Launch the fixed Kimi-K3/DSpARK bonus + NUM_SPEC-draft specialization."""
@@ -1349,6 +1613,12 @@ def _run_kda_decode_mtp_dspark(
             if ASYNC_P1
             else 0
         )
+        # FOLD_PENDING: pending rawk/rawv (bf16), g, keys, decays (fp32), beta.
+        + (
+            (2 * t_loop * TILE_K * 2 + 3 * t_loop * TILE_K * 4 + 32 + 96)
+            if FOLD_PENDING
+            else 0
+        )
         + 256
     )
     kda_decode_mtp_kernel(
@@ -1396,13 +1666,15 @@ def _run_kda_decode_mtp_dspark(
         prof,
         PROF,
         PF_DIST,
+        fold_pend,
+        FOLD_PENDING,
     ).launch(
         grid=(H, N, 1),
         block=[BLOCK_THREADS, 1, 1],
         smem=smem_bytes,
         stream=stream,
         use_pdl=True,
-        **_launch_bounds(ASYNC_P1 or P2_VW > 1, BLOCK_THREADS),
+        **_launch_bounds(ASYNC_P1 or P2_VW > 1 or FOLD_PENDING, BLOCK_THREADS),
     )
 
 
@@ -1534,6 +1806,7 @@ def fused_kda_decode_mtp_dspark(
     onorm_weight=None,
     onorm_eps=None,
     prof_buf=None,
+    replayssm_pending=None,
 ):
     """Run Kimi-K3 KDA verify while preserving DSpARK rollback semantics.
 
@@ -1644,6 +1917,7 @@ def fused_kda_decode_mtp_dspark(
         cache_ring
         and num_spec >= 1
         and block_threads == BLOCK_THREADS_NARROW
+        and replayssm_pending is None
         and _persist_enabled()
     ):
         from sglang.kernels.ops.attention.kda_decode_mtp_v3 import run_persist
@@ -1696,6 +1970,10 @@ def fused_kda_decode_mtp_dspark(
 
     p2_vw = int(os.environ.get("SGLANG_KDA_VERIFY_P2_VW", "1")) if num_spec >= 1 else 1
     prof = prof_buf is not None
+    # Pending-ring fold: needs the rings, the register-resident path and <= 8 rows.
+    fold_pending = replayssm_pending is not None
+    if fold_pending and not (cache_ring and 1 <= num_spec <= 7 and not async_p1):
+        raise ValueError("replayssm_pending needs ReplaySSM rings and 2..8 verify rows")
     pf_dist = 0
     if num_spec >= 1 and _l2pf_enabled():
         # Resident blocks per wave: two narrow blocks per SM, one wide.
@@ -1738,6 +2016,7 @@ def fused_kda_decode_mtp_dspark(
         onorm_gate if apply_onorm else x_v,
         onorm_weight if apply_onorm else dt_bias,
         prof_buf if prof else cu_seqlens,
+        replayssm_pending if fold_pending else cu_seqlens,
     )
     fits_32bit = tuple(_fits_32bit_stride(tensor) for tensor in args)
     key = (
@@ -1753,6 +2032,7 @@ def fused_kda_decode_mtp_dspark(
         p2_vw,
         prof,
         pf_dist,
+        fold_pending,
         float(scale),
         float(lower_bound),
         *(_tensor_layout_key(tensor, fits) for tensor, fits in zip(args, fits_32bit)),
@@ -1780,6 +2060,7 @@ def fused_kda_decode_mtp_dspark(
             P2_VW=p2_vw,
             PROF=prof,
             PF_DIST=pf_dist,
+            FOLD_PENDING=fold_pending,
             stream=stream,
         )
         _DSPARK_COMPILED[key] = compiled
