@@ -119,6 +119,9 @@ class PPBubbleDiag:
         self.bin_vote_ms = [0.0] * n
         self.bin_vote_calls = [0] * n
         self.bin_ticket_ms = [0.0] * n
+        # PP tensor-dict traffic by direction and kind (bytes, messages).
+        self.bytes: dict[str, int] = defaultdict(int)
+        self.byte_msgs: dict[str, int] = defaultdict(int)
 
     # ---- wall-time partition ----
 
@@ -129,6 +132,11 @@ class PPBubbleDiag:
         prev = self._label
         self._label = label
         return prev
+
+    def count_bytes(self, label: str, tensor_dict) -> None:
+        n = sum(t.numel() * t.element_size() for t in tensor_dict.values() if hasattr(t, "element_size"))
+        self.bytes[label] += n
+        self.byte_msgs[label] += 1
 
     def phase(self, name: str) -> None:
         """Mark the loop phase; host time from here on is booked to it."""
@@ -298,6 +306,8 @@ class PPBubbleDiag:
             "bin_vote_ms": [r(x) for x in self.bin_vote_ms],
             "bin_vote_calls": self.bin_vote_calls,
             "bin_ticket_ms": [r(x) for x in self.bin_ticket_ms],
+            "bytes": dict(self.bytes),
+            "byte_msgs": dict(self.byte_msgs),
         }
         return stats
 

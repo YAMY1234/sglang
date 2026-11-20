@@ -109,6 +109,17 @@ class TestWallPartition(unittest.TestCase):
             pass
         self.assertIn("wait.send_commit.ingest", d.snapshot(1.0)["calls"])
 
+    def test_tensor_dict_bytes_are_counted_by_label(self):
+        import torch
+
+        d, _ = _diag()
+        msg = {"hidden": torch.zeros(4, 8, dtype=torch.bfloat16), "__msg_type__": "proxy"}
+        d.count_bytes("send.proxy", msg)
+        d.count_bytes("send.proxy", msg)
+        stats = d.snapshot(1.0)
+        self.assertEqual(stats["bytes"]["send.proxy"], 2 * 4 * 8 * 2)
+        self.assertEqual(stats["byte_msgs"]["send.proxy"], 2)
+
 
 class TestPasses(unittest.TestCase):
     def test_vote_relay_is_binned_by_queue_length(self):

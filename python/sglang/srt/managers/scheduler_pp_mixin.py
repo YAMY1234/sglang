@@ -1050,6 +1050,9 @@ class SchedulerPPMixin:
                 "Consider adding msg_type='proxy' or 'output' to avoid recv conflicts."
             )
         tensor_dict["__msg_type__"] = msg_type
+        diag = pp_bubble_diag.get()
+        if diag is not None:
+            diag.count_bytes("send." + msg_type, tensor_dict)
         p2p_work = []
         with self.pp_comm_stream_ctx:
             if ready_event is not None:
@@ -1100,6 +1103,9 @@ class SchedulerPPMixin:
                     )
                 recv_event = self._pp_record_comm_event()
             received_kind = tensor_dict.get("__msg_type__", "default")
+            diag = pp_bubble_diag.get()
+            if diag is not None:
+                diag.count_bytes("recv." + received_kind, tensor_dict)
             if received_kind == expected_kind:
                 if received_kind == "default":
                     logger.warning_once(
