@@ -2157,6 +2157,9 @@ class Envs:
     # LOCALITY_MAX_TOKENS rows (two slots), each die's SMs posting its own rows. Needs MLOPart.
     SGLANG_OPT_DSV41_MEGA_MHC_LOCALITY = EnvBool(False)
     SGLANG_OPT_EXACT_CHUNK_BUDGET = EnvBool(False)
+    # Prefill (4096-65536 rows) mHC mix stats on Blackwell: packed K-major bf16x3 weights and a row-blocked
+    # reduce/Sinkhorn instead of _hc_mix_stats_bf16x3 + the per-row reduce. Same compensated precision.
+    SGLANG_OPT_DSV41_HC_STATS_PACKED = EnvBool(False)
     SGLANG_OPT_DSV41_MEGA_MHC_LOCALITY_MAX_TOKENS = EnvInt(32768)
     # Deprecated for --engram-config "replication".
     SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT = EnvStr("per_rank")

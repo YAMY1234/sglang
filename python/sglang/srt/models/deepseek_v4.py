@@ -3631,6 +3631,7 @@ class DeepseekV4DecoderLayerBase(nn.Module):
         self.ffn_hc: Optional[mhc.HcSubLayer] = None
         self._hc_attn_tf32_parts = self._hc_ffn_tf32_parts = None
         self._hc_attn_bf16_parts = self._hc_ffn_bf16_parts = None
+        self._hc_attn_bf16_packed = self._hc_ffn_bf16_packed = None
         self._init_hyper_connections()
         self.engram = None
         if engram_layout is not None and layer_id in engram_layout.layer_ids:
@@ -3676,6 +3677,7 @@ class DeepseekV4DecoderLayerBase(nn.Module):
             self.input_layernorm,
             self._hc_attn_tf32_parts,
             self._hc_attn_bf16_parts,
+            self._hc_attn_bf16_packed,
         )
         self.ffn_hc = mhc.HcSubLayer(
             self.hc_cfg,
@@ -3685,6 +3687,7 @@ class DeepseekV4DecoderLayerBase(nn.Module):
             self.post_attention_layernorm,
             self._hc_ffn_tf32_parts,
             self._hc_ffn_bf16_parts,
+            self._hc_ffn_bf16_packed,
         )
 
     def refresh_mhc_norm_weight_cache(self):
@@ -3701,6 +3704,7 @@ class DeepseekV4DecoderLayerBase(nn.Module):
         # The original FP32 parameters stay intact for small rows and invariant mode.
         self._hc_attn_tf32_parts = self._hc_ffn_tf32_parts = None
         self._hc_attn_bf16_parts = self._hc_ffn_bf16_parts = None
+        self._hc_attn_bf16_packed = self._hc_ffn_bf16_packed = None
         if (
             self.hc_pre_from_prev_sublayer
             and (
@@ -3743,6 +3747,16 @@ class DeepseekV4DecoderLayerBase(nn.Module):
                         )
                         self._hc_ffn_bf16_parts = split_bf16_hc_weight(
                             self.hc_ffn_fn.data
+                        )
+                if envs.SGLANG_OPT_DSV41_HC_STATS_PACKED.get():
+                    from sglang.kernels.ops.layernorm.mhc import pack_bf16_hc_weight
+
+                    if self._hc_attn_bf16_parts is not None:
+                        self._hc_attn_bf16_packed = pack_bf16_hc_weight(
+                            self._hc_attn_bf16_parts
+                        )
+                        self._hc_ffn_bf16_packed = pack_bf16_hc_weight(
+                            self._hc_ffn_bf16_parts
                         )
         if self.hc_pre_from_prev_sublayer:
             self._init_hyper_connections()

@@ -144,6 +144,7 @@ class HcSubLayer(NamedTuple):
     norm: RMSNorm
     tf32_parts: Optional[Any] = None
     bf16_parts: Optional[Any] = None
+    bf16_packed: Optional[torch.Tensor] = None
 
 
 # ---------------------------------------------------------------------------
@@ -401,7 +402,21 @@ def _mix_stats_impl(hc: HcSubLayer, x: torch.Tensor) -> HcTriplet:
     if x.is_cuda and use_fused_stats and x.dtype == torch.bfloat16:
         # The default split-K/Sinkhorn fusion preserves batch invariance;
         # compensated projections above are disabled in batch-invariant mode.
-        if use_bf16_projection:
+        if use_bf16_projection and hc.bf16_packed is not None and not hopper_medium:
+            from sglang.kernels.ops.layernorm.mhc import (
+                hc_mix_stats_sinkhorn_packed,
+            )
+
+            pre, post, comb = hc_mix_stats_sinkhorn_packed(
+                x_flat,
+                hc.bf16_packed,
+                hc.scale,
+                hc.base,
+                cfg.sinkhorn_iters,
+                cfg.rms_eps,
+                cfg.eps,
+            )
+        elif use_bf16_projection:
             from sglang.kernels.ops.layernorm.mhc import (
                 hc_mix_stats_sinkhorn_bf16x3,
             )
