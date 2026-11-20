@@ -599,6 +599,7 @@ __global__ __launch_bounds__(LayoutTraits<kLayout>::kNumThreads, 1) void fstk_sc
           CUTE_TIE_DECL(kv_pipeline.advance(), kv_stage_idx, kv_phase);
           smem.full_kv_barriers[kv_stage_idx].wait(kv_phase);
           float scale_kv[kMmaPerSplit];
+          float results[kFilter ? kMmaPerSplit : 1];
 #pragma unroll
           for (uint32_t h = 0; h < kMmaPerSplit; ++h)
             scale_kv[h] = kMode != kModeNoEpi ? ptx::ld_shared(smem.smem_sf_kv[kv_stage_idx] + h * UMMA_M + lane_key) : 0.0f;
@@ -622,9 +623,19 @@ __global__ __launch_bounds__(LayoutTraits<kLayout>::kNumThreads, 1) void fstk_sc
             cutlass::arch::fence_view_async_tmem_load();
             ptx::tcgen05_before_thread_sync();
             smem.empty_tmem_barriers[tmem_stage_idx].arrive();
-            const uint32_t kv_offset = kv_base + kv_split_idx * kSplitKV + h * UMMA_M + lane_key;
-            handle(q_block_idx, my_row, 0, win_start, win_len, row_tau, kv_offset,
-                   dg_reduce<kAluHeads>(accum, weights) * scale_kv[h]);
+            const float result = dg_reduce<kAluHeads>(accum, weights) * scale_kv[h];
+            if constexpr (kFilter) {
+              results[h] = result;
+            } else {
+              handle(q_block_idx, my_row, 0, 0, 0, 0.0f, kv_base + kv_split_idx * kSplitKV + h * UMMA_M + lane_key, result);
+            }
+          }
+          if constexpr (kFilter) {
+            // Appends after both halves are scored (see the layout-0 path).
+#pragma unroll
+            for (uint32_t h = 0; h < kMmaPerSplit; ++h)
+              handle(q_block_idx, my_row, 0, win_start, win_len, row_tau,
+                     kv_base + kv_split_idx * kSplitKV + h * UMMA_M + lane_key, results[h]);
           }
         }
 
@@ -801,7 +812,7 @@ CUTLASS_DEVICE void radix_pick_bin(const uint32_t* hist, uint32_t remaining, uin
 }
 
 constexpr uint32_t kSelectThreads = 512;
-constexpr uint32_t kSelectBins = 2048;
+constexpr uint32_t kSelectWarps = kSelectThreads / 32;
 
 struct SelectParams {
   const uint64_t* cand_key;
@@ -819,18 +830,28 @@ struct SelectParams {
   uint32_t page_bits;
 };
 
+// Adds 1 to hist[bin] for every lane with a bin; lanes with equal bins share one atomic.
+CUTLASS_DEVICE void warp_hist_add(uint32_t* hist, bool active, uint32_t bin) {
+  const uint32_t act = __ballot_sync(0xffffffffu, active);
+  if (!active) return;
+  const uint32_t peers = __match_any_sync(act, bin);
+  if ((__ffs(peers) - 1) == static_cast<int>(threadIdx.x % 32)) atomicAdd(hist + bin, __popc(peers));
+}
+
 // One CTA per row. Keys are (ordered score, ~column): unique, larger is better, so the
-// top-k is every key >= the k-th largest. Radix select over the score half (11/11/10 bits);
-// only when equal scores straddle the k-th place does it continue on the column half,
-// so those resolve to the smaller columns.
+// top-k is every key >= the k-th largest, found by 8-bit radix steps that start at the
+// highest bit where the row's keys differ (candidates share their leading score bits).
+// Equal scores at the k-th place resolve to the smaller columns.
 __global__ __launch_bounds__(kSelectThreads) void fstk_select_kernel(const SelectParams p) {
   extern __shared__ __align__(16) uint8_t select_smem[];
   auto* keys = reinterpret_cast<uint64_t*>(select_smem);
-  __shared__ uint32_t hist[kSelectBins];
-  __shared__ uint32_t s_bin, s_above, s_out, s_eq;
+  __shared__ uint32_t hist[256];
+  __shared__ uint32_t s_bin, s_above, s_out;
+  __shared__ uint64_t s_or[kSelectWarps], s_and[kSelectWarps];
 
   const uint32_t row = blockIdx.x;
   const uint32_t tx = threadIdx.x;
+  const uint32_t lane = tx % 32, warp = tx / 32;
   const uint32_t len = static_cast<uint32_t>(max(p.lengths[row], 0));
   const int32_t* table = p.page_table + static_cast<int64_t>(p.row_to_batch[row]) * p.page_table_stride;
   const uint32_t page_mask = (1u << p.page_bits) - 1u;
@@ -859,49 +880,75 @@ __global__ __launch_bounds__(kSelectThreads) void fstk_select_kernel(const Selec
   __syncthreads();
   if (s_bad) return;
   const uint32_t n = s_off[kNumMathWarps];
+  uint64_t k_or = 0, k_and = ~0ull;
 #pragma unroll 1
   for (uint32_t w = 0; w < kNumMathWarps; ++w) {
     const uint64_t* src = p.cand_key + (static_cast<uint64_t>(row) * kNumMathWarps + w) * p.cand_sub_cap;
     const uint32_t c = s_off[w + 1] - s_off[w];
-    for (uint32_t t = tx; t < c; t += kSelectThreads) keys[s_off[w] + t] = src[t];
+    for (uint32_t t = tx; t < c; t += kSelectThreads) {
+      const uint64_t k = src[t];
+      keys[s_off[w] + t] = k;
+      k_or |= k;
+      k_and &= k;
+    }
+  }
+  // Bits set in some key and clear in another: the radix steps start at the highest one.
+#pragma unroll
+  for (int o = 16; o > 0; o >>= 1) {
+    k_or |= __shfl_xor_sync(0xffffffffu, k_or, o);
+    k_and &= __shfl_xor_sync(0xffffffffu, k_and, o);
+  }
+  if (lane == 0) {
+    s_or[warp] = k_or;
+    s_and[warp] = k_and;
   }
   __syncthreads();
+  k_or = 0;
+  k_and = ~0ull;
+#pragma unroll
+  for (uint32_t w = 0; w < kSelectWarps; ++w) {
+    k_or |= s_or[w];
+    k_and &= s_and[w];
+  }
+  const uint64_t diff = k_or & ~k_and;
+  const int top = 63 - __clzll(diff);  // >= 0: keys are unique and n >= topk >= 1... n > 1 here
 
   uint64_t prefix = 0, prefix_mask = 0;
   uint32_t remaining = p.topk;
-  // Digits (shift, width) from the top: score bits 63..32, then column bits 31..0.
-  constexpr int kShift[6] = {53, 42, 32, 21, 10, 0};
-  constexpr int kWidth[6] = {11, 11, 10, 11, 11, 10};
 #pragma unroll 1
-  for (int d = 0; d < 6; ++d) {
-    const int shift = kShift[d];
-    const uint64_t dmask = (1ull << kWidth[d]) - 1;
-    for (uint32_t b = tx; b < kSelectBins; b += kSelectThreads) hist[b] = 0;
+  for (int hi = top; hi >= 0; hi -= 8) {
+    const int shift = max(hi - 7, 0);
+    const uint64_t dmask = (1ull << (hi - shift + 1)) - 1;
+    if (tx < 256) hist[tx] = 0;
     __syncthreads();
-    for (uint32_t t = tx; t < n; t += kSelectThreads) {
-      const uint64_t k = keys[t];
-      if ((k & prefix_mask) == prefix) atomicAdd(&hist[(k >> shift) & dmask], 1u);
+    const uint32_t rounds = (n + kSelectThreads - 1) / kSelectThreads;
+    for (uint32_t r = 0; r < rounds; ++r) {
+      const uint32_t t = r * kSelectThreads + tx;
+      const uint64_t k = t < n ? keys[t] : 0;
+      warp_hist_add(hist, t < n and (k & prefix_mask) == prefix, static_cast<uint32_t>((k >> shift) & dmask));
     }
     __syncthreads();
-    radix_pick_bin<kSelectBins>(hist, remaining, &s_bin, &s_above);
+    radix_pick_bin<256>(hist, remaining, &s_bin, &s_above);
     __syncthreads();
-    if (tx == 0) s_eq = hist[s_bin];
     remaining -= s_above;
     prefix |= static_cast<uint64_t>(s_bin) << shift;
     prefix_mask |= dmask << shift;
+    if (remaining == hist[s_bin]) break;  // the whole bin is selected
     __syncthreads();
-    // After the score digits: if every key of this score is needed, no column order applies.
-    if (d == 2 and s_eq == remaining) break;
   }
-  // Every key >= prefix (score digits only, or the exact k-th key) is selected.
+  // The keys >= prefix under the bits fixed so far are exactly the top-k (the last bin is taken whole).
   if (tx == 0) s_out = 0;
   __syncthreads();
-  for (uint32_t t = tx; t < n; t += kSelectThreads) {
-    const uint64_t k = keys[t];
-    if (k >= prefix) {
-      const uint32_t pos = atomicAdd(&s_out, 1u);
-      out[pos] = to_slot(~static_cast<uint32_t>(k));
-    }
+  const uint32_t rounds = (n + kSelectThreads - 1) / kSelectThreads;
+  for (uint32_t r = 0; r < rounds; ++r) {
+    const uint32_t t = r * kSelectThreads + tx;
+    const uint64_t k = t < n ? keys[t] : 0;
+    const bool take = t < n and (k & prefix_mask) >= prefix;
+    const uint32_t m = __ballot_sync(0xffffffffu, take);
+    uint32_t base = 0;
+    if (lane == 0 and m) base = atomicAdd(&s_out, __popc(m));
+    base = __shfl_sync(0xffffffffu, base, 0);
+    if (take) out[base + __popc(m & ((1u << lane) - 1u))] = to_slot(~static_cast<uint32_t>(k));
   }
 }
 
