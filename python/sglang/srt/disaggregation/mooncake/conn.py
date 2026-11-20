@@ -3694,6 +3694,15 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             # As upstream sgl-project#42163: a room's chunks stay ordered on one queue, and
             # room IDs can be congruent with their DP rank, so mix all bits first.
             shard_idx = _mix_room_id(bootstrap_room) % len(self.transfer_queues)
+        elif envs.SGLANG_DISAGG_TRANSFER_SHARD_BY_DST_RR.get():
+            # One queue per destination session set, assigned round-robin on first sight: a decode
+            # instance's DP groups land on distinct queues (port sums can collide) and a set's
+            # chunks stay on one queue, which keeps early abort with failed sessions.
+            key = frozenset(self.transfer_infos[bootstrap_room].keys())
+            dst_queue = getattr(self, "_dst_queue", None)
+            if dst_queue is None:
+                dst_queue = self._dst_queue = {}
+            shard_idx = dst_queue.setdefault(key, len(dst_queue) % len(self.transfer_queues))
         else:
             dst_infos = self.transfer_infos[bootstrap_room].keys()
             session_port_sum = sum(
