@@ -623,10 +623,22 @@ class DraftBlockProposer:
         verify_cache_loc_2d = verify_window.verify_cache_loc_2d
 
         draft_block_ids = self.draft_block_ids_view(bs=bs, device=prefix_lens.device)
-        if not anchor_prepared:
-            draft_block_ids[:, 0].copy_(draft_input.bonus_tokens.view(-1))
-        draft_positions = positions_2d[:, :query_token_num].reshape(-1)
-        draft_cache_loc = verify_cache_loc_2d[:, :query_token_num].reshape(-1)
+        if envs.SGLANG_OPT_DSPARK_FUSED_DRAFT_INPUTS.get() and prefix_lens.is_cuda:
+            from sglang.kernels.ops.speculative.dspark.draft_inputs import draft_inputs
+
+            draft_positions, draft_cache_loc = draft_inputs(
+                draft_input.bonus_tokens.view(-1),
+                draft_block_ids,
+                positions_2d,
+                verify_cache_loc_2d,
+                query_token_num,
+                write_bonus=not anchor_prepared,
+            )
+        else:
+            if not anchor_prepared:
+                draft_block_ids[:, 0].copy_(draft_input.bonus_tokens.view(-1))
+            draft_positions = positions_2d[:, :query_token_num].reshape(-1)
+            draft_cache_loc = verify_cache_loc_2d[:, :query_token_num].reshape(-1)
 
         draft_owns_embed = envs.SGLANG_DSPARK_EMBED_IN_GRAPH.get() and hasattr(
             self.draft_model, "forward_embed"
