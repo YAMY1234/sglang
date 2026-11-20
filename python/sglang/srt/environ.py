@@ -2316,6 +2316,8 @@ class Envs:
     SGLANG_DSA_FUSED_INDEXER_TOPK_LOG_INTERVAL = EnvInt(64)
     # Debug: every N calls, compare 256 rows with the unfused path and log (0 = off).
     SGLANG_DSA_FUSED_INDEXER_TOPK_CHECK_INTERVAL = EnvInt(0)
+    # Debug: log the GPU time of the prefill top-k (CUDA events) every N calls (0 = off).
+    SGLANG_DSA_INDEXER_TOPK_TIMING_INTERVAL = EnvInt(0)
     # Requires a DeepGEMM paged-MQA scheduler supporting batches > SM count
     # (0.2.3 does); set to 0 for an older DeepGEMM.
     SGLANG_DSA_FULL_BATCH_MQA = EnvBool(True)

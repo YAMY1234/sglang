@@ -230,6 +230,53 @@ def _fused_topk_precompile() -> bool:
 _FUSED_TOPK_STATS = None
 
 
+class _IndexerTopkTimer:
+    """Debug: GPU time of the prefill top-k (scores + selection) from CUDA events, read
+    once they complete (no host sync), logged every ``interval`` calls."""
+
+    def __init__(self, interval: int):
+        self.interval = interval
+        self.pending = []
+        self.window = [0, 0, 0.0]  # calls, rows, ms
+        self.total = [0, 0, 0.0]
+
+    def start(self) -> torch.cuda.Event:
+        event = torch.cuda.Event(enable_timing=True)
+        event.record()
+        return event
+
+    def stop(self, start: torch.cuda.Event, rows: int) -> None:
+        end = torch.cuda.Event(enable_timing=True)
+        end.record()
+        self.pending.append((start, end, rows))
+        while self.pending and self.pending[0][1].query():
+            s, e, n = self.pending.pop(0)
+            ms = s.elapsed_time(e)
+            for acc in (self.window, self.total):
+                acc[0] += 1
+                acc[1] += n
+                acc[2] += ms
+            if self.window[0] >= self.interval:
+                c, r, t = self.window
+                logger.info(
+                    "IDXT window calls=%d rows=%d ms=%.3f ms_per_call=%.4f "
+                    "total calls=%d rows=%d ms=%.1f",
+                    c, r, t, t / c, *self.total,
+                )
+                self.window = [0, 0, 0.0]
+
+
+_INDEXER_TOPK_TIMER: Any = False
+
+
+def _indexer_topk_timer() -> Optional[_IndexerTopkTimer]:
+    global _INDEXER_TOPK_TIMER
+    if _INDEXER_TOPK_TIMER is False:
+        interval = envs.SGLANG_DSA_INDEXER_TOPK_TIMING_INTERVAL.get()
+        _INDEXER_TOPK_TIMER = _IndexerTopkTimer(interval) if interval > 0 else None
+    return _INDEXER_TOPK_TIMER
+
+
 def _fused_topk_stats():
     global _FUSED_TOPK_STATS
     if _FUSED_TOPK_STATS is None:
@@ -1757,6 +1804,29 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         return budget_bytes
 
     def _get_topk_ragged(
+        self,
+        enable_dual_stream: bool,
+        forward_batch: ForwardBatch,
+        layer_id: int,
+        q_fp8: torch.Tensor,
+        weights: torch.Tensor,
+        metadata: BaseIndexerMetadata,
+        topk_result: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        args = (enable_dual_stream, forward_batch, layer_id, q_fp8, weights, metadata)
+        timer = _indexer_topk_timer()
+        if (
+            timer is None
+            or get_is_capture_mode()
+            or torch.cuda.is_current_stream_capturing()
+        ):
+            return self._get_topk_ragged_impl(*args, topk_result)
+        start = timer.start()
+        topk_result = self._get_topk_ragged_impl(*args, topk_result)
+        timer.stop(start, rows=q_fp8.shape[0])
+        return topk_result
+
+    def _get_topk_ragged_impl(
         self,
         enable_dual_stream: bool,
         forward_batch: ForwardBatch,
