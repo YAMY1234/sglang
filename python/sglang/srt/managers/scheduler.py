@@ -5056,6 +5056,8 @@ class Scheduler(
         ops_line = pmicro_hoststats.take_ops_line(time.perf_counter())
         if ops_line is not None:
             logger.info(ops_line)
+            if envs.SGLANG_HICACHE_HOST_COMPOSITION_LOG.get():
+                logger.info(self.tree_cache.host_composition_line())
 
     @scheduler_stage_method(SCHEDULER_STAGE_RUN_BATCH)
     def run_batch(

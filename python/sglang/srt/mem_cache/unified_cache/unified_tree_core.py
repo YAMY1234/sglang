@@ -530,9 +530,12 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         # Full KV on both tiers -> redundant host copy, reclaimed first by
         # write_back; insertion-ordered dict keeps victims TP-deterministic.
         self.full_host_duplicates: dict[NodeId, UnifiedTreeNode] = {}
-        # Device-tail nodes the write-ahead walk keeps backed; the first
-        # duplicate-reclaim pass spares them like the imminent demotes.
+        # Device-tail nodes the write-ahead walk keeps backed; duplicate
+        # reclaim never takes them.
         self.write_ahead_spare: set[NodeId] = set()
+        # Full host tokens freed, cumulative: [duplicate reclaim, host-leaf
+        # eviction under Full pressure, under Mamba pressure].
+        self.host_evicted_tokens: list[int] = [0, 0, 0]
         # Rolling digest of reclaim victim ids, cross-checked across TP ranks.
         self.write_back_duplicate_reclaim_digest: int = 0
 
@@ -1982,6 +1985,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         result = DriveHostEvictionResult()
         comp = self.components_by_type.get(component_type)
         if comp is not None:
+            before = result.tracker.get(BASE_COMPONENT_TYPE, 0)
             if (
                 not envs.SGLANG_HICACHE_SKIP_HOST_DUPLICATE_RECLAIM.get()
                 and self.is_write_back
@@ -1994,12 +1998,18 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                     result.host_frees,
                     cache_actions=result.cache_actions,
                 )
+            reclaimed = result.tracker.get(BASE_COMPONENT_TYPE, 0)
             comp.drive_host_eviction(
                 num_tokens,
                 result.tracker,
                 result.device_frees,
                 result.host_frees,
                 cache_actions=result.cache_actions,
+            )
+            self.host_evicted_tokens[0] += reclaimed - before
+            leaf_kind = 1 if component_type == BASE_COMPONENT_TYPE else 2
+            self.host_evicted_tokens[leaf_kind] += (
+                result.tracker.get(BASE_COMPONENT_TYPE, 0) - reclaimed
             )
         return result
 
@@ -2021,6 +2031,19 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
 
     def set_write_ahead_spare(self, node_ids: list[NodeId]) -> None:
         self.write_ahead_spare = set(node_ids)
+
+    def host_composition(self) -> tuple[int, int, int, list[int]]:
+        dup = spared = host_only = 0
+        for node in self._node_arena.values():
+            cd = node.component_data[BASE_COMPONENT_TYPE]
+            if node is self.root_node or cd.host_value is None:
+                continue
+            if cd.value is not None:
+                dup += len(node.key)
+                spared += len(node.key) if node.id in self.write_ahead_spare else 0
+            else:
+                host_only += len(node.key)
+        return dup, spared, host_only, list(self.host_evicted_tokens)
 
     def peek_mamba_host_eviction_leaves(
         self, max_states: int

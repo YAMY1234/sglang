@@ -1157,6 +1157,8 @@ class TestDeviceWriteAhead(CustomTestCase):
         cache._wa_evicted_tokens = 0
         cache._wa_peak_evicted = 0.0
         cache._wa_ready_count = 0
+        cache._wa_preevict_tokens = 0
+        cache._hostcomp_last = (0, 0, 0, 0)
         cache.tree_core.peek_device_eviction_candidates.return_value = list(tail)
         cache.tree_core.build_backup_spec.side_effect = lambda n: (
             torch.arange(4) + 10 * n,
@@ -1224,6 +1226,7 @@ class TestDeviceWriteAhead(CustomTestCase):
         self.assertEqual(tc.set_write_ahead_spare.call_count, 2)
         self.assertEqual([c.args[0] for c in cache._execute_kv_backup.call_args_list], [5, 8, 9])
         self.assertEqual(cache.evict_host.call_args_list, [call(5), call(1)])
+        self.assertEqual(cache._wa_preevict_tokens, 6)
         self.assertEqual(list(cache._wa_issue_steps), [1, 2])
         # At the in-flight cap the spare set still refreshes, nothing is written.
         tc.peek_device_eviction_candidates.return_value = [(10, 4, True, False)]
@@ -1232,6 +1235,23 @@ class TestDeviceWriteAhead(CustomTestCase):
         self.assertEqual(tc.set_write_ahead_spare.call_count, 3)
         self.assertEqual(cache._execute_kv_backup.call_count, 3)
         self.assertEqual(cache.evict_host.call_count, 2)
+
+    def test_host_composition_line_reports_deltas_since_the_previous_line(self):
+        cache = self._wa_cache()
+        comp = cache.tree_core.host_composition
+        comp.return_value = (40, 20, 30, [5, 6, 1])
+        cache._wa_preevict_tokens = 7
+        self.assertEqual(
+            cache.host_composition_line(),
+            "PMICRO_HOSTCOMP host_free=3 dup=40 dup_wa_tail=20 host_only=30 | "
+            "evict_dup=5 evict_leaf=6 evict_leaf_mamba=1 wa_preevict=7",
+        )
+        comp.return_value = (41, 20, 29, [9, 6, 1])
+        self.assertTrue(
+            cache.host_composition_line().endswith(
+                "evict_dup=4 evict_leaf=0 evict_leaf_mamba=0 wa_preevict=0"
+            )
+        )
 
     def test_tail_target_follows_the_decayed_eviction_peak(self):
         cache = self._wa_cache()

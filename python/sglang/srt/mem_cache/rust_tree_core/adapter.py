@@ -279,6 +279,10 @@ def _tracker_to_binding(tracker: dict[ComponentType, int]) -> dict[int, int]:
     return {int(component): freed for component, freed in tracker.items()}
 
 
+_HOST_COMPOSITION_REBUILD = (
+    "SGLANG_HICACHE_HOST_COMPOSITION_LOG needs a Rust TreeCore extension that has "
+    "host_composition; rebuild rust/sglang-radix-tree or unset it"
+)
 _WRITE_AHEAD_REBUILD = (
     "SGLANG_HICACHE_DEVICE_WRITE_AHEAD needs a Rust TreeCore extension that has "
     "peek_device_eviction_candidates and set_write_ahead_spare; rebuild "
@@ -943,6 +947,14 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
         except AttributeError:
             raise RuntimeError(_WRITE_AHEAD_REBUILD) from None
         set_spare(list(node_ids))
+
+    def host_composition(self) -> tuple[int, int, int, list[int]]:
+        try:
+            composition = self._binding.host_composition
+        except AttributeError:
+            raise RuntimeError(_HOST_COMPOSITION_REBUILD) from None
+        dup, spared, host_only, evicted = composition()
+        return dup, spared, host_only, list(evicted)
 
     def peek_mamba_host_eviction_leaves(
         self, max_states: int

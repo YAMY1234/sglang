@@ -916,6 +916,9 @@ class Envs:
     SGLANG_HICACHE_DEVICE_WRITE_AHEAD_ACK_LAG = EnvInt(1)
     # Staged write-back: batch small page copies and merge adjacent host rows.
     SGLANG_OPT_HICACHE_BATCH_WRITE_BACK_COPY = EnvBool(False)
+    # With SGLANG_PMICRO_HOSTSTATS: one PMICRO_HOSTCOMP line per PMICRO_HOSTOPS window, the Full host
+    # tokens by kind (device duplicate, write-ahead tail, host-only) and host evictions by kind.
+    SGLANG_HICACHE_HOST_COMPOSITION_LOG = EnvBool(False)
     # p-micro rig only: per-launch host / D2H counters and per-op HiCache timings
     # (PMICRO_HOSTSTAT / PMICRO_HOSTOPS log lines, see mem_cache/pmicro_hoststats.py).
     SGLANG_PMICRO_HOSTSTATS = EnvBool(False)

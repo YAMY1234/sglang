@@ -587,6 +587,14 @@ class UnifiedTreeCoreInterface(ABC):
         ...
 
     @abstractmethod
+    def host_composition(self) -> tuple[int, int, int, list[int]]:
+        """Full host tokens held as (device duplicate, of them in the write-ahead
+        spare, host-only), plus the cumulative Full host tokens freed by
+        [duplicate reclaim, host-leaf eviction under Full, under Mamba pressure].
+        Read-only; walks every live node."""
+        ...
+
+    @abstractmethod
     def peek_mamba_host_eviction_leaves(
         self, max_states: int
     ) -> list[tuple[NodeId, int, Optional[list[str]]]]:

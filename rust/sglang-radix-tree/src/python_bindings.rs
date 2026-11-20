@@ -2075,6 +2075,10 @@ macro_rules! tree_core_methods {
                 py.detach(move || self.core().set_write_ahead_spare(node_ids));
             }
 
+            fn host_composition(&self, py: Python<'_>) -> (usize, usize, usize, [usize; 3]) {
+                py.detach(move || self.core().host_composition())
+            }
+
             /// Full host leaves in drive_host_eviction's order, read-only.
             fn peek_host_eviction_candidates(
                 &self,
@@ -3520,6 +3524,12 @@ macro_rules! tree_core_binding {
             /// Replace the device-tail set that Full duplicate reclaim never takes.
             fn set_write_ahead_spare(&self, py: Python<'_>, node_ids: Vec<NodeId>) -> PyResult<()> {
                 catch_native_panic(|| { self.inner.set_write_ahead_spare(py, node_ids); Ok(()) })
+            }
+
+            /// Full host tokens (device duplicates, of them in the write-ahead spare, host-only) and the
+            /// cumulative host eviction tokens [duplicate reclaim, leaf under Full, leaf under Mamba].
+            fn host_composition(&self, py: Python<'_>) -> PyResult<(usize, usize, usize, [usize; 3])> {
+                catch_native_panic(|| Ok(self.inner.host_composition(py)))
             }
 
             /// Full host leaves in the order drive_host_eviction takes them, until

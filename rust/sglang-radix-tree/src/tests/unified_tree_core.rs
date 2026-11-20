@@ -9819,3 +9819,26 @@ fn write_ahead_spare_is_never_reclaimed_as_a_duplicate() {
     assert_eq!(run(false), (0, true));
     assert_eq!(run(true), (2, true));
 }
+
+#[test]
+fn host_composition_counts_host_tokens_and_evictions_by_kind() {
+    let mut tc = write_back_core();
+    tc.insert(&insert_params(&vec![1, 2, 3], &[10, 11, 12]));
+    tc.insert(&insert_params(&vec![1, 2], &[10, 11]));
+    let spared = tc.match_prefix(&match_params(&vec![1, 2])).best_match_node_id;
+    back_up_and_ack(&mut tc, spared, &[20, 21]);
+    tc.insert(&insert_params(&vec![5, 6], &[50, 51]));
+    let dup = tc.match_prefix(&match_params(&vec![5, 6])).best_match_node_id;
+    back_up_and_ack(&mut tc, dup, &[60, 61]);
+    tc.insert(&insert_params(&vec![7, 8], &[70, 71]));
+    let leaf = tc.match_prefix(&match_params(&vec![7, 8])).best_match_node_id;
+    back_up_and_ack(&mut tc, leaf, &[80, 81]);
+    tc.demote(leaf).expect("backed live node");
+    tc.set_write_ahead_spare(vec![spared]);
+    assert_eq!(tc.host_composition(), (4, 2, 2, [0, 0, 0]));
+    // The unspared duplicate is reclaimed first, then the host-only leaf is evicted.
+    assert_eq!(tc.drive_host_eviction(FULL, 4).tracker[&FULL], 4);
+    assert_eq!(tc.host_composition(), (2, 2, 0, [2, 2, 0]));
+    tc.reset();
+    assert_eq!(tc.host_composition(), (0, 0, 0, [0, 0, 0]));
+}
