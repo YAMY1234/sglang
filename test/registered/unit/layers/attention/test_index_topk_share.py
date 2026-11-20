@@ -311,6 +311,30 @@ def test_dcp_topk_merge_min_blocks_fail_closed():
         dcp_topk_merge._staged_launch.__wrapped__()
 
 
+@pytest.mark.parametrize("env,world,expected", [(None, 4, 768), (1024, 4, 1024), (1024, 8, 384)])
+def test_dcp4_push_cand_k_env(env, world, expected):
+    from sglang.kernels.ops.attention.dsa import dcp_topk_merge
+    from sglang.srt.environ import envs
+    from sglang.srt.layers.attention.dsa import dsa_dcp_sharded
+
+    with envs.SGLANG_DCP4_PUSH_CAND_K.override(env or 768):
+        assert dsa_dcp_sharded._merge_cand_k(world, 2048) == expected
+    loaded = []
+    with patch.object(dcp_topk_merge, "load_jit", lambda *a, **kw: loaded.append((a, kw))):
+        dcp_topk_merge._jit_dcp_topk_merge_pushed_module.__wrapped__(world, 2048, expected)
+    (args, kwargs), = loaded
+    assert kwargs["cuda_wrappers"][0][1].startswith(f"DcpTopKMergePushedKernel<{world}, 2048, {expected}, ")
+
+
+@pytest.mark.parametrize("cand_k", [500, 256, 4096])
+def test_dcp4_push_cand_k_fail_closed(cand_k):
+    from sglang.srt.environ import envs
+    from sglang.srt.layers.attention.dsa import dsa_dcp_sharded
+
+    with envs.SGLANG_DCP4_PUSH_CAND_K.override(cand_k), pytest.raises(ValueError, match="CAND_K"):
+        dsa_dcp_sharded._merge_cand_k(4, 2048)
+
+
 @pytest.mark.parametrize("form", ["0", "v3"])
 def test_dcp_push_combine_form_selects_the_kernel(form):
     import os

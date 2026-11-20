@@ -27,6 +27,7 @@ import torch.distributed as dist
 import sglang.srt.distributed.parallel_state as ps
 from sglang.kernels.jit.utils import cache_once
 from sglang.kernels.ops.attention.dsv4.topk import topk_transform_candidates_v2
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.dsa_dcp_sharded import DcpTopKMerge
 from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -85,6 +86,18 @@ def _rows(kind: str, seed: int) -> list[torch.Tensor]:
             rows.append(
                 base.repeat(n // 8 + 1)[:n] + 4.0 * torch.randperm(n, generator=g) / n
             )
+        return rows
+    if kind == "skew":
+        # DCP4: rank 1 holds 900 of the global top-2048, more than 768 candidates
+        rows = []
+        for shift in (0, 4):
+            x = torch.randn(65536, generator=g)
+            pos = torch.arange(65536)
+            hot = pos[pos % 4 == 1][torch.randperm(16384, generator=g)[:900]]
+            rest = pos[pos % 4 != 1][torch.randperm(49152, generator=g)[:1148]]
+            x[hot] = 10 + torch.rand(900, generator=g)
+            x[rest] = 10 + torch.rand(1148, generator=g)
+            rows.append(x[shift:])
         return rows
     if kind == "short":
         lengths = [1, 3, 7, 9, 300, 2047, 2048, 2049, 2055, 3000, 5000]
@@ -168,6 +181,25 @@ class _Case:
         )
         merge(self.candidates, self.global_lens, self.page_table, self.out, span)
 
+    def run_pushed(self, merge: DcpTopKMerge, span: int) -> None:
+        self.local, self.lengths = merge.merge_pushed(
+            self.logits.clone(), self.local_lens, self.global_lens, self.page_table, self.out, span
+        )
+
+    def pushed_failures(self, rank: int, world: int) -> list[str]:
+        bad = []
+        for i in range(self.rows):
+            n = len(self.expect[i])
+            if sorted(self.out[i, :n].tolist()) != self.expect[i]:
+                bad.append(f"rank {rank} row {i}: merged slots differ")
+            if not bool((self.out[i, n:] == -1).all()):
+                bad.append(f"rank {rank} row {i}: padding is not -1")
+            if int(self.lengths[i]) != n or sorted(self.local[i, :n].tolist()) != sorted(
+                s // world for s in self.expect[i]
+            ):
+                bad.append(f"rank {rank} row {i}: localized rows differ")
+        return bad
+
     def failures(self, rank: int) -> list[str]:
         bad = []
         for i in range(self.rows):
@@ -217,5 +249,43 @@ def test_dcp_topk_merge(kind: str) -> None:
         assert _all_ranks_ok(not bad), bad or "failed on another rank"
 
 
+_PUSH_MERGES: dict[int, DcpTopKMerge] = {}
+
+
+def _push_merge(cand_k: int) -> DcpTopKMerge:
+    if cand_k not in _PUSH_MERGES:
+        _init_once()
+        with envs.SGLANG_DCP4_PUSH_CAND_K.override(cand_k):
+            _PUSH_MERGES[cand_k] = DcpTopKMerge(ps._WORLD, MAX_ROWS, TOPK, push=True)
+    return _PUSH_MERGES[cand_k]
+
+
+@pytest.mark.parametrize("cand_k", [768, 1024])
+@pytest.mark.parametrize("kind", ["random", "dense_top", "ties", "periodic", "skew", "short"])
+@torch.inference_mode()
+def test_dcp4_topk_merge_pushed(kind: str, cand_k: int) -> None:
+    """DCP4 push merge: exact for either candidate count (SGLANG_DCP4_PUSH_CAND_K);
+    a rank holding 768-1023 of the top-k fails the certificate only at 768."""
+    world, rank = ps._WORLD.world_size, ps._WORLD.rank_in_group
+    if world != 4:
+        pytest.skip("the DCP4 push merge needs 4 ranks")
+    merge = _push_merge(cand_k)
+    if merge.buffer is None:
+        pytest.skip("multimem multicast unavailable")
+    assert merge.cand_k == cand_k
+    span = PAGE_SIZE * world
+    for seed in SEEDS:
+        case = _Case(kind, seed, rank, world, span)
+        case.run_pushed(merge, span)
+        torch.cuda.synchronize()
+        bad = case.pushed_failures(rank, world)
+        assert _all_ranks_ok(not bad), bad or "failed on another rank"
+        fell_back = merge.fallback[: case.rows].tolist()
+        if kind == "periodic" or (kind == "skew" and cand_k == 768):
+            assert all(fell_back), fell_back
+        elif kind in ("random", "short", "skew"):
+            assert not any(fell_back), fell_back
+
+
 if __name__ == "__main__":
-    multigpu_pytest_main(__name__, __file__, num_gpus=(8,))
+    multigpu_pytest_main(__name__, __file__, num_gpus=(4, 8))
