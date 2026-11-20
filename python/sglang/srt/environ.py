@@ -1014,6 +1014,9 @@ class Envs:
     # Build the cross-rank restorable-prefix mask with one indexed write instead of
     # one tensor write per restorable page (scheduler-thread time per lookup).
     SGLANG_EXTERNAL_LINKER_VECTORIZED_RESTORABLE_MASK = EnvBool(False)
+    # Keep each queued request's storage page hashes, so a re-query hashes only
+    # the pages before its last lookup's start instead of the whole tail again.
+    SGLANG_EXTERNAL_LINKER_REQUERY_HASH_CACHE = EnvBool(False)
     # Seconds between L3 lease renewals of a prefix the device serves: an
     # existence query renews its pages' leases, so Mooncake (oldest lease
     # evicted first) keeps hot prefixes. 0 disables.
