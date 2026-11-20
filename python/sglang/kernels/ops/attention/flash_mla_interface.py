@@ -10,6 +10,7 @@ token-interleaved V4.1 caches (``KVLayout.V41_NEW`` / ``V41_FP4_NEW``) take
 ``use_legacy=False``. CUDA only: HIP and XPU keep their own sgl-kernel ops.
 """
 
+from functools import lru_cache
 from typing import Optional, Tuple, Union
 
 import flash_mla
@@ -198,9 +199,39 @@ def flash_mla_mega_prefill(
     rms_norm_eps: float = 0.0,
     use_legacy: bool = True,
     out_sf_swizzled_128x4: bool = False,
+    q_head_scale: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, ...]:
     """MegaAttention prefill over a bf16 ``kv``: (out_fp8, out_sf, max_logits, lse).
-    ``out_sf_swizzled_128x4`` writes out_sf per wv group in the 128x4 layout (s_q % 128 == 0)."""
+    ``out_sf_swizzled_128x4`` writes out_sf per wv group in the 128x4 layout (s_q % 128 == 0).
+    An E4M3 ``q`` with ``q_head_scale`` (fp32 [heads], q = Q / scale) needs the e4m3 ``kv``."""
+    if q_head_scale is not None:
+        # The op directly: the installed wheel's Python wrapper may predate q_head_scale.
+        from flash_mla._loader import get_ops
+
+        assert not use_legacy and q.dtype == torch.float8_e4m3fn
+        p = _MEGA_FIXED_PARAMS
+        return get_ops(False).fused_norm_rope_attn_rope_cast_fwd(
+            q,
+            kv,
+            indices,
+            softmax_scale,
+            512,
+            attn_sink,
+            topk_length,
+            enable_q_norm,
+            rms_norm_eps,
+            positions,
+            p["is_rope_neox_style"],
+            p["rope_dim"],
+            cos_sin_cache,
+            q.shape[1] // 8,
+            p["num_per_channels"],
+            p["use_tma_aligned_col_major_sf"],
+            p["round_sf"],
+            p["use_packed_ue8m0"],
+            out_sf_swizzled_128x4,
+            q_head_scale,
+        )
     return _mega.prefill(
         token_positions=positions,
         cos_sin_cache=cos_sin_cache,
@@ -292,6 +323,16 @@ def mega_decode_takes_q_head_scale() -> bool:
 
 
 _TAKES_Q_HEAD_SCALE: Optional[bool] = None
+
+
+@lru_cache(maxsize=1)
+def mega_prefill_takes_q_head_scale() -> bool:
+    """Whether the installed FlashMLA's prefill op takes ``q_head_scale`` (an E4M3 q with
+    static per-head scales, over the e4m3 kv workspace)."""
+    from flash_mla._loader import get_ops
+
+    op = get_ops(False).fused_norm_rope_attn_rope_cast_fwd
+    return any(a.name == "q_head_scale" for a in op.default._schema.arguments)
 _FP8_Q_LOGGED = False
 
 

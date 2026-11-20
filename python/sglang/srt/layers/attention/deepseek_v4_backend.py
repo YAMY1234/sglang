@@ -190,6 +190,16 @@ PAGE_INDEX_ALIGNED_SIZE = 64
 DSV4_CUTEDSL_H16_PREFILL_BACKEND = "cutedsl_h16"
 
 
+def _dequant_static_fp8_q(q: torch.Tensor, q_head_scale: torch.Tensor) -> torch.Tensor:
+    """bf16 Q from the model's static FP8 Q (E4M3 holding Q / scale per head), for the
+    paths that read bf16 Q only. Q is in MegaAttention's permuted layout: column n of a
+    token belongs to head n % (H * 16) // 16."""
+    heads = q_head_scale.shape[0]
+    rows = q.reshape(-1, heads * 16)
+    col = q_head_scale.repeat_interleave(16)
+    return (rows.float() * col).to(torch.bfloat16).view(q.shape)
+
+
 def _use_dsv4_cutedsl_h16_forward(
     dsv4_prefill_backend: str, forward_batch: ForwardBatch
 ) -> bool:
@@ -4642,6 +4652,25 @@ class DeepseekV4AttnBackend(
                 self._use_sparse_prefill(forward_batch, num_qo_tokens=q.shape[0])
                 and not use_mega_paged
             ):
+                use_cutedsl_h16 = _use_dsv4_cutedsl_h16_forward(
+                    self.dsv4_prefill_backend, forward_batch
+                )
+                q_head_scale = None
+                if q.dtype == torch.float8_e4m3fn:
+                    # The model's static FP8 Q (E4M3 wq_b output, Q / scale per head): only
+                    # FlashMLA's fp8 prefill over the e4m3 workspace reads it as is
+                    if (
+                        not use_dsv4_q8kv8_sparse_prefill(self.dsv4_prefill_backend)
+                        and cos_sin_cache is not None
+                        and self._use_fp8_prefill_workspace(
+                            compress_ratio=compress_ratio,
+                            num_heads=q.shape[-2],
+                            mega=not use_cutedsl_h16,
+                        )
+                    ):
+                        q_head_scale = layer.mega_q_head_scale
+                    else:
+                        q = _dequant_static_fp8_q(q, layer.mega_q_head_scale)
                 if use_dsv4_q8kv8_sparse_prefill(self.dsv4_prefill_backend):
                     return self._forward_prefill_sparse_q8kv8(
                         q=q,
@@ -4661,11 +4690,16 @@ class DeepseekV4AttnBackend(
                     core_attn_metadata=core_attn_metadata,
                     attn_sink=attn_sink,
                     cos_sin_cache=cos_sin_cache,
-                    use_cutedsl_h16=_use_dsv4_cutedsl_h16_forward(
-                        self.dsv4_prefill_backend, forward_batch
-                    ),
+                    use_cutedsl_h16=use_cutedsl_h16,
                     mega_sf_swizzled_128x4=mega_sf_swizzled_128x4,
+                    q_head_scale=q_head_scale,
                 )
+            if q.dtype == torch.float8_e4m3fn and not (
+                (cos_sin_cache is not None and use_mega_paged)
+                or forward_batch.forward_mode.is_decode_or_idle()
+                or forward_batch.forward_mode.is_target_verify()
+            ):
+                q = _dequant_static_fp8_q(q, layer.mega_q_head_scale)
 
             if cos_sin_cache is not None:
                 return self._forward_mega_decode(
@@ -4818,6 +4852,7 @@ class DeepseekV4AttnBackend(
         cos_sin_cache: Optional[torch.Tensor] = None,
         use_cutedsl_h16: bool = False,
         mega_sf_swizzled_128x4: bool = False,
+        q_head_scale: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         """Gathers each request's SWA window and c4/c128 cache into a flat bf16
         workspace that flash_mla_sparse_fwd reads through per-query rebased indices."""
@@ -4927,6 +4962,7 @@ class DeepseekV4AttnBackend(
                 attn_sink=attn_sink,
                 topk_length=combined_lens,
                 sf_swizzled_128x4=mega_sf_swizzled_128x4,
+                q_head_scale=q_head_scale,
             )
 
         if use_cutedsl_h16:

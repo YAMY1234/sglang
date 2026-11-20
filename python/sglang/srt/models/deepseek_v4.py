@@ -149,7 +149,7 @@ from sglang.srt.model_executor.forward_context import (
     get_attn_backend,
     get_token_to_kv_pool,
 )
-from sglang.srt.model_executor.forward_mode import CaptureHiddenMode
+from sglang.srt.model_executor.forward_mode import CaptureHiddenMode, ForwardMode
 from sglang.srt.model_executor.runner import (
     compile_in_capture_mode,
     get_is_capture_mode,
@@ -292,6 +292,9 @@ logger = logging.getLogger(__name__)
 
 # Layers set up for the MegaAttention decode's static FP8 Q (logged once)
 _MEGA_FP8_Q_LAYERS = 0
+# Prefill wq_b with an E4M3 output (SGLANG_OPT_DSV41_FP8_PREFILL_Q), an SM107 mm_mxfp8 tactic
+# (mma_tiler_mn, cluster_shape_mn, swap_ab, mma_inst_shape_m)
+_WQ_B_PREFILL_FP8_Q_TACTIC = ((256, 256), (4, 2), True, 256)
 
 _FP8_WO_A_GEMM = envs.SGLANG_OPT_FP8_WO_A_GEMM.get()
 _FP8_WO_A_UE8M0 = _FP8_WO_A_GEMM and DEEPGEMM_SCALE_UE8M0
@@ -1588,8 +1591,12 @@ class MqaAttentionBase(nn.Module):
         Q / scale as E4M3, the per-head power-of-two scales folded into its UE8M0 weight
         scales, and FlashMLA's fp8 decode multiplies them back into the softmax scale."""
         method = self.wq_b.quant_method
+        prefill_q = (
+            envs.SGLANG_OPT_DSV41_FP8_PREFILL_Q.get()
+            and envs.SGLANG_OPT_DSV41_FP8_PREFILL_ATTN.get()
+        )
         if not (
-            envs.SGLANG_OPT_DSV4_MEGA_FP8_Q.get()
+            (envs.SGLANG_OPT_DSV4_MEGA_FP8_Q.get() or prefill_q)
             and self.mega_wq_b_permuted
             and self.n_local_heads == 64
             and self.compress_ratio > 0
@@ -1601,6 +1608,7 @@ class MqaAttentionBase(nn.Module):
 
         from sglang.kernels.ops.attention.flash_mla_interface import (
             mega_decode_takes_q_head_scale,
+            mega_prefill_takes_q_head_scale,
         )
         from sglang.srt.layers.attention.deepseek_v4_mega_backend import (
             static_fp8_q_head_scale,
@@ -1609,11 +1617,21 @@ class MqaAttentionBase(nn.Module):
             block_fp8_scale_to_mxfp8_e8m0,
         )
 
-        if not mega_decode_takes_q_head_scale():
+        self._mega_fp8_q_decode = envs.SGLANG_OPT_DSV4_MEGA_FP8_Q.get()
+        if self._mega_fp8_q_decode and not mega_decode_takes_q_head_scale():
             logger.warning(
                 "SGLANG_OPT_DSV4_MEGA_FP8_Q: the installed FlashMLA decode takes no "
                 "q_head_scale; keeping bf16 Q"
             )
+            self._mega_fp8_q_decode = False
+        self._mega_fp8_q_prefill = prefill_q
+        if prefill_q and not mega_prefill_takes_q_head_scale():
+            logger.warning(
+                "SGLANG_OPT_DSV41_FP8_PREFILL_Q: the installed FlashMLA prefill takes no "
+                "q_head_scale; keeping bf16 Q"
+            )
+            self._mega_fp8_q_prefill = False
+        if not (self._mega_fp8_q_decode or self._mega_fp8_q_prefill):
             return
         n, k = self.wq_b.weight.shape
         # wq_b's per-row UE8M0 scales [N, K / 32], rows already in the query layout. A block-fp8
@@ -1643,7 +1661,9 @@ class MqaAttentionBase(nn.Module):
         if _MEGA_FP8_Q_LAYERS == 1:
             logger.info(
                 "DSV4 MegaAttention: static FP8 Q (E4M3 wq_b output) on the compressed "
-                "layers; layer %d head scales %s",
+                "layers (decode %s, prefill %s); layer %d head scales %s",
+                self._mega_fp8_q_decode,
+                self._mega_fp8_q_prefill,
                 self.layer_id,
                 [float(x) for x in scale[:4]],
             )
@@ -1654,6 +1674,12 @@ class MqaAttentionBase(nn.Module):
         if self.mega_q_head_scale is None:
             return False
         mode = forward_batch.forward_mode
+        if self._mega_fp8_q_prefill and mode == ForwardMode.EXTEND:
+            # Prefill: FlashMLA's fp8 prefill over the e4m3 workspace reads it; the backend
+            # turns it back to bf16 Q on any other path
+            return True
+        if not self._mega_fp8_q_decode:
+            return False
         if not (mode.is_decode() or mode.is_target_verify()):
             return False
         if self._mega_fp8_q_fp4_cache is None:
@@ -1663,21 +1689,28 @@ class MqaAttentionBase(nn.Module):
             )
         return self._mega_fp8_q_fp4_cache
 
-    def _wq_b_static_fp8_q(self, q) -> Optional[torch.Tensor]:
-        """wq_b with an E4M3 output at the static per-head scales, on the SM107 PDL MXFP8
-        GEMM at its decode-table tactic. None (bf16 Q) when the input is not FlashInfer's
-        swizzled MXFP8 or M is not tabled."""
+    def _wq_b_static_fp8_q(self, q, prefill: bool = False) -> Optional[torch.Tensor]:
+        """wq_b with an E4M3 output at the static per-head scales, on the SM107 MXFP8 GEMM:
+        decode on the PDL copy at its decode-table tactic, prefill (at least
+        SGLANG_OPT_DSV41_FP8_PREFILL_Q_MIN_ROWS rows) at _WQ_B_PREFILL_FP8_Q_TACTIC without PDL.
+        None (bf16 Q) when the input is not FlashInfer's swizzled MXFP8 or M has no tactic."""
         if not isinstance(q, Mxfp8SwizzledInput):
             return None
         from sglang.kernels.ops.gemm import mxfp8_sm107_dense as dense
 
         weight = self.wq_b.weight
         m = q.data.shape[0]
-        for max_m, tactic, _ in dense.DECODE_TABLE.get(tuple(weight.shape), ()):
-            if m <= max_m:
-                break
+        if prefill:
+            if m < envs.SGLANG_OPT_DSV41_FP8_PREFILL_Q_MIN_ROWS.get():
+                return None
+            tactic, use_pdl = _WQ_B_PREFILL_FP8_Q_TACTIC, False
         else:
-            return None
+            for max_m, tactic, _ in dense.DECODE_TABLE.get(tuple(weight.shape), ()):
+                if m <= max_m:
+                    break
+            else:
+                return None
+            use_pdl = envs.SGLANG_OPT_SM107_MXFP8_DENSE_TABLE_MODE.get() != "nopdl"
         if not dense._source_ok():
             return None
         out = torch.empty(
@@ -1690,7 +1723,7 @@ class MqaAttentionBase(nn.Module):
             self.mega_wq_b_fp8_q_sf,
             out,
             tactic,
-            use_pdl=envs.SGLANG_OPT_SM107_MXFP8_DENSE_TABLE_MODE.get() != "nopdl",
+            use_pdl=use_pdl,
         )
 
     def _wq_b_uses_flashinfer_mxfp8(self) -> bool:
@@ -1735,7 +1768,10 @@ class MqaAttentionBase(nn.Module):
                     self, q, y, y_sf, attn_sink
                 )
                 return deepgemm_mxfp8_linear_input(y, y_sf)
-            o = q.new_empty((rows, self.n_local_groups, self.o_lora_rank))
+            # bf16 out also for the static FP8 Q (an E4M3 q)
+            o = q.new_empty(
+                (rows, self.n_local_groups, self.o_lora_rank), dtype=torch.bfloat16
+            )
             bcg_deepseek_v4_mega_attention_with_output(self, q, o, attn_sink)
             return o
         return self._mega_core(
@@ -2017,6 +2053,9 @@ class MQALayer(MqaAttentionBase):
         self.mega_q_head_scale: Optional[torch.Tensor] = None
         self.mega_wq_b_fp8_q_sf: Optional[torch.Tensor] = None
         self._mega_fp8_q_step = False
+        self._mega_fp8_q_prefill_step = False
+        self._mega_fp8_q_decode = False
+        self._mega_fp8_q_prefill = False
         self._mega_fp8_q_fp4_cache: Optional[bool] = None
         if self.use_mega_attention:
             self.wo_b.deepgemm_mxfp8_input = (
@@ -2133,7 +2172,7 @@ class MQALayer(MqaAttentionBase):
         q_out: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if self.use_mega_attention and self._mega_fp8_q_step:
-            q8 = self._wq_b_static_fp8_q(q)
+            q8 = self._wq_b_static_fp8_q(q, prefill=self._mega_fp8_q_prefill_step)
             if q8 is not None:
                 return q8.view(-1, self.n_local_heads, self.head_dim)
         q, _ = self.wq_b(q)
@@ -3102,6 +3141,9 @@ class MQALayer(MqaAttentionBase):
         if self.use_mega_attention:
             kernel_num_heads = 64 if self.n_local_heads <= 64 else 128
             self._mega_fp8_q_step = self._use_mega_fp8_q(forward_batch)
+            self._mega_fp8_q_prefill_step = (
+                self._mega_fp8_q_step and forward_batch.forward_mode == ForwardMode.EXTEND
+            )
         elif (
             self.is_dsv41
             and not self.q_head_norm

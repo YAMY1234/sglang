@@ -199,6 +199,7 @@ class DeepseekV4MegaAttnBackend(DeepseekV4AttnBackend):
         attn_sink: torch.Tensor,
         topk_length: torch.Tensor,
         sf_swizzled_128x4: bool = False,
+        q_head_scale: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         from sglang.kernels.ops.attention import flash_mla_interface
 
@@ -214,6 +215,7 @@ class DeepseekV4MegaAttnBackend(DeepseekV4AttnBackend):
                 topk_length=topk_length[rows],
                 use_legacy=not self._swa_interleaved,
                 out_sf_swizzled_128x4=swizzled,
+                q_head_scale=q_head_scale,
             )
             if swizzled:
                 # [n_wv_group, 128x4-swizzled words]
