@@ -108,7 +108,93 @@ def _combine_lse(part_ptr, req, which: tl.constexpr, NSPLIT: tl.constexpr):
 
 
 @triton.jit
-def _residual_bonus_row_partial_kernel(
+def _residual_weights(
+    logits_ptr,
+    logits_stride,
+    draft_ptr,
+    draft_stride0,
+    draft_stride1,
+    lse_part_ptr,
+    req,
+    row,
+    dc,
+    offs,
+    t,
+    td,
+    residual_row,
+    vocab,
+    width,
+    NSPLIT: tl.constexpr,
+):
+    # (max(p - q, 0), p) over ``offs`` of the stop row, normalised by the row logsumexps.
+    x = tl.load(
+        logits_ptr + row.to(tl.int64) * logits_stride + offs,
+        mask=offs < vocab,
+        other=float("-inf"),
+    ).to(tl.float32)
+    p = tl.exp(x / t - _combine_lse(lse_part_ptr, req, 0, NSPLIT))
+    d = tl.load(
+        draft_ptr + req.to(tl.int64) * draft_stride0 + dc * draft_stride1 + offs,
+        mask=residual_row & (offs < width),
+        other=float("-inf"),
+    ).to(tl.float32)
+    q = tl.exp(d / td - _combine_lse(lse_part_ptr, req, 1, NSPLIT))
+    r = tl.where(residual_row, tl.maximum(p - q, 0.0), p)
+    return r, p, x
+
+
+@triton.jit
+def _residual_mass_kernel(
+    logits_ptr,
+    logits_stride,
+    temperatures_ptr,
+    correct_len_ptr,
+    correct_len_stride,
+    draft_ptr,
+    draft_stride0,
+    draft_stride1,
+    draft_temperatures_ptr,
+    lse_part_ptr,
+    mass_ptr,
+    part_val_ptr,
+    part_idx_ptr,
+    vocab,
+    width,
+    ROWS: tl.constexpr,
+    NSPLIT: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    # Per (request, split): the residual mass and the target mass (inverse-CDF pass 1);
+    # argmax rows (T <= 0) keep the plain per-split argmax for the select.
+    req = tl.program_id(0)
+    split = tl.program_id(1)
+    c = tl.load(correct_len_ptr + req * correct_len_stride)
+    row = req * ROWS + c
+    t_raw = tl.load(temperatures_ptr + req).to(tl.float32)
+    td_raw = tl.load(draft_temperatures_ptr + req).to(tl.float32)
+    t = tl.maximum(t_raw, 1e-5)
+    td = tl.maximum(td_raw, 1e-5)
+    residual_row = (c < ROWS - 1) & (td_raw > 0.0)
+    dc = tl.minimum(c, ROWS - 2)
+    offs = split * BLOCK + tl.arange(0, BLOCK)
+    r, p, x = _residual_weights(
+        logits_ptr, logits_stride, draft_ptr, draft_stride0, draft_stride1,
+        lse_part_ptr, req, row, dc, offs, t, td, residual_row, vocab, width, NSPLIT,
+    )
+    tl.store(mass_ptr + (req * NSPLIT + split) * 2, tl.sum(r, axis=0))
+    tl.store(mass_ptr + (req * NSPLIT + split) * 2 + 1, tl.sum(p, axis=0))
+    if t_raw <= 0.0:
+        v = tl.where(offs < vocab, x, float("-inf"))
+        top = tl.max(v, axis=0)
+        tl.store(part_val_ptr + req * NSPLIT + split, top)
+        tl.store(
+            part_idx_ptr + req * NSPLIT + split,
+            tl.min(tl.where(v == top, offs, vocab), axis=0),
+        )
+
+
+@triton.jit
+def _residual_pick_kernel(
     logits_ptr,
     logits_stride,
     temperatures_ptr,
@@ -120,6 +206,7 @@ def _residual_bonus_row_partial_kernel(
     draft_stride1,
     draft_temperatures_ptr,
     lse_part_ptr,
+    mass_ptr,
     part_val_ptr,
     part_idx_ptr,
     vocab,
@@ -128,44 +215,42 @@ def _residual_bonus_row_partial_kernel(
     NSPLIT: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
-    # Gumbel-max over log(max(p - q, 0)) at a stop row (correct_len < gamma), as a
-    # rejection's resample would draw; the all-accepted row and argmax rows keep the
-    # plain target draw. A zero residual (p == q) falls back to p, ranked below any r > 0.
+    # Inverse-CDF pass 2: one uniform per request picks the split, then the token inside
+    # it. Draws from max(p - q, 0) at a stop row (correct_len < gamma), as a rejection's
+    # resample would, and from p on the all-accepted row or when the residual is empty.
+    # The pick is written as split 0 of the (value, index) partials the select reduces.
     req = tl.program_id(0)
-    split = tl.program_id(1)
-    c = tl.load(correct_len_ptr + req * correct_len_stride)
-    row = req * ROWS + c
-    t = tl.load(temperatures_ptr + req).to(tl.float32)
-    td = tl.load(draft_temperatures_ptr + req).to(tl.float32)
-    offs = split * BLOCK + tl.arange(0, BLOCK)
-    mask = offs < vocab
-    x = tl.load(
-        logits_ptr + row.to(tl.int64) * logits_stride + offs,
-        mask=mask,
-        other=float("-inf"),
-    ).to(tl.float32)
-    seed = tl.load(seed_ptr)
-    u = tl.rand(seed, req * vocab + offs)
-    g = -tl.log(-tl.log(u))
-    ts = tl.maximum(t, 1e-5)
-    plain = x / ts + g
-    residual_row = (c < ROWS - 1) & (td > 0.0) & (t > 0.0)
-    dc = tl.minimum(c, ROWS - 2)
-    d = tl.load(
-        draft_ptr + req.to(tl.int64) * draft_stride0 + dc * draft_stride1 + offs,
-        mask=offs < width,
-        other=float("-inf"),
-    ).to(tl.float32)
-    logp = x / ts - _combine_lse(lse_part_ptr, req, 0, NSPLIT)
-    logq = d / tl.maximum(td, 1e-5) - _combine_lse(lse_part_ptr, req, 1, NSPLIT)
-    r = tl.exp(logp) - tl.exp(logq)
-    resid = tl.where(r > 0.0, tl.log(tl.maximum(r, 1e-38)) + g, logp + g - 1.0e4)
-    v = tl.where(residual_row, resid, plain)
-    v = tl.where(mask, tl.where(t > 0.0, v, x), float("-inf"))
-    top = tl.max(v, axis=0)
-    idx = tl.min(tl.where(v == top, offs, vocab), axis=0)
-    tl.store(part_val_ptr + req * NSPLIT + split, top)
-    tl.store(part_idx_ptr + req * NSPLIT + split, idx)
+    t_raw = tl.load(temperatures_ptr + req).to(tl.float32)
+    if t_raw > 0.0:
+        c = tl.load(correct_len_ptr + req * correct_len_stride)
+        row = req * ROWS + c
+        td_raw = tl.load(draft_temperatures_ptr + req).to(tl.float32)
+        t = tl.maximum(t_raw, 1e-5)
+        td = tl.maximum(td_raw, 1e-5)
+        k = tl.arange(0, NSPLIT)
+        mass_r = tl.load(mass_ptr + (req * NSPLIT + k) * 2)
+        mass_p = tl.load(mass_ptr + (req * NSPLIT + k) * 2 + 1)
+        residual_row = (c < ROWS - 1) & (td_raw > 0.0) & (tl.sum(mass_r, axis=0) > 0.0)
+        mass = tl.where(residual_row, mass_r, mass_p)
+        total = tl.sum(mass, axis=0)
+        u = tl.sum(tl.rand(tl.load(seed_ptr), req + tl.zeros([1], tl.int32)), axis=0)
+        target = u * total
+        cum = tl.cumsum(mass, axis=0)
+        last_split = tl.max(tl.where(mass > 0.0, k, 0), axis=0)
+        pick = tl.minimum(tl.sum((cum <= target).to(tl.int32), axis=0), last_split)
+        rem = target - tl.sum(tl.where(k < pick, mass, 0.0), axis=0)
+        dc = tl.minimum(c, ROWS - 2)
+        offs = pick * BLOCK + tl.arange(0, BLOCK)
+        r, p, x = _residual_weights(
+            logits_ptr, logits_stride, draft_ptr, draft_stride0, draft_stride1,
+            lse_part_ptr, req, row, dc, offs, t, td, residual_row, vocab, width, NSPLIT,
+        )
+        cw = tl.cumsum(r, axis=0)
+        last = tl.max(tl.where(r > 0.0, tl.arange(0, BLOCK), 0), axis=0)
+        idx = tl.minimum(tl.sum((cw <= rem).to(tl.int32), axis=0), last)
+        k1 = tl.arange(0, NSPLIT)
+        tl.store(part_val_ptr + req * NSPLIT + k1, tl.where(k1 == 0, 0.0, float("-inf")))
+        tl.store(part_idx_ptr + req * NSPLIT + k1, tl.where(k1 == 0, pick * BLOCK + idx, 0))
 
 
 @triton.jit
@@ -262,13 +347,29 @@ def simulated_bonus_partials_graph(
             BLOCK=block,
             num_warps=8,
         )
-        _residual_bonus_row_partial_kernel[(bs, nsplit)](
-            target_logits, target_logits.stride(0), temperatures, correct_len,
-            correct_len.stride(0), seed, draft_logits, draft_logits.stride(0),
-            draft_logits.stride(1), draft_temperatures, lse_part, part_val,
-            part_idx, vocab, width, ROWS=rows_per_request, NSPLIT=nsplit,
-            BLOCK=block, num_warps=8,
+        mass = torch.empty((bs, nsplit, 2), dtype=torch.float32, device=device)
+        args = (
+            target_logits,
+            target_logits.stride(0),
+            temperatures,
+            correct_len,
+            correct_len.stride(0),
         )
+        draft_args = (
+            draft_logits,
+            draft_logits.stride(0),
+            draft_logits.stride(1),
+            draft_temperatures,
+            lse_part,
+            mass,
+            part_val,
+            part_idx,
+            vocab,
+            width,
+        )
+        meta = dict(ROWS=rows_per_request, NSPLIT=nsplit, BLOCK=block, num_warps=8)
+        _residual_mass_kernel[(bs, nsplit)](*args, *draft_args, **meta)
+        _residual_pick_kernel[(bs,)](*args, seed, *draft_args, **meta)
         return part_val, part_idx
     _simulated_bonus_row_partial_kernel[(bs, nsplit)](
         target_logits,

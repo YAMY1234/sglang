@@ -131,27 +131,27 @@ class TestResidualSimulatedBonus(unittest.TestCase):
         out = _residual_draw(target, draft, correct_len, rows, 1.0, 1.0, seed=9)
         self.assertTrue(torch.all(out == 5))
 
-    def test_all_accepted_row_keeps_plain_draw(self):
+    def test_all_accepted_row_draws_from_target(self):
         torch.manual_seed(4)
-        vocab, rows, bs = 1000, 4, 64
+        vocab, rows, n = 16, 4, 200_000
+        base_t = torch.randn(vocab, device="cuda")
+        target = base_t.repeat(n * rows, 1)
+        draft = torch.randn(vocab, device="cuda").repeat(n, rows - 1, 1)
+        correct_len = torch.full((n,), rows - 1, dtype=torch.int64, device="cuda")
+        out = _residual_draw(target, draft, correct_len, rows, 0.8, 0.8, seed=7)
+        freq = torch.bincount(out, minlength=vocab).float() / n
+        want = torch.softmax(base_t / 0.8, -1)
+        self.assertLess((freq - want).abs().max().item(), 5e-3)
+
+    def test_argmax_rows_keep_argmax(self):
+        torch.manual_seed(8)
+        vocab, rows, bs = 1000, 4, 32
         target = torch.randn(bs * rows, vocab, device="cuda")
         draft = torch.randn(bs, rows - 1, vocab, device="cuda")
-        correct_len = torch.full((bs,), rows - 1, dtype=torch.int64, device="cuda")
-        args = dict(
-            target_logits=target,
-            correct_len=correct_len,
-            temperatures=torch.full((bs,), 0.8, device="cuda"),
-            seed=torch.full((1,), 7, dtype=torch.int32, device="cuda"),
-            bs=bs,
-            rows_per_request=rows,
-        )
-        plain = simulated_bonus_sample_graph(**args)
-        resid = simulated_bonus_sample_graph(
-            **args,
-            draft_logits=draft,
-            draft_temperatures=torch.full((bs,), 0.8, device="cuda"),
-        )
-        self.assertTrue(torch.equal(plain, resid))
+        correct_len = torch.randint(0, rows, (bs,), device="cuda")
+        out = _residual_draw(target, draft, correct_len, rows, 0.0, 1.0, seed=3)
+        ref = target.view(bs, rows, vocab).argmax(-1)[torch.arange(bs), correct_len]
+        self.assertTrue(torch.equal(out, ref))
 
     def test_narrow_draft_vocab_and_graph_capture(self):
         torch.manual_seed(6)
