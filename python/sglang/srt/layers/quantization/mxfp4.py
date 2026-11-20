@@ -17,6 +17,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 from dataclasses import fields, replace
 from functools import lru_cache
@@ -64,6 +65,7 @@ from sglang.srt.utils import (
 from sglang.srt.utils.common import get_bool_env_var
 from sglang.srt.utils.custom_op import register_custom_op
 
+logger = logging.getLogger(__name__)
 has_triton_kernels = is_triton_kernels_available()
 
 # Serialized MXFP4 scales use raw UE8M0 bytes. Keep fresh parameters valid for
@@ -787,12 +789,31 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                     (layer.w2_weight.data, layer.w2_weight_scale.data),
                     mma_type=mma_type,
                 )
+                from sglang.srt.layers.moe.mega_moe import (
+                    _is_mega_moe_localization_enabled,
+                    localize_mega_moe_weights,
+                )
+
+                localized = (
+                    mma_type == "fp8xfp4" and _is_mega_moe_localization_enabled()
+                )
+                if localized:
+                    l1_pair, l2_pair = localize_mega_moe_weights(l1_pair, l2_pair)
                 layer.mega_l1_weights = l1_pair
                 layer.mega_l2_weights = l2_pair
-                layer.w13_weight.data = l1_pair[0]
+                # Localized weights are (domains, experts, ...): the params keep an
+                # expert-major view of the same memory and the plain copies are freed.
+                layer.w13_weight.data = (
+                    l1_pair[0].transpose(0, 1) if localized else l1_pair[0]
+                )
                 layer.w13_weight_scale.data = l1_pair[1]
-                layer.w2_weight.data = l2_pair[0]
+                layer.w2_weight.data = (
+                    l2_pair[0].transpose(0, 1) if localized else l2_pair[0]
+                )
                 layer.w2_weight_scale.data = l2_pair[1]
+                layer._mega_moe_weights_localized = localized
+                if localized:
+                    torch.cuda.empty_cache()
                 layer._mega_moe_weights_built = True
             layer._mxfp4_backend = "deep_gemm"
             return
@@ -869,6 +890,21 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             w2_weight = layer.w2_weight.data
             w13_bias = layer.w13_weight_bias.data.to(torch.float32)
             w2_bias = layer.w2_weight_bias.data.to(torch.float32)
+
+            if (
+                self._fi_kernel == "trtllm_sm100"
+                and envs.SGLANG_K31_PREFILL_MOE_CUTE_FC1.get()
+            ):
+                self._process_weights_for_cute_prefill_moe(
+                    layer,
+                    w13_weight=w13_weight,
+                    w13_weight_scale=w13_weight_scale,
+                    w2_weight=w2_weight,
+                    w2_weight_scale=w2_weight_scale,
+                    beta=_alpha,
+                    lbeta=_limit,
+                )
+                return
 
             # Swap w1 and w3 as the definition of
             # swiglu is different in the trtllm-gen
@@ -1205,6 +1241,29 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             layer.w13_weight = Parameter(w13_weight.data, requires_grad=False)
             layer.w2_weight = Parameter(w2_weight.data, requires_grad=False)
         torch.cuda.empty_cache()
+
+    def _process_weights_for_cute_prefill_moe(
+        self, layer, *, w13_weight, w13_weight_scale, w2_weight, w2_weight_scale, beta, lbeta
+    ):
+        from sglang.srt.layers.moe.moe_runner.cute_prefill_moe import runner as cute_moe
+
+        # The FC1 reorder takes gate rows [0, I) and up rows [I, 2I) (K3 Latent MoE).
+        if getattr(layer.moe_runner_config, "gate_up_interleaved", True):
+            raise NotImplementedError(
+                "SGLANG_K31_PREFILL_MOE_CUTE_FC1 needs non-interleaved gate/up rows"
+            )
+        weights = cute_moe.prepare_weights(
+            w13_weight, w13_weight_scale, w2_weight, w2_weight_scale, beta=beta, lbeta=lbeta
+        )
+        # One copy per layer: the params now hold this path's layout (no trtllm-gen layout is built).
+        layer.w13_weight = Parameter(weights.w13, requires_grad=False)
+        layer.w13_weight_scale = Parameter(weights.s13, requires_grad=False)
+        layer.w2_weight = Parameter(weights.w2, requires_grad=False)
+        layer.w2_weight_scale = Parameter(weights.s2, requires_grad=False)
+        layer.cute_prefill_moe = weights
+        logger.info(
+            "SGLANG_K31_PREFILL_MOE_CUTE_FC1: MoE layer %d weights in the CuTe prefill layout", layer.layer_id
+        )
 
     def _process_weights_for_sm90_cutlass(self, layer):
         """De-interleave + pad + halving-swap + byte-interleave MXFP4 weights
@@ -1628,6 +1687,12 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
 
         routing_bias = layer._situ_routing_bias_bf16
         topk_output = dispatch_output.topk_output
+        if TopKOutputChecker.format_is_standard(topk_output):
+            from sglang.srt.layers.moe import expert_count_log
+
+            expert_count_log.maybe_record(
+                layer.layer_id, topk_output.topk_ids, layer.num_experts
+            )
         if (
             self.moe_runner_config.activation == "situ"
             and routing_bias is None
@@ -1655,6 +1720,11 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             hidden_size=self.hidden_size,
             flashinfer_mxfp4_moe_precision=self.flashinfer_mxfp4_moe_precision,
             routing_bias=routing_bias,
+            cute_prefill_moe=(
+                layer.cute_prefill_moe
+                if envs.SGLANG_K31_PREFILL_MOE_CUTE_FC1.get()
+                else None
+            ),
         )
         return self.runner.run(dispatch_output, quant_info)
 

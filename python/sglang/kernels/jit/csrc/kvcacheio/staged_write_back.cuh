@@ -183,10 +183,86 @@ inline bool try_copy_page_first_pages_batch(
 #endif
 }
 
+// Same bytes as copy_page_first_pages_fallback, but pages whose source and destination are both adjacent are
+// merged into one range and all ranges go out as one cudaMemcpyBatchAsync, whatever the page size.
+inline void copy_page_first_pages_coalesced(
+    const std::vector<tvm::ffi::TensorView>& src_ptrs,
+    std::vector<tvm::ffi::TensorView> dst_ptrs,
+    const int64_t* dst_indices_ptr,
+    int64_t num_pages,
+    int64_t page_size,
+    int device_id,
+    cudaStream_t stream) {
+  using namespace host;
+
+  RuntimeCheck(src_ptrs.size() == dst_ptrs.size(), "Source and destination tensors must have the same count");
+  std::vector<char*> srcs;
+  std::vector<char*> dsts;
+  std::vector<size_t> sizes;
+  for (const auto tensor_id : irange(src_ptrs.size())) {
+    RuntimeCheck(
+        src_ptrs[tensor_id].dtype() == dst_ptrs[tensor_id].dtype(),
+        "Source and destination tensors must have the same dtype");
+    const int64_t elem_size = host::dtype_bytes(src_ptrs[tensor_id].dtype());
+    const int64_t src_stride0 = src_ptrs[tensor_id].stride(0);
+    const int64_t dst_stride0 = dst_ptrs[tensor_id].stride(0);
+    const size_t src_page_bytes = static_cast<size_t>(page_size * src_stride0 * elem_size);
+    const size_t dst_page_bytes = static_cast<size_t>(page_size * dst_stride0 * elem_size);
+    RuntimeCheck(src_page_bytes == dst_page_bytes, "Source and destination page spans must match");
+    const size_t first = sizes.size();
+    for (const auto page_offset : irange(num_pages)) {
+      char* src_ptr = static_cast<char*>(src_ptrs[tensor_id].data_ptr()) +
+                      static_cast<size_t>(page_offset * page_size * src_stride0 * elem_size);
+      char* dst_ptr = static_cast<char*>(dst_ptrs[tensor_id].data_ptr()) +
+                      static_cast<size_t>(dst_indices_ptr[page_offset * page_size] * dst_stride0 * elem_size);
+      if (sizes.size() > first && srcs.back() + sizes.back() == src_ptr && dsts.back() + sizes.back() == dst_ptr) {
+        sizes.back() += src_page_bytes;
+      } else {
+        srcs.push_back(src_ptr);
+        dsts.push_back(dst_ptr);
+        sizes.push_back(src_page_bytes);
+      }
+    }
+  }
+  if (sizes.empty()) {
+    return;
+  }
+
+#if !defined(USE_ROCM) && defined(CUDA_VERSION) && CUDA_VERSION >= 12080
+  int driver_version = 0;
+  auto copy_fn = get_cuda_memcpy_batch_async();
+  if (cudaDriverGetVersion(&driver_version) == cudaSuccess && driver_version >= 12080 && copy_fn != nullptr) {
+    std::vector<CudaMemcpyBatchPtr> batch_srcs(srcs.begin(), srcs.end());
+    std::vector<CudaMemcpyBatchPtr> batch_dsts(dsts.begin(), dsts.end());
+    size_t attrs_idx = 0;
+    cudaMemcpyAttributes attrs{};
+    attrs.srcAccessOrder = cudaMemcpySrcAccessOrderStream;
+    attrs.srcLocHint.type = cudaMemLocationTypeDevice;
+    attrs.srcLocHint.id = device_id;
+    attrs.dstLocHint.type = cudaMemLocationTypeHost;
+    attrs.dstLocHint.id = 0;
+    attrs.flags = 0;
+    const cudaError_t err = call_cuda_memcpy_batch_async(
+        copy_fn, batch_dsts.data(), batch_srcs.data(), sizes.data(), sizes.size(), &attrs, &attrs_idx, 1, stream);
+    if (err == cudaSuccess) {
+      return;
+    }
+    RuntimeCheck(
+        err == cudaErrorNotSupported || err == cudaErrorCallRequiresNewerDriver || err == cudaErrorInvalidValue,
+        "cudaMemcpyBatchAsync failed. error=",
+        cudaGetErrorString(err));
+    (void)cudaGetLastError();
+  }
+#endif
+  for (const auto i : irange(sizes.size())) {
+    RuntimeDeviceCheck(cudaMemcpyAsync(dsts[i], srcs[i], sizes[i], cudaMemcpyDeviceToHost, stream));
+  }
+}
+
 template <int64_t kElementSize, uint32_t kUnroll, uint32_t kBlockQuota, uint32_t kBlockSize>
 struct HiCacheStagedWriteBackKernel {
  private:
-  template <bool kIsMLA>
+  template <bool kIsMLA, bool kCoalesced = false>
   static void run_staged_impl(
       const tvm::ffi::TensorView k_cache_dst,
       const tvm::ffi::TensorView v_cache_dst,
@@ -270,7 +346,21 @@ struct HiCacheStagedWriteBackKernel {
 
     auto stream = LaunchKernel::resolve_device(device);
     const int64_t* dst_indices_ptr = static_cast<const int64_t*>(dst_indices_cpu.data_ptr());
-    if constexpr (kIsMLA) {
+    if constexpr (kCoalesced) {
+      if constexpr (kIsMLA) {
+        copy_page_first_pages_coalesced(
+            {staging_k}, {k_cache_dst}, dst_indices_ptr, P.unwrap(), page_size, device.device_id, stream);
+      } else {
+        copy_page_first_pages_coalesced(
+            {staging_k, staging_v},
+            {k_cache_dst, v_cache_dst},
+            dst_indices_ptr,
+            P.unwrap(),
+            page_size,
+            device.device_id,
+            stream);
+      }
+    } else if constexpr (kIsMLA) {
       if (!try_copy_page_first_pages_batch(
               {staging_k}, {k_cache_dst}, dst_indices_ptr, P.unwrap(), page_size, device.device_id, stream)) {
         copy_page_first_pages_fallback({staging_k}, {k_cache_dst}, dst_indices_ptr, P.unwrap(), page_size, stream);
@@ -321,6 +411,39 @@ struct HiCacheStagedWriteBackKernel {
       const tvm::ffi::TensorView ptr_src,
       const int64_t page_size) {
     run_staged_impl<true>(
+        cache_dst, cache_dst, dst_indices_cpu, staging, staging, page_indices_src, ptr_src, ptr_src, page_size);
+  }
+
+  static void run_all_lf_pf_staged_coalesced(
+      const tvm::ffi::TensorView k_cache_dst,
+      const tvm::ffi::TensorView v_cache_dst,
+      const tvm::ffi::TensorView dst_indices_cpu,
+      const tvm::ffi::TensorView staging_k,
+      const tvm::ffi::TensorView staging_v,
+      const tvm::ffi::TensorView page_indices_src,
+      const tvm::ffi::TensorView k_ptr_src,
+      const tvm::ffi::TensorView v_ptr_src,
+      const int64_t page_size) {
+    run_staged_impl<false, true>(
+        k_cache_dst,
+        v_cache_dst,
+        dst_indices_cpu,
+        staging_k,
+        staging_v,
+        page_indices_src,
+        k_ptr_src,
+        v_ptr_src,
+        page_size);
+  }
+
+  static void run_all_mla_lf_pf_staged_coalesced(
+      const tvm::ffi::TensorView cache_dst,
+      const tvm::ffi::TensorView dst_indices_cpu,
+      const tvm::ffi::TensorView staging,
+      const tvm::ffi::TensorView page_indices_src,
+      const tvm::ffi::TensorView ptr_src,
+      const int64_t page_size) {
+    run_staged_impl<true, true>(
         cache_dst, cache_dst, dst_indices_cpu, staging, staging, page_indices_src, ptr_src, ptr_src, page_size);
   }
 };

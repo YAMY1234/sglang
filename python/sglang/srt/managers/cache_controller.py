@@ -23,6 +23,8 @@ from typing import TYPE_CHECKING, Any, Callable, List, NamedTuple, Optional
 
 import torch
 
+from sglang.srt.environ import envs
+from sglang.srt.mem_cache import pmicro_hoststats
 from sglang.srt.mem_cache.hicache_storage import (
     STORAGE_BATCH_SIZE,
     HiCacheStorageConfig,
@@ -247,6 +249,7 @@ class StorageOperation:
         self.all_hash_values: Optional[List[str]] = None
         # Prefetch-outcome accounting, set at enqueue by the tree cache.
         self.stats_requested_tokens = 0
+        self.stats_tree_kv_tokens = 0
         # Absolute token offset at which this storage-prefetched span starts.
         self.storage_start = 0
 
@@ -330,7 +333,36 @@ def check_dcp_l3_extra_pool(entry: Any, anchor: Any) -> None:
     )
 
 
+class StoragePutPacer:
+    """Caps the average L3 put bandwidth of one backup thread.
+
+    Each put batch is booked on a virtual clock that never runs behind real
+    time, so idle time earns no burst credit; the thread sleeps (GIL released)
+    until the clock catches up. Under write-on-host-evict a host page is freed
+    only after its L3 write, so pacing also delays host eviction and can raise
+    host pressure (and stall layout changes waiting on a hybrid layout lease).
+    """
+
+    def __init__(self, max_gbps: float, clock=time.perf_counter, sleep=time.sleep):
+        self.bytes_per_s = max_gbps * 1e9
+        self.clock = clock
+        self.sleep = sleep
+        self.next_free = 0.0
+
+    def pace(self, t_start: float, nbytes: int) -> float:
+        """Book ``nbytes`` of a put that started at ``t_start``; sleep and
+        return the delay that keeps the rate under the cap."""
+        self.next_free = max(self.next_free, t_start) + nbytes / self.bytes_per_s
+        delay = self.next_free - self.clock()
+        if delay > 0:
+            self.sleep(delay)
+        return delay
+
+
 class HiCacheController:
+    # Set from SGLANG_HICACHE_STORAGE_PUT_MAX_GBPS; None leaves puts unpaced.
+    _storage_put_pacer: Optional[StoragePutPacer] = None
+
     def __init__(
         self,
         token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
@@ -352,6 +384,9 @@ class HiCacheController:
     ):
         self.tp_group = tp_group
         self.host_memory_mode = host_memory_mode
+        put_max_gbps = envs.SGLANG_HICACHE_STORAGE_PUT_MAX_GBPS.get()
+        if put_max_gbps > 0:
+            self._storage_put_pacer = StoragePutPacer(put_max_gbps)
         self.attn_cp_group = attn_cp_group
         self.attn_tp_group = attn_tp_group
         self.pp_group = pp_group
@@ -412,7 +447,15 @@ class HiCacheController:
         # write D2H behind in-flight forwards (see start_loading, start_writing).
         self.load_fence_stream = None
         self.write_fence_stream = None
+        # Write-back eviction fences (record_forward_start, record_war_barrier).
+        self.forward_start_event: Optional[device_module.Event] = None
+        self.war_barrier_event: Optional[device_module.Event] = None
+        self.war_barrier_seq = 0
+        # True while the schedule stream waits on the latest launched forward.
+        self.war_barrier_after_forward = False
         self.ack_write_queue: List[HiCacheAck] = []
+        # Device write-ahead copies (SGLANG_HICACHE_DEVICE_WRITE_AHEAD): eviction never waits on them.
+        self.ack_write_ahead_queue: List[HiCacheAck] = []
 
         self.l2_transfer_engine = L2TransferEngine(io_backend)
 
@@ -683,6 +726,7 @@ class HiCacheController:
                     "npu_memcache",
                     "eic",
                     "nixl",
+                    "nixl_dram",
                     "simm",
                     "mori",
                     "tensorcast",
@@ -849,6 +893,7 @@ class HiCacheController:
         self.write_queue.clear()
         self.load_queue.clear()
         self.ack_write_queue.clear()
+        self.ack_write_ahead_queue.clear()
         self.ack_load_queue.clear()
         if self.enable_storage:
             self.prefetch_queue.queue.clear()
@@ -887,6 +932,7 @@ class HiCacheController:
             self.write_queue
             or self.load_queue
             or self.ack_write_queue
+            or self.ack_write_ahead_queue
             or self.ack_load_queue
         )
 
@@ -911,32 +957,66 @@ class HiCacheController:
         self.start_writing()
         return host_indices
 
-    def start_writing(self) -> None:
+    def record_forward_start(self, event: device_module.Event) -> None:
+        """Take the event recorded on the forward stream before a forward's
+        kernels: it covers earlier forwards and the scheduler work the forward
+        waited on, but not the forward itself."""
+        self.forward_start_event = event
+        self.war_barrier_after_forward = False
+
+    def record_war_barrier(self, event: device_module.Event) -> None:
+        """Take the event recorded on the schedule stream just before it waits
+        on the in-flight forward (the WAR barrier)."""
+        self.war_barrier_event = event
+        self.war_barrier_seq += 1
+        self.war_barrier_after_forward = self.forward_start_event is not None
+
+    def start_writing(
+        self,
+        fence_event: Optional[device_module.Event] = None,
+        ack_queue: Optional[List[HiCacheAck]] = None,
+        stream=None,
+    ) -> None:
+        """Submit the queued D2H writes behind the forward stream, or only behind
+        ``fence_event``. Pass the event only if no forward launched after it can
+        still write the queued sources. The ack goes to ``ack_queue`` (default
+        ``ack_write_queue``), the copy to ``stream`` (default the engine's D2H stream)."""
         if len(self.write_queue) == 0:
             return
+        if ack_queue is None:
+            ack_queue = self.ack_write_queue
+        d2h_stream = (
+            self.l2_transfer_engine.device_to_host_stream if stream is None else stream
+        )
 
+        t0 = time.perf_counter() if pmicro_hoststats.ON else 0.0
         op = CacheOperation.merge_ops(self.write_queue)
+        if pmicro_hoststats.ON:
+            pmicro_hoststats.count_d2h(op.host_indices, self.page_size)
         host_indices, device_indices, pool_transfers = self._move_write_operation(op)
         self.write_queue.clear()
 
-        if self.write_fence_stream is not None:
+        if fence_event is not None:
+            d2h_stream.wait_event(fence_event)
+        elif self.write_fence_stream is not None:
             # The copy may read KV a forward is still writing: under overlap
             # scheduling a finished request is cached while the next forward
             # writes its last token, and an evicted SWA page can belong to an
             # unfinished checkpoint. Later forwards still overlap with the copy.
-            self.l2_transfer_engine.device_to_host_stream.wait_stream(
-                self.write_fence_stream
-            )
+            d2h_stream.wait_stream(self.write_fence_stream)
 
-        completion = self.l2_transfer_engine.submit_device_to_host(
-            self._l2_transfers(host_indices, device_indices, pool_transfers)
+        transfers = self._l2_transfers(host_indices, device_indices, pool_transfers)
+        completion = (
+            self.l2_transfer_engine.submit_device_to_host(transfers)
+            if stream is None
+            else self.l2_transfer_engine.submit_device_to_host(transfers, stream=stream)
         )
 
         self.mem_pool_device_allocator.set_hicache_transfer_done_event(
             (id(self), "write"), completion.finish_event
         )
 
-        self.ack_write_queue.append(
+        ack_queue.append(
             HiCacheAck(
                 start_event=completion.start_event,
                 finish_event=completion.finish_event,
@@ -947,6 +1027,17 @@ class HiCacheController:
                 num_bytes=self._transfer_num_bytes(op),
             )
         )
+        if pmicro_hoststats.ON:
+            ack = ack_queue[-1]
+            pmicro_hoststats.OPS[
+                "backup_launch" if ack_queue is self.ack_write_queue else "write_ahead_launch"
+            ].add(
+                time.perf_counter() - t0, ack.num_tokens, ack.num_bytes
+            )
+            if ack.timing_enabled:
+                pmicro_hoststats.note_d2h(
+                    ack.start_event, ack.finish_event, ack.num_bytes
+                )
 
     def _transfer_num_bytes(self, op: CacheOperation) -> int:
         return len(op.device_indices) * self.mem_pool_host.size_per_token
@@ -971,13 +1062,40 @@ class HiCacheController:
         )
         return device_indices
 
+    def _pinned_indices_to_device(self, host_indices: torch.Tensor) -> torch.Tensor:
+        """Pageable host indices uploaded asynchronously through a pinned buffer of their own: a buffer goes back to
+        the free list once its copy's event has completed (polled, never waited on), and the pool grows when every
+        buffer is still in flight (a load uploads one index set per pool)."""
+        pool = self.__dict__.setdefault("_index_pin_pool", {"free": [], "busy": []})
+        busy, pool["busy"] = pool["busy"], []
+        for buf, event in busy:
+            (pool["free"].append(buf) if event.query() else pool["busy"].append((buf, event)))
+        n = host_indices.numel()
+        fit = [i for i, b in enumerate(pool["free"]) if b.numel() >= n and b.dtype == host_indices.dtype]
+        if fit:
+            buf = pool["free"].pop(fit[0])
+        else:
+            buf = torch.empty(max(n, 1 << 16), dtype=host_indices.dtype, pin_memory=True)
+        buf[:n].copy_(host_indices.reshape(-1))
+        out = buf[:n].to(self.device, non_blocking=True).view(host_indices.shape)
+        event = device_module.Event()
+        event.record()
+        pool["busy"].append((buf, event))
+        return out
+
     def move_indices(
         self, host_indices: torch.Tensor, device_indices: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # move indices to GPU if using kernels, to host if using direct indexing
         if self.io_backend == "kernel":
             if not host_indices.is_cuda:
-                host_indices = host_indices.to(self.device, non_blocking=True)
+                # loads only: their transfer waits on start_event, recorded on this stream after the upload; a write
+                # fenced on fence_event does not wait on this stream
+                if (envs.SGLANG_HICACHE_PIN_LOAD_INDICES.get() and getattr(self, "_index_pin_load", False)
+                        and not host_indices.is_pinned()):
+                    host_indices = self._pinned_indices_to_device(host_indices)
+                else:
+                    host_indices = host_indices.to(self.device, non_blocking=True)
             return host_indices, device_indices
         elif self.io_backend == "direct":
             if self.mem_pool_host.layout == "layer_first":
@@ -1060,7 +1178,11 @@ class HiCacheController:
 
         producer_id = self.layer_done_counter.update_producer()
         op = CacheOperation.merge_ops(self.load_queue)
-        host_indices, device_indices, pool_transfers = self._move_op_indices(op)
+        self._index_pin_load = True
+        try:
+            host_indices, device_indices, pool_transfers = self._move_op_indices(op)
+        finally:
+            self._index_pin_load = False
         self.load_queue.clear()
         producer_event = self.layer_done_counter.events[producer_id]
         producer_event.start_event.record()
@@ -1441,6 +1563,21 @@ class HiCacheController:
             self.storage_backend.batch_set_v1(hash_values, host_indices, extra_info)
         )
 
+    def _storage_put_begin(self) -> Optional[float]:
+        """Start time of one L3 put batch if it is timed or paced, else None."""
+        if not pmicro_hoststats.ON and self._storage_put_pacer is None:
+            return None
+        t0 = time.perf_counter()
+        if pmicro_hoststats.ON:
+            pmicro_hoststats.note_put_begin(t0)
+        return t0
+
+    def _storage_put_end(self, t0: float, nbytes: int) -> None:
+        if pmicro_hoststats.ON:
+            pmicro_hoststats.note_put(t0, time.perf_counter(), nbytes)
+        if self._storage_put_pacer is not None:
+            self._storage_put_pacer.pace(t0, nbytes)
+
     # Backup batch by batch
     def _page_backup(self, operation):
         # Backup batch by batch
@@ -1453,7 +1590,15 @@ class HiCacheController:
             # Set one batch token, and record if success.
             # todo: allow partial success
             extra_info = HiCacheStorageExtraInfo(prefix_keys=prefix_keys)
+            t0 = self._storage_put_begin()
             success = self.page_set_func(batch_hashes, batch_host_indices, extra_info)
+            if t0 is not None:
+                self._storage_put_end(
+                    t0,
+                    len(batch_hashes)
+                    * self.page_size
+                    * self.storage_host_pool.size_per_token,
+                )
             if not success:
                 logger.warning(
                     f"Write page to storage: {len(batch_hashes)} pages failed."
