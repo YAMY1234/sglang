@@ -367,7 +367,7 @@ def kda_decode_mtp_kernel(
     r_w4 = cute.make_rmem_tensor(
         cute.make_layout((KERNEL_WIDTH,), stride=(1,)), cutlass.Float32
     )
-    if cutlass.const_expr(STREAM_STATE or ASYNC_P1):
+    if cutlass.const_expr(STREAM_STATE):
         r_v4q = cute.make_rmem_tensor(
             cute.make_layout((4,), stride=(1,)), cutlass.Float32
         )
@@ -1031,15 +1031,16 @@ def kda_decode_mtp_kernel(
                 r_beta_val = sBeta[i_t]
                 if cutlass.const_expr(ASYNC_P1):
                     # Lane-major sQ/sK/sG: a lane's P2_VEC channels are
-                    # contiguous, so each loads as P2_VEC // 4 128-bit vectors.
+                    # contiguous, so each loads as P2_VEC // 4 128-bit vectors
+                    # straight into the operand registers (no staging).
                     for jv in range(P2_VEC // 4):
-                        cute.autovec_copy(sQ[(i_t, k_grp, jv, None)], r_v4q)
-                        cute.autovec_copy(sK[(i_t, k_grp, jv, None)], r_v4k)
-                        cute.autovec_copy(sG[(i_t, k_grp, jv, None)], r_v4g)
-                        for c in range(4):
-                            r_q[jv * 4 + c] = r_v4q[c]
-                            r_k[jv * 4 + c] = r_v4k[c]
-                            r_decay[jv * 4 + c] = r_v4g[c]
+                        for src, dst in ((sQ, r_q), (sK, r_k), (sG, r_decay)):
+                            cute.autovec_copy(
+                                src[(i_t, k_grp, jv, None)],
+                                cute.make_tensor(
+                                    dst.iterator + jv * 4, cute.make_layout((4,))
+                                ),
+                            )
                 else:
                     # Read once per token, and the resident state already claims
                     # every spare register, so don't pay for vector staging.
@@ -1293,7 +1294,16 @@ def _run_kda_decode_mtp_dspark(
         smem=smem_bytes,
         stream=stream,
         use_pdl=True,
+        **_launch_bounds(ASYNC_P1, BLOCK_THREADS),
     )
+
+
+def _launch_bounds(async_p1: bool, block_threads: int) -> dict:
+    """ASYNC_P1 keeps the two-blocks-per-SM residency of the narrow block (<= 128 registers)."""
+    if not async_p1:
+        return {}
+    blocks = 2 if block_threads == BLOCK_THREADS_NARROW else 1
+    return dict(max_number_threads=(block_threads, 1, 1), min_blocks_per_mp=blocks)
 
 
 def _async_p1_enabled() -> bool:
