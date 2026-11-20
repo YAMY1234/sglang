@@ -389,6 +389,7 @@ from sglang.srt.utils.weight_versions import (
 from sglang.srt.mem_cache.unified_cache.pp_linker_relay import (
     PPLinkerActions,
     PPLinkerOffloadCounts,
+    split_after_loads,
 )
 from sglang.srt.mem_cache.unified_cache.unified_cache_linker import LinkerAdmissionVerdicts
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
@@ -2438,9 +2439,16 @@ class Scheduler(
         if linker_actions:
             work = getattr(self.tree_cache, "ring_wait_work", None)
             if work is not None and envs.SGLANG_LINKER_PP_DEFER_ACTIONS.get():
-                # Every stage applies them in its ring-output wait, before this
-                # round's result (SGLANG_PP_RING_WAIT_WORK), instead of before admission.
-                work.append(lambda: self.tree_cache.linker_apply_actions(linker_actions))
+                # Every stage applies the loads now (their private slots must come before
+                # admission's) and the rest in its ring-output wait, before this round's
+                # result (SGLANG_PP_RING_WAIT_WORK).
+                now, later = split_after_loads(linker_actions)
+                if now:
+                    self.tree_cache.linker_apply_actions([PPLinkerActions(now)])
+                if later:
+                    work.append(
+                        lambda: self.tree_cache.linker_apply_actions([PPLinkerActions(later)])
+                    )
             else:
                 self.tree_cache.linker_apply_actions(linker_actions)
         return [*recv_reqs, *verdicts, *linker_actions]

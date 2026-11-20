@@ -174,22 +174,43 @@ class TestLinkerVerdictsRideTheRequestRelay(unittest.TestCase):
         self.assertEqual(forwarded, ["req", actions])
 
     def test_deferred_actions_wait_for_the_ring_wait_and_still_ride_on(self):
-        # SGLANG_LINKER_PP_DEFER_ACTIONS: the stage forwards them as before but
-        # applies them from the ring-wait queue, after this round's requests.
+        # SGLANG_LINKER_PP_DEFER_ACTIONS: the stage forwards them as before, applies
+        # the loads (private slots, ahead of admission) after this round's requests,
+        # and the rest from the ring-wait queue.
         from collections import deque
 
         from sglang.srt.environ import envs
+        from sglang.srt.mem_cache.unified_cache.pp_linker_relay import PPLinkerActions
 
         work = deque()
-        s, actions = self._actions_scheduler(work)
+        s, load = self._actions_scheduler(work)
+        rest = PPLinkerActions(actions=[("e", 2, "g", 1, "finish", True), ("e", 3, "f", 2, "stop", None)])
+        s.request_receiver.recv_requests.side_effect = lambda local_reqs: ["req", load, rest]
         with envs.SGLANG_LINKER_PP_DEFER_ACTIONS.override(True):
             forwarded = self._ingest(s, pp_rank=3)
-        s.tree_cache.linker_apply_actions.assert_not_called()
         s.process_input_requests.assert_called_once_with(["req"])
-        self.assertEqual(forwarded, ["req", actions])
+        s.tree_cache.linker_apply_actions.assert_called_once_with([load])
+        self.assertEqual(forwarded, ["req", load, rest])
         self.assertEqual(len(work), 1)
         work.popleft()()
-        s.tree_cache.linker_apply_actions.assert_called_once_with([actions])
+        s.tree_cache.linker_apply_actions.assert_called_with([rest])
+        self.assertEqual(s.tree_cache.linker_apply_actions.call_count, 2)
+
+    def test_deferred_actions_without_loads_all_wait(self):
+        from collections import deque
+
+        from sglang.srt.environ import envs
+        from sglang.srt.mem_cache.unified_cache.pp_linker_relay import PPLinkerActions
+
+        work = deque()
+        s, _ = self._actions_scheduler(work)
+        rest = PPLinkerActions(actions=[("e", 1, "g", 1, "finish", False)])
+        s.request_receiver.recv_requests.side_effect = lambda local_reqs: ["req", rest]
+        with envs.SGLANG_LINKER_PP_DEFER_ACTIONS.override(True):
+            self._ingest(s, pp_rank=3)
+        s.tree_cache.linker_apply_actions.assert_not_called()
+        work.popleft()()
+        s.tree_cache.linker_apply_actions.assert_called_once_with([rest])
 
     def test_a_later_stage_applies_and_forwards_without_processing_them(self):
         from sglang.srt.mem_cache.unified_cache.unified_cache_linker import (

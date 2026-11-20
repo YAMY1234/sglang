@@ -35,6 +35,15 @@ class PPLinkerActions:
     actions: list = field(default_factory=list)
 
 
+def split_after_loads(batches) -> tuple[list, list]:
+    """SGLANG_LINKER_PP_DEFER_ACTIONS: the relayed actions through the last load,
+    which takes private device slots and so applies before admission, and the rest,
+    which can wait for the ring-output wait."""
+    flat = [action for batch in batches for action in batch.actions]
+    cut = max((i + 1 for i, action in enumerate(flat) if action[4] == "load"), default=0)
+    return flat[:cut], flat[cut:]
+
+
 @dataclass
 class PPLinkerOffloadCounts:
     """PP0's linker offload commits of one loop iteration, appended to the request
@@ -82,6 +91,9 @@ class PPLinkerRelay:
         # in flight never hold an offload commit back.
         self.offload_serial = self.offload_issued = 0
         self.commit_window = max(1, envs.SGLANG_LINKER_PP_OFFLOAD_COMMIT_WINDOW.get())
+        # PP0 relays each round's loads first, so stages that defer the rest keep
+        # most of it out of the admission path (split_after_loads).
+        self.loads_first = envs.SGLANG_LINKER_PP_DEFER_ACTIONS.get()
         # PP0 commit-lag stats (SGLANG_EXTERNAL_LINKER_LOOKUP_STATS).
         self._decide_step = 0
         self._covered = 0
@@ -190,6 +202,12 @@ class PPLinkerRelay:
         if not self.outbox:
             return None
         actions, self.outbox = self.outbox, []
+        if self.loads_first:
+            # Ops on different requests commute; a request's stop ahead of its own
+            # load meets a zero-page load, which ends it the same. Serials stay consecutive.
+            first = actions[0][1]
+            ordered = sorted(actions, key=lambda action: action[4] != "load")
+            actions = [(e, first + i, h, c, op, v) for i, (e, _, h, c, op, v) in enumerate(ordered)]
         return PPLinkerActions(actions)
 
     def _issue(self, handle, entry, op, value):
