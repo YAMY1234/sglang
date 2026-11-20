@@ -226,6 +226,17 @@ def _fused_topk_precompile() -> bool:
         return False
 
 
+@functools.lru_cache(maxsize=1)
+def _fused_topk_bf16_reduce() -> bool:
+    """SGLANG_DSA_FUSED_INDEXER_TOPK_BF16_REDUCE, read once; logged once when on."""
+    on = envs.SGLANG_DSA_FUSED_INDEXER_TOPK_BF16_REDUCE.get()
+    if on:
+        logger.info(
+            "SGLANG_DSA_FUSED_INDEXER_TOPK_BF16_REDUCE: fused indexer top-k scores with the BF16 head reduction"
+        )
+    return on
+
+
 _FUSED_TOPK_STATS = None
 _FUSED_TOPK_SCRATCH: Dict[int, Any] = {}
 
@@ -2266,6 +2277,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 workspace=scratch.workspace,
                 stats=dev_stats,
                 serving=True,
+                bf16_reduce=_fused_topk_bf16_reduce(),
             )
             chunks += 1
         if stats.record(rows=rows, long_rows=long_rows, chunks=chunks, budget=budget):

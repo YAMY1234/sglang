@@ -26,8 +26,10 @@ logger = logging.getLogger(__name__)
 
 MODE_LOGITS, MODE_NO_EPI, MODE_NO_STORE, MODE_FILTER, MODE_TAU, MODE_FILTER_COMPACT = 0, 1, 2, 3, 4, 5
 # layout -> (rows per q-block, keys per split); see LayoutTraits in the kernel.
-LAYOUTS = {0: (4, 256), 1: (4, 256), 2: (8, 128), 3: (4, 256), 4: (8, 128), 5: (4, 256)}
+LAYOUTS = {0: (4, 256), 1: (4, 256), 2: (8, 128), 3: (4, 256), 4: (8, 128), 5: (4, 256), 15: (4, 256)}
 DEFAULT_LAYOUT = 5  # measured fastest for the filter pass (VR, 11-20)
+# Layout 5 with DeepGEMM's BF16 head reduction (scores are its BF16 logits); serving builds it too.
+BF16_LAYOUT = 15
 MATH_WARPS = 8  # candidate sub-lists per row in layouts 0-4: one per math warp of the row's CTA
 SUB_LISTS = 4  # layout 5 (the fused path): one per warp of the row's warpgroup
 SELECT_KEYS, SELECT_REPAIR_KEYS = 8192, 16384  # select kernel shared-memory capacity, in keys
@@ -49,7 +51,8 @@ def _deep_gemm_include() -> tuple[str, bool]:
 
 @cache_once
 def _jit_module(cuh_path: Optional[str] = None, serving: bool = False):
-    """serving builds only what the prefill path runs (DEFAULT_LAYOUT, threshold and filter)."""
+    """serving builds only what the prefill path runs (DEFAULT_LAYOUT and BF16_LAYOUT: threshold,
+    filter and repair passes)."""
     dg_root, dg_legacy = _deep_gemm_include()
     return load_jit(
         "dsa_fused_indexer_topk",
@@ -230,6 +233,7 @@ def fused_indexer_topk(
     keep_all: Optional[int] = None,
     lpt: bool = False,
     select_keys: int = SELECT_KEYS,
+    bf16_reduce: bool = False,
     out: Optional[torch.Tensor] = None,
     workspace: Optional[torch.Tensor] = None,
     stats: Optional[torch.Tensor] = None,
@@ -241,7 +245,8 @@ def fused_indexer_topk(
     ``workspace`` (uint8, at least ``rows * scratch_bytes_per_row + workspace_fixed_bytes``)
     holds every scratch buffer, so a call allocates nothing large. ``stats``: optional
     [NUM_STATS] int64 device counters. ``lpt``: visit q-blocks longest span first (else in
-    order; the kernel deals them out snake-wise either way)."""
+    order; the kernel deals them out snake-wise either way). ``bf16_reduce``: score with
+    DeepGEMM's BF16 head reduction (the exact top-k of its BF16 logits) instead of the FP32 one."""
     dev = q_fp8.device
     ws = _Carver(workspace)
     rows = q_fp8.shape[0]
@@ -250,7 +255,8 @@ def fused_indexer_topk(
     # Rows this short keep every score: at most keep_all / SUB_LISTS per sub-list.
     keep_all = cand_cap // 2 if keep_all is None else keep_all
     jit = _jit_module(cuh_path, serving)
-    common = dict(layout=DEFAULT_LAYOUT, cuh_path=cuh_path, serving=serving, stats=stats, topk=topk)
+    layout = BF16_LAYOUT if bf16_reduce else DEFAULT_LAYOUT
+    common = dict(layout=layout, cuh_path=cuh_path, serving=serving, stats=stats, topk=topk)
     i32, i64 = _empty(dev, torch.int32), _empty(dev, torch.int64)
     st = stats if stats is not None else i64
     sms = _num_sms(dev)
@@ -265,8 +271,8 @@ def fused_indexer_topk(
     sample_order = order = None
     if lpt:
         sks = (ks + sample_stride - 1) // sample_stride
-        sample_order = lpt_order(sks, (ke + sample_stride - 1) // sample_stride, n_s)
-        order = lpt_order(ks, ke, num_kv)
+        sample_order = lpt_order(sks, (ke + sample_stride - 1) // sample_stride, n_s, layout)
+        order = lpt_order(ks, ke, num_kv, layout)
     tau = ws.take((rows,), torch.float32, dev)
     score(
         q_fp8, kv_s, sc_s, weights, ks, ke, mode=MODE_TAU, order=sample_order, tau_out=tau,

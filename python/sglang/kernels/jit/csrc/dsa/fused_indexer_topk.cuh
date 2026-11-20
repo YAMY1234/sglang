@@ -15,6 +15,10 @@
 //     of the warp's exact top-k, so no row overflows. The exact top-k is selected afterwards;
 //     rows with fewer than k candidates are rescored on the device with tau = -inf.
 //   - kModeLogits writes the scores exactly as DeepGEMM (used for the bitwise check).
+//   - Layout 15 is layout 5 with DeepGEMM's BF16 head reduction (the reduce_dtype = bf16 path of
+//     its SM100 MQA logits kernel, deepseek-ai/DeepGEMM 54e2261 "#364" and later): relu and BF16
+//     rounding in one cvt, BF16 weights, bf16x2 FMA chains, a BF16 sum and a BF16 product with
+//     the BF16-rounded key scale, so every score is DeepGEMM's BF16 logit.
 //   - kModeNoEpi / kModeNoStore exist for calibration only: no TMEM reads at all, or the
 //     full epilogue arithmetic without a store.
 
@@ -28,6 +32,7 @@
 #include <tvm/ffi/container/tensor.h>
 
 #include <cuda.h>
+#include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
 // FSTK_SERVING=1 builds only the layout and passes the prefill path runs.
@@ -149,7 +154,9 @@ struct ScoreParams {
 //      warps per SM sub-partition hide the TMEM load latency.
 template <int kLayout>
 struct LayoutTraits {
-  static constexpr int kBase = kLayout == 3 ? 0 : (kLayout == 4 ? 2 : kLayout);
+  static constexpr int kBase = kLayout == 3 ? 0 : (kLayout == 4 ? 2 : (kLayout == 15 ? 5 : kLayout));
+  // Layout 15: DeepGEMM's BF16 head reduction (see dg_reduce_bf16).
+  static constexpr bool kBF16Reduce = kLayout == 15;
   static constexpr bool kPairLoads = kLayout == 3 or kLayout == 4;
   static constexpr uint32_t kBlockQ = kBase == 2 ? 8 : 4;
   static constexpr uint32_t kSplitKV = kBase == 2 ? 128 : 256;
@@ -351,6 +358,33 @@ CUTLASS_DEVICE float dg_reduce(const float* accum, const float* w) {
   }
   auto sum = __fadd2_rn(sum_0, sum_1);
   return (sum.x + sum.y) / 2;
+}
+
+// DeepGEMM's cvt_relu_bf16x2_f32 (deep_gemm/include/deep_gemm/ptx/utils.cuh): relu, then round to
+// nearest BF16, two lanes per instruction; v.x lands in the low half.
+CUTLASS_DEVICE nv_bfloat162 cvt_relu_bf16x2_f32(const float2& v) {
+  uint32_t packed;
+  asm volatile("cvt.rn.relu.bf16x2.f32 %0, %1, %2;\n" : "=r"(packed) : "f"(v.y), "f"(v.x));
+  return *reinterpret_cast<const nv_bfloat162*>(&packed);
+}
+
+// The BF16 head reduction of one (row, key), operation for operation DeepGEMM's reduce_dtype = bf16
+// path of sm100_mqa_logits (deepseek-ai/DeepGEMM 54e2261 through 66081d4; sgl-deep-gemm 0.2.8
+// legacy/impls/sm100_mqa_logits.cuh): relu+cvt to bf16x2, two bf16x2 FMA chains over head pairs
+// (j, j+1) and (j+2, j+3), their bf16x2 sum, the two halves added in BF16, times the key scale
+// rounded to BF16. w2[i] holds heads 2i, 2i+1 rounded to nearest BF16 (DeepGEMM takes BF16 weights).
+CUTLASS_DEVICE float dg_reduce_bf16(const float* accum, const nv_bfloat162* w2, const float scale) {
+  auto sum_0 = __floats2bfloat162_rn(0.0f, 0.0f);
+  auto sum_1 = __floats2bfloat162_rn(0.0f, 0.0f);
+#pragma unroll
+  for (uint32_t j = 0; j < kNumHeads; j += 4) {
+    sum_0 = __hfma2(cvt_relu_bf16x2_f32(make_float2(accum[j], accum[j + 1])), w2[j / 2], sum_0);
+    sum_1 = __hfma2(cvt_relu_bf16x2_f32(make_float2(accum[j + 2], accum[j + 3])), w2[j / 2 + 1], sum_1);
+  }
+  const auto sum = __hadd2_rn(sum_0, sum_1);
+  const __nv_bfloat16 reduced = __hadd_rn(sum.x, sum.y);
+  // reduced * scale_kv with scale_kv = static_cast<__nv_bfloat16>(float): __hmul of the RN-rounded scale.
+  return __bfloat162float(__hmul(reduced, __float2bfloat16(scale)));
 }
 
 template <int kMode, bool kReuseKV, int kLayout, uint32_t kAluHeads>
@@ -739,7 +773,8 @@ __global__ __launch_bounds__(LayoutTraits<kLayout>::kNumThreads, 1) void fstk_sc
       // Thread t of warpgroup g: TMEM lane t (key t of each 128-key half), row g.
       const uint32_t lane_key = (warp_idx % 4) * 32 + lane_idx;
       const uint32_t my_row = math_warpgroup_idx;
-      float weights[kNumHeads];
+      float weights[Traits::kBF16Reduce ? 1 : kNumHeads];
+      nv_bfloat162 weights2[Traits::kBF16Reduce ? kNumHeads / 2 : 1];
       float accum[kNumHeads];
       // Filter: rows past the batch (or past the repair list) take nothing and publish nothing.
       const uint32_t valid_rows = params.num_rows_dev != nullptr
@@ -856,9 +891,16 @@ __global__ __launch_bounds__(LayoutTraits<kLayout>::kNumThreads, 1) void fstk_sc
         };
         if constexpr (kMode != kModeNoEpi) {
           const auto smem_weights_row = smem.smem_weights[q_stage_idx] + my_row * kNumWeightElementsPerRow;
+          if constexpr (Traits::kBF16Reduce) {
 #pragma unroll
-          for (uint32_t j = 0; j < kNumHeads; ++j)
-            weights[j] = ptx::ld_shared(smem_weights_row + j) * (j < kAluHeads ? 2.0f : 1.0f);
+            for (uint32_t j = 0; j < kNumHeads / 2; ++j)
+              weights2[j] = __floats2bfloat162_rn(ptx::ld_shared(smem_weights_row + 2 * j),
+                                                  ptx::ld_shared(smem_weights_row + 2 * j + 1));
+          } else {
+#pragma unroll
+            for (uint32_t j = 0; j < kNumHeads; ++j)
+              weights[j] = ptx::ld_shared(smem_weights_row + j) * (j < kAluHeads ? 2.0f : 1.0f);
+          }
         }
 
         for (uint32_t kv_split_idx = 0; kv_split_idx < num_kv_splits; ++kv_split_idx) {
@@ -889,7 +931,11 @@ __global__ __launch_bounds__(LayoutTraits<kLayout>::kNumThreads, 1) void fstk_sc
             cutlass::arch::fence_view_async_tmem_load();
             ptx::tcgen05_before_thread_sync();
             smem.empty_tmem_barriers[tmem_stage_idx].arrive();
-            const float result = dg_reduce<kAluHeads>(accum, weights) * scale_kv[h];
+            float result;
+            if constexpr (Traits::kBF16Reduce)
+              result = dg_reduce_bf16(accum, weights2, scale_kv[h]);
+            else
+              result = dg_reduce<kAluHeads>(accum, weights) * scale_kv[h];
             if constexpr (kWindowed) {
               results[h] = result;
             } else {
@@ -1584,11 +1630,17 @@ struct FusedIndexerTopK {
   return score_dispatch<LY, AH>(q, kv, kv_scale, weights, ks, ke, order, logits, tau, cand_key, cand_count, x, mode, reuse_kv, num_ctas)
 #if FSTK_SERVING
     sglang::host::RuntimeCheck(
-        layout == FSTK_SERVING_LAYOUT and alu_heads == 0, "fstk serving: only layout ", FSTK_SERVING_LAYOUT);
+        (layout == FSTK_SERVING_LAYOUT or layout == 15) and alu_heads == 0,
+        "fstk serving: only layouts ", FSTK_SERVING_LAYOUT, " and 15");
+    if (layout == 15) FSTK_DISPATCH(15, 0);
     FSTK_DISPATCH(FSTK_SERVING_LAYOUT, 0);
 #else
     sglang::host::RuntimeCheck(alu_heads == 0 or alu_heads == 16, "fstk: alu_heads must be 0 or 16");
-    sglang::host::RuntimeCheck(layout >= 0 and layout <= 5, "fstk: layout must be 0..5");
+    sglang::host::RuntimeCheck((layout >= 0 and layout <= 5) or layout == 15, "fstk: layout must be 0..5 or 15");
+    if (layout == 15) {
+      sglang::host::RuntimeCheck(alu_heads == 0, "fstk: layout 15 takes no alu_heads");
+      FSTK_DISPATCH(15, 0);
+    }
     if (layout == 0) {
       if (alu_heads) FSTK_DISPATCH(0, 16);
       FSTK_DISPATCH(0, 0);

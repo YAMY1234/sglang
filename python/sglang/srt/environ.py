@@ -2318,6 +2318,10 @@ class Envs:
     SGLANG_DSA_FUSED_INDEXER_TOPK_MIN_MEAN_KEYS = EnvInt(65536)
     # Debug: every N calls, compare 256 rows with the unfused path and log (0 = off).
     SGLANG_DSA_FUSED_INDEXER_TOPK_CHECK_INTERVAL = EnvInt(0)
+    # Fused path scores with DeepGEMM's BF16 head reduction (its MQA logits reduce_dtype = bf16
+    # path: BF16 weights, bf16x2 FMA, BF16 logits) instead of the FP32 one. Changes the scores, so
+    # the CHECK_INTERVAL comparison with the (FP32) unfused path reports differences.
+    SGLANG_DSA_FUSED_INDEXER_TOPK_BF16_REDUCE = EnvBool(False)
     # Debug: log the GPU time of the prefill top-k (CUDA events) every N calls (0 = off).
     SGLANG_DSA_INDEXER_TOPK_TIMING_INTERVAL = EnvInt(0)
     # Requires a DeepGEMM paged-MQA scheduler supporting batches > SM count
