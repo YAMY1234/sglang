@@ -2309,10 +2309,9 @@ class Envs:
     SGLANG_DSA_HIP_DISABLE_PRESHUFFLE = EnvBool(False)
     SGLANG_DSA_MQA_LOGITS_FREE_MEM_FRACTION = EnvFloat(0.2)
     # Packed PAGED prefill top-k from a fused scorer that never writes the score
-    # matrix (kernels/ops/attention/dsa/fused_indexer_topk.py); its unsettled rows
-    # take the chunked path.
+    # matrix (kernels/ops/attention/dsa/fused_indexer_topk.py); exact, no host sync.
     SGLANG_DSA_FUSED_INDEXER_TOPK = EnvBool(False)
-    # Log the fused path's row and fallback counters every N calls (0 = off).
+    # Log the fused path's row, repair and compaction counters every N calls (0 = off).
     SGLANG_DSA_FUSED_INDEXER_TOPK_LOG_INTERVAL = EnvInt(64)
     # Use the fused path only when the batch's mean row window has at least this many keys
     # (1-GPU crossover: 0.90x at 48k, 1.02x at 64k, 1.30x at 128k keys per row; 0 = always).

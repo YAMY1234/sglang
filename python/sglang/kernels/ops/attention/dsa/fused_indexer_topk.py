@@ -2,12 +2,12 @@
 
 Scores are bitwise DeepGEMM's legacy ``fp8_mqa_logits`` (32 heads x 128, FP8, FP32
 reduction); the [rows, num_kv] score matrix is never written. Each row first gets a
-threshold ``tau`` from every ``sample_stride``-th key of its window (the ``rank``-th
-largest sample score), the main pass appends the scores >= tau of the row's window to
-a per-row candidate list, and the exact top-k (equal scores: smaller column first) is
-selected from it and mapped through the page table. A row whose list holds fewer than
-``topk`` entries (tau too high) or overflows ``cand_cap`` is reported for the caller's
-fallback path, so the output set is exact for every row.
+threshold ``tau`` from every ``sample_stride``-th key of its window (the ``rank``-th largest
+sample score its threads kept), the main pass appends the scores >= tau of the row's window
+to per-warp candidate sub-lists (a sub-list about to overflow drops keys that cannot be in
+the warp's top-k), and the exact top-k (equal scores: smaller column first) is selected and
+mapped through the page table. Rows whose list holds fewer than ``topk`` entries (tau too
+high) are rescored on the device with tau = -inf, so every row is exact with no host sync.
 """
 
 from __future__ import annotations
@@ -23,11 +23,15 @@ from sglang.kernels.jit.utils import cache_once, cuda_stubs_dir, load_jit
 
 logger = logging.getLogger(__name__)
 
-MODE_LOGITS, MODE_NO_EPI, MODE_NO_STORE, MODE_FILTER = 0, 1, 2, 3
+MODE_LOGITS, MODE_NO_EPI, MODE_NO_STORE, MODE_FILTER, MODE_TAU = 0, 1, 2, 3, 4
 # layout -> (rows per q-block, keys per split); see LayoutTraits in the kernel.
 LAYOUTS = {0: (4, 256), 1: (4, 256), 2: (8, 128), 3: (4, 256), 4: (8, 128), 5: (4, 256)}
 DEFAULT_LAYOUT = 5  # measured fastest for the filter pass (VR, 11-20)
-MATH_WARPS = 8  # candidate sub-lists per row: one per math warp of the row's CTA
+MATH_WARPS = 8  # candidate sub-lists per row in layouts 0-4: one per math warp of the row's CTA
+SUB_LISTS = 4  # layout 5 (the fused path): one per warp of the row's warpgroup
+# Device counters (int64) of fused_indexer_topk; see Stat in the kernel.
+STAT_CALLS, STAT_REPAIR_ROWS, STAT_MAX_REPAIR, STAT_COMPACTIONS, STAT_UNREPAIRED = range(5)
+NUM_STATS = 8
 
 
 def _deep_gemm_include() -> tuple[str, bool]:
@@ -43,7 +47,7 @@ def _deep_gemm_include() -> tuple[str, bool]:
 
 @cache_once
 def _jit_module(cuh_path: Optional[str] = None, serving: bool = False):
-    """serving builds only what the prefill path runs (DEFAULT_LAYOUT, scores and filter)."""
+    """serving builds only what the prefill path runs (DEFAULT_LAYOUT, threshold and filter)."""
     dg_root, dg_legacy = _deep_gemm_include()
     return load_jit(
         "dsa_fused_indexer_topk",
@@ -53,7 +57,7 @@ def _jit_module(cuh_path: Optional[str] = None, serving: bool = False):
         cuda_wrappers=[
             ("score", "fstk::FusedIndexerTopK::score"),
             ("select", "fstk::FusedIndexerTopK::select"),
-            ("tau", "fstk::FusedIndexerTopK::tau"),
+            ("repair_prep", "fstk::FusedIndexerTopK::repair_prep"),
         ],
         # DeepGEMM's own JIT flags; no fast-math, the bitwise contract depends on it.
         extra_cuda_cflags=[
@@ -105,6 +109,14 @@ def score(
     tau: Optional[torch.Tensor] = None,
     cand_key: Optional[torch.Tensor] = None,
     cand_count: Optional[torch.Tensor] = None,
+    tau_out: Optional[torch.Tensor] = None,
+    lengths: Optional[torch.Tensor] = None,
+    row_map: Optional[torch.Tensor] = None,
+    num_rows: Optional[torch.Tensor] = None,
+    stats: Optional[torch.Tensor] = None,
+    topk: int = 0,
+    rank: int = 0,
+    keep_all: int = 0,
     reuse_kv: bool = False,
     layout: int = DEFAULT_LAYOUT,
     alu_heads: int = 0,
@@ -114,7 +126,8 @@ def score(
 ) -> None:
     dev = q_fp8.device
     if num_ctas is None:
-        num_ctas = torch.cuda.get_device_properties(dev).multi_processor_count
+        num_ctas = _num_sms(dev)
+    i32 = _empty(dev, torch.int32)
     _jit_module(cuh_path, serving).score(
         q_fp8,
         kv_fp8,
@@ -122,17 +135,34 @@ def score(
         weights,
         ks,
         ke,
-        order if order is not None else _empty(dev, torch.int32),
+        order if order is not None else i32,
         logits if logits is not None else _empty(dev),
         tau if tau is not None else _empty(dev),
         cand_key if cand_key is not None else _empty(dev, torch.int64),
-        cand_count if cand_count is not None else _empty(dev, torch.int32),
+        cand_count if cand_count is not None else i32,
+        tau_out if tau_out is not None else _empty(dev),
+        lengths if lengths is not None else i32,
+        row_map if row_map is not None else i32,
+        num_rows if num_rows is not None else i32,
+        stats if stats is not None else _empty(dev, torch.int64),
+        topk,
+        rank,
+        keep_all,
         mode,
         int(reuse_kv),
         layout,
         alu_heads,
         num_ctas,
     )
+
+
+@cache_once
+def _num_sms_cached(index: int) -> int:
+    return torch.cuda.get_device_properties(index).multi_processor_count
+
+
+def _num_sms(dev: torch.device) -> int:
+    return _num_sms_cached(dev.index if dev.index is not None else torch.cuda.current_device())
 
 
 class _Carver:
@@ -152,26 +182,27 @@ class _Carver:
         return self.ws[start : start + n].view(dtype).view(shape)
 
 
-def _sample_stride_elems(num_samples: int) -> int:
-    return (num_samples + 512 + 255) // 256 * 256
+def _sub_cap(cand_cap: int) -> int:
+    return cand_cap // SUB_LISTS
 
 
 def scratch_bytes_per_row(num_kv: int, sample_stride: int = 16, cand_cap: int = 16384) -> int:
-    """Device scratch of fused_indexer_topk per query row (sample scores, candidates)."""
-    num_samples = (num_kv + sample_stride - 1) // sample_stride
-    return 4 * _sample_stride_elems(num_samples) + 8 * cand_cap + 4 * MATH_WARPS + 16
+    """Device scratch of fused_indexer_topk per query row: candidates, threshold, counts, and
+    the compact copy of a row for the device-side repair."""
+    del num_kv, sample_stride
+    return 8 * cand_cap + 4 * SUB_LISTS + 4 + 4 + (32 * 128 + 4 * 32 + 3 * 4)
 
 
 def workspace_fixed_bytes(num_kv: int, sample_stride: int = 16) -> int:
-    """Workspace bytes of a call that do not scale with its rows (sample keys, padding rows, alignment)."""
+    """Workspace bytes of a call that do not scale with its rows (sample keys, row padding, alignment)."""
     num_samples = (num_kv + sample_stride - 1) // sample_stride
-    return num_samples * (128 + 4) + 8 * 4 * _sample_stride_elems(num_samples) + 16 * 256
+    return num_samples * (128 + 4) + 4 * scratch_bytes_per_row(num_kv) + 16 * 256
 
 
 class FusedTopKResult(NamedTuple):
     out: torch.Tensor  # [rows, topk] int32 physical KV slots, -1 padded
-    num_fallback: torch.Tensor  # [1] int32
-    fallback_rows: torch.Tensor  # [rows] int32, first num_fallback valid
+    num_repaired: torch.Tensor  # [1] int32: rows rescored on the device with tau = -inf
+    repaired_rows: torch.Tensor  # [rows] int32, first num_repaired valid
     tau: torch.Tensor
     cand_count: torch.Tensor
 
@@ -194,25 +225,27 @@ def fused_indexer_topk(
     cand_cap: int = 16384,
     keep_all: Optional[int] = None,
     order: Optional[torch.Tensor] = None,
-    layout: int = DEFAULT_LAYOUT,
-    alu_heads: int = 0,
+    sample_order: Optional[torch.Tensor] = None,
     out: Optional[torch.Tensor] = None,
     workspace: Optional[torch.Tensor] = None,
+    stats: Optional[torch.Tensor] = None,
     cuh_path: Optional[str] = None,
     serving: bool = False,
 ) -> FusedTopKResult:
-    """Exact top-k of every packed row; rows listed in ``fallback_rows`` were not written.
+    """Exact top-k of every packed row, written to ``out``; no host sync.
 
     ``workspace`` (uint8, at least ``rows * scratch_bytes_per_row + workspace_fixed_bytes``)
-    holds every scratch buffer, so a call allocates nothing large."""
+    holds every scratch buffer, so a call allocates nothing large. ``stats``: optional
+    [NUM_STATS] int64 device counters."""
     dev = q_fp8.device
     ws = _Carver(workspace)
     rows = q_fp8.shape[0]
     num_kv = kv_fp8.shape[0]
-    # Rows this short keep every score; the 8 sub-lists of such a row stay within the cap.
+    sub_cap = _sub_cap(cand_cap)
+    # Rows this short keep every score: at most keep_all / SUB_LISTS per sub-list, no compaction.
     keep_all = cand_cap // 2 if keep_all is None else keep_all
-    if order is None:
-        order = lpt_order(ks, ke, num_kv, layout)
+    jit = _jit_module(cuh_path, serving)
+    common = dict(layout=DEFAULT_LAYOUT, cuh_path=cuh_path, serving=serving, stats=stats, topk=topk)
 
     # Sample keys: every sample_stride-th flattened position; a row's window [ks, ke)
     # holds the samples [ceil(ks / s), ceil(ke / s)).
@@ -223,102 +256,116 @@ def fused_indexer_topk(
     sc_s.copy_(kv_scale[::sample_stride])
     sks = (ks + sample_stride - 1) // sample_stride
     ske = (ke + sample_stride - 1) // sample_stride
-    # Room for a q-block's span past the last key and for its padded rows.
-    stride_s = _sample_stride_elems(n_s)
-    sample_logits = ws.take((rows + 8, stride_s), torch.float32, dev)
-    score(
-        q_fp8,
-        kv_s,
-        sc_s,
-        weights,
-        sks,
-        ske,
-        mode=MODE_LOGITS,
-        order=lpt_order(sks, ske, n_s, layout),
-        logits=sample_logits,
-        layout=layout,
-        alu_heads=alu_heads,
-        cuh_path=cuh_path,
-        serving=serving,
-    )
+    if sample_order is None:
+        sample_order = lpt_order(sks, ske, n_s)
     tau = ws.take((rows,), torch.float32, dev)
-    module = _jit_module(cuh_path, serving)
-    module.tau(sample_logits, sks, ske, lengths, tau, rank, topk, keep_all)
-    del sample_logits
-
-    # Select keys: (order-preserving score bits << 32) | ~window column, one sub-list per
-    # math warp; a warp that never sees a row leaves its zero count.
-    cand_key = ws.take((rows, MATH_WARPS, cand_cap // MATH_WARPS), torch.int64, dev)
-    cand_count = ws.take((rows, MATH_WARPS), torch.int32, dev)
-    cand_count.zero_()
     score(
-        q_fp8,
-        kv_fp8,
-        kv_scale,
-        weights,
-        ks,
-        ke,
-        mode=MODE_FILTER,
-        order=order,
-        tau=tau,
-        cand_key=cand_key,
-        cand_count=cand_count,
-        layout=layout,
-        alu_heads=alu_heads,
-        cuh_path=cuh_path,
-        serving=serving,
+        q_fp8, kv_s, sc_s, weights, sks, ske, mode=MODE_TAU, order=sample_order,
+        tau_out=tau, lengths=lengths, rank=rank, keep_all=keep_all, **common,
+    )
+
+    # Select keys: (order-preserving score bits << 32) | ~window column, one sub-list per warp.
+    cand_key = ws.take((rows, SUB_LISTS, sub_cap), torch.int64, dev)
+    cand_count = ws.take((rows, SUB_LISTS), torch.int32, dev)
+    cand_count.zero_()
+    if order is None:
+        order = lpt_order(ks, ke, num_kv)
+    score(
+        q_fp8, kv_fp8, kv_scale, weights, ks, ke, mode=MODE_FILTER, order=order,
+        tau=tau, cand_key=cand_key, cand_count=cand_count, **common,
     )
     # The select kernel writes rows of exactly topk entries.
     dst = out if out is not None and out.is_contiguous() else None
     if dst is None:
         dst = torch.empty(rows, topk, device=dev, dtype=torch.int32)
-    fallback_rows = ws.take((rows,), torch.int32, dev)
-    num_fallback = ws.take((1,), torch.int32, dev)
-    num_fallback.zero_()
-    module.select(
-        cand_key,
-        cand_count,
-        lengths,
-        row_to_batch,
-        page_table,
-        dst,
-        fallback_rows,
-        num_fallback,
-        page_size,
+    repair_rows = ws.take((rows,), torch.int32, dev)
+    num_repair = ws.take((1,), torch.int32, dev)
+    num_repair.zero_()
+    i32, i64 = _empty(dev, torch.int32), _empty(dev, torch.int64)
+    st = stats if stats is not None else i64
+    sms = _num_sms(dev)
+    jit.select(cand_key, cand_count, lengths, row_to_batch, page_table, dst,
+               repair_rows, num_repair, i32, i32, st, page_size, sms)
+
+    # Device-side repair: listed rows are rescored with tau = -inf (every key a candidate) and
+    # selected again; three launches that do nothing when the list is empty.
+    q_c = ws.take((rows, 32, 128), q_fp8.dtype, dev)
+    w_c = ws.take((rows, 32), torch.float32, dev)
+    ks_c = ws.take((rows,), torch.int32, dev)
+    ke_c = ws.take((rows,), torch.int32, dev)
+    tau_c = ws.take((rows,), torch.float32, dev)
+    jit.repair_prep(repair_rows, num_repair, q_fp8, weights, ks, ke, q_c, w_c, ks_c, ke_c, tau_c,
+                    cand_count, st, 4 * sms)
+    score(
+        q_c, kv_fp8, kv_scale, w_c, ks_c, ke_c, mode=MODE_FILTER, tau=tau_c,
+        cand_key=cand_key, cand_count=cand_count, row_map=repair_rows, num_rows=num_repair, **common,
     )
+    jit.select(cand_key, cand_count, lengths, row_to_batch, page_table, dst,
+               i32, i32, repair_rows, num_repair, st, page_size, 4 * sms)
     if out is None:
         out = dst
     elif dst is not out:
         out.copy_(dst)
-    return FusedTopKResult(out, num_fallback, fallback_rows, tau, cand_count)
+    return FusedTopKResult(out, num_repair, repair_rows, tau, cand_count)
+
+
+class DeviceStatsReader:
+    """Reads the [NUM_STATS] device counters without a host sync: a snapshot is copied to
+    pinned memory behind an event and read once the event has completed."""
+
+    def __init__(self, device: torch.device):
+        self.stats = torch.zeros(NUM_STATS, device=device, dtype=torch.int64)
+        self._host = torch.zeros(NUM_STATS, dtype=torch.int64, pin_memory=True)
+        self._event: Optional[torch.cuda.Event] = None
+        self.last: Optional[list] = None
+
+    def poll(self) -> Optional[list]:
+        """The newest completed snapshot (and starts the next one)."""
+        if self._event is not None and self._event.query():
+            self.last = self._host.tolist()
+            self._event = None
+        if self._event is None:
+            self._host.copy_(self.stats, non_blocking=True)
+            self._event = torch.cuda.Event()
+            self._event.record()
+        return self.last
 
 
 class FusedTopKStats:
-    """Process-wide counters of the serving path, logged every ``log_interval`` calls."""
+    """Process-wide counters of the serving path, logged every ``log_interval`` calls. Host
+    counters are exact; the device counters (repaired rows, compactions) come from the newest
+    completed snapshot, so they may trail by one interval."""
+
+    _DEVICE_KEYS = ("dev_calls", "repair_rows", "max_repair", "compactions", "unrepaired")
 
     def __init__(self, log_interval: int, check_interval: int):
         self.log_interval = log_interval
         self.check_interval = check_interval
-        self.total = dict(calls=0, rows=0, long_rows=0, fallback_rows=0, max_fallback=0, chunks=0,
-                          budget_mb=0, gated_calls=0, gated_rows=0,
+        self.total = dict(calls=0, rows=0, long_rows=0, chunks=0, budget_mb=0, gated_calls=0, gated_rows=0,
                           check_rows=0, check_differ=0, check_tie_explained=0, check_tie_checked=0)
         self.window = dict(self.total)
         self.events = 0
+        self.device: Optional[DeviceStatsReader] = None
+
+    def device_stats(self, device: torch.device) -> torch.Tensor:
+        if self.device is None:
+            self.device = DeviceStatsReader(device)
+        return self.device.stats
 
     def _tick(self) -> None:
         self.events += 1
         if self.log_interval and self.events % self.log_interval == 0:
-            logger.info("FSTK window %s total %s", self.window, self.total)
+            snap = self.device.poll() if self.device is not None else None
+            dev = dict(zip(self._DEVICE_KEYS, snap)) if snap is not None else {}
+            logger.info("FSTK window %s total %s device %s", self.window, self.total, dev)
             self.window = {k: 0 for k in self.window}
 
-    def record(self, *, rows: int, long_rows: int, fallback_rows: int, chunks: int = 1, budget: int = 0) -> bool:
+    def record(self, *, rows: int, long_rows: int, chunks: int = 1, budget: int = 0) -> bool:
         """Counts one call; True when this call should also run the stock-path check."""
         for d in (self.total, self.window):
             d["calls"] += 1
             d["rows"] += rows
             d["long_rows"] += long_rows
-            d["fallback_rows"] += fallback_rows
-            d["max_fallback"] = max(d["max_fallback"], fallback_rows)
             d["chunks"] += chunks
             d["budget_mb"] = budget >> 20
         self._tick()
