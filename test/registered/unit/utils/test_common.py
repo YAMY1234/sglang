@@ -276,6 +276,20 @@ class TestFreezeGc(CustomTestCase):
         freezer = BatchCountGCFreezer("test", after=2)
         self.assertEqual([n for n in range(1, 6) if freezer.on_batch(n)], [2])
 
+    def test_freezer_never_walks_the_frozen_heap_on_re_freezes(self):
+        # gc.get_freeze_count() is O(frozen objects): never in production, and with
+        # log_frozen only once, after the first freeze.
+        with mock.patch.object(gc, "get_freeze_count", return_value=7) as count:
+            quiet = BatchCountGCFreezer("test", after=2, every=1)
+            self.assertEqual(
+                [n for n in range(1, 7) if quiet.on_batch(n)], [2, 3, 4, 5, 6]
+            )
+            self.assertEqual(count.call_count, 0)
+            logged = BatchCountGCFreezer("test", after=2, every=1, log_frozen=True)
+            for n in range(1, 7):
+                logged.on_batch(n)
+            self.assertEqual(count.call_count, 1)
+
 
 if __name__ == "__main__":
     unittest.main()
