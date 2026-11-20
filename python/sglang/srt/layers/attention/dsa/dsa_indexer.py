@@ -2231,7 +2231,13 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 out=topk_result,
             )
         stats = _fused_topk_stats()
-        if stats.record(rows=rows, long_rows=counts[-1], fallback_rows=num_fallback):
+        if stats.record(
+            rows=rows,
+            long_rows=counts[-1],
+            fallback_rows=num_fallback,
+            chunks=len(nums),
+            budget=budget,
+        ):
             self._fused_topk_check(
                 budget=budget,
                 q_fp8=q_fp8,
