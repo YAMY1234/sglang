@@ -527,6 +527,9 @@ __global__ __launch_bounds__(LayoutTraits<kLayout>::kNumThreads, 1) void fstk_sc
               }
             }
           } else {
+            // Filter: all rows' scores first, appends after; a vote and branch per row
+            // between them would stop the rows' loads and FMA chains from overlapping.
+            float results[kFilter ? kBlockQ : 1];
 #pragma unroll
             for (uint32_t i = 0; i < kBlockQ; ++i) {
               uint32_t tmem_addr = tmem_stage_idx * UMMA_N + i * kNumHeads;
@@ -540,15 +543,17 @@ __global__ __launch_bounds__(LayoutTraits<kLayout>::kNumThreads, 1) void fstk_sc
                 ptx::tcgen05_before_thread_sync();
                 smem.empty_tmem_barriers[tmem_stage_idx].arrive();
               }
-              handle(
-                  q_block_idx,
-                  i,
-                  i,
-                  seq_k_start[kFilter ? i : 0],
-                  seq_k_end[kFilter ? i : 0] - seq_k_start[kFilter ? i : 0],
-                  tau[kFilter ? i : 0],
-                  kv_offset,
-                  dg_reduce<kAluHeads>(accum[0], weights[i]) * scale_kv);
+              const float result = dg_reduce<kAluHeads>(accum[0], weights[i]) * scale_kv;
+              if constexpr (kFilter) {
+                results[i] = result;
+              } else {
+                handle(q_block_idx, i, i, 0, 0, 0.0f, kv_offset, result);
+              }
+            }
+            if constexpr (kFilter) {
+#pragma unroll
+              for (uint32_t i = 0; i < kBlockQ; ++i)
+                handle(q_block_idx, i, i, seq_k_start[i], seq_k_end[i] - seq_k_start[i], tau[i], kv_offset, results[i]);
             }
           }
         }
@@ -713,7 +718,8 @@ __global__ __launch_bounds__(LayoutTraits<kLayout>::kNumThreads, 1) void fstk_sc
                 handle(q_block_idx, row0 + r + 1, r + 1, win_start[r + 1], win_len[r + 1], row_tau[r + 1], kv_offset, r1);
               }
             } else {
-              // DeepGEMM's per-row load pattern over this warpgroup's 4 rows.
+              // DeepGEMM's per-row load pattern over this warpgroup's rows; filter appends deferred.
+              float results[kFilter ? kRows : 1];
 #pragma unroll
               for (uint32_t r = 0; r < kRows; ++r) {
                 const uint32_t addr = tmem_addr + r * kNumHeads;
@@ -725,15 +731,17 @@ __global__ __launch_bounds__(LayoutTraits<kLayout>::kNumThreads, 1) void fstk_sc
                   ptx::tcgen05_before_thread_sync();
                   smem.empty_tmem_barriers[tmem_stage_idx].arrive();
                 }
-                handle(
-                    q_block_idx,
-                    row0 + r,
-                    r,
-                    win_start[r],
-                    win_len[r],
-                    row_tau[r],
-                    kv_offset,
-                    dg_reduce<kAluHeads>(accum[0], weights[r]) * scale_kv[h]);
+                const float result = dg_reduce<kAluHeads>(accum[0], weights[r]) * scale_kv[h];
+                if constexpr (kFilter) {
+                  results[r] = result;
+                } else {
+                  handle(q_block_idx, row0 + r, r, 0, 0, 0.0f, kv_offset, result);
+                }
+              }
+              if constexpr (kFilter) {
+#pragma unroll
+                for (uint32_t r = 0; r < kRows; ++r)
+                  handle(q_block_idx, row0 + r, r, win_start[r], win_len[r], row_tau[r], kv_offset, results[r]);
               }
             }
           }
@@ -761,7 +769,39 @@ __global__ __launch_bounds__(LayoutTraits<kLayout>::kNumThreads, 1) void fstk_sc
 // Exact selection over the candidate lists
 // ---------------------------------------------------------------------------
 
-constexpr uint32_t kSelectThreads = 1024;
+// One radix step: the bin (counted from the top) holding the remaining-th largest key.
+// Warp 0 scans kBins histogram bins, kBins/32 per lane; publishes {bin, count above it}.
+template <uint32_t kBins>
+CUTLASS_DEVICE void radix_pick_bin(const uint32_t* hist, uint32_t remaining, uint32_t* s_bin, uint32_t* s_above) {
+  constexpr uint32_t kPer = kBins / 32;
+  const uint32_t lane = threadIdx.x;
+  if (lane >= 32) return;
+  uint32_t lsum = 0;
+#pragma unroll 8
+  for (uint32_t b = 0; b < kPer; ++b) lsum += hist[kBins - 1 - (lane * kPer + b)];
+  uint32_t incl = lsum;
+#pragma unroll
+  for (int o = 1; o < 32; o <<= 1) {
+    const uint32_t v = __shfl_up_sync(0xffffffffu, incl, o);
+    if (lane >= static_cast<uint32_t>(o)) incl += v;
+  }
+  uint32_t above = incl - lsum;
+  if (above < remaining and above + lsum >= remaining) {
+#pragma unroll 1
+    for (uint32_t b = 0; b < kPer; ++b) {
+      const uint32_t c = hist[kBins - 1 - (lane * kPer + b)];
+      if (above + c >= remaining) {
+        *s_bin = kBins - 1 - (lane * kPer + b);
+        *s_above = above;
+        break;
+      }
+      above += c;
+    }
+  }
+}
+
+constexpr uint32_t kSelectThreads = 512;
+constexpr uint32_t kSelectBins = 2048;
 
 struct SelectParams {
   const uint64_t* cand_key;
@@ -780,13 +820,14 @@ struct SelectParams {
 };
 
 // One CTA per row. Keys are (ordered score, ~column): unique, larger is better, so the
-// top-k is every key >= the k-th largest, found by an 8-bit radix select. Equal scores
-// at the k-th place resolve to the smaller columns.
-__global__ __launch_bounds__(kSelectThreads, 1) void fstk_select_kernel(const SelectParams p) {
+// top-k is every key >= the k-th largest. Radix select over the score half (11/11/10 bits);
+// only when equal scores straddle the k-th place does it continue on the column half,
+// so those resolve to the smaller columns.
+__global__ __launch_bounds__(kSelectThreads) void fstk_select_kernel(const SelectParams p) {
   extern __shared__ __align__(16) uint8_t select_smem[];
   auto* keys = reinterpret_cast<uint64_t*>(select_smem);
-  __shared__ uint32_t hist[256];
-  __shared__ uint32_t s_bin, s_above, s_out;
+  __shared__ uint32_t hist[kSelectBins];
+  __shared__ uint32_t s_bin, s_above, s_out, s_eq;
 
   const uint32_t row = blockIdx.x;
   const uint32_t tx = threadIdx.x;
@@ -824,50 +865,35 @@ __global__ __launch_bounds__(kSelectThreads, 1) void fstk_select_kernel(const Se
     const uint32_t c = s_off[w + 1] - s_off[w];
     for (uint32_t t = tx; t < c; t += kSelectThreads) keys[s_off[w] + t] = src[t];
   }
+  __syncthreads();
+
   uint64_t prefix = 0, prefix_mask = 0;
   uint32_t remaining = p.topk;
-  __syncthreads();
+  // Digits (shift, width) from the top: score bits 63..32, then column bits 31..0.
+  constexpr int kShift[6] = {53, 42, 32, 21, 10, 0};
+  constexpr int kWidth[6] = {11, 11, 10, 11, 11, 10};
 #pragma unroll 1
-  for (int shift = 56; shift >= 0; shift -= 8) {
-    if (tx < 256) hist[tx] = 0;
+  for (int d = 0; d < 6; ++d) {
+    const int shift = kShift[d];
+    const uint64_t dmask = (1ull << kWidth[d]) - 1;
+    for (uint32_t b = tx; b < kSelectBins; b += kSelectThreads) hist[b] = 0;
     __syncthreads();
     for (uint32_t t = tx; t < n; t += kSelectThreads) {
       const uint64_t k = keys[t];
-      if ((k & prefix_mask) == prefix) atomicAdd(&hist[(k >> shift) & 0xFFu], 1u);
+      if ((k & prefix_mask) == prefix) atomicAdd(&hist[(k >> shift) & dmask], 1u);
     }
     __syncthreads();
-    if (tx < 32) {
-      // Suffix sums over 256 bins, 8 per lane, from the top bin down.
-      uint32_t local[8];
-      uint32_t lsum = 0;
-#pragma unroll
-      for (int b = 0; b < 8; ++b) {
-        local[b] = hist[255 - (tx * 8 + b)];
-        lsum += local[b];
-      }
-      uint32_t incl = lsum;
-#pragma unroll
-      for (int o = 1; o < 32; o <<= 1) {
-        const uint32_t v = __shfl_up_sync(0xffffffffu, incl, o);
-        if (tx >= static_cast<uint32_t>(o)) incl += v;
-      }
-      uint32_t above = incl - lsum;
-#pragma unroll
-      for (int b = 0; b < 8; ++b) {
-        if (above < remaining and above + local[b] >= remaining) {
-          s_bin = 255 - (tx * 8 + b);
-          s_above = above;
-        }
-        above += local[b];
-      }
-    }
+    radix_pick_bin<kSelectBins>(hist, remaining, &s_bin, &s_above);
     __syncthreads();
+    if (tx == 0) s_eq = hist[s_bin];
     remaining -= s_above;
     prefix |= static_cast<uint64_t>(s_bin) << shift;
-    prefix_mask |= 0xFFull << shift;
+    prefix_mask |= dmask << shift;
     __syncthreads();
+    // After the score digits: if every key of this score is needed, no column order applies.
+    if (d == 2 and s_eq == remaining) break;
   }
-  // prefix is the k-th largest key (keys are unique).
+  // Every key >= prefix (score digits only, or the exact k-th key) is selected.
   if (tx == 0) s_out = 0;
   __syncthreads();
   for (uint32_t t = tx; t < n; t += kSelectThreads) {
@@ -880,7 +906,7 @@ __global__ __launch_bounds__(kSelectThreads, 1) void fstk_select_kernel(const Se
 }
 
 // ---------------------------------------------------------------------------
-// Per-row threshold from sample scores: tau = r-th largest sample score of the row
+// Per-row threshold from sample scores: tau <= the r-th largest sample score of the row
 // ---------------------------------------------------------------------------
 
 struct TauParams {
@@ -897,9 +923,12 @@ struct TauParams {
 };
 
 constexpr uint32_t kTauThreads = 512;
+constexpr uint32_t kTauBins = 4096;
 
+// Two 12-bit radix passes over the ordered score bits: tau is the lower edge of the 24-bit
+// bin holding the r-th largest sample (at most 2^-15 relative below it).
 __global__ __launch_bounds__(kTauThreads) void fstk_tau_kernel(const TauParams p) {
-  __shared__ uint32_t hist[256];
+  __shared__ uint32_t hist[kTauBins];
   __shared__ uint32_t s_bin, s_above;
   const uint32_t row = blockIdx.x;
   const uint32_t tx = threadIdx.x;
@@ -917,45 +946,23 @@ __global__ __launch_bounds__(kTauThreads) void fstk_tau_kernel(const TauParams p
   const float* in = p.sample_logits + row * p.sample_stride + s0;
   uint32_t prefix = 0, prefix_mask = 0, remaining = p.rank;
 #pragma unroll 1
-  for (int shift = 24; shift >= 0; shift -= 8) {
-    if (tx < 256) hist[tx] = 0;
+  for (int shift = 20; shift >= 8; shift -= 12) {
+    for (uint32_t b = tx; b < kTauBins; b += kTauThreads) hist[b] = 0;
     __syncthreads();
     for (uint32_t t = tx; t < n; t += kTauThreads) {
       const uint32_t k = ordered_key(in[t]);
-      if ((k & prefix_mask) == prefix) atomicAdd(&hist[(k >> shift) & 0xFFu], 1u);
+      if ((k & prefix_mask) == prefix) atomicAdd(&hist[(k >> shift) & 0xFFFu], 1u);
     }
     __syncthreads();
-    if (tx < 32) {
-      uint32_t local[8];
-      uint32_t lsum = 0;
-#pragma unroll
-      for (int b = 0; b < 8; ++b) {
-        local[b] = hist[255 - (tx * 8 + b)];
-        lsum += local[b];
-      }
-      uint32_t incl = lsum;
-#pragma unroll
-      for (int o = 1; o < 32; o <<= 1) {
-        const uint32_t v = __shfl_up_sync(0xffffffffu, incl, o);
-        if (tx >= static_cast<uint32_t>(o)) incl += v;
-      }
-      uint32_t above = incl - lsum;
-#pragma unroll
-      for (int b = 0; b < 8; ++b) {
-        if (above < remaining and above + local[b] >= remaining) {
-          s_bin = 255 - (tx * 8 + b);
-          s_above = above;
-        }
-        above += local[b];
-      }
-    }
+    radix_pick_bin<kTauBins>(hist, remaining, &s_bin, &s_above);
     __syncthreads();
     remaining -= s_above;
     prefix |= s_bin << shift;
-    prefix_mask |= 0xFFu << shift;
+    prefix_mask |= 0xFFFu << shift;
     __syncthreads();
   }
   if (tx == 0) {
+    // Low 8 bits zero: the smallest ordered key of the bin, decoded back to a float.
     const uint32_t bits = (prefix & 0x80000000u) ? (prefix & 0x7FFFFFFFu) : ~prefix;
     p.tau[row] = __uint_as_float(bits);
   }
