@@ -3517,7 +3517,7 @@ macro_rules! tree_core_binding {
                 })
             }
 
-            /// Replace the device-tail set the first Full duplicate-reclaim pass spares.
+            /// Replace the device-tail set that Full duplicate reclaim never takes.
             fn set_write_ahead_spare(&self, py: Python<'_>, node_ids: Vec<NodeId>) -> PyResult<()> {
                 catch_native_panic(|| { self.inner.set_write_ahead_spare(py, node_ids); Ok(()) })
             }

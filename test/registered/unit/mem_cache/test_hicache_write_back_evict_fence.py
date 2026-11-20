@@ -1173,6 +1173,14 @@ class TestDeviceWriteAhead(CustomTestCase):
         cache.dec_lock_ref = MagicMock()
         cache.buffer_pipeline = None
         cache.enable_storage = False
+        cc.mem_pool_host = SimpleNamespace(
+            available_size=lambda: 3,
+            anchor_entry=SimpleNamespace(
+                host_pool=SimpleNamespace(shared_allocation_domain=None),
+                host_evict_fn=None,
+            ),
+        )
+        cache.evict_host = MagicMock(side_effect=lambda n: n)
         return cache
 
     def test_eviction_wait_ignores_write_ahead_copies(self):
@@ -1194,10 +1202,12 @@ class TestDeviceWriteAhead(CustomTestCase):
             cache._write_ahead_device_tail()
         tc, cc = cache.tree_core, cache.cache_controller
         tc.peek_device_eviction_candidates.assert_called_once_with(
-            ComponentType.FULL, 4000
+            ComponentType.FULL, 2000
         )
         tc.set_write_ahead_spare.assert_called_once_with([5, 6, 7, 8])
         self.assertEqual([c.args[0] for c in cache._execute_kv_backup.call_args_list], [5, 8])
+        # One host eviction covers the batch's shortfall (8 tokens, 3 free).
+        self.assertEqual(cache.evict_host.call_args_list, [call(5)])
         self.assertEqual([c.args[0] for c in cache.inc_lock_ref.call_args_list], [5, 8])
         self.assertEqual(set(cache.ongoing_write_ahead), {5, 8})
         # Earlier queued writes go out on their own; the batch acks separately.
@@ -1213,6 +1223,7 @@ class TestDeviceWriteAhead(CustomTestCase):
         cache._write_ahead_device_tail()
         self.assertEqual(tc.set_write_ahead_spare.call_count, 2)
         self.assertEqual([c.args[0] for c in cache._execute_kv_backup.call_args_list], [5, 8, 9])
+        self.assertEqual(cache.evict_host.call_args_list, [call(5), call(1)])
         self.assertEqual(list(cache._wa_issue_steps), [1, 2])
         # At the in-flight cap the spare set still refreshes, nothing is written.
         tc.peek_device_eviction_candidates.return_value = [(10, 4, True, False)]
@@ -1220,6 +1231,7 @@ class TestDeviceWriteAhead(CustomTestCase):
             cache._write_ahead_device_tail()
         self.assertEqual(tc.set_write_ahead_spare.call_count, 3)
         self.assertEqual(cache._execute_kv_backup.call_count, 3)
+        self.assertEqual(cache.evict_host.call_count, 2)
 
     def test_tail_target_follows_the_decayed_eviction_peak(self):
         cache = self._wa_cache()
@@ -1232,7 +1244,7 @@ class TestDeviceWriteAhead(CustomTestCase):
             cache._wa_peak_evicted = 10.0
             cache._write_ahead_device_tail()
         targets = [c.args[1] for c in peek.call_args_list]
-        self.assertEqual(targets, [400_000, 396_000, 392_040, 1000])
+        self.assertEqual(targets, [200_000, 198_000, 196_020, 1000])
 
     def test_publish_count_needs_the_lag_and_a_finished_copy(self):
         cache = self._wa_cache()

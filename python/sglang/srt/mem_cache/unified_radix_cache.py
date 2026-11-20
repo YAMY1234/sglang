@@ -2775,8 +2775,8 @@ class UnifiedRadixCache(BasePrefixCache):
         """Keep the device LRU tail backed on host so device eviction demotes
         without a D2H wait (SGLANG_HICACHE_DEVICE_WRITE_AHEAD).
 
-        The tail is K x the decayed peak of per-step device evictions. Its nodes
-        are spared by the first duplicate-reclaim pass; the unbacked ones are
+        The tail is K x the decayed peak of per-step device evictions. Host
+        eviction never reclaims its copies as duplicates; the unbacked ones are
         copied in one batch per step on a private stream behind the forward,
         locked until the rank-agreed ack commits them (_write_ahead_commit). A
         node enters the tail's hot end about K steps before eviction reaches it,
@@ -2813,12 +2813,25 @@ class UnifiedRadixCache(BasePrefixCache):
         # Writes queued by others keep their own ack queue and fence.
         cc.start_writing()
         budget = envs.SGLANG_HICACHE_DEVICE_WRITE_AHEAD_BATCH_MAX_TOKENS.get()
-        issued = 0
+        batch = []
         for node_id, num_tokens, unbacked, pending in tail:
             if not unbacked or pending:
                 continue
             if num_tokens > budget:
                 break
+            batch.append((node_id, num_tokens))
+            budget -= num_tokens
+        # One host eviction for the whole batch, not one per node.
+        anchor_entry = cc.mem_pool_host.anchor_entry
+        if batch and (
+            anchor_entry.host_pool.shared_allocation_domain is None
+            or anchor_entry.host_evict_fn is None
+        ):
+            needed = sum(n for _, n in batch) - cc.mem_pool_host.available_size()
+            if needed > 0:
+                self.evict_host(needed)
+        issued = 0
+        for node_id, num_tokens in batch:
             device_value, comp_xfers = self.tree_core.build_backup_spec(node_id)
             sidecar_xfers = self._build_backup_sidecar(device_value, comp_xfers)
             host_indices = self._execute_kv_backup(
@@ -2834,7 +2847,6 @@ class UnifiedRadixCache(BasePrefixCache):
             self.ongoing_write_ahead[node_id] = _OngoingWriteThrough(
                 node_id, lock_params, publish_node_ids
             )
-            budget -= num_tokens
             issued += num_tokens
         if issued:
             cc.start_writing(

@@ -908,7 +908,7 @@ class Envs:
     # clamped to [MIN_TOKENS, MAX_TOKENS]; each step writes its unbacked part as one batch (at most
     # MAX_INFLIGHT batches), committed ACK_LAG steps after PP0 sees the copy done.
     SGLANG_HICACHE_DEVICE_WRITE_AHEAD = EnvBool(False)
-    SGLANG_HICACHE_DEVICE_WRITE_AHEAD_K = EnvFloat(4.0)
+    SGLANG_HICACHE_DEVICE_WRITE_AHEAD_K = EnvFloat(2.0)
     SGLANG_HICACHE_DEVICE_WRITE_AHEAD_MIN_TOKENS = EnvInt(32768)
     SGLANG_HICACHE_DEVICE_WRITE_AHEAD_MAX_TOKENS = EnvInt(2097152)
     SGLANG_HICACHE_DEVICE_WRITE_AHEAD_BATCH_MAX_TOKENS = EnvInt(1048576)

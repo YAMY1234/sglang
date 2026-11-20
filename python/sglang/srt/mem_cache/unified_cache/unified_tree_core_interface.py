@@ -583,7 +583,7 @@ class UnifiedTreeCoreInterface(ABC):
 
     @abstractmethod
     def set_write_ahead_spare(self, node_ids: list[NodeId]) -> None:
-        """Replace the device-tail set the first Full duplicate-reclaim pass spares."""
+        """Replace the device-tail set that Full duplicate reclaim never takes."""
         ...
 
     @abstractmethod

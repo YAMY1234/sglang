@@ -2061,7 +2061,8 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         cache_actions: list[CacheAction | ComponentAction],
     ) -> None:
         """Reclaim Full host duplicates until num_tokens are freed; pass 1
-        spares evictable D-leaves (imminent free demotes), pass 2 takes them."""
+        spares evictable D-leaves (imminent free demotes), pass 2 takes them.
+        The written-ahead tail is spared by both passes."""
         swept_ids: list[NodeId] = []
         for spare_imminent_demotes in (True, False):
             if tracker[BASE_COMPONENT_TYPE] >= num_tokens:
@@ -2073,9 +2074,8 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                 if cd.value is None or cd.host_value is None:
                     swept_ids.append(node.id)  # stale entry
                     continue
-                if spare_imminent_demotes and (
-                    node in self.evictable_device_leaves
-                    or node.id in self.write_ahead_spare
+                if node.id in self.write_ahead_spare or (
+                    spare_imminent_demotes and node in self.evictable_device_leaves
                 ):
                     continue
                 if not self._can_reclaim_full_host_duplicate(node):

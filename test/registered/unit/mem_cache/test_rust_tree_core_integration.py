@@ -5758,9 +5758,7 @@ def test_peek_device_eviction_candidates_follows_the_device_eviction_walk(backen
 
 @pytest.mark.parametrize("backend", ["python", "rust"])
 @pytest.mark.parametrize("spare_first", [False, True])
-def test_write_ahead_spare_survives_the_first_duplicate_reclaim_pass(
-    backend, spare_first
-):
+def test_write_ahead_spare_is_never_reclaimed_as_a_duplicate(backend, spare_first):
     core = _tree_core(backend)
     core.set_hicache_enabled()
     core.is_write_back = True
@@ -5783,11 +5781,16 @@ def test_write_ahead_spare_survives_the_first_duplicate_reclaim_pass(
     assert torch.cat(host_frees[ComponentType.FULL]).tolist() == reclaimed
     assert core.is_backuped(first) == spare_first
     assert core.is_backuped(second) != spare_first
-    # Spared only in the first pass: with nothing else left it is reclaimed too.
+    # The second pass does not take the spared copy either: the drive frees
+    # nothing when only it is left (unspared, the other duplicate goes).
     host_frees = {}
     with envs.SGLANG_HICACHE_SKIP_HOST_DUPLICATE_RECLAIM.override(False):
         _accumulate_step(
             core.drive_host_eviction(ComponentType.FULL, 2), {}, {}, host_frees
         )
-    assert not core.is_backuped(first) and not core.is_backuped(second)
+    freed = host_frees.get(ComponentType.FULL, [])
+    assert (torch.cat(freed).tolist() if freed else []) == (
+        [] if spare_first else [600, 601]
+    )
+    assert core.is_backuped(first) == spare_first and not core.is_backuped(second)
     core.sanity_check([], [])

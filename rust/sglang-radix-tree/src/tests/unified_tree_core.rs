@@ -9795,17 +9795,27 @@ fn write_ahead_spare_survives_the_first_duplicate_reclaim_pass() {
 }
 
 #[test]
-fn write_ahead_spare_is_a_first_pass_preference_only() {
-    let mut tc = write_back_core();
-    tc.insert(&insert_params(&vec![1, 2, 3], &[10, 11, 12]));
-    tc.insert(&insert_params(&vec![1, 2], &[10, 11]));
-    let parent = tc.match_prefix(&match_params(&vec![1, 2])).best_match_node_id;
-    back_up_and_ack(&mut tc, parent, &[20, 21]);
-    tc.set_write_ahead_spare(vec![parent]);
-    // Nothing else can free host space: the second pass still takes the spared copy.
-    let result = tc.drive_host_eviction(FULL, 2);
-    assert_eq!(result.tracker[&FULL], 2);
-    assert!(!tc.arena.node(tc.arena.resolve(parent).unwrap()).backuped());
-    tc.reset();
-    assert!(tc.write_ahead_spare.is_empty());
+fn write_ahead_spare_is_never_reclaimed_as_a_duplicate() {
+    let run = |with_host_only_leaf: bool| {
+        let mut tc = write_back_core();
+        tc.insert(&insert_params(&vec![1, 2, 3], &[10, 11, 12]));
+        tc.insert(&insert_params(&vec![1, 2], &[10, 11]));
+        let parent = tc.match_prefix(&match_params(&vec![1, 2])).best_match_node_id;
+        back_up_and_ack(&mut tc, parent, &[20, 21]);
+        if with_host_only_leaf {
+            tc.insert(&insert_params(&vec![7, 8], &[70, 71]));
+            let leaf = tc.match_prefix(&match_params(&vec![7, 8])).best_match_node_id;
+            back_up_and_ack(&mut tc, leaf, &[80, 81]);
+            tc.demote(leaf).expect("backed live node");
+        }
+        tc.set_write_ahead_spare(vec![parent]);
+        let freed = tc.drive_host_eviction(FULL, 2).tracker[&FULL];
+        let kept = tc.arena.node(tc.arena.resolve(parent).unwrap()).backuped();
+        tc.reset();
+        assert!(tc.write_ahead_spare.is_empty());
+        (freed, kept)
+    };
+    // Neither pass takes the spared copy; host eviction drops a host-only leaf instead.
+    assert_eq!(run(false), (0, true));
+    assert_eq!(run(true), (2, true));
 }

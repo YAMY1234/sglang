@@ -3252,7 +3252,8 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         out
     }
 
-    /// Replace the device-tail set the first duplicate-reclaim pass spares.
+    /// Replace the device-tail set that duplicate reclaim never takes (host
+    /// eviction drops host-only leaves instead of these written-ahead copies).
     pub fn set_write_ahead_spare(&mut self, node_ids: Vec<NodeId>) {
         self.write_ahead_spare.clear();
         for node_id in node_ids {
