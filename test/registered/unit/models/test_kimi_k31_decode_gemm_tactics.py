@@ -54,3 +54,28 @@ def test_overlapping_ranges_are_rejected(registry):
     cg.register_tgv_m_ranges({(2112, 7168): ((1, 64, None),)})
     with pytest.raises(ValueError):
         cg.register_tgv_m_ranges({(2112, 7168): ((64, 96, 21),)})
+
+
+@pytest.mark.parametrize("word", ["SGLANG_K31_SM107_NDT5_ROWS", "SGLANG_K31_SM107_NDT5_PEAK_ROWS"])
+def test_sm107_ndt5_rows_replace_the_built_in_table(word, monkeypatch):
+    monkeypatch.delenv("SGLANG_K31_SM107_GEMM_TABLE", raising=False)
+    monkeypatch.setenv(word, "1")
+    kimi_k3._k31_sm107_load.cache_clear()
+    try:
+        dense, side, lt = kimi_k3._k31_sm107_load()
+        rows = kimi_k3._K31_SM107_NDT5_PEAK_ROWS if "PEAK" in word else kimi_k3._K31_SM107_NDT5_ROWS
+        assert dense == rows["table"] and side == rows["side"] and lt == rows["lt"]
+        assert kimi_k3._k31_sm107_tables() == (dense, side) and kimi_k3._k31_sm107_lt_ranges() == lt
+    finally:
+        kimi_k3._k31_sm107_load.cache_clear()
+
+
+def test_sm107_default_table_has_no_cublaslt_ranges(monkeypatch):
+    for word in ("SGLANG_K31_SM107_GEMM_TABLE", "SGLANG_K31_SM107_NDT5_ROWS", "SGLANG_K31_SM107_NDT5_PEAK_ROWS"):
+        monkeypatch.delenv(word, raising=False)
+    kimi_k3._k31_sm107_load.cache_clear()
+    try:
+        assert kimi_k3._k31_sm107_tables() == (kimi_k3._K31_SM107_TGV_M_RANGES, kimi_k3._K31_SM107_BFA_SIDE_TGV_M_RANGES)
+        assert kimi_k3._k31_sm107_lt_ranges() == {}
+    finally:
+        kimi_k3._k31_sm107_load.cache_clear()

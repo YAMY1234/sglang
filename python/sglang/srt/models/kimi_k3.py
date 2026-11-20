@@ -277,6 +277,65 @@ _K31_SM107_TABLE_SHAPES = frozenset(
 )
 _K31_SM107_SIDE_SHAPES = frozenset({(144, 7168)})
 
+# H238: the NDT=5 table for the K=4 decode (--speculative-num-draft-tokens 5):
+# verify rows M = 5 x graph bs, which the M = 6 x bs rows above never measured
+# (cuBLAS lands in slow windows there, e.g. qkvg at M 640: +1.0 ms per step).
+# None until the NDT=5 sweep (benchmark/kernels/k31_sm107/
+# sweep_sm107_decode_gemms.py --ndt 5, then gen_ndt5_rows.py --inline) fills it
+# with {"id": str, "table": {(n, k): ((m_lo, m_hi, tactic), ...)},
+# "side": {(n, k): ((m_lo, m_hi, tactic), ...)}, "lt": {(n, k): ((m_lo, m_hi), ...)}}:
+# the complete table (the 6 x bs rows it keeps included), used whole in place of
+# the built-in table under SGLANG_K31_SM107_NDT5_ROWS. "lt" ranges take cuBLASLt
+# (cutedsl_bf16_gemm.register_cublaslt_m_ranges), disjoint from every TGV range.
+_K31_SM107_NDT5_ROWS: Optional[dict] = {
+    "id": "ndt5 sweep (sm107_table_ndt5 d5b1badb)",
+    "table": {
+        (1536, 7168): ((168, 192, 21), (200, 200, 21), (336, 359, 23), (361, 399, 23), (401, 439, 23), (441, 480, 23),),
+        (2112, 7168): ((160, 160, 21), (528, 528, 24), (912, 960, 28),),
+        (6144, 7168): ((132, 192, 24), (624, 624, 24),),
+        (7168, 1536): ((72, 79, 24), (81, 96, 24),),
+        (7168, 3584): ((10, 10, 18), (15, 15, 6), (52, 64, 23), (132, 144, 27),),
+    },
+    "side": {
+        (144, 7168): ((108, 120, 21), (132, 132, 23), (156, 192, 23), (336, 336, 24), (560, 560, 23), (600, 600, 28), (640, 640, 28), (672, 768, 28),),
+    },
+    "lt": {
+        (1536, 7168): ((360, 360), (400, 400), (440, 440),),
+        (2112, 7168): ((360, 360), (480, 480), (520, 520), (560, 560),),
+        (2304, 1536): ((320, 320),),
+        (6144, 7168): ((280, 280), (560, 560), (600, 600), (640, 640),),
+        (7168, 1536): ((80, 80), (240, 240), (320, 320), (560, 560),),
+        (7168, 3584): ((50, 50),),
+    },
+}
+
+# D1: the NDT=5 table through the EP16 peak's verify rows (graph bs 136-224, M
+# 680-1120), which the rows above never measured. The complete table: the NDT=5
+# rows at M <= 640 plus the sweep's picks above (sweep_sm107_decode_gemms.py
+# --ndt 5 --bs-list 136:224:8, then gen_ndt5_rows.py --merge-below 640 --inline
+# --slot _K31_SM107_NDT5_PEAK_ROWS). Used whole under SGLANG_K31_SM107_NDT5_PEAK_ROWS.
+_K31_SM107_NDT5_PEAK_ROWS: Optional[dict] = {
+    "id": "ndt5 sweep (sm107_table_ndt5_peak ac434082)",
+    "table": {
+        (1536, 7168): ((168, 192, 21), (200, 200, 21), (336, 359, 23), (361, 399, 23), (401, 439, 23), (441, 480, 23),),
+        (2112, 7168): ((160, 160, 21), (528, 528, 24), (912, 960, 28),),
+        (6144, 7168): ((132, 192, 24), (624, 624, 24),),
+        (7168, 1536): ((72, 79, 24), (81, 96, 24),),
+        (7168, 3584): ((10, 10, 18), (15, 15, 6), (52, 64, 23), (132, 134, 27), (136, 139, 27), (141, 144, 27),),
+    },
+    "side": {
+        (144, 7168): ((108, 120, 21), (132, 132, 23), (156, 192, 23), (336, 336, 24), (560, 560, 23), (600, 600, 28), (640, 640, 28), (672, 768, 28),),
+    },
+    "lt": {
+        (1536, 7168): ((360, 360), (400, 400), (440, 440), (680, 680), (800, 800),),
+        (2112, 7168): ((360, 360), (480, 480), (520, 520), (560, 560),),
+        (2304, 1536): ((320, 320),),
+        (6144, 7168): ((280, 280), (560, 560), (600, 600), (640, 640), (840, 840),),
+        (7168, 1536): ((80, 80), (240, 240), (320, 320), (560, 560), (1000, 1000),),
+        (7168, 3584): ((50, 50), (130, 130), (135, 135), (140, 140),),
+    },
+}
+
 
 def _k31_sm107_tuning(config) -> bool:
     """Kimi-K3.1 on VR200 under SGLANG_K31_SM107_GEMM_TACTICS (default off):
@@ -314,28 +373,126 @@ def _k31_sm107_parse_ranges(section: dict, allowed: frozenset) -> dict:
     return out
 
 
+def _k31_sm107_parse_lt(section: dict, allowed: frozenset) -> dict:
+    """``{"n,k": [[m_lo, m_hi], ...]}`` -> the cuBLASLt m-range dict. Same rules
+    as _k31_sm107_parse_ranges, without a tactic; the slice shape is TGV-only
+    (k3_ar_fusion.slice_gemm never takes the dispatch)."""
+    out = {}
+    for key, ranges in section.items():
+        n, k = (int(v) for v in key.split(","))
+        if (n, k) not in allowed or (n, k) == (896, 3584):
+            raise ValueError(f"SM107 GEMM table: lt shape {(n, k)} is not allowed")
+        floor = max((hi for _, hi, _ in _K31_TGV_M_RANGES.get((n, k), ())), default=0)
+        rows = []
+        for m_lo, m_hi in ranges:
+            if not (
+                type(m_lo) is int
+                and type(m_hi) is int
+                and floor < m_lo <= m_hi <= 4096
+            ):
+                raise ValueError(
+                    f"SM107 GEMM table: bad lt range {(m_lo, m_hi)} for {(n, k)}"
+                )
+            rows.append((m_lo, m_hi))
+        out[(n, k)] = tuple(rows)
+    return out
+
+
+def _k31_sm107_check_disjoint(dense: dict, lt: dict) -> None:
+    """A cuBLASLt range must not overlap a TGV range of the same shape (the
+    generic K3.1 ranges included): the dispatch would take cuBLASLt first and
+    leave the TGV row dead, so the table would not say what runs."""
+    for shape, lt_rows in lt.items():
+        tgv_rows = tuple(_K31_TGV_M_RANGES.get(shape, ())) + tuple(
+            dense.get(shape, ())
+        )
+        for lo, hi in lt_rows:
+            for t_lo, t_hi, _ in tgv_rows:
+                if lo <= t_hi and t_lo <= hi:
+                    raise ValueError(
+                        f"SM107 GEMM table: lt range {(lo, hi)} overlaps the TGV "
+                        f"range {(t_lo, t_hi)} of {shape}"
+                    )
+
+
 @lru_cache(maxsize=1)
-def _k31_sm107_tables() -> tuple:
-    """(dense-GEMM m ranges, side-stream [f_a | b] m ranges) for SM107: the JSON
-    at SGLANG_K31_SM107_GEMM_TABLE, else the built-in table."""
+def _k31_sm107_load() -> tuple:
+    """(dense-GEMM TGV m ranges, side-stream [f_a | b] TGV m ranges, cuBLASLt m
+    ranges) for SM107: the JSON at SGLANG_K31_SM107_GEMM_TABLE, else the
+    built-in NDT=5 peak rows under SGLANG_K31_SM107_NDT5_PEAK_ROWS, else the
+    built-in NDT=5 rows under SGLANG_K31_SM107_NDT5_ROWS, else the built-in
+    M = 6 x bs table (no cuBLASLt ranges)."""
     path = envs.SGLANG_K31_SM107_GEMM_TABLE.get()
+    ndt5 = envs.SGLANG_K31_SM107_NDT5_ROWS.get()
+    peak = envs.SGLANG_K31_SM107_NDT5_PEAK_ROWS.get()
+    table_id = path
+    if peak and not path and _K31_SM107_NDT5_PEAK_ROWS is None:
+        logger.warning(
+            "SGLANG_K31_SM107_NDT5_PEAK_ROWS=1 but this build carries no peak rows "
+            "(kimi_k3._K31_SM107_NDT5_PEAK_ROWS is None): ignored"
+        )
     if path:
         with open(path) as f:
             doc = json.load(f)
         dense = _k31_sm107_parse_ranges(doc["table"], _K31_SM107_TABLE_SHAPES)
         side = _k31_sm107_parse_ranges(doc.get("side", {}), _K31_SM107_SIDE_SHAPES)
+        lt = _k31_sm107_parse_lt(doc.get("lt", {}), _K31_SM107_TABLE_SHAPES)
+    elif (peak and _K31_SM107_NDT5_PEAK_ROWS is not None) or (
+        ndt5 and _K31_SM107_NDT5_ROWS is not None
+    ):
+        rows = (
+            _K31_SM107_NDT5_PEAK_ROWS
+            if peak and _K31_SM107_NDT5_PEAK_ROWS is not None
+            else _K31_SM107_NDT5_ROWS
+        )
+        dense = _k31_sm107_parse_ranges(
+            {f"{n},{k}": v for (n, k), v in rows["table"].items()},
+            _K31_SM107_TABLE_SHAPES,
+        )
+        side = _k31_sm107_parse_ranges(
+            {f"{n},{k}": v for (n, k), v in rows["side"].items()},
+            _K31_SM107_SIDE_SHAPES,
+        )
+        lt = _k31_sm107_parse_lt(
+            {f"{n},{k}": v for (n, k), v in rows["lt"].items()},
+            _K31_SM107_TABLE_SHAPES,
+        )
+        table_id = rows["id"]
     else:
-        dense, side = _K31_SM107_TGV_M_RANGES, _K31_SM107_BFA_SIDE_TGV_M_RANGES
+        if ndt5:
+            logger.warning(
+                "SGLANG_K31_SM107_NDT5_ROWS=1 but this build carries no NDT=5 "
+                "rows (kimi_k3._K31_SM107_NDT5_ROWS is None): the built-in "
+                "M = 6 x bs table stays"
+            )
+        dense, side, lt = _K31_SM107_TGV_M_RANGES, _K31_SM107_BFA_SIDE_TGV_M_RANGES, {}
+        table_id = _K31_SM107_TABLE_ID
+    _k31_sm107_check_disjoint(dense, lt)
     logger.info(
         "K3.1 SM107 decode GEMM tactics on (SGLANG_K31_SM107_GEMM_TACTICS=1): "
-        "table=%s dense=%s side=%s side-stream rows bfa<=%d gate<=%d",
-        path or _K31_SM107_TABLE_ID,
+        "table=%s ndt5_flag=%s peak_flag=%s dense=%s side=%s lt=%s "
+        "side-stream rows bfa<=%d gate<=%d",
+        table_id,
+        ndt5,
+        peak,
         {f"{n}x{k}": [r[:2] for r in v] for (n, k), v in dense.items()},
         {f"{n}x{k}": [r[:2] for r in v] for (n, k), v in side.items()},
+        {f"{n}x{k}": [list(r) for r in v] for (n, k), v in lt.items()},
         envs.SGLANG_K31_SM107_BFA_SIDE_MAX_TOKENS.get(),
         envs.SGLANG_K31_SM107_GATE_SIDE_MAX_TOKENS.get(),
     )
-    return dense, side
+    return dense, side, lt
+
+
+def _k31_sm107_tables() -> tuple:
+    """(dense-GEMM TGV m ranges, side-stream [f_a | b] TGV m ranges) for SM107."""
+    return _k31_sm107_load()[:2]
+
+
+def _k31_sm107_lt_ranges() -> dict:
+    """The cuBLASLt m ranges for SM107 ({} unless a table or the NDT=5 rows
+    carry some)."""
+    return _k31_sm107_load()[2]
 
 
 def _k3_side_stream_max_tokens(config, sm107_max_tokens=None) -> int:
@@ -3819,6 +3976,12 @@ class KimiK3LinearForCausalLM(nn.Module):
                 register_tgv_m_ranges(_K31_GB300_TGV_M_RANGES)
             elif _k31_sm107_tuning(config):
                 register_tgv_m_ranges(_k31_sm107_tables()[0])
+                if _k31_sm107_lt_ranges():
+                    from sglang.kernels.ops.gemm.cutedsl_bf16_gemm import (
+                        register_cublaslt_m_ranges,
+                    )
+
+                    register_cublaslt_m_ranges(_k31_sm107_lt_ranges())
         if quant_config is not None:
             if isinstance(quant_config, ModelSlimConfig):
                 model_mapping = {
