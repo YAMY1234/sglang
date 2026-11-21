@@ -34,6 +34,8 @@ class PPSendWindow:
         assert bound >= 0, bound
         self._bound = bound
         self._rounds: Deque[Tuple[Any, ...]] = deque()
+        # Most rounds outstanding since the last take_peak(); > 1 shows the window is used.
+        self._peak = 0
 
     def __len__(self) -> int:
         return len(self._rounds)
@@ -44,6 +46,7 @@ class PPSendWindow:
         if works:
             # Copied: callers clear their work list after handing it over.
             self._rounds.append(tuple(works))
+            self._peak = max(self._peak, len(self._rounds))
         waited = 0
         while len(self._rounds) > self._bound:
             self._wait_oldest()
@@ -59,6 +62,10 @@ class PPSendWindow:
     def _wait_oldest(self) -> None:
         for p2p_work in self._rounds.popleft():
             p2p_work.work.wait()
+
+    def take_peak(self) -> int:
+        peak, self._peak = self._peak, len(self._rounds)
+        return peak
 
 
 class PPSendWindows(msgspec.Struct, frozen=True):
@@ -83,6 +90,20 @@ class PPSendWindows(msgspec.Struct, frozen=True):
             release=PPSendWindow(bound),
         )
 
+    def take_peaks(self) -> Dict[str, int]:
+        windows = {
+            "req": self.req,
+            "proxy": self.proxy,
+            "output": self.output,
+            "transfer": self.transfer,
+            "release": self.release,
+        }
+        return {
+            name: window.take_peak()
+            for name, window in windows.items()
+            if window is not None
+        }
+
 
 class _InboxFailure(msgspec.Struct, frozen=True):
     exc: BaseException
@@ -98,6 +119,9 @@ class PPRecvInbox:
         assert depth >= 1, depth
         self._recv_one = recv_one
         self._queue: queue.Queue = queue.Queue(maxsize=depth)
+        # Pops since take_counts(), and how many found their message already received.
+        self._pops = 0
+        self._ready_pops = 0
         self._thread = threading.Thread(target=self._run, name=name, daemon=True)
         self._thread.start()
 
@@ -105,6 +129,8 @@ class PPRecvInbox:
         return not self._queue.empty()
 
     def pop(self) -> Any:
+        self._pops += 1
+        self._ready_pops += not self._queue.empty()
         item = self._queue.get()
         if isinstance(item, _InboxFailure):
             # Keep failing on later pops too: the channel is unusable.
@@ -113,6 +139,11 @@ class PPRecvInbox:
                 f"PP receive thread {self._thread.name} failed"
             ) from item.exc
         return item
+
+    def take_counts(self) -> Tuple[int, int]:
+        counts = (self._pops, self._ready_pops)
+        self._pops = self._ready_pops = 0
+        return counts
 
     def _run(self) -> None:
         try:

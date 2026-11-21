@@ -7,6 +7,8 @@ the digest, compared per epoch, is how a run proves that.
 """
 
 import random
+import threading
+import time
 import unittest
 import weakref
 from array import array
@@ -84,6 +86,40 @@ class TestPPSendWindow(CustomTestCase):
         self.assertEqual(window.drain(), 2)
         self.assertEqual(log[4:], ["r2.0", "r2.1", "r3.0", "r3.1"])
         self.assertTrue(all(ref() is None for ref in payloads))
+
+    def test_peak_counts_outstanding_rounds_and_restarts_at_the_current_depth(self):
+        log = []
+        windows = PPSendWindows.create(bound=3, tensor_bound=1)
+        for i in range(3):
+            windows.req.push(works=_round(f"q{i}", log))
+            windows.proxy.push(works=_round(f"p{i}", log))
+        self.assertEqual(
+            windows.take_peaks(),
+            {"req": 3, "proxy": 2, "output": 0, "transfer": 0, "release": 0},
+        )
+        self.assertEqual(windows.take_peaks()["req"], 3)
+        windows.req.drain()
+        self.assertEqual(windows.take_peaks()["req"], 3)
+        self.assertEqual(windows.take_peaks()["req"], 0)
+
+    def test_inbox_counts_pops_that_found_their_message_received(self):
+        items = iter(range(3))
+        gate = threading.Event()
+
+        def recv_one():
+            gate.wait()
+            return next(items)
+
+        inbox = pp_decouple.PPRecvInbox(recv_one=recv_one, depth=2, name="t-inbox")
+        gate.set()
+        deadline = time.monotonic() + 10
+        while inbox._queue.qsize() < 2 and time.monotonic() < deadline:
+            time.sleep(0.001)
+        self.assertEqual((inbox.pop(), inbox.pop(), inbox.pop()), (0, 1, 2))
+        pops, ready = inbox.take_counts()
+        self.assertEqual(pops, 3)
+        self.assertGreaterEqual(ready, 2)
+        self.assertEqual(inbox.take_counts(), (0, 0))
 
     def test_commit_windows_sends_but_waits_a_cuda_graph_fenced_proxy_now(self):
         log = []

@@ -212,6 +212,8 @@ class PPBubbleDiag:
         self._pass_relay0 = (0, 0, 0)
         self.stack_sampler: Optional[_StackSampler] = None
         self.gc_timer: Optional[_GCTimer] = None
+        # Extra per-interval counters from the loop (PP decouple liveness), or None.
+        self.extra_stats = None
         # Slow-event log (SGLANG_PP_DIAG_SLOW_MS): per-iteration label time and walls.
         self.slow_ns = 0
         self._it_ns: dict[str, int] = defaultdict(int)
@@ -454,6 +456,8 @@ class PPBubbleDiag:
         }
         if self.gc_timer is not None:
             stats["gc"] = self.gc_timer.snapshot()
+        if self.extra_stats is not None:
+            stats.update(self.extra_stats())
         if torch.cuda.is_available():
             # Allocator counters, no device sync; the peak is reset every interval.
             gib = 1 << 30

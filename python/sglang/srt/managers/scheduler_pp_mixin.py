@@ -437,8 +437,14 @@ class SchedulerPPMixin:
                         # This result must find its early sends made and ended. Forwards
                         # before the one just launched are done by now or nearly, and
                         # that one is queued, so waiting on them leaves the GPU busy.
+                        # Decoupled, the host runs ahead of its GPU: wait only for this
+                        # mb's own forward; the per-iteration flush sends the rest.
                         self._pp_pd_flush_early_sends(
-                            max(self.mbs[next_mb_id].forward_iter, self.forward_ct - 1)
+                            self.mbs[next_mb_id].forward_iter
+                            if decoupled
+                            else max(
+                                self.mbs[next_mb_id].forward_iter, self.forward_ct - 1
+                            )
                         )
                         self._pp_pd_settle_early_sends(self.mbs[next_mb_id])
                     next_md = self.mb_metadata[next_mb_id]
@@ -812,6 +818,8 @@ class SchedulerPPMixin:
                     name=f"pp{pp_rank}-relay-recv",
                 )
             )
+        if self.pp_bubble_diag is not None:
+            self.pp_bubble_diag.extra_stats = self._pp_decouple_stats
         logger.info(
             "PP PD prefill: stages decoupled (SGLANG_PP_DECOUPLE_HOST); %d send "
             "rounds per channel un-waited, relay window %d.",
@@ -819,6 +827,21 @@ class SchedulerPPMixin:
             pp_sync_window(),
         )
         return True
+
+    def _pp_decouple_stats(self: Scheduler) -> dict:
+        """Per-interval proof the decoupled path runs: peak un-waited send rounds per
+        channel, and inbox pops that found their message already received."""
+        inboxes = {"dict": self._pp_dict_inbox, "relay": pp_decouple.relay_inbox()}
+        return {
+            "decouple": {
+                "win_peak": self.pp_send_windows.take_peaks(),
+                "inbox_pops_ready": {
+                    name: inbox.take_counts()
+                    for name, inbox in inboxes.items()
+                    if inbox is not None
+                },
+            }
+        }
 
     def _pp_overlap_input_wait(self: Scheduler, inbox: Optional[PPRecvInbox]) -> None:
         """While the next input is still upstream, send the early KV chunks whose
