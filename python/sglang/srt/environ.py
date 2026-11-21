@@ -899,6 +899,8 @@ class Envs:
     # PP loop with a separate comm stream: the schedule stream waits on each launched
     # forward (the WAR barrier the non-PP loop applies), since no send on it does.
     SGLANG_PP_SCHED_WAR_FENCE = EnvBool(False)
+    # Debug: log every PP tensor-dict send / receive (kind, batch tag, stash) and every launch.
+    SGLANG_PP_DEBUG_TRACE = EnvBool(False)
     SGLANG_PP_CE_PUSH_SLOT_MB = EnvInt(1600)
     # PP PD prefill: log a digest of allocator and radix tree state every N loop
     # epochs (0 = off); every stage must log the same digest at the same epoch.

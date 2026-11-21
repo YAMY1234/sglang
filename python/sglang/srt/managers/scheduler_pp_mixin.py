@@ -64,6 +64,9 @@ if TYPE_CHECKING:
     from sglang.srt.observability.forward_pass_metrics import FpmTiming
 
 
+_PP_TRACE = envs.SGLANG_PP_DEBUG_TRACE.get()
+
+
 def _pp_can_skip_output_comm(batch: ScheduleBatch) -> bool:
     """Check if output send/recv can be skipped for this batch."""
     return (
@@ -1321,6 +1324,11 @@ class SchedulerPPMixin:
                 "Consider adding msg_type='proxy' or 'output' to avoid recv conflicts."
             )
         tensor_dict["__msg_type__"] = msg_type
+        if _PP_TRACE:
+            logger.info(
+                "PPT send %s tag=%s fct=%d", msg_type,
+                tensor_dict.get(pp_decouple.PROXY_BATCH_KEY), self.forward_ct,
+            )
         p2p_work = []
         with self.pp_comm_stream_ctx:
             if ready_event is not None:
@@ -1373,6 +1381,12 @@ class SchedulerPPMixin:
         if expected_kind in self._pp_tensor_dict_inbox:
             inbox_queue = self._pp_tensor_dict_inbox[expected_kind]
             if inbox_queue:
+                if _PP_TRACE:
+                    logger.info(
+                        "PPT recv exp=%s from=stash tag=%s left=%d fct=%d", expected_kind,
+                        inbox_queue[0][0].get(pp_decouple.PROXY_BATCH_KEY),
+                        len(inbox_queue) - 1, self.forward_ct,
+                    )
                 return inbox_queue.popleft()
 
         while True:
@@ -1395,6 +1409,11 @@ class SchedulerPPMixin:
                 else:
                     recv_event = self._pp_record_comm_event()
             received_kind = tensor_dict.get("__msg_type__", "default")
+            if _PP_TRACE:
+                logger.info(
+                    "PPT recv exp=%s got=%s tag=%s fct=%d", expected_kind, received_kind,
+                    tensor_dict.get(pp_decouple.PROXY_BATCH_KEY), self.forward_ct,
+                )
             if received_kind == expected_kind:
                 if received_kind == "default":
                     logger.warning_once(
@@ -2214,6 +2233,11 @@ class SchedulerPPMixin:
                 )
                 if self._pp_debug_vocab is not None:
                     self._pp_debug_check_input_ids(cur_batch)
+                if _PP_TRACE:
+                    logger.info(
+                        "PPT launch mb=%d fct=%d tag=%s local=%s", mb_id, self.forward_ct,
+                        pp_decouple.proxy_batch_tag(cur_batch), self._pp_pd_local_result(cur_batch),
+                    )
                 result = self.run_batch(cur_batch, pp_proxy_tensors)
                 set_time_batch(
                     cur_batch.reqs,
