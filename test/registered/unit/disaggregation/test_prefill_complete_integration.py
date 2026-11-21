@@ -731,6 +731,38 @@ class TestAllocationIntegration(CustomTestCase):
         long_.disagg_kv_sender.mark_prefill_complete.assert_not_called()
         self.assertTrue(long_.disagg_ready_checked)
 
+    def test_ready_at_launch_defers_readiness_to_the_first_batch(self):
+        # Decode reserves only from launch: no readiness at the handshake or in the
+        # waiting queue; the first batch decides as before.
+        scheduler = SimpleNamespace(
+            tree_cache=SimpleNamespace(supports_fast_match_prefix=lambda: True)
+        )
+        for name in (
+            "maybe_send_early_readiness",
+            "send_early_readiness_for",
+            "send_early_readiness_waiting",
+        ):
+            setattr(scheduler, name, MethodType(getattr(SchedulerDisaggregationPrefillMixin, name), scheduler))
+        short = SimpleNamespace(
+            pending_bootstrap=True,
+            disagg_ready_checked=False,
+            origin_input_ids=[0] * 100,
+            num_matched_prefix_tokens=64,
+            disagg_kv_sender=Mock(),
+        )
+        scheduler.waiting_queue = [short]
+        with envs.SGLANG_PREFILL_COMPLETE_MIN_WORK_TOKENS.override(64), envs.SGLANG_PREFILL_COMPLETE_READY_AT_LAUNCH.override(
+            True
+        ), patch("sglang.srt.disaggregation.prefill.match_kv_cache") as match:
+            scheduler.send_early_readiness_for([short])
+            scheduler.send_early_readiness_waiting()
+            match.assert_not_called()
+            short.disagg_kv_sender.mark_prefill_complete.assert_not_called()
+            self.assertFalse(short.disagg_ready_checked)
+            scheduler.maybe_send_early_readiness(short)
+        short.disagg_kv_sender.mark_prefill_complete.assert_called_once()
+        self.assertTrue(short.disagg_ready_checked)
+
     def test_min_work_tokens_readies_at_bootstrap_even_while_batch_is_full(self):
         # Readiness goes out as requests leave the bootstrap queue, not from batch
         # scheduling, which returns early while the running batch is full.

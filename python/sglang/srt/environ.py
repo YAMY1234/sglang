@@ -914,6 +914,9 @@ class Envs:
     # its KV as under early; 0 (default) keeps every request's reservation until
     # prefill completes.
     SGLANG_PREFILL_COMPLETE_MIN_WORK_TOKENS = EnvInt(0)
+    # With MIN_WORK_TOKENS > 0, decide at the request's first prefill batch instead of the
+    # handshake, so decode reserves KV from launch rather than through the queue wait.
+    SGLANG_PREFILL_COMPLETE_READY_AT_LAUNCH = EnvBool(False)
 
     # ===================================================================
     # Distributed and model-parallel runtime

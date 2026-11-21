@@ -1683,6 +1683,7 @@ class SchedulerDisaggregationPrefillMixin:
         if (
             not reqs
             or envs.SGLANG_PREFILL_COMPLETE_MIN_WORK_TOKENS.get() <= 0
+            or envs.SGLANG_PREFILL_COMPLETE_READY_AT_LAUNCH.get()
             or get_disagg().disaggregation_decode_allocation_policy
             != "prefill_complete"
             or not self.tree_cache.supports_fast_match_prefix()
@@ -1698,6 +1699,7 @@ class SchedulerDisaggregationPrefillMixin:
         reserves before launch and their KV can be sent at forward completion."""
         if (
             envs.SGLANG_PREFILL_COMPLETE_MIN_WORK_TOKENS.get() > 0
+            and not envs.SGLANG_PREFILL_COMPLETE_READY_AT_LAUNCH.get()
             and get_disagg().disaggregation_decode_allocation_policy
             == "prefill_complete"
         ):
