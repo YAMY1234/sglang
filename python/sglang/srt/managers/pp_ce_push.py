@@ -15,11 +15,15 @@ the stages already exchange; a message larger than a slot falls back to NCCL.
 
 from __future__ import annotations
 
+import json
 import logging
+import os
 from collections import deque, namedtuple
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import torch
+
+from sglang.srt.environ import envs
 
 logger = logging.getLogger(__name__)
 
@@ -167,6 +171,31 @@ def _import(device_id: int, fabric: bytes, size: int, peer: int) -> int:
     )
 
 
+class _CEChecksum:
+    """Debug only (SGLANG_DEBUG_PP_CE_CHECKSUM=N): the int64 sum of the int32 view of every tensor of the first N messages
+    a stage pushes (send) or reads from its ring (recv), kept on the GPU with no host sync and written once to
+    SGLANG_DEBUG_PP_CE_CHECKSUM_DIR/ck-{send,recv}-pp<rank>.json. Sender PPk and receiver PPk+1 must match message by message."""
+
+    def __init__(self, n: int, path: str, device: str) -> None:
+        self.n, self.path, self.count = n, path, 0
+        self.sums = torch.zeros(n, 8, dtype=torch.int64, device=device)
+        self.keys: List[Optional[List[str]]] = [None] * n
+
+    def add(self, items: Sequence[Tuple[str, torch.Tensor]]) -> None:
+        i = self.count
+        if i >= self.n:
+            return
+        for j, (_, t) in enumerate(items):
+            flat = t.reshape(-1).view(torch.uint8)
+            self.sums[i, j] = (flat.view(torch.int32) if flat.numel() % 4 == 0 else flat).sum(dtype=torch.int64)
+        self.keys[i] = [k for k, _ in items]
+        self.count += 1
+        if self.count == self.n:
+            with open(self.path, "w") as f:
+                json.dump({"keys": self.keys, "sums": self.sums.tolist()}, f)
+            logger.info("PP CE checksum: wrote %d messages to %s", self.n, self.path)
+
+
 class PPCEPush:
     """One stage's side of the ring protocol: an input ring (stage > 0) and a push target (stage < last)."""
 
@@ -201,6 +230,9 @@ class PPCEPush:
         self.max_bytes = 0
         # (copy start, done) timing events of recent pushes: how long the copy engine runs per message.
         self._timed: deque = deque(maxlen=64)
+        self._ck_send: Optional[_CEChecksum] = None
+        self._ck_recv: Optional[_CEChecksum] = None
+        self._ck_views: Dict[int, List[Tuple[str, torch.Tensor]]] = {}
         self.ring_bytes = slots * slot_bytes
         # Local staging words for signal(): [0] the push stream's full flags, [1] the release's free flags.
         self._scratch = torch.zeros(64, dtype=torch.int32, device=f"cuda:{device_id}")
@@ -282,6 +314,8 @@ class PPCEPush:
         with torch.cuda.stream(self.stream):
             if ready_event is not None:
                 self.stream.wait_event(ready_event)
+            if self._ck_send is not None:
+                self._ck_send.add(list(tensors.items()))
             target = free_target(seq, self.slots)
             if target > 0:
                 self.drv.wait_geq(self.stream, self.free_va + 4 * slot, target)
@@ -323,11 +357,28 @@ class PPCEPush:
                 )
             elif key != CE_KEY:
                 out[key] = value
+        if self._ck_recv is not None:
+            self._ck_views[seq] = [(k, v) for k, v in out.items() if isinstance(meta[k], CESlice)]
         return out, (slot, seq)
 
     def wait_full(self, stream: torch.cuda.Stream, slot_seq: Tuple[int, int]) -> None:
         slot, seq = slot_seq
         self.drv.wait_geq(stream, self.full_va + 4 * slot, seq + 1)
+        if self._ck_recv is not None:
+            with torch.cuda.stream(stream):
+                self._ck_recv.add(self._ck_views.pop(seq))
+
+    def enable_checksum(self, rank: int) -> None:
+        n = envs.SGLANG_DEBUG_PP_CE_CHECKSUM.get()
+        if n <= 0:
+            return
+        d = envs.SGLANG_DEBUG_PP_CE_CHECKSUM_DIR.get()
+        os.makedirs(d, exist_ok=True)
+        if self.has_next:
+            self._ck_send = _CEChecksum(n, f"{d}/ck-send-pp{rank}.json", f"cuda:{self.device_id}")
+        if self.has_prev:
+            self._ck_recv = _CEChecksum(n, f"{d}/ck-recv-pp{rank}.json", f"cuda:{self.device_id}")
+        logger.warning("PP CE checksum (debug) on PP%d: first %d messages per side -> %s", rank, n, d)
 
     def release(self, stream: torch.cuda.Stream, slot_seq: Tuple[int, int]) -> None:
         # Its own staging word: the release can run on a different stream from the pushes.
@@ -405,6 +456,7 @@ def setup_ce_push(*, pp_group, device_id: int, slots: int, slot_mb: Sequence[int
     if not all_ranks_ok(pp_group.cpu_group, ok):
         return None
     _warm_ring_p2p(pp_group, device_id)
+    ce.enable_checksum(rank)
     logger.info(
         "PP CE push on PP%d: %d slots x %.0f MiB input ring, copy-engine pushes to PP%s (%s MiB slots)",
         rank,

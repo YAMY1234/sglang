@@ -209,6 +209,26 @@ class TestPPCEPush(CustomTestCase):
         self.assertEqual(ce.take_stats(), {"fallbacks": 1, "max_mib": 1})
         self.assertEqual(ce.take_stats(), {"fallbacks": 0, "max_mib": 0})
 
+    def test_checksum_sums_the_int32_view_of_each_tensor_and_writes_once(self):
+        """Debug copy check: each side sums every pushed tensor's int32 view (bytes when not a multiple of 4) for the
+        first N messages, then writes them once; sender and receiver files must match message by message."""
+        import json
+        import tempfile
+
+        from sglang.srt.managers.pp_ce_push import _CEChecksum
+
+        with tempfile.TemporaryDirectory() as d:
+            ck = _CEChecksum(2, f"{d}/ck.json", "cpu")
+            h = torch.arange(6, dtype=torch.bfloat16).reshape(3, 2)
+            odd = torch.arange(3, dtype=torch.uint8)
+            ck.add([("hidden_states", h), ("tag", odd)])
+            ck.add([("hidden_states", h + 1)])
+            ck.add([("hidden_states", h + 2)])  # past N: ignored
+            got = json.load(open(f"{d}/ck.json"))
+        self.assertEqual(got["keys"], [["hidden_states", "tag"], ["hidden_states"]])
+        self.assertEqual(got["sums"][0][:2], [int(h.view(torch.int32).sum()), 3])
+        self.assertEqual(got["sums"][1][0], int((h + 1).view(torch.int32).sum()))
+
     def _scheduler(self, last, log):
         from sglang.srt.managers.pp_ce_push import CEWait
 
