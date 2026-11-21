@@ -866,7 +866,8 @@ def build_mega_moe_experts_weights(experts) -> None:
 
         # (domains, experts, N / domains, K) for the kernel; the parameters get the
         # expert-major view of the same memory.
-        mega_l1, mega_l2 = deep_gemm.localize(mega_l1), deep_gemm.localize(mega_l2)
+        mega_l1 = _localize_mega_moe_weight(deep_gemm, mega_l1, experts, "l1")
+        mega_l2 = _localize_mega_moe_weight(deep_gemm, mega_l2, experts, "l2")
         w13_interleaved, w2 = mega_l1.transpose(0, 1), mega_l2.transpose(0, 1)
         experts._mega_moe_weights_localized = True
 
@@ -913,8 +914,8 @@ def build_mega_moe_shared_weights(
         # The fused shared expert runs inside the fp8xfp4 kernel; localize with its build
         deep_gemm = _mega_moe_dg("fp8xfp4")
 
-        l1 = (deep_gemm.localize(l1[0]), l1[1])
-        l2 = (deep_gemm.localize(l2[0]), l2[1])
+        l1 = (_localize_mega_moe_weight(deep_gemm, l1[0], shared_experts, "l1"), l1[1])
+        l2 = (_localize_mega_moe_weight(deep_gemm, l2[0], shared_experts, "l2"), l2[1])
         gate_up_proj.weight.data = gate_up_proj.weight.data.new_empty(0)
         down_proj.weight.data = down_proj.weight.data.new_empty(0)
         torch.cuda.empty_cache()
@@ -923,6 +924,83 @@ def build_mega_moe_shared_weights(
 
 def _is_mega_moe_localization_enabled() -> bool:
     return envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_LOCALIZE.get() and _device_sm == 107
+
+
+def _localize_mega_moe_weight(
+    deep_gemm, t: torch.Tensor, owner, key: str
+) -> torch.Tensor:
+    """`deep_gemm.localize(t)`, copying into the destination preallocated at construction if it fits."""
+    dst = getattr(owner, "_mega_moe_localized_dst", {}).pop(key, None)
+    if dst is not None:
+        dg, dst = dst
+        n = deep_gemm.get_num_locality_domains()
+        want = (n, *t.shape[:-2], t.shape[-2] // n, t.shape[-1])
+        if (
+            dg is deep_gemm
+            and tuple(dst.shape) == want
+            and dst.element_size() == t.element_size()
+        ):
+            dst = dst.view(t.dtype)
+            dst.copy_(t.unflatten(-2, (n, -1)).movedim(-3, 0))
+            _log_prealloc_localized_once(
+                "copied the built layout into the preallocated memory"
+            )
+            return dst
+        logger.warning(
+            f"MegaMoE preallocated {key} {tuple(dst.shape)} {dst.dtype} does not fit "
+            f"{want} {t.dtype}; localizing into new memory"
+        )
+    return deep_gemm.localize(t)
+
+
+def preallocate_mega_moe_localized_weights(moe: DeepseekV2MoE) -> None:
+    """Allocate the per-domain MegaMoE weights before any checkpoint loads, as vLLM's
+    construction-time localization does; the post-load build copies into them."""
+    if not (
+        envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_PREALLOC_LOCALIZED.get()
+        and _is_mega_moe_localization_enabled()
+        and get_moe_a2a_backend().is_megamoe()
+        and not _use_amd_flydsl_mega_moe()
+    ):
+        return
+    experts = moe.experts
+    w13, w2 = getattr(experts, "w13_weight", None), getattr(experts, "w2_weight", None)
+    if w13 is None or w2 is None or _mega_moe_mma_type(experts) != "fp8xfp4":
+        return
+    deep_gemm = _mega_moe_dg("fp8xfp4")
+    n = deep_gemm.get_num_locality_domains()
+
+    def alloc(shape, dtype):
+        *b, rows, k = shape
+        return deep_gemm.locality_domain.empty_per_domain((*b, rows // n, k), dtype)
+
+    experts._mega_moe_localized_dst = {
+        "l1": (deep_gemm, alloc(w13.shape, w13.dtype)),
+        "l2": (deep_gemm, alloc(w2.shape, w2.dtype)),
+    }
+    nbytes = w13.nbytes + w2.nbytes
+    shared = moe.shared_experts
+    if (
+        shared is not None
+        and is_sm100_supported()
+        and moe.shared_experts_is_fp8
+        and moe.shared_experts_weight_block_size is not None
+        and moe.shared_experts_weight_block_size[1] % 32 == 0
+    ):
+        gu, dp = shared.gate_up_proj.weight, shared.down_proj.weight
+        shared._mega_moe_localized_dst = {
+            "l1": (deep_gemm, alloc(gu.shape, gu.dtype)),
+            "l2": (deep_gemm, alloc(dp.shape, dp.dtype)),
+        }
+        nbytes += gu.nbytes + dp.nbytes
+    _log_prealloc_localized_once(
+        f"preallocated at construction ({nbytes / (1 << 20):.1f} MiB for the first layer)"
+    )
+
+
+@functools.lru_cache(maxsize=None)
+def _log_prealloc_localized_once(what: str) -> None:
+    logger.info(f"MegaMoE localized weights {what}")
 
 
 def _transform_mega_moe_shared_sf(linear) -> torch.Tensor:

@@ -1042,6 +1042,13 @@ class DeepseekV2MoE(nn.Module):
 
             bind_gluon_moe_backend(self, GlmMxfp4GluonMoeBackend())
 
+        if get_moe_a2a_backend().is_megamoe():
+            from sglang.srt.layers.moe.mega_moe import (
+                preallocate_mega_moe_localized_weights,
+            )
+
+            preallocate_mega_moe_localized_weights(self)
+
     def get_moe_weights(self):
         # EPLB only rebalances physical routed experts. Fused shared expert
         # slots live after each rank's routed slots and must stay stable.
