@@ -155,21 +155,29 @@ class TestPPSendWindow(CustomTestCase):
 
 
 class _CountedWork:
+    """A gloo send Work: is_completed() turns true only once it is waited."""
+
     def __init__(self):
         self.waits = 0
 
     def wait(self):
         self.waits += 1
 
+    def is_completed(self):
+        return self.waits > 0
+
 
 class TestHostSendsBeforeProfilerStop(CustomTestCase):
-    def test_waits_each_main_thread_send_once_and_later_waits_do_not_reach_gloo(self):
+    def test_waits_each_unwaited_main_thread_send_once_and_never_a_waited_one(self):
         """torch.profiler.stop() frees the events of RecordFunctions that gloo sends opened
-        under it; a send waited after the stop writes into that memory. The stop path waits
-        them first, and a later window wait must not wait a gloo send a second time (hangs)."""
-        parallel_state.wait_host_sends()
+        under it; a send waited after the stop writes into that memory. The stop waits the
+        tracked sends first. A send waited twice blocks, so one the loop already waited is
+        skipped and the loop's own later wait of a drained send must not reach gloo."""
+        parallel_state.enable_host_send_tracking()
+        parallel_state.track_host_sends()
         works = [_CountedWork() for _ in range(3)]
         sends = [parallel_state.host_send(w, torch.zeros(1)) for w in works]
+        sends[0].work.wait()  # the loop's own window wait, before the stop
         other = []
         thread = threading.Thread(
             target=lambda: other.append(parallel_state.host_send(_CountedWork(), None))
@@ -177,11 +185,12 @@ class TestHostSendsBeforeProfilerStop(CustomTestCase):
         thread.start()
         thread.join()
 
-        self.assertEqual(parallel_state.wait_host_sends(), 3)
-        for send in sends:
+        self.assertEqual(parallel_state.wait_host_sends(), 2)
+        for send in sends[1:]:
             send.work.wait()
         self.assertEqual([w.waits for w in works], [1, 1, 1])
         self.assertEqual(other[0].work.waits, 0)
+        parallel_state.host_send(_CountedWork(), None)  # after the stop: not tracked
         self.assertEqual(parallel_state.wait_host_sends(), 0)
 
 

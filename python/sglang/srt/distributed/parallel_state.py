@@ -135,8 +135,8 @@ class P2PWork:
 
 
 class _WaitedHostSend:
-    """Stands in for a gloo send Work that wait_host_sends() already waited: waiting a
-    gloo send twice blocks for a second completion that never comes."""
+    """Stands in for a gloo send Work that wait_host_sends() waited: waiting a gloo send
+    twice blocks for a second completion that never comes."""
 
     def wait(self, timeout=None) -> bool:
         return True
@@ -146,27 +146,47 @@ class _WaitedHostSend:
 
 
 _WAITED_HOST_SEND = _WaitedHostSend()
-# Async CPU-group sends of the scheduler (main) thread that wait_host_sends() has not waited.
+# Async CPU-group sends of the scheduler (main) thread, tracked between a torch profiler's
+# start and stop once enable_host_send_tracking() was called (decoupled PP stages).
+_host_send_tracking_enabled = False
+_tracking_host_sends = False
 _host_sends: "weakref.WeakSet[P2PWork]" = weakref.WeakSet()
 
 
 def host_send(work: torch.distributed.Work, payload: torch.Tensor) -> P2PWork:
-    """An async CPU-group (gloo) send; the main thread's are tracked for wait_host_sends()."""
+    """An async CPU-group (gloo) send; tracked for wait_host_sends() while a profiler runs."""
     p2p_work = P2PWork(work, payload)
-    if threading.current_thread() is threading.main_thread():
+    if _tracking_host_sends and threading.current_thread() is threading.main_thread():
         _host_sends.add(p2p_work)
     return p2p_work
 
 
+def enable_host_send_tracking() -> None:
+    """For a process whose profiler starts and stops only where waiting its sends cannot
+    deadlock (a decoupled PP stage toggles it at the micro-batch boundary)."""
+    global _host_send_tracking_enabled
+    _host_send_tracking_enabled = True
+
+
+def track_host_sends() -> None:
+    """At torch profiler start; sends issued before it opened no RecordFunction."""
+    global _tracking_host_sends
+    _tracking_host_sends = _host_send_tracking_enabled
+    _host_sends.clear()
+
+
 def wait_host_sends() -> int:
-    """Wait the main thread's outstanding gloo sends; returns how many. Called before
-    torch.profiler stops: a gloo send started under the profiler ends its RecordFunction
-    at wait(), and after stop() that end writes into freed event storage (heap corruption)."""
-    pending = [w for w in _host_sends if w.work is not _WAITED_HOST_SEND]
+    """Before torch.profiler.stop(): wait the tracked sends nobody waited yet; returns how many.
+    A gloo send started under the profiler ends its RecordFunction at wait(), and after stop()
+    that end writes into freed event storage (host heap corruption). A send already waited
+    reports is_completed() and is skipped, since a second wait blocks."""
+    global _tracking_host_sends
+    pending = [w for w in _host_sends if not w.work.is_completed()]
     for p2p_work in pending:
         p2p_work.work.wait()
         p2p_work.work = _WAITED_HOST_SEND
     _host_sends.clear()
+    _tracking_host_sends = False
     return len(pending)
 
 

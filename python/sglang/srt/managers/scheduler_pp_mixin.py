@@ -19,7 +19,7 @@ from sglang.srt.disaggregation.utils import (
 )
 from sglang.srt.distributed.communication_op import attn_cp_tp_broadcast_pyobj
 from sglang.srt.distributed.communication_tags import P2PTag
-from sglang.srt.distributed.parallel_state import P2PWork
+from sglang.srt.distributed.parallel_state import P2PWork, enable_host_send_tracking
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.linear.utils import pp_spec_stable_rows_enabled
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
@@ -492,6 +492,7 @@ class SchedulerPPMixin:
                         self._pp_send_proxy_to_next_stage(result)
                 elif cur_batch:
                     self._pp_ce_release_input()
+                self.profiler_manager.run_at_boundary()
 
                 self.pp_outputs = next_pp_outputs
                 release_rids = next_release_rids
@@ -844,6 +845,10 @@ class SchedulerPPMixin:
         self._pp_late_recv = (
             envs.SGLANG_PP_DECOUPLE_LATE_RECV.get() and self.pp_comm_stream is not None
         )
+        # Every message of an iteration is sent once it ends, so a profiler stop there may wait
+        # this stage's sends; mid-iteration the next stage still waits for this one's relay.
+        self.profiler_manager.at_boundary = True
+        enable_host_send_tracking()
         if self.pp_bubble_diag is not None:
             self.pp_bubble_diag.extra_stats = self._pp_decouple_stats
         logger.info(

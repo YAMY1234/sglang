@@ -8,7 +8,7 @@ from typing import Callable, Dict, List, Optional
 
 import torch
 
-from sglang.srt.distributed.parallel_state import wait_host_sends
+from sglang.srt.distributed.parallel_state import track_host_sends, wait_host_sends
 from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import ProfileReqOutput
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
@@ -348,6 +348,7 @@ class _ProfilerTorch(_ProfilerConcreteBase):
             ),
         )
         self.torch_profiler.start()
+        track_host_sends()
 
     def stop(self):
         Path(self.output_dir).mkdir(parents=True, exist_ok=True)
