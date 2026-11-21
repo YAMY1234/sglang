@@ -4427,6 +4427,56 @@ def configure_gc_warning(warn_threshold_secs):
     gc.callbacks.append(gc_callback)
 
 
+class BatchCountGCFreezer:
+    """gc.freeze() once a process has run `after` batches, then every `every` batches
+    (0: once). A full collection walks every tracked object; frozen ones are skipped,
+    so the long-lived heap built so far stops costing collections. Each freeze first
+    collects the young generations, so their cyclic garbage is not frozen for good."""
+
+    def __init__(
+        self,
+        context: str,
+        after: int,
+        every: int = 0,
+        threshold: Optional[Sequence[int]] = None,
+        log_frozen: bool = False,
+    ):
+        self.context = context
+        self.next_at = after
+        self.every = every
+        # gc.get_freeze_count() walks the whole frozen list (O(heap)): only once, and
+        # only when asked (log_frozen, the PP diag), right after the first freeze.
+        self.log_frozen = log_frozen
+        self.frozen_logged = False
+        if threshold:
+            gc.set_threshold(*threshold)
+        logger.info(
+            "%s GC: freeze after %d batches, every %d; threshold %s",
+            context,
+            after,
+            every,
+            gc.get_threshold(),
+        )
+
+    def on_batch(self, count: int) -> bool:
+        if not self.next_at or count < self.next_at:
+            return False
+        t0 = time.perf_counter()
+        gc.collect(1)
+        gc.freeze()
+        ms = (time.perf_counter() - t0) * 1e3
+        self.next_at = count + self.every if self.every else 0
+        logger.info("%s gc.freeze at batch %d: %.1f ms", self.context, count, ms)
+        if self.log_frozen and not self.frozen_logged:
+            self.frozen_logged = True
+            logger.info(
+                "%s GC: %d objects frozen at the first freeze",
+                self.context,
+                gc.get_freeze_count(),
+            )
+        return True
+
+
 def freeze_gc(context: str, gc_threshold: Optional[Sequence[int]] = None):
     if gc_threshold is not None:
         gc.set_threshold(*gc_threshold)

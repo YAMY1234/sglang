@@ -4,6 +4,7 @@ import logging
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Callable, NamedTuple, Optional
 
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.hicache_storage import (
     PoolHitPolicy,
     PoolName,
@@ -252,6 +253,33 @@ def _split_hicache_size(
         hicache_size * size_bytes / total_device_pool_size
         for size_bytes in device_pool_sizes
     )
+
+
+def _split_hicache_size_with_mamba_share(
+    hicache_size: int, kv_pools: tuple[Any, ...], mamba_pool: Any
+) -> tuple[float, ...]:
+    """_split_hicache_size over (*kv_pools, mamba_pool). SGLANG_HICACHE_MAMBA_HOST_SCALE
+    scales the Mamba pool's share and the KV pools split the rest as before. A
+    scale rather than a fixed share keeps each PP stage's split relative to its
+    own pools; the host pools then sync their counts to the PP minimum as usual."""
+    sizes = _split_hicache_size(hicache_size, (*kv_pools, mamba_pool))
+    scale = envs.SGLANG_HICACHE_MAMBA_HOST_SCALE.get()
+    if scale is None:
+        return sizes
+    mamba_size = sizes[-1] * scale
+    if not 0.0 < mamba_size < hicache_size:
+        raise ValueError(
+            f"SGLANG_HICACHE_MAMBA_HOST_SCALE={scale} gives the Mamba host pool "
+            f"{mamba_size:.2f} of {hicache_size} GB"
+        )
+    kv_sizes = _split_hicache_size(hicache_size - mamba_size, kv_pools)
+    logger.info(
+        "HiCache host split: Mamba %.2f GB (SGLANG_HICACHE_MAMBA_HOST_SCALE=%s), KV %s GB",
+        mamba_size,
+        scale,
+        "/".join(f"{x:.2f}" for x in kv_sizes),
+    )
+    return (*kv_sizes, mamba_size)
 
 
 def build_pool_entry(
@@ -1317,8 +1345,8 @@ def build_hybrid_mamba_stack(
     kv_pool = root.decl.device_pool
     kv_host_size, mamba_host_size = None, 0
     if get_memory().hicache_size > 0:
-        kv_host_size, mamba_host_size = _split_hicache_size(
-            get_memory().hicache_size, (kv_pool, mamba_pool)
+        kv_host_size, mamba_host_size = _split_hicache_size_with_mamba_share(
+            get_memory().hicache_size, (kv_pool,), mamba_pool
         )
     if qsa_pool is not None and kv_host_size is not None:
         kv_bytes = sum(kv_pool.get_kv_size_bytes())
@@ -1455,8 +1483,10 @@ def build_hybrid_mamba_swa_stack(
     mamba_allocator = params.req_to_token_pool.mamba_allocator
     kv_host_size, swa_host_size, mamba_host_size = None, None, 0
     if get_memory().hicache_size > 0:
-        kv_host_size, swa_host_size, mamba_host_size = _split_hicache_size(
-            get_memory().hicache_size, (full_kv_pool, swa_kv_pool, mamba_pool)
+        kv_host_size, swa_host_size, mamba_host_size = (
+            _split_hicache_size_with_mamba_share(
+                get_memory().hicache_size, (full_kv_pool, swa_kv_pool), mamba_pool
+            )
         )
     host_pool_group = build_hybrid_swa_group(
         page_size=page_size,

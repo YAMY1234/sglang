@@ -8,6 +8,7 @@ from typing import Optional, Sequence
 import numpy as np
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.device_pool_info import MambaStateBufferInfo
 from sglang.srt.mem_cache.pool_host.base import (
     HostKVCache,
@@ -37,6 +38,7 @@ if _is_cuda or _is_hip:
     )
 if _is_cuda or _is_hip:
     from sglang.kernels.ops.mamba.transfer_mamba import (
+        precompile_transfer_mamba,
         transfer_kv_mamba_lf_pf,
         transfer_kv_mamba_pf_lf,
     )
@@ -113,6 +115,11 @@ class MambaPoolHost(HostKVCache):
                 "(--enable-hierarchical-cache, "
                 "--disaggregation-decode-retraction-backup=host_pool)."
             )
+
+        if (_is_cuda or _is_hip) and envs.SGLANG_HICACHE_PRECOMPILE_TRANSFER_MAMBA.get():
+            # Built lazily, the first host transfer stalls its stage for seconds,
+            # which can push PP stages out of phase.
+            precompile_transfer_mamba()
 
         self.layout = layout
         self.pin_memory = pin_memory
@@ -348,6 +355,13 @@ class MambaPoolHost(HostKVCache):
         self.can_use_write_back_jit = True
         self._temporal_can_use_jit = False
         self._conv_can_use_jit = [False] * len(self.conv_buffer)
+        backup_quota = envs.SGLANG_HICACHE_MAMBA_BACKUP_BLOCK_QUOTA.get()
+        if backup_quota > 0:
+            logger.info(
+                "HiCache Mamba backup grid capped at %d blocks "
+                "(SGLANG_HICACHE_MAMBA_BACKUP_BLOCK_QUOTA).",
+                backup_quota,
+            )
 
     def get_hybrid_pool_buffer(self):
         # Expose all mamba host tensors that need Mooncake buffer registration.
@@ -550,6 +564,7 @@ class MambaPoolHost(HostKVCache):
                 layer_id=layer_id,
                 item_size=item_size,
                 src_layout_dim=item_size * num_layers,
+                block_quota=envs.SGLANG_HICACHE_LOAD_BLOCK_QUOTA.get(),
             )
         elif io_backend == "direct":
             transfer_kv_per_layer_direct_pf_lf(
@@ -628,6 +643,7 @@ class MambaPoolHost(HostKVCache):
                 item_size=item_size,
                 dst_layout_dim=item_size * num_layers,
                 num_layers=num_layers,
+                block_quota=envs.SGLANG_HICACHE_MAMBA_BACKUP_BLOCK_QUOTA.get(),
             )
         elif io_backend == "direct":
             src_ptrs = [src_layers[i] for i in range(num_layers)]

@@ -26,7 +26,7 @@ from sglang.srt.layers.attention.linear.utils import (
     select_verify_intermediate_state_indices,
 )
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
-from sglang.srt.utils import is_cpu, is_cuda, is_hip, is_npu
+from sglang.srt.utils import is_cpu, is_cuda, is_hip, is_npu, print_info_once
 from sglang.srt.utils.common import is_gfx95_supported, rank0_log
 
 # KDA always uses the triton causal_conv1d_fn (no CUDA override).
@@ -53,6 +53,9 @@ from sglang.srt.runtime_context import (
 )
 
 
+_P1_HOIST_LOGGED = False
+
+
 def _validate_flashinfer_kda_prefill(
     *,
     chunk_size: int,
@@ -72,7 +75,8 @@ def _validate_flashinfer_kda_prefill(
 
 
 def flashinfer_kda_prefill_default(model_runner: ModelRunner) -> Optional[str]:
-    """Default safe-gate KDA prefill to FlashInfer on SM100/SM103."""
+    """Default safe-gate KDA prefill to FlashInfer on SM100/SM103 (and SM107 with
+    SGLANG_K31_KDA_PREFILL_FI_SM107=1)."""
     from sglang.srt.configs.bailing_hybrid import BailingHybridConfig
     from sglang.srt.configs.hybrid_arch import hybrid_kda_config
 
@@ -90,7 +94,13 @@ def flashinfer_kda_prefill_default(model_runner: ModelRunner) -> Optional[str]:
         and not execution.overlap.enable_two_batch_overlap
         and execution.graph.cuda_graph_config.prefill.backend != CudaGraphBackend.FULL
         and is_cuda()
-        and torch.cuda.get_device_capability() in ((10, 0), (10, 3))
+        and (
+            torch.cuda.get_device_capability() in ((10, 0), (10, 3))
+            or (
+                torch.cuda.get_device_capability() == (10, 7)
+                and envs.SGLANG_K31_KDA_PREFILL_FI_SM107.get()
+            )
+        )
     ):
         return "flashinfer"
     return None
@@ -744,6 +754,17 @@ class KDAAttnBackend(MambaAttnBackendBase):
             self.forward_metadata.query_start_loc_i64 = (
                 self.forward_metadata.query_start_loc.to(torch.int64)
             )
+            # Host lengths describe query_start_loc only under the condition
+            # HybridLinearAttnBackend uses to trust them for the token count.
+            if (
+                forward_batch.extend_seq_lens_cpu is not None
+                and len(forward_batch.extend_seq_lens_cpu) == forward_batch.batch_size
+                and forward_batch.tbo_parent_token_range is None
+            ):
+                self.kernel_dispatcher.extend_kernel.seed_query_start_loc(
+                    self.forward_metadata.query_start_loc_i64,
+                    forward_batch.extend_seq_lens_cpu,
+                )
         if self.forward_metadata.has_mamba_track_mask:
             if self.forward_metadata.mamba_track_mask_indices is None:
                 self.forward_metadata.mamba_track_mask_indices = (
@@ -1032,10 +1053,23 @@ class KDAAttnBackend(MambaAttnBackendBase):
         mixed_qkv: torch.Tensor,
         conv_states: torch.Tensor,
         cache_indices: torch.Tensor,
-    ) -> torch.Tensor:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return Q/K/V, using contiguous planes for equal-width FlashInfer prefill."""
         # Depthwise conv is channel-independent, so one packed call over the
         # full qkv width matches the decode path and saves two kernel launches.
-        return causal_conv1d_fn(
+        split_size = (
+            layer.q_dim
+            if envs.SGLANG_KDA_PREFILL_CONV_QKV_PLANES.get()
+            and self.kernel_dispatcher.prefill_backend.is_flashinfer()
+            and layer.q_dim == layer.k_dim == layer.v_dim
+            else 0
+        )
+        if split_size:
+            print_info_once(
+                "KDA prefill: causal conv writes contiguous Q/K/V planes "
+                "(SGLANG_KDA_PREFILL_CONV_QKV_PLANES)"
+            )
+        conv_output = causal_conv1d_fn(
             mixed_qkv.transpose(0, 1),
             layer.conv_weights,
             layer.bias,
@@ -1045,7 +1079,13 @@ class KDAAttnBackend(MambaAttnBackendBase):
             cache_indices=cache_indices,
             query_start_loc=self.forward_metadata.query_start_loc,
             seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
-        ).transpose(0, 1)
+            output_split_size=split_size,
+        )
+        if split_size:
+            return conv_output.unbind(0)
+        return conv_output.transpose(0, 1).split(
+            [layer.q_dim, layer.k_dim, layer.v_dim], dim=-1
+        )
 
     def forward_extend(
         self,
@@ -1129,10 +1169,9 @@ class KDAAttnBackend(MambaAttnBackendBase):
                 self.forward_metadata.conv_states_mask_indices
             ] = mixed_qkv[self.forward_metadata.track_conv_indices]
 
-        qkv = self._convolve_prefill(
+        q, k, v = self._convolve_prefill(
             layer, forward_batch, mixed_qkv, conv_states, cache_indices
         )
-        q, k, v = qkv.split([layer.q_dim, layer.k_dim, layer.v_dim], dim=-1)
 
         q = q.unflatten(-1, (-1, layer.head_q_dim)).unsqueeze(0)  # n (h d) -> 1 n h d
         k = k.unflatten(-1, (-1, layer.head_k_dim)).unsqueeze(0)  # n (h d) -> 1 n h d
@@ -1846,9 +1885,22 @@ class KDAAttnBackend(MambaAttnBackendBase):
         replayssm_g: Optional[torch.Tensor] = None,
         replayssm_beta: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        from sglang.kernels.ops.attention.kda_decode_mtp import (
-            fused_kda_decode_mtp_dspark,
-        )
+        if envs.SGLANG_OPT_KDA_MTP_VERIFY_P1_HOIST.get():
+            from sglang.kernels.ops.attention.kda_decode_mtp_v2 import (
+                fused_kda_decode_mtp_dspark,
+            )
+
+            global _P1_HOIST_LOGGED
+            if not _P1_HOIST_LOGGED:
+                _P1_HOIST_LOGGED = True
+                rank0_log(
+                    "KDA verify: phase-1-hoisted CuTe MTP kernel "
+                    "(SGLANG_OPT_KDA_MTP_VERIFY_P1_HOIST)"
+                )
+        else:
+            from sglang.kernels.ops.attention.kda_decode_mtp import (
+                fused_kda_decode_mtp_dspark,
+            )
 
         seq_len = mixed_qkv.shape[0]
         h = layer.num_v_heads
@@ -1875,10 +1927,14 @@ class KDAAttnBackend(MambaAttnBackendBase):
         # into the recurrence.
         onorm_gate = getattr(layer, "_k3_onorm_gate", None)
         fused_static = getattr(layer, "_k3_fused_decode_args", None)
-        apply_onorm = onorm_gate is not None and fused_static is not None
+        onorm_args = (
+            fused_static[5:7]
+            if fused_static is not None
+            else getattr(layer, "_k3_onorm_fold_args", None)
+        )
+        apply_onorm = onorm_gate is not None and onorm_args is not None
         if apply_onorm:
-            onorm_weight = fused_static[5]
-            onorm_eps = fused_static[6]
+            onorm_weight, onorm_eps = onorm_args
             onorm_gate = onorm_gate.reshape(1, seq_len, h, layer.head_v_dim)
         else:
             onorm_weight = None

@@ -11,6 +11,7 @@ import triton
 import triton.language as tl
 
 from sglang.kernels.jit.utils import is_arch_support_pdl
+from sglang.srt.environ import envs
 
 PAD_SLOT_ID = -1
 
@@ -34,7 +35,7 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
     block_table_ptr,  # (num_blocks, 2) int32 (seq, chunk) rows; USE_BLOCK_TABLE only
     # Matrix dimensions
     dim: tl.constexpr,
-    seqlen: tl.int32,  # cu_seqlen
+    total_tokens: tl.int32,  # cu_seqlen
     num_cache_lines: tl.constexpr,  # added to support vLLM larger cache lines
     # Strides
     stride_x_seq: tl.constexpr,  # stride to get to next sequence,
@@ -62,6 +63,8 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     USE_BLOCK_TABLE: tl.constexpr = False,
+    OUTPUT_SPLIT_SIZE: tl.constexpr = 0,
+    UNROLL4: tl.constexpr = False,
 ):
     conv_states_ptr = initial_states_ptr
     conv_state_indices_ptr = cache_indices_ptr
@@ -347,6 +350,69 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
         w_ptrs = w_base + (3 * stride_w_width)  # [BLOCK_N] tensor
         w_col3 = tl.load(w_ptrs, mask_w, other=0.0)
     mask_x_1d = idx_feats < dim
+    if UNROLL4 and KERNEL_WIDTH == 4:
+        # Four tokens per iteration with their loads issued together; each output
+        # still adds the same four bf16 products in tap order (bitwise equal).
+        if OUTPUT_SPLIT_SIZE:
+            o_base = (
+                o_ptr
+                + (idx_feats // OUTPUT_SPLIT_SIZE).to(tl.int64)
+                * total_tokens
+                * OUTPUT_SPLIT_SIZE
+                + idx_feats % OUTPUT_SPLIT_SIZE
+            )
+            stride_o_tok_eff = OUTPUT_SPLIT_SIZE
+        else:
+            o_base = o_ptr + idx_feats * stride_o_dim
+            stride_o_tok_eff = stride_o_token
+        out_start = (sequence_start_index + token_offset).to(tl.int64)
+        for idx_token in range(0, segment_len, 4):
+            m0 = mask_x_1d & (idx_token < segment_len)
+            m1 = mask_x_1d & (idx_token + 1 < segment_len)
+            m2 = mask_x_1d & (idx_token + 2 < segment_len)
+            m3 = mask_x_1d & (idx_token + 3 < segment_len)
+            x_ptrs_1d = x_base_1d + idx_token * stride_x_token
+            x0 = tl.load(x_ptrs_1d, mask=m0, other=0.0)
+            x1 = tl.load(x_ptrs_1d + stride_x_token, mask=m1, other=0.0)
+            x2 = tl.load(x_ptrs_1d + 2 * stride_x_token, mask=m2, other=0.0)
+            x3 = tl.load(x_ptrs_1d + 3 * stride_x_token, mask=m3, other=0.0)
+            o_ptrs_1d = o_base + (out_start + idx_token) * stride_o_tok_eff
+            acc = acc_preload
+            acc += col0 * w_col0
+            acc += col1 * w_col1
+            acc += col2 * w_col2
+            acc += x0 * w_col3
+            if SILU_ACTIVATION:
+                acc = acc / (1 + tl.exp(-acc))
+            tl.store(o_ptrs_1d + 0 * stride_o_tok_eff, acc, mask=m0)
+            acc = acc_preload
+            acc += col1 * w_col0
+            acc += col2 * w_col1
+            acc += x0 * w_col2
+            acc += x1 * w_col3
+            if SILU_ACTIVATION:
+                acc = acc / (1 + tl.exp(-acc))
+            tl.store(o_ptrs_1d + 1 * stride_o_tok_eff, acc, mask=m1)
+            acc = acc_preload
+            acc += col2 * w_col0
+            acc += x0 * w_col1
+            acc += x1 * w_col2
+            acc += x2 * w_col3
+            if SILU_ACTIVATION:
+                acc = acc / (1 + tl.exp(-acc))
+            tl.store(o_ptrs_1d + 2 * stride_o_tok_eff, acc, mask=m2)
+            acc = acc_preload
+            acc += x0 * w_col0
+            acc += x1 * w_col1
+            acc += x2 * w_col2
+            acc += x3 * w_col3
+            if SILU_ACTIVATION:
+                acc = acc / (1 + tl.exp(-acc))
+            tl.store(o_ptrs_1d + 3 * stride_o_tok_eff, acc, mask=m3)
+            col0 = x1
+            col1 = x2
+            col2 = x3
+        return
     for idx_token in range(segment_len):
         acc = acc_preload
 
@@ -395,14 +461,33 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
         mask_1d = (idx_token < segment_len) & (
             idx_feats < dim
         )  # token-index  # feature-index
-        o_ptrs = (
-            o_ptr
-            + (sequence_start_index + token_offset + idx_token).to(tl.int64)
-            * stride_o_token
-            + (idx_feats * stride_o_dim)
-        )
+        output_token = (sequence_start_index + token_offset + idx_token).to(tl.int64)
+        if OUTPUT_SPLIT_SIZE:
+            # Store each channel group as a contiguous [tokens, channels] plane.
+            # KDA can consume Q/K/V directly without three materialization copies.
+            o_ptrs = (
+                o_ptr
+                + (idx_feats // OUTPUT_SPLIT_SIZE).to(tl.int64)
+                * total_tokens
+                * OUTPUT_SPLIT_SIZE
+                + output_token * OUTPUT_SPLIT_SIZE
+                + idx_feats % OUTPUT_SPLIT_SIZE
+            )
+        else:
+            o_ptrs = o_ptr + output_token * stride_o_token + idx_feats * stride_o_dim
 
         tl.store(o_ptrs, acc, mask=mask_1d)
+
+
+# SGLANG_K31_CONV1D_FWD_WIDE: (BLOCK_M, BLOCK_N, num_warps, UNROLL4) of the wide
+# launch, bitwise equal to the default; block-table launches keep their BLOCK_M.
+FWD_WIDE_LAUNCH = (64, 512, 4, True)
+
+
+def _fwd_launch(wide_ok: bool):
+    if wide_ok and envs.SGLANG_K31_CONV1D_FWD_WIDE.get():
+        return FWD_WIDE_LAUNCH
+    return CAUSAL_CONV1D_FWD_BLOCK_M, 256, 4, False
 
 
 def causal_conv1d_fn(
@@ -418,6 +503,7 @@ def causal_conv1d_fn(
     pad_slot_id: int = PAD_SLOT_ID,
     validate_data=False,
     block_table: Optional[torch.Tensor] = None,
+    output_split_size: int = 0,
     **kwargs,
 ):
     """support varlen + continuous batching when x is 2D tensor
@@ -462,15 +548,26 @@ def causal_conv1d_fn(
         in this case, the kernel will not process entries at
         indices 0 and 3
 
-    out: same shape as `x`
+    output_split_size: channel width of each independently contiguous output
+        plane, or zero for the original layout. Must divide dim.
+    out: same shape as `x`, or (dim // output_split_size, cu_seq_len,
+        output_split_size) when output_split_size is nonzero.
     """
     if isinstance(activation, bool) and activation:
         activation = "silu"
 
-    out = torch.empty_like(x)
-
     is_channel_last = (x.stride(0) == 1) & (x.stride(1) > 1)
     dim, cu_seqlen = x.shape
+    if output_split_size:
+        if output_split_size < 0 or dim % output_split_size:
+            raise ValueError("output_split_size must be positive and divide dim")
+        out = torch.empty(
+            (dim // output_split_size, cu_seqlen, output_split_size),
+            dtype=x.dtype,
+            device=x.device,
+        )
+    else:
+        out = torch.empty_like(x)
     _, width = weight.shape
     state_len = width - 1
     np2_statelen = triton.next_power_of_2(state_len)
@@ -500,7 +597,13 @@ def causal_conv1d_fn(
         stride_istate_dim = conv_states.stride(1)
         stride_istate_token = conv_states.stride(2)
         # assert stride_istate_dim == 1
-    if out.dim() == 2:
+    if output_split_size:
+        # The plane pitch uses runtime total_tokens in the kernel; do not
+        # specialize the launch on every ragged prefill's token count.
+        stride_o_seq = 0
+        stride_o_dim = 1
+        stride_o_token = output_split_size
+    elif out.dim() == 2:
         stride_o_seq = 0
         stride_o_dim = out.stride(0)
         stride_o_token = out.stride(1)
@@ -529,6 +632,10 @@ def causal_conv1d_fn(
         assert weight.stride(1) == 1
         assert (dim, width) == weight.shape
         assert is_channel_last, "Need to run in channel-last layout"
+
+    block_m, block_n, num_warps, unroll4 = _fwd_launch(
+        block_table is None and width == 4
+    )
 
     def grid(META):
         if block_table is not None:
@@ -580,10 +687,13 @@ def causal_conv1d_fn(
         USE_PAD_SLOT=pad_slot_id is not None,
         NP2_STATELEN=np2_statelen,
         # launch_cooperative_grid=True
-        BLOCK_M=CAUSAL_CONV1D_FWD_BLOCK_M,
-        BLOCK_N=256,
+        BLOCK_M=block_m,
+        BLOCK_N=block_n,
         USE_BLOCK_TABLE=block_table is not None,
+        OUTPUT_SPLIT_SIZE=output_split_size,
+        UNROLL4=unroll4,
         num_stages=2,
+        num_warps=num_warps,
     )
     return out
 

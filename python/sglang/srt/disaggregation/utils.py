@@ -26,8 +26,10 @@ from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.distributed.communication_tags import P2PTag
 from sglang.srt.distributed.parallel_state import GroupCoordinator
 from sglang.srt.environ import envs
+from sglang.srt.managers import pp_bubble_diag
 from sglang.srt.runtime_context import (
     get_disagg,
+    get_parallel,
     get_spec,
 )
 from sglang.srt.utils import is_npu
@@ -59,33 +61,47 @@ def pp_sync_polls(
     pp_rank: int,
     pp_size: int,
     sync_work_list: List,
+    tag: P2PTag = P2PTag.DISAGG_BOOTSTRAP_PP_SYNC,
+    window: int = 1,
 ) -> List[int]:
     """Synchronize poll states from PP0 through the PP pipeline.
 
     PP0 provides the data. Each later PP rank receives it from the previous
-    rank and asynchronously forwards it to the next rank.
+    rank and asynchronously forwards it to the next rank. With window > 1,
+    sync_work_list holds one list of sends per round and only rounds older
+    than the window are waited.
     """
     if pp_size <= 1:
         assert polls is not None
         return polls
 
-    for p2p_work in sync_work_list:
-        p2p_work.work.wait()
-    sync_work_list.clear()
+    with pp_bubble_diag.wait("polls_drain." + tag.name):
+        if window > 1:
+            sync_work_list.append([])
+            while len(sync_work_list) > window:
+                for p2p_work in sync_work_list.pop(0):
+                    p2p_work.work.wait()
+            round_work_list = sync_work_list[-1]
+        else:
+            for p2p_work in sync_work_list:
+                p2p_work.work.wait()
+            sync_work_list.clear()
+            round_work_list = sync_work_list
 
     data = polls
     if pp_rank > 0:
-        data = pp_group.recv_object(
-            src=pp_rank - 1,
-            tag=P2PTag.DISAGG_BOOTSTRAP_PP_SYNC,
-        )
+        with pp_bubble_diag.wait("polls_recv." + tag.name):
+            data = pp_group.recv_object(
+                src=pp_rank - 1,
+                tag=tag,
+            )
     if pp_rank + 1 < pp_size:
-        sync_work_list.extend(
+        round_work_list.extend(
             pp_group.send_object(
                 data,
                 dst=pp_rank + 1,
                 async_send=True,
-                tag=P2PTag.DISAGG_BOOTSTRAP_PP_SYNC,
+                tag=tag,
             )
         )
     return data
@@ -117,6 +133,7 @@ def poll_and_all_reduce_prefill_pp(
     pp_rank: int,
     pp_size: int,
     pp_poll_sync_work_list: List[torch.distributed.Work],
+    window: int = 1,
 ) -> List[int]:
     polls: List[int] = []
     if pp_rank == 0:
@@ -124,8 +141,29 @@ def poll_and_all_reduce_prefill_pp(
         polls = _all_reduce_polls(polls, attn_tp_cpu_group)
         polls = _all_reduce_polls(polls, attn_cp_cpu_group)
     # Propagate PP0's data to other ranks
-    polls = pp_sync_polls(polls, pp_group, pp_rank, pp_size, pp_poll_sync_work_list)
+    polls = pp_sync_polls(
+        polls, pp_group, pp_rank, pp_size, pp_poll_sync_work_list, window=window
+    )
     return polls
+
+
+def pp_sync_window() -> int:
+    """Rounds of PP relay sends left un-waited (SGLANG_PP_SYNC_WINDOW)."""
+    if not envs.SGLANG_PP_SYNC_WINDOW.get():
+        return 1
+    return get_parallel().pp_size + get_parallel().pp_async_batch_depth
+
+
+def poll_pp_consensus_and_all_reduce(
+    pollers: List[CommonKVSender],
+    attn_cp_cpu_group: dist.ProcessGroup,
+    attn_tp_cpu_group: dist.ProcessGroup,
+) -> List[int]:
+    """PP0 only: each room's minimum status over every PP stage, MIN-reduced
+    across attention TP and CP."""
+    polls = _poll_with_failure_injection_pp(pollers)
+    polls = _all_reduce_polls(polls, attn_tp_cpu_group)
+    return _all_reduce_polls(polls, attn_cp_cpu_group)
 
 
 def get_dsa_seed_metadata_dim(hf_config) -> int:
@@ -581,9 +619,12 @@ class MetadataBuffers:
             self.bootstrap_room[idx].clone(),
         )
 
-    def set_buf(self, req: Req):
-
-        self.output_ids[req.metadata_buffer_index][0] = req.output_ids[0]
+    def set_buf(self, req: Req, first_output_id: Optional[int] = None):
+        # first_output_id: the sampled first token, for a send made before the
+        # request's result appends it to output_ids.
+        self.output_ids[req.metadata_buffer_index][0] = (
+            req.output_ids[0] if first_output_id is None else first_output_id
+        )
         # The cached_tokens buffer is (size, 16); slots 0-3 hold cached token
         # counts and slots 4-6 are reused for multimodal prompt token counts
         # (slots 7-15 remain spare). This avoids adding new RDMA buffers.
