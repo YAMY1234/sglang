@@ -3763,18 +3763,25 @@ class UnifiedRadixCache(BasePrefixCache):
     def check_prefetch_progress(self, request: CacheRequestHandle) -> bool:
         done = self._check_prefetch_progress(request)
         if done and request in self._kv_fill_pending:
-            # The fill ended (refilled, missed or revoked): go on with today's path
-            # from the rematched prefix, at the same step on every rank.
-            on_complete = self._end_kv_fill(request)
-            if on_complete is not None:
-                self.storage_prefetch_retries.cancel(request.rid)
-                on_complete()
-                return (
-                    request not in self.ongoing_prefetch
-                    and request not in self._mamba_state_restores
-                    and request not in self._kv_fill_pending
-                )
+            if self.prefetch_stop_policy == "best_effort":
+                # Admission cuts any new fetch at once under best_effort: admit now.
+                self._end_kv_fill(request)
+                return True
+            self._continue_kv_fill(request)
+            return (
+                request not in self.ongoing_prefetch
+                and request not in self._mamba_state_restores
+                and request not in self._kv_fill_pending
+            )
         return done
+
+    def _continue_kv_fill(self, request: CacheRequestHandle) -> None:
+        """The fill ended (refilled, missed or revoked): release its state locks and run
+        today's path from the rematched prefix, at the same step on every rank."""
+        on_complete = self._end_kv_fill(request)
+        if on_complete is not None:
+            self.storage_prefetch_retries.cancel(request.rid)
+            on_complete()
 
     def _check_prefetch_progress(self, request: CacheRequestHandle) -> bool:
         if request in getattr(self, "_mamba_state_restores", {}):
@@ -4836,6 +4843,7 @@ class UnifiedRadixCache(BasePrefixCache):
                 self._invalidate_absent_from_hit_query(operation)
                 if isinstance(operation, KvFillOperation):
                     self._invalidate_unfillable_states(operation)
+                    kv_fills_seen.append(operation.handle)
                 request = operation.handle
                 hit_tokens = operation.storage_hit_count
                 info = self.ongoing_prefetch.get(request)
@@ -4903,6 +4911,8 @@ class UnifiedRadixCache(BasePrefixCache):
                         # check_prefetch_progress() is not called for this rid yet.
                         # Let us insert the prefetch result into the radix tree.
                         self._handle_prefetch_result(operation)
+                        if isinstance(operation, KvFillOperation):
+                            kv_fills_seen.append(operation.handle)
                     if operation.ack_releases_incomplete_host_indices:
                         cc.append_host_mem_release(
                             operation.host_indices[operation.completed_tokens :],
@@ -5029,11 +5039,17 @@ class UnifiedRadixCache(BasePrefixCache):
                 drained[pool_name] = (len(host_indices_list), released_tokens)
             return drained
 
+        # KV fills revoked at the hit drain or committed at their ACK continue at once
+        # (today's L3 path from the longer prefix), not at the request's admission poll.
+        kv_fills_seen: list[CacheRequestHandle] = []
         _drain_and_alloc_storage_hit()
         _drain_ack_prefetch()
         _drain_backup()
         _drain_release()
         _drain_extra_release()
+        for request in kv_fills_seen:
+            if request not in self.ongoing_prefetch and request in self._kv_fill_pending:
+                self._continue_kv_fill(request)
 
     def drain_storage_control_queues(self) -> None:
         cc = self.cache_controller
