@@ -2052,6 +2052,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             # KDA's host-side checkpoint plan for the current request.
             mamba_prefill_track_mask_cpu=forward_batch.mamba_prefill_track_mask_cpu,
             mamba_track_seqlens_cpu=forward_batch.mamba_track_seqlens_cpu,
+            mamba_fork_tracks=forward_batch.mamba_fork_tracks,
             encoder_lens=forward_batch.encoder_lens,
             return_logprob=(
                 forward_batch.return_logprob

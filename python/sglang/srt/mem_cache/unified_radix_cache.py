@@ -1595,14 +1595,22 @@ class UnifiedRadixCache(BasePrefixCache):
         """Insert ``[cache_protected_len, up_to)`` of the request's record and
         move its tree lock onto the node the insert ended on."""
         is_finished = req.finished()
+        if req.kv.mamba_fork_track_idx is not None:
+            # SGLANG_MAMBA_BRANCH_TRACK_DUAL: the branching-point state the last
+            # extend tracked goes in first, as a split forward would have put it.
+            self._checkpoint_into_tree(
+                req, up_to=req.kv.mamba_fork_track_seqlen, mamba_fork=True
+            )
         self._checkpoint_into_tree(req, up_to=up_to, **kwargs)
         if is_finished:
             self._release_request_mamba(req)
 
-    def _checkpoint_into_tree(self, req: Req, *, up_to: int, **kwargs) -> None:
+    def _checkpoint_into_tree(
+        self, req: Req, *, up_to: int, mamba_fork: bool = False, **kwargs
+    ) -> None:
         # A finished request hands its component state (mamba) to the tree
         # instead of forking it, and the tree frees what the request still held.
-        is_finished = req.finished()
+        is_finished = req.finished() and not mamba_fork
         token_ids = req.full_untruncated_fill_ids[:up_to]
 
         if self.disable:
@@ -1629,6 +1637,7 @@ class UnifiedRadixCache(BasePrefixCache):
                     and up_to >= len(req.origin_input_ids)
                 )
             ),
+            mamba_fork=mamba_fork,
         )
         effective_cache_len = len(token_ids)
         for comp in self._components_tuple:
