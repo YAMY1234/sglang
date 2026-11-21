@@ -120,11 +120,15 @@ class LoadBalanceMethod(Enum):
 
 
 class DPBudget:
-    def __init__(self, num_dp_ranks: int):
+    ROWS_KV_CAP = 0.95
+
+    def __init__(self, num_dp_ranks: int, rows_kv_eps: float = 0.0):
         self.num_dp_ranks = num_dp_ranks
         self.total_requests = [0] * num_dp_ranks
         self.total_tokens = [0] * num_dp_ranks
+        self.max_tokens = [0] * num_dp_ranks
         self.last_timestamp = [0.0] * num_dp_ranks
+        self.rows_kv_eps = rows_kv_eps
 
     def update_budget(self, loads):
         """Update budget from shm snapshots, skipping stale reads."""
@@ -136,16 +140,21 @@ class DPBudget:
                 load.num_running_reqs + load.num_waiting_reqs
             )
             self.total_tokens[load.dp_rank] = load.num_total_tokens
+            self.max_tokens[load.dp_rank] = load.max_total_num_tokens
 
     def dispatch(self, method: LoadBalanceMethod, estimated_tokens: int = 0):
         if method == LoadBalanceMethod.TOTAL_REQUESTS:
             target_rank = self.total_requests.index(min(self.total_requests))
         elif method == LoadBalanceMethod.TOTAL_TOKENS:
-            # Use total_requests as a tie-breaker when total_tokens are equal
-            target_rank = min(
-                range(self.num_dp_ranks),
-                key=lambda i: (self.total_tokens[i], self.total_requests[i]),
-            )
+            target_rank = None
+            if self.rows_kv_eps > 0:
+                target_rank = self._fewest_rows_within_kv_guard(estimated_tokens)
+            if target_rank is None:
+                # Use total_requests as a tie-breaker when total_tokens are equal
+                target_rank = min(
+                    range(self.num_dp_ranks),
+                    key=lambda i: (self.total_tokens[i], self.total_requests[i]),
+                )
         else:
             return None
 
@@ -153,6 +162,23 @@ class DPBudget:
         self.total_requests[target_rank] += 1
         self.total_tokens[target_rank] += estimated_tokens
         return target_rank
+
+    def _fewest_rows_within_kv_guard(self, estimated_tokens: int):
+        # Decode step time follows the busiest DP's rows; total_requests counts running plus
+        # requests already holding KV (they run within the new request's lifetime).
+        if not all(self.max_tokens):
+            return None
+        ranks = range(self.num_dp_ranks)
+        fracs = [self.total_tokens[i] / self.max_tokens[i] for i in ranks]
+        limit = min(self.ROWS_KV_CAP, sum(fracs) / len(fracs) + self.rows_kv_eps)
+        fits = [
+            i
+            for i in ranks
+            if (self.total_tokens[i] + estimated_tokens) / self.max_tokens[i] <= limit
+        ]
+        if not fits:
+            return None
+        return min(fits, key=lambda i: (self.total_requests[i], self.total_tokens[i]))
 
 
 class DataParallelController:
@@ -226,7 +252,14 @@ class DataParallelController:
             self.max_dp_size - self.launch_dp_size
         )
 
-        self.dp_budget = DPBudget(get_parallel().num_dp_ranks)
+        self.dp_budget = DPBudget(
+            get_parallel().num_dp_ranks,
+            rows_kv_eps=(
+                envs.SGLANG_DISAGG_DECODE_LB_ROWS_EPS.get()
+                if get_disagg().disaggregation_mode == "decode"
+                else 0.0
+            ),
+        )
         self.load_snapshot_reader = create_load_snapshot_reader(
             port_args,
             caller="DataParallelController",

@@ -793,6 +793,9 @@ class Envs:
     SGLANG_PD_INFLIGHT_DIAG = EnvBool(False)
     # Decode: dispatch to the DP rank --load-balance-method picks, ignoring the router's routed_dp_rank.
     SGLANG_DISAGG_DECODE_IGNORE_ROUTED_DP_RANK = EnvBool(False)
+    # Decode total_tokens LB: if > 0, pick the DP with the fewest requests (running + awaiting KV)
+    # among those whose projected KV fraction stays within the mean + this margin (and <= 0.95).
+    SGLANG_DISAGG_DECODE_LB_ROWS_EPS = EnvFloat(0.0)
     # A wedged RDMA stack fails startup here instead of at the scheduler watchdog.
     SGLANG_DISAGGREGATION_ENGINE_INIT_TIMEOUT = EnvInt(60)
     SGLANG_DISAGGREGATION_NIXL_BACKEND = EnvStr("UCX")
