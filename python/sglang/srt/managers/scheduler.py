@@ -4516,6 +4516,16 @@ class Scheduler(
             (r.rid[:6], r.num_matched_prefix_tokens, len(r.origin_input_ids), r.extend_end)
             for r in wq[:6]
         ]
+        pol = self.policy
+        # Full order with every sort input: pass counters, last-match pass, entry-time rank.
+        entry_rank = {r.rid: i for i, r in enumerate(sorted(wq, key=lambda r: r.time_stats.wait_queue_entry_time))}
+        logger.info(
+            "PPT order fct=%d passes=%d/%d/%d q=%s", self.forward_ct,
+            pol._prefix_match_passes, pol._shortest_prefill_calls, pol._waiting_prefix_refresh_calls,
+            [(r.rid[:6], r.num_matched_prefix_tokens, len(r.origin_input_ids) + len(r.output_ids),
+              pol._prefix_matched_at.get(r.rid), entry_rank[r.rid], r.arrival_processed_tokens)
+             for r in wq],
+        )
         from sglang.srt.managers.scheduler_pp_mixin import pp_debug_verify_ids
 
         pp_debug_verify_ids(wq[:6], "admission", self.forward_ct)
