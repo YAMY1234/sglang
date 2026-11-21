@@ -684,6 +684,7 @@ class Scheduler(
                 cache_controller.write_fence_stream = (
                     self.tp_worker.model_runner.forward_stream
                 )
+                cache_controller.forward_on_fence_stream = self.enable_overlap
         self.emit_metrics_constants()
         self.maybe_init_hccl_dp_prewarm()
 
@@ -1628,9 +1629,11 @@ class Scheduler(
                 transfer_backend=self.transfer_backend,
             )
 
+        # Encoder-only prefill sends no draft state; decode's tail extend fills it.
         draft_token_to_kv_pool = (
             self.draft_worker.primary_draft_kv_pool
             if self.draft_worker is not None
+            and not get_disagg().dsv41_encoder_only_prefill
             else None
         )
 
@@ -3818,6 +3821,10 @@ class Scheduler(
             req.time_stats.set_wait_queue_entry_time()
             req.arrival_processed_tokens = self.processed_tokens_counter
         elif self.disaggregation_mode == DisaggregationMode.PREFILL:
+            if get_disagg().dsv41_encoder_only_prefill and not (
+                self.prepare_dsv41_encoder_only_req(req)
+            ):
+                return
             self._prefetch_kvcache(req)
             self.disagg_prefill_bootstrap_queue.add(
                 req, self.model_config.num_key_value_heads
@@ -6804,6 +6811,10 @@ def _dispatch_event_loop_once(scheduler: Scheduler):
     # A PD role switch can select a different loop on the same scheduler.
     scheduler.enable_continuous_input_polling = False
     scheduler.enable_skip_finishing_decode = False
+    if get_disagg().dsv41_tail_stage_server:
+        from sglang.srt.disaggregation.dsv41_tail_stage.server import run_tail_stage
+
+        return run_tail_stage(scheduler)
     disaggregation_mode: DisaggregationMode = scheduler.disaggregation_mode
     if disaggregation_mode == DisaggregationMode.NULL:
         if get_parallel().pp_size > 1:

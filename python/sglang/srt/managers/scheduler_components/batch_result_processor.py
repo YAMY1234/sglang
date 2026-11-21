@@ -971,6 +971,11 @@ class SchedulerBatchResultProcessor:
         self.advance_grammar_fsm(result, batch)
 
         predict_tokens = []
+        num_fed_tokens = 0
+        result.num_fed_only_reqs = 0
+        result.num_fed_per_req = None
+        # Only SGLANG_DSV41_FUSED_TAIL feeds prompt tokens through verify steps.
+        fused_tail = envs.SGLANG_DSV41_FUSED_TAIL.get()
         for i, req in enumerate(batch.reqs):
             accept_tokens = next_token_ids[i * stride : i * stride + accept_lens[i]]
 
@@ -987,6 +992,22 @@ class SchedulerBatchResultProcessor:
                 # Commit the full accepted run (drafts + bonus).
                 num_accept_tokens = len(accept_tokens)
                 req.kv.commit_decode(num_accept_tokens)
+                fed = (
+                    min(num_accept_tokens, req.dsv41_feed_prompt_left)
+                    if fused_tail
+                    else 0
+                )
+                if fed:
+                    # A fed tail's run starts with prompt tokens: KV, not output.
+                    req.dsv41_feed_prompt_left -= fed
+                    accept_tokens = accept_tokens[fed:]
+                    num_fed_tokens += fed
+                    if result.num_fed_per_req is None:
+                        result.num_fed_per_req = [0] * len(batch.reqs)
+                    result.num_fed_per_req[i] = fed
+                    result.num_fed_only_reqs += not accept_tokens
+                    predict_tokens.append(accept_tokens)
+                    continue
                 req.spec_verify_ct += 1
 
                 num_correct_drafts = result.num_correct_drafts_per_req_cpu[i]
@@ -1001,6 +1022,8 @@ class SchedulerBatchResultProcessor:
 
             predict_tokens.append(accept_tokens)
 
+        # Generated tokens are counted as correct drafts plus one per request.
+        result.num_correct_drafts -= num_fed_tokens
         return predict_tokens
 
     def _accept_grammar_tokens(
@@ -1152,9 +1175,11 @@ class SchedulerBatchResultProcessor:
         num_generated_tokens = result.get_num_generated_tokens(batch_size)
         self.metrics_reporter.num_generated_tokens += num_generated_tokens
         if not batch.spec_algorithm.is_none():
+            # A verify that only fed prompt tokens is no speculation step.
+            fed_only = result.num_fed_only_reqs
             self.metrics_reporter.update_spec_metrics(
-                batch_size,
-                result.num_correct_drafts,
+                batch_size - fed_only,
+                result.num_correct_drafts + fed_only,
                 num_accept_tokens=num_generated_tokens,
                 num_block_accept_tokens=result.num_block_accept_tokens,
                 num_cap_tokens=result.num_cap_tokens,
@@ -1172,6 +1197,8 @@ class SchedulerBatchResultProcessor:
         if batch.spec_algorithm.is_none() and logits_output is not None:
             self.beam_coordinator.commit_decode(reqs_still_in_batch, batch.forward_iter)
 
+        # Only SGLANG_DSV41_FUSED_TAIL feeds prompt tokens through verify steps.
+        fused_tail = envs.SGLANG_DSV41_FUSED_TAIL.get()
         for i, req in enumerate(batch.reqs):
             req: Req
 
@@ -1191,6 +1218,13 @@ class SchedulerBatchResultProcessor:
             # run for spec (already grammar-truncated in _resolve_spec_v2_tokens).
             next_token_id = next_token_ids[i]
             is_spec = not batch.spec_algorithm.is_none()
+            if (
+                fused_tail
+                and req.dsv41_feed_floor is not None
+                and len(next_token_id) == 0
+            ):
+                # A fed tail step that accepted only prompt tokens has no output.
+                continue
 
             req.time_stats.set_last_decode_finish_time()
             sampling_mask_finish_reason = None
@@ -1225,6 +1259,7 @@ class SchedulerBatchResultProcessor:
                     next_token_id=next_token_id,
                     next_token_logprobs=next_token_logprobs,
                     logits_output=logits_output,
+                    fed_per_req=result.num_fed_per_req,
                 )
 
             if req.return_sampling_mask:
@@ -1321,9 +1356,12 @@ class SchedulerBatchResultProcessor:
         next_token_id: Union[int, List[int]],
         next_token_logprobs: list,
         logits_output: LogitsProcessorOutput,
+        fed_per_req: Optional[List[int]] = None,
     ) -> None:
         # accepted_ids is already a per-req list; non-spec logprobs are flat, so
         # the scalar logprob still needs wrapping.
+        # A fed tail's run starts with prompt tokens the output skips.
+        fed = 0 if fed_per_req is None else fed_per_req[i]
         if not batch.spec_algorithm.is_none():
             accepted_logprobs = next_token_logprobs[i]
             accepted_ids = next_token_id
@@ -1333,7 +1371,7 @@ class SchedulerBatchResultProcessor:
             accepted_ids = next_token_id
             max_accept = 1
 
-        for j, tok_id in enumerate(accepted_ids):
+        for j, tok_id in enumerate(accepted_ids, start=fed):
             self.logprob_result_processor.append_output_token_logprobs(
                 req,
                 tok_id,

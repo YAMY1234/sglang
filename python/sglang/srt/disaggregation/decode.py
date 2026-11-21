@@ -63,9 +63,19 @@ from sglang.srt.disaggregation.decode_hicache_mixin import (
     HiCacheRestoreGatedKVReceiver,
     HiCacheRestoreResult,
 )
+from sglang.srt.disaggregation.dsv41_tail_stage_decode import (
+    LEAN_RECLAIM_EVERY,
+    TAIL_AUX_ABORT_REST_STEPS,
+    TAIL_AUX_READ_REST_STEPS,
+    DecodeCpuStats,
+    TailAuxStaging,
+    append_tail_stage_entries,
+    lean_admit_on,
+)
 from sglang.srt.disaggregation.minimax import minimax_index_transfer_pages
 from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.disaggregation.utils import (
+    DSV41_PREFIX_LEN_SLOT,
     KVClassType,
     MetadataBuffers,
     NetworkTransferWaiter,
@@ -75,6 +85,12 @@ from sglang.srt.disaggregation.utils import (
     all_reduce_flags,
     build_kv_layer_ids,
     build_staging_slot_metadata,
+    dsv41_encoder_only_prefill_enabled,
+    dsv41_encoder_only_unsupported,
+    dsv41_encoder_prefix_len,
+    dsv41_late_tail_fed,
+    dsv41_tail_can_feed,
+    dsv41_tail_stage_enabled,
     end_network_transfer,
     get_dsa_tail_state_indices,
     get_kv_class,
@@ -175,6 +191,13 @@ from sglang.srt.utils.network import NetworkAddress
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 logger = logging.getLogger(__name__)
+
+
+def _dsv41_lean_admit(scheduler) -> bool:
+    """SGLANG_DSV41_LEAN_ADMIT for the scheduler's current step."""
+    mode = envs.SGLANG_DSV41_LEAN_ADMIT.get()
+    return mode == "1" or (mode == "alt" and lean_admit_on(mode, scheduler.forward_ct))
+
 
 _is_npu = is_npu()
 
@@ -466,12 +489,38 @@ class _PendingReceive(msgspec.Struct, frozen=True):
     refresh: Callable[[], Tuple[Any, Optional[List]]]
 
 
+# SGLANG_DSV41_TAIL_HOLD_MS counts forward steps of this nominal length: a decode
+# step of the high-throughput DeepSeek-V4.1 PD configs (DSpark verify) takes 18-25 ms.
+DSV41_TAIL_HOLD_STEP_MS = 20
+
+# State types whose publish payloads are host-built or device tensors read back
+# together with the page ids (SGLANG_DISAGG_DECODE_ASYNC_PUBLISH_READBACK).
+_ASYNC_READBACK_STATE_TYPES = frozenset(
+    {
+        StateType.MAMBA,
+        StateType.SWA,
+        StateType.SWA_RING,
+        StateType.DSV4_REQUEST_STATE,
+        StateType.REQUEST_ROW,
+        StateType.DSV41_TAIL_SWA,
+        StateType.DSV41_TAIL_DRAFT_AUX,
+        StateType.BLOCK_SCALE,
+        StateType.BLOCK_SCALE_SWA,
+    }
+)
+
+
 class DecodePreallocQueue(DecodeHiCachePreallocMixin):
     """
     Store the requests that are preallocating.
     """
 
     _defer_publish: bool = False
+    _async_publish_readback: bool = False
+    # SGLANG_DSV41_TAIL_STAGE with DSpark: where the tail server's draft captures land.
+    tail_aux: Optional[TailAuxStaging] = None
+    # Pre-allocation passes that stopped for want of a tail aux slot.
+    tail_aux_waits: int = 0
 
     def __init__(
         self,
@@ -517,6 +566,12 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             and not transfer_queue.enable_staging
             and torch.cuda.is_available()
             and is_war_barrier_enabled()
+        )
+        # The deferred publish's readback waits only on its allocation; with this
+        # it also stops blocking the host on each payload's D2H.
+        self._async_publish_readback = (
+            self._defer_publish
+            and envs.SGLANG_DISAGG_DECODE_ASYNC_PUBLISH_READBACK.get()
         )
         self._pending_publish: List[_PendingPublish] = []
         # Assumes nothing else in-process draws priority -1 (true for srt on CUDA),
@@ -565,6 +620,17 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         self.kv_manager = self._init_kv_manager()
         if self.enable_staging:
             self.transfer_queue._init_staging_handler(self.kv_manager)
+        if self._async_publish_readback:
+            state_types = self.kv_manager.kv_args.state_types
+            logger.info(
+                "PD decode async publish readback %s (state types: %s)",
+                (
+                    "engaged"
+                    if set(state_types) <= _ASYNC_READBACK_STATE_TYPES
+                    else "inert: unsupported state types"
+                ),
+                ", ".join(str(t.value) for t in state_types) or "none",
+            )
 
         if (
             self.scheduler.tp_worker.is_hybrid_swa
@@ -824,6 +890,30 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             {name: tokens + window_reserved for name, tokens in windows.items()},
         )
 
+    def _append_tail_stage_entries(self, kv_args) -> None:
+        """SGLANG_DSV41_TAIL_STAGE: the tail server's entries after the prefill's,
+        and the staging its draft captures land in when this server drafts."""
+        config = self.scheduler.model_config
+        model = self.scheduler.tp_worker.model_runner.model
+        captures = getattr(model.model, "dspark_layers_to_capture", None)
+        if self.scheduler.spec_algorithm.is_dspark() and captures:
+            self.tail_aux = TailAuxStaging(
+                slots=envs.SGLANG_DSV41_TAIL_STAGE_DECODE_AUX_SLOTS.get(),
+                window=config.sliding_window_size,
+                captures=len(captures),
+                hidden_size=config.hf_text_config.hidden_size,
+                dtype=self.scheduler.tp_worker.model_runner.dtype,
+                device=self.token_to_kv_pool.device,
+                mem_pool=self.token_to_kv_pool.custom_mem_pool,
+            )
+        boundary = max(config.hf_text_config.kv_source_layer_ids)
+        append_tail_stage_entries(
+            kv_args,
+            pool=self.token_to_kv_pool,
+            layer_ids=range(boundary, config.num_hidden_layers),
+            aux=self.tail_aux,
+        )
+
     def _init_kv_manager(self) -> CommonKVManager:
         kv_args_class = get_kv_class(self.transfer_backend, KVClassType.KVARGS)
         kv_args = kv_args_class()
@@ -913,6 +1003,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             total_kv_layers=self.scheduler.model_config.num_hidden_layers,
             window_tails=storage.retained_window_lengths(),
         )
+        if dsv41_tail_stage_enabled():
+            self._append_tail_stage_entries(kv_args)
         if get_disagg().disaggregation_decode_host_receive_threshold < 1:
             pool = self.token_to_kv_pool
             group = self.tree_cache.host_pool_group
@@ -1130,6 +1222,29 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             req.time_stats.set_retract_time()
             is_retracted = False
             is_rebootstrap = True
+
+        if dsv41_encoder_only_prefill_enabled() and not is_retracted:
+            unsupported = dsv41_encoder_only_unsupported(req)
+            if unsupported is not None:
+                prepare_abort(
+                    req,
+                    f"--dsv41-encoder-only-prefill does not support {unsupported}",
+                    status_code=HTTPStatus.BAD_REQUEST,
+                )
+                self.scheduler.request_retirer.retire_unadmitted(req)
+                return
+            # Prefill sends the encoder prefix of what it recomputes (a rebootstrap's
+            # prompt plus all output but the pending last id); the tail extend here
+            # runs the rest and samples the next token.
+            req.dsv41_tail_start = None
+            fill_len = pre_alloc_fill_len(req)
+            window = self.scheduler.model_config.sliding_window_size
+            req.dsv41_tail_start = dsv41_encoder_prefix_len(fill_len, window)
+            # SGLANG_DSV41_TAIL_STAGE: the tail stage writes the late layers' window
+            # below the split; only the one or two rows from it are left here.
+            req.dsv41_late_fed = dsv41_tail_stage_enabled() and dsv41_late_tail_fed(
+                fill_len, window
+            )
 
         if self._check_if_req_exceed_kv_capacity(req):
             return
@@ -1754,6 +1869,22 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             if self.req_to_metadata_buffer_idx_allocator.available_size() <= 0:
                 break
 
+            if (
+                self.tail_aux is not None
+                and decode_req.req.dsv41_late_fed
+                and decode_req.req.dsv41_tail_aux_slot is None
+                and not _is_fake_transfer(decode_req.req)
+            ):
+                # The tail server's draft captures land in this slot; no slot, no
+                # transfer yet.
+                slot = self.tail_aux.reserve(
+                    decode_req.req, step=self.scheduler.forward_ct
+                )
+                if slot is None:
+                    self.tail_aux_waits += 1
+                    break
+                decode_req.req.dsv41_tail_aux_slot = slot
+
             if self.scheduler.enable_lora and not self.scheduler.can_schedule_lora_req(
                 decode_req.req, running_loras
             ):
@@ -2113,7 +2244,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             and torch.cuda.is_available()
             and set(state_types) <= {StateType.MAMBA}
             and not _is_fake_transfer(decode_req.req)
-        )
+        ) or self._reads_back_async(decode_req, state_types)
 
         def _mamba_payload():
             state_ids = self.token_to_kv_pool_allocator.state_ids(
@@ -2138,6 +2269,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 token_start=total_prefix_len,
                 token_boundary=seq_len,
             )
+            if non_blocking_metadata:
+                return resume.unit_ids
             return resume.unit_ids.cpu().numpy()
 
         def _full_kv_pages_payload():
@@ -2146,6 +2279,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             ]
             # Indexer lives on device pool; always use device page_size
             device_page_size = self.token_to_kv_pool.page_size
+            if non_blocking_metadata:
+                return kv_indices_full[::device_page_size] // device_page_size
             return kv_to_page_indices(kv_indices_full, device_page_size)
 
         def _minimax_payload():
@@ -2200,6 +2335,28 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         def _request_row_payload():
             return np.array([decode_req.req.kv.req_pool_idx], dtype=np.int32)
 
+        def _tail_swa_payload():
+            # The window pages of [e - window, e), the window the tail server runs:
+            # the window entry's own rule (layers 20-39 instead of 0-19), no host sync.
+            req = decode_req.req
+            if not req.dsv41_late_fed:
+                return np.empty((0,), dtype=np.int32)
+            e = req.dsv41_tail_start
+            storage = kv_storage_of(
+                self.req_to_token_pool, self.token_to_kv_pool_allocator
+            )
+            pages = storage.resume_units(
+                window_sub_pool_of(self.token_to_kv_pool_allocator),
+                req,
+                token_start=e - self.scheduler.model_config.sliding_window_size,
+                token_boundary=e,
+            ).unit_ids
+            return pages if non_blocking_metadata else pages.cpu().numpy()
+
+        def _tail_aux_payload():
+            slot = decode_req.req.dsv41_tail_aux_slot
+            return np.array([] if slot is None else [slot], dtype=np.int32)
+
         if StateType.DSV4_REQUEST_STATE in state_types and isinstance(
             self.token_to_kv_pool, DeepSeekV4TokenToKVPool
         ):
@@ -2220,6 +2377,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             StateType.SWA_RING: _swa_ring_payload,
             StateType.DSV4_REQUEST_STATE: _request_state_payload,
             StateType.REQUEST_ROW: _request_row_payload,
+            StateType.DSV41_TAIL_SWA: _tail_swa_payload,
+            StateType.DSV41_TAIL_DRAFT_AUX: _tail_aux_payload,
             StateType.BLOCK_SCALE: _full_kv_pages_payload,
             StateType.BLOCK_SCALE_SWA: _swa_payload,
         }
@@ -2331,6 +2490,15 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         storage.end_receive_hold(decode_req.req)
         return page_indices, metadata_index, state_indices
 
+    def _reads_back_async(self, decode_req: DecodeRequest, state_types) -> bool:
+        """Whether this deferred publish reads its ids back through pinned copies
+        and leaves the send to the transfer queue once they land."""
+        return (
+            self._async_publish_readback
+            and set(state_types) <= _ASYNC_READBACK_STATE_TYPES
+            and not _is_fake_transfer(decode_req.req)
+        )
+
     def _send_kv_metadata(
         self,
         decode_req,
@@ -2354,9 +2522,14 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         readback_ready = None
         if non_blocking:
 
-            def to_host(indices):
-                host = torch.empty(indices.shape, dtype=indices.dtype, pin_memory=True)
-                host.copy_(indices, non_blocking=True)
+            def to_host(payload):
+                # A payload is a tensor, a list of them, or already host-built.
+                if isinstance(payload, list):
+                    return [to_host(part) for part in payload]
+                if not isinstance(payload, torch.Tensor):
+                    return payload
+                host = torch.empty(payload.shape, dtype=payload.dtype, pin_memory=True)
+                host.copy_(payload, non_blocking=True)
                 return host.numpy()
 
             # The receive is recorded by the device ids: the host copies are
@@ -2364,11 +2537,10 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             device_pages = (kv_indices[::page_size] // page_size).int()
             device_state_indices = state_indices
             page_indices = to_host(device_pages)
-            state_indices = [
-                [to_host(indices) for indices in payload] for payload in state_indices
-            ]
-            # Fence both the D2H and the prior forward before exposing reused pages.
-            if self.scheduler.enable_overlap:
+            state_indices = [to_host(payload) for payload in state_indices]
+            # Fence both the D2H and the prior forward before exposing reused pages;
+            # a deferred publish's stream already waits on its allocation's forwards.
+            if self.scheduler.enable_overlap and not self._defer_publish:
                 forward_done = self.scheduler.device_module.Event()
                 forward_done.record(stream=self.scheduler.forward_stream)
                 torch.cuda.current_stream().wait_event(forward_done)
@@ -3342,6 +3514,26 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 # an ack racing back is never dropped.
                 decode_req.kv_receiver.abort()
 
+    @staticmethod
+    def _commit_cached_tokens(req: Req, cached_tokens: torch.Tensor) -> None:
+        req.cached_tokens = cached_tokens[0].item()
+        # The prefill node already reported its prefix-cache hit in
+        # cached_tokens[0]. Seed already_computed with it so that
+        # prepare_for_prebuilt's `cached_tokens += pre_len - already_computed`
+        # only adds decode-side reuse *beyond* what prefill counted, instead of
+        # double-counting the shared prompt prefix (which would make
+        # cached_tokens exceed prompt_tokens when decode radix cache is on).
+        req.already_computed = req.cached_tokens
+        req.cached_tokens_device = cached_tokens[1].item()
+        req.cached_tokens_host = cached_tokens[2].item()
+        req.cached_tokens_storage = cached_tokens[3].item()
+        # Multimodal prompt token counts packed into cached_tokens slots 4-6
+        # by the prefill node (see MetadataBuffers.set_buf).
+        req.mm_image_tokens = cached_tokens[4].item()
+        req.mm_audio_tokens = cached_tokens[5].item()
+        req.mm_video_tokens = cached_tokens[6].item()
+        req.mm_token_counts_ready = True
+
     def _kv_checksum_comparable(self, signature: int) -> bool:
         """Digests compare only when the prefill digested this decode's layout.
         One with another TP width or a PP stage is admitted unverified and
@@ -3438,6 +3630,32 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
 
         self._commit_hicache_local_restore_to_req(decode_req)
 
+        if (
+            dsv41_encoder_only_prefill_enabled()
+            and decode_req.req.dsv41_tail_start is not None
+        ):
+            # Prefill sampled nothing; the tail extend here samples the next token.
+            # A rebootstrap keeps its output ids: as in a collocated retraction,
+            # the tail takes the pending last id as input instead of resampling it.
+            req = decode_req.req
+            covered = cached_tokens[DSV41_PREFIX_LEN_SLOT].item()
+            if covered != req.dsv41_tail_start and not _is_fake_transfer(req):
+                # The tail extend would read KV prefill never wrote, or overwrite it.
+                prepare_abort(
+                    req,
+                    f"Encoder-only prefill covered {covered} prompt tokens, "
+                    f"decode expected {req.dsv41_tail_start}",
+                    status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                )
+                decode_req.kv_receiver.clear()
+                decode_req.kv_receiver = None
+                return
+            self._commit_cached_tokens(req, cached_tokens)
+            decode_req.kv_receiver.clear()
+            decode_req.kv_receiver = None
+            decode_req.req.time_stats.set_wait_queue_entry_time()
+            return
+
         # Case 3: Success - commit the transfer
         # A rebootstrap resumes from its last output id, already committed; the
         # prefill's sampled token is dropped.
@@ -3492,23 +3710,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 sampling_mask_idx=sampling_mask_idx,
                 sampling_mask_logprobs=sampling_mask_logprobs,
             )
-        decode_req.req.cached_tokens = cached_tokens[0].item()
-        # The prefill node already reported its prefix-cache hit in
-        # cached_tokens[0]. Seed already_computed with it so that
-        # prepare_for_prebuilt's `cached_tokens += pre_len - already_computed`
-        # only adds decode-side reuse *beyond* what prefill counted, instead of
-        # double-counting the shared prompt prefix (which would make
-        # cached_tokens exceed prompt_tokens when decode radix cache is on).
-        decode_req.req.already_computed = decode_req.req.cached_tokens
-        decode_req.req.cached_tokens_device = cached_tokens[1].item()
-        decode_req.req.cached_tokens_host = cached_tokens[2].item()
-        decode_req.req.cached_tokens_storage = cached_tokens[3].item()
-        # Multimodal prompt token counts packed into cached_tokens slots 4-6
-        # by the prefill node (see MetadataBuffers.set_buf).
-        decode_req.req.mm_image_tokens = cached_tokens[4].item()
-        decode_req.req.mm_audio_tokens = cached_tokens[5].item()
-        decode_req.req.mm_video_tokens = cached_tokens[6].item()
-        decode_req.req.mm_token_counts_ready = True
+        self._commit_cached_tokens(decode_req.req, cached_tokens)
         if not self.spec_algorithm.is_none():
             decode_req.req.output_topk_p = output_topk_p
             decode_req.req.output_topk_index = output_topk_index
@@ -3929,6 +4131,11 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         self._unregister_staging_room(room)
         # release pre-allocated kv cache, but don't insert into the tree since it's failed
         self.scheduler.request_retirer.release(decode_req.req, checkpoint=False)
+        if dsv41_tail_stage_enabled():
+            # A write of the failed transfer may still land in its aux slot.
+            self.scheduler._release_dsv41_tail_aux(
+                decode_req.req, rest=TAIL_AUX_ABORT_REST_STEPS
+            )
         self.metadata_buffers.clear_slot(idx)
         self.req_to_metadata_buffer_idx_allocator.free(idx)
         if not self._is_host_destination(decode_req):
@@ -4019,6 +4226,15 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             )
 
 
+def defer_decode_prealloc() -> bool:
+    """Whether the overlap loop preallocates after launching its batch, so the
+    allocation runs beside the forward instead of ahead of the DP shape sync."""
+    return envs.SGLANG_DISAGG_DECODE_DEFER_PREALLOC.get() or (
+        envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get()
+        and envs.SGLANG_ENABLE_NV_MEGA_PDDEC_RUNTIME_OPTIMIZATION.get()
+    )
+
+
 class SchedulerDisaggregationDecodeMixin:
     @torch.no_grad()
     def event_loop_normal_disagg_decode(self: Scheduler):
@@ -4069,10 +4285,9 @@ class SchedulerDisaggregationDecodeMixin:
     def event_loop_overlap_disagg_decode(self: Scheduler):
         self.result_queue = deque()
         self.last_batch: Optional[ScheduleBatch] = None
-        defer_prealloc = (
-            envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get()
-            and envs.SGLANG_ENABLE_NV_MEGA_PDDEC_RUNTIME_OPTIMIZATION.get()
-        )
+        defer_prealloc = defer_decode_prealloc()
+        cpu = DecodeCpuStats() if envs.SGLANG_DSV41_DECODE_CPU_STATS.get() else None
+        self.dsv41_cpu_stats = cpu
 
         def pop_and_process():
             tmp_batch, tmp_result = self.result_queue.popleft()
@@ -4082,6 +4297,8 @@ class SchedulerDisaggregationDecodeMixin:
             if self.gracefully_exit:
                 break
             self.increment_scheduler_iterations()
+            if cpu:
+                cpu.start()
 
             # Pending rooms from the prior cycle can overlap request intake and
             # the tail of the in-flight decode graph.
@@ -4092,7 +4309,11 @@ class SchedulerDisaggregationDecodeMixin:
             if self.pause_state.paused:
                 self._record_scheduler_state_for_paused_engine()
                 continue
+            if cpu:
+                cpu.mark("ingest")
             prealloc_deferred = self.process_decode_queue(defer_prealloc=defer_prealloc)
+            if cpu:
+                cpu.mark("decode_queue")
 
             # overlap + spec + grammar is unsupported (would desync DP ranks).
             process_last_batch_early = self.should_process_last_batch_early(
@@ -4100,6 +4321,8 @@ class SchedulerDisaggregationDecodeMixin:
             )
             if process_last_batch_early:
                 pop_and_process()
+            if cpu:
+                cpu.mark("result_early")
 
             # Get the next batch to run
             plan = self.get_next_disagg_decode_batch_to_run(
@@ -4112,6 +4335,8 @@ class SchedulerDisaggregationDecodeMixin:
             )
             self.cur_batch_for_debug = batch
             self._flush_staging_scatters()
+            if cpu:
+                cpu.mark("next_batch")
 
             # Launch the current batch
             if batch:
@@ -4127,6 +4352,8 @@ class SchedulerDisaggregationDecodeMixin:
                     self._preallocate_new_requests()
                 batch_result = None
                 self._sched_idled = True
+            if cpu:
+                cpu.mark("launch")
 
             # Process the last batch
             if self.last_batch:
@@ -4134,10 +4361,18 @@ class SchedulerDisaggregationDecodeMixin:
                     pop_and_process()
             elif batch is None:
                 self.on_idle()
+            if cpu:
+                cpu.mark("result")
 
             # Run sample of the current batch
             # It depends on the result of the last batch (e.g., grammar), so we run it after the last batch is processed.
             self.launch_batch_sample_if_needed(batch_result, batch)
+            if cpu and batch is not None:
+                cpu.mark("sample")
+                cpu.lean = _dsv41_lean_admit(self)
+                line = cpu.end()
+                if line:
+                    logger.info(line)
 
             # Update last_batch
             self.last_batch = batch
@@ -4164,13 +4399,178 @@ class SchedulerDisaggregationDecodeMixin:
 
         return GenerationBatchResult()
 
+    def _merge_dsv41_tail_extend(
+        self: Scheduler, running_batch: ScheduleBatch
+    ) -> ScheduleBatch:
+        """Merge the previous step's tail extend into the decode batch.
+
+        As in collocated serving, the merge precedes the extend's result
+        processing under overlap: its first tokens reach the decode inputs
+        through the future map, and finished requests leave in a later filter.
+        """
+        last_batch = self.last_batch
+        if (
+            last_batch is None
+            or last_batch is running_batch
+            or not last_batch.forward_mode.is_extend()
+        ):
+            return running_batch
+        last_batch.filter_batch()
+        if last_batch.is_empty():
+            return running_batch
+        # Its requests start running at the merge.
+        move(
+            [req for req in last_batch.reqs if req not in self.running_reqs],
+            self.running_reqs,
+        )
+        if running_batch.is_empty():
+            return last_batch
+        running_batch.merge_batch(last_batch)
+        return running_batch
+
+    def _get_new_dsv41_tail_extend_batch(
+        self: Scheduler, running_batch: ScheduleBatch
+    ) -> Optional[ScheduleBatch]:
+        """Run the final window of transferred prompts on top of their prefix.
+
+        The transferred encoder prefix and its SWA window stand where a previous
+        prefill chunk would leave them, so the tail is an ordinary extend; the
+        decoder SWA bounded replay floors the decoder layers at its start.
+        """
+        hold_ms = envs.SGLANG_DSV41_TAIL_HOLD_MS.get()
+        if hold_ms > 0:
+            # While decode has work, tails run only on the first step of each
+            # hold period, so one extend step takes several. Periods count forward
+            # steps, which every TP rank (and every DP rank) runs alike, so all
+            # ranks cross a boundary on the same step: a clock read per rank could
+            # split one step's decision between TP ranks and hang their collectives.
+            period_steps = max(1, round(hold_ms / DSV41_TAIL_HOLD_STEP_MS))
+            period = self.forward_ct // period_steps
+            period_start = period != getattr(self, "dsv41_tail_period", None)
+            self.dsv41_tail_period = period
+        if self.grammar_manager.has_waiting_grammars():
+            for req in self.grammar_manager.get_ready_grammar_requests():
+                self._add_request_to_queue(req)
+        if not self.waiting_queue:
+            return None
+        last_batch = self.last_batch
+        if (
+            not running_batch.is_empty()
+            and last_batch is not None
+            and last_batch.forward_mode.is_extend()
+        ):
+            # Alternate with decode so a stream of arrivals cannot starve it.
+            return None
+        if hold_ms > 0 and not period_start and not running_batch.is_empty():
+            queued_tokens = sum(
+                len(req.full_untruncated_fill_ids) - req.dsv41_tail_start
+                for req in self.waiting_queue
+            )
+            if queued_tokens < self.max_prefill_tokens:
+                return None
+
+        num_free_reqs = (
+            min(self.req_to_token_pool.size, self.max_running_requests)
+            - running_batch.batch_size()
+        )
+        page_size = self.token_to_kv_pool_allocator.page_size
+        num_free_tokens = self.token_to_kv_pool_allocator.available_size()
+        can_run_list: List[Req] = []
+        num_tokens = num_alloc_tokens = 0
+        for req in self.waiting_queue:
+            fill_len = len(req.full_untruncated_fill_ids)
+            tail_len = fill_len - req.dsv41_tail_start
+            alloc_len = ceil_align(fill_len, page_size) - ceil_align(
+                req.dsv41_tail_start, page_size
+            )
+            if (
+                len(can_run_list) >= num_free_reqs
+                or num_alloc_tokens + alloc_len > num_free_tokens
+                or (can_run_list and num_tokens + tail_len > self.max_prefill_tokens)
+            ):
+                # Decode frees memory or retracts until the tail fits.
+                break
+            can_run_list.append(req)
+            num_tokens += tail_len
+            num_alloc_tokens += alloc_len
+        if not can_run_list:
+            return None
+        if not getattr(self, "dsv41_tail_extend_logged", False):
+            self.dsv41_tail_extend_logged = True
+            logger.info(
+                "DeepSeek-V4.1 encoder-only decode: first tail extend, %d requests, "
+                "%d tokens on top of their transferred prefixes",
+                len(can_run_list),
+                num_tokens,
+            )
+        # As a collocated prefill's, until the merge into the running batch.
+        move(can_run_list, self.prefill_launched_reqs)
+        if dsv41_tail_stage_enabled():
+            self._write_dsv41_tail_draft_kv(can_run_list)
+
+        storage = kv_storage_of(self.req_to_token_pool, self.token_to_kv_pool_allocator)
+        for req in can_run_list:
+            if req.kv.kv_allocated_len == 0:
+                # A prompt within one window transferred nothing: extend it whole
+                # in a fresh row, like a new collocated request.
+                storage.release_row(req)
+            req.prefix_len = req.dsv41_tail_start
+            req.extend_end = len(req.full_untruncated_fill_ids)
+            # The transferred prefix was computed, not hit; prefill reported its
+            # cache hits already.
+            req.already_computed = req.prefix_len
+            req._cache_breakdown_computed = True
+            req.dsv41_tail_start = None
+            if req.output_ids:
+                # A rebootstrap replays its emitted tokens: not prompt tokens to score.
+                req.logprob_start_len = max(req.logprob_start_len, req.extend_end)
+        set_time_batch(can_run_list, "set_forward_entry_time")
+
+        new_batch = ScheduleBatch.init_new(
+            can_run_list,
+            self.req_to_token_pool,
+            self.token_to_kv_pool_allocator,
+            self.tree_cache,
+            self.model_config,
+            self.enable_overlap,
+            self.spec_algorithm,
+        )
+        new_batch.prepare_for_extend()
+        return new_batch
+
     @scheduler_stage_method(SCHEDULER_STAGE_GET_NEXT_BATCH)
     def get_next_disagg_decode_batch_to_run(
         self: Scheduler, running_batch: ScheduleBatch
     ) -> NextBatchPlan:
         """Process prebuilt batch and schedule the next decode batch."""
-        # Process pending prebuilt batch: output processing + filter + merge
-        new_prebuilt_batch = self.get_new_prebuilt_batch(running_batch)
+        if dsv41_encoder_only_prefill_enabled():
+            if dsv41_tail_stage_enabled():
+                self._reclaim_dsv41_tail_aux()
+            running_batch = self._merge_dsv41_tail_extend(running_batch)
+            running_batch = self._admit_dsv41_fed_tails(running_batch)
+            tail_batch = self._get_new_dsv41_tail_extend_batch(running_batch)
+            # As in collocated scheduling, spec with DP attention keeps extend
+            # and decode on separate steps: ranks without a tail run idle.
+            sync_tail = (
+                self.require_mlp_sync
+                and not self.spec_algorithm.is_none()
+                and not envs.SGLANG_ENABLE_DP_SPEC_PREFILL_COORDINATION.get()
+            )
+            if tail_batch is not None or sync_tail:
+                # The tail is an extend forward; running decodes wait one step.
+                tail_batch = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(
+                    tail_batch
+                )
+            if tail_batch is not None:
+                set_schedule_time_batch(tail_batch)
+                return NextBatchPlan(
+                    batch_to_run=tail_batch, running_batch=running_batch
+                )
+            # Every request runs the tail extend; none is prebuilt.
+            new_prebuilt_batch = None
+        else:
+            # Process pending prebuilt batch: output processing + filter + merge
+            new_prebuilt_batch = self.get_new_prebuilt_batch(running_batch)
         if new_prebuilt_batch:
             assert self.chunked_req is None
             self.batch_result_processor.process_batch_result_prebuilt(
@@ -4194,8 +4594,260 @@ class SchedulerDisaggregationDecodeMixin:
 
         ret = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(ret)
         if ret:
+            if dsv41_encoder_only_prefill_enabled():
+                self._set_dsv41_feed_inputs(ret)
             set_schedule_time_batch(ret)
         return NextBatchPlan(batch_to_run=ret, running_batch=running_batch)
+
+    def _admit_dsv41_fed_tails(
+        self: Scheduler, running_batch: ScheduleBatch
+    ) -> ScheduleBatch:
+        """SGLANG_DSV41_FUSED_TAIL: join transferred requests to the running decode
+        batch, so their tails ride the verify steps decode runs anyway.
+
+        A request enters like a stock PD prebuilt one, with its KV at the tail
+        start s and the prompt token at s as the next verify input; the verify
+        steps then take the rest of the prompt six tokens at a time (see
+        _set_dsv41_feed_inputs). Requests the feed cannot serve stay queued for
+        the tail extend, as do all requests while the rank has nothing running:
+        the extend's single step gives the faster first token then.
+
+        A fed request holds a batch slot for every step of its feed without
+        producing tokens, so admission keeps the batch within the largest
+        captured decode CUDA graph; past it every step would run eagerly. The
+        requests it turns away take the tail extend, as without the flag.
+        """
+        if (
+            not envs.SGLANG_DSV41_FUSED_TAIL.get()
+            or not self.waiting_queue
+            or running_batch.is_empty()
+        ):
+            return running_batch
+        max_reqs = min(self.req_to_token_pool.size, self.max_running_requests)
+        graph_bs = self.tp_worker.get_decode_cuda_graph_bs()
+        if graph_bs:
+            max_reqs = min(max_reqs, max(graph_bs))
+        num_free_reqs = max_reqs - running_batch.batch_size()
+        lean = _dsv41_lean_admit(self)
+        if lean and num_free_reqs <= 0:
+            return running_batch
+        page_size = self.token_to_kv_pool_allocator.page_size
+        num_free_tokens = self.token_to_kv_pool_allocator.available_size()
+        fed: List[Req] = []
+        num_alloc_tokens = 0
+        for req in self.waiting_queue:
+            if lean and len(fed) >= num_free_reqs:
+                break
+            start = req.dsv41_tail_start
+            fill_len = len(req.origin_input_ids)
+            alloc_len = ceil_align(fill_len, page_size) - ceil_align(
+                start or 0, page_size
+            )
+            if (
+                len(fed) < num_free_reqs
+                and dsv41_tail_can_feed(req)
+                and num_alloc_tokens + alloc_len <= num_free_tokens
+            ):
+                fed.append(req)
+                num_alloc_tokens += alloc_len
+        if not fed:
+            return running_batch
+        stats = getattr(self, "dsv41_cpu_stats", None)
+        if stats is not None:
+            stats.admitted += len(fed)
+        # They run from here on, as a prebuilt batch's do.
+        move(fed, self.running_reqs)
+        if dsv41_tail_stage_enabled():
+            self._write_dsv41_tail_draft_kv(fed)
+
+        for req in fed:
+            start = req.dsv41_tail_start
+            # The prebuilt batch covers the transferred prefix [0, start).
+            req.prefix_len = 0
+            req.extend_end = start
+            req.already_computed = start
+            req._cache_breakdown_computed = True
+            req.dsv41_tail_start = None
+            req.dsv41_feed_floor = start
+            req.dsv41_feed_next = start
+            req.dsv41_feed_prompt_left = len(req.origin_input_ids) - 1 - start
+        set_time_batch(fed, "set_forward_entry_time")
+
+        new_batch = ScheduleBatch.init_new(
+            fed,
+            self.req_to_token_pool,
+            self.token_to_kv_pool_allocator,
+            self.tree_cache,
+            self.model_config,
+            self.enable_overlap,
+            self.spec_algorithm,
+        )
+        new_batch.prepare_for_prebuilt()
+        if self.enable_overlap:
+            # As for a prebuilt batch: drain an in-flight forward of a request
+            # that just finished before a new request seeds its row.
+            self.schedule_stream.wait_stream(self.forward_stream)
+        self.ngram_embedding_manager.prepare_for_forward(new_batch, chunked_req=None)
+        new_batch.process_prebuilt(self.future_map)
+        for req in fed:
+            req.time_stats.set_decode_prebuilt_finish_time()
+        running_batch.merge_batch(new_batch)
+        self.dsv41_fed_tail_ct = getattr(self, "dsv41_fed_tail_ct", 0) + len(fed)
+        now = time.monotonic()
+        if now - getattr(self, "dsv41_fed_tail_log_t", -1e9) > 5:
+            self.dsv41_fed_tail_log_t = now
+            logger.info(
+                "SGLANG_DSV41_FUSED_TAIL: %d tails fed through verify steps so far",
+                self.dsv41_fed_tail_ct,
+            )
+            if dsv41_tail_stage_enabled():
+                steps, done = getattr(self, "dsv41_late_feed_steps", (0, 0))
+                logger.info(
+                    "SGLANG_DSV41_TAIL_STAGE: %d late-fed tails fed in %d slot-steps "
+                    "(%.2f per tail); %d draft windows written from the tail stage; "
+                    "%d pre-allocation passes waited for an aux slot",
+                    done,
+                    steps,
+                    steps / max(done, 1),
+                    getattr(self, "dsv41_tail_admit_ct", 0),
+                    self.disagg_decode_prealloc_queue.tail_aux_waits,
+                )
+        return running_batch
+
+    def _tail_aux(self: Scheduler) -> Optional[TailAuxStaging]:
+        return self.disagg_decode_prealloc_queue.tail_aux
+
+    def _release_dsv41_tail_aux(self: Scheduler, req: Req, *, rest: int) -> None:
+        slot = req.dsv41_tail_aux_slot
+        if slot is not None:
+            self._tail_aux().release(slot, step=self.forward_ct, rest=rest)
+            req.dsv41_tail_aux_slot = None
+
+    def _reclaim_dsv41_tail_aux(self: Scheduler) -> None:
+        """SGLANG_DSV41_TAIL_STAGE: aux slots of requests aborted after their
+        transfer and before admission."""
+        aux = self._tail_aux()
+        if aux is None:
+            return
+        if _dsv41_lean_admit(self) and self.forward_ct % LEAN_RECLAIM_EVERY:
+            return
+        for req in aux.finished_holders():
+            self._release_dsv41_tail_aux(req, rest=TAIL_AUX_ABORT_REST_STEPS)
+
+    def _write_dsv41_tail_draft_kv(self: Scheduler, reqs: List[Req]) -> None:
+        """SGLANG_DSV41_TAIL_STAGE: the admitted late-fed requests' draft KV of their
+        window, from the tail server's captures, ordered before their first step on
+        the forward stream; each aux slot is free once that step has run."""
+        staged = [req for req in reqs if req.dsv41_tail_aux_slot is not None]
+        if not staged:
+            return
+        aux = self._tail_aux()
+        window = self.model_config.sliding_window_size
+        device = aux.buf.device
+        with self.forward_stream_ctx:
+            self.model_worker.write_tail_draft_kv(
+                req_pool_indices=async_h2d(
+                    [req.kv.req_pool_idx for req in staged],
+                    dtype=torch.int64,
+                    device=device,
+                ),
+                starts=async_h2d(
+                    [req.dsv41_tail_start - window for req in staged],
+                    dtype=torch.int64,
+                    device=device,
+                ),
+                aux=torch.cat([aux.rows(req.dsv41_tail_aux_slot) for req in staged]),
+            )
+        for req in staged:
+            self._release_dsv41_tail_aux(req, rest=TAIL_AUX_READ_REST_STEPS)
+        self.dsv41_tail_admit_ct = getattr(self, "dsv41_tail_admit_ct", 0) + len(staged)
+
+    def _set_dsv41_feed_inputs(self: Scheduler, batch: ScheduleBatch) -> None:
+        """Give this decode step's fed requests their next prompt tokens.
+
+        A fed request's verify rows sit at positions p .. p + w - 1, row 0 holding
+        the prompt token at p. Forcing the token after each row to the prompt's
+        makes the verify accept the prompt and hand the next prompt token on as
+        the bonus; the first row past the prompt verifies as usual, so the first
+        output token is sampled from the last prompt position. Progress is a
+        function of this schedule alone (every forced row is accepted), so it
+        runs ahead of the overlapped results.
+
+        Entries are -1 for requests not fed and -2 for a fed request's rows past
+        its prompt: those verify as usual but keep the served accept, so the first
+        output token is a real sample, as the tail extend's is.
+        """
+        batch.dsv41_forced_tokens = None
+        batch.dsv41_swa_floor = None
+        if not batch.forward_mode.is_decode():
+            return
+        # SGLANG_DSV41_LEAN_ADMIT: rows for the fed requests only, scattered on device.
+        lean = _dsv41_lean_admit(self)
+        if lean:
+            rows = [
+                i for i, req in enumerate(batch.reqs) if req.dsv41_feed_next is not None
+            ]
+            if not rows:
+                return
+        elif not any(req.dsv41_feed_next is not None for req in batch.reqs):
+            return
+        else:
+            rows = range(len(batch.reqs))
+        # The verify width the DSpark worker resolved (draft block + 1).
+        width = self.model_worker.verify_num_draft_tokens
+        window = self.model_config.sliding_window_size
+        tail_stage = dsv41_tail_stage_enabled()
+        late_steps = late_done = 0
+        forced = [[-1] * width for _ in rows]
+        floor = [0] * len(rows)
+        for k, i in enumerate(rows):
+            req = batch.reqs[i]
+            p = req.dsv41_feed_next
+            if p is None:
+                continue
+            prompt = req.origin_input_ids
+            end = min(len(prompt), p + width + 1)
+            forced[k] = [-2] * width
+            forced[k][: end - p - 1] = prompt[p + 1 : end]
+            # The tail extend's bounded replay starts the late layers at the last
+            # window, one row past the tail start for a 129-token tail. A late-fed
+            # tail's late layers already hold that window below its start.
+            floor[k] = (
+                len(prompt) - window
+                if tail_stage and req.dsv41_late_fed
+                else max(req.dsv41_feed_floor, len(prompt) - window)
+            )
+            nxt = p + width
+            # A step ending on the last prompt token leaves the first output to
+            # the next step, which stays in the feed with no prompt rows.
+            req.dsv41_feed_next = nxt if nxt < len(prompt) else None
+            if tail_stage and req.dsv41_late_fed:
+                late_steps += 1
+                late_done += req.dsv41_feed_next is None
+        if tail_stage:
+            steps, done = getattr(self, "dsv41_late_feed_steps", (0, 0))
+            self.dsv41_late_feed_steps = (steps + late_steps, done + late_done)
+        if not lean:
+            batch.dsv41_forced_tokens = async_h2d(
+                forced, dtype=torch.int64, device=batch.device
+            )
+            batch.dsv41_swa_floor = async_h2d(
+                floor, dtype=torch.int64, device=batch.device
+            )
+            return
+        # One copy of [row, floor, forced...] per fed request, then two scatters.
+        packed = async_h2d(
+            [[i, f, *r] for i, f, r in zip(rows, floor, forced)],
+            dtype=torch.int64,
+            device=batch.device,
+        )
+        bs = len(batch.reqs)
+        batch.dsv41_forced_tokens = torch.full(
+            (bs, width), -1, dtype=torch.int64, device=batch.device
+        ).index_copy_(0, packed[:, 0], packed[:, 2:])
+        batch.dsv41_swa_floor = torch.zeros(
+            bs, dtype=torch.int64, device=batch.device
+        ).index_copy_(0, packed[:, 0], packed[:, 1])
 
     def get_new_prebuilt_batch(
         self, running_batch: ScheduleBatch

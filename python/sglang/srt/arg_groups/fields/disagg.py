@@ -125,6 +125,25 @@ class Disagg(msgspec.Struct):
     optimistic_prefill_attempts: A[
         int, "Number of optimistic prefill forward passes that skip the bootstrap wait."
     ] = 0
+    dsv41_encoder_only_prefill: A[
+        bool,
+        "DeepSeek-V4.1 asymmetric PD; set on both servers. Prefill loads only the "
+        "encoder layers and processes all but the last sliding window of the "
+        "prompt; decode receives that KV plus the encoder SWA window, runs the "
+        "final window through the full model, and samples the first token.",
+    ] = False
+    dsv41_tail_stage_addr: A[
+        Optional[str],
+        "DeepSeek-V4.1 encoder-only prefill with SGLANG_DSV41_TAIL_STAGE: HOST:PORT "
+        "of the shared tail server, which runs every late-fed request's last window "
+        "through the late layers as pipeline stage 1.",
+    ] = None
+    dsv41_tail_stage_server: A[
+        bool,
+        "DeepSeek-V4.1 tail server for encoder-only PD (SGLANG_DSV41_TAIL_STAGE). "
+        "Set by its entrypoint, not on the command line: the server loads only the "
+        "layers from the last KV source on and runs prompt windows through them.",
+    ] = False
 
     # -------------------------------------------------------------------------
     # Encode prefill disaggregation

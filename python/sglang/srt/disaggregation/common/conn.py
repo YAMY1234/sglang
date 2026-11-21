@@ -44,10 +44,14 @@ from sglang.srt.disaggregation.common.bootstrap import (
 )
 from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.disaggregation.pp_consensus_store import PPConsensusStore
+from sglang.srt.disaggregation.dsv41_tail_stage.registration import (
+    TAIL_STAGE_PP_SIZE,
+)
 from sglang.srt.disaggregation.utils import (
     MetadataBuffers,
     check_stage_state_wires,
     check_state_wire,
+    dsv41_tail_stage_enabled,
     filter_kv_indices_for_cp_rank,
     filter_kv_indices_for_shard_rank,
     get_dsv41_spec_layout,
@@ -1760,6 +1764,12 @@ class CommonKVManager(BaseKVManager):
         wire = state_wire(self.kv_args)
         if wire:
             payload["state_wire"] = wire
+        if dsv41_tail_stage_enabled():
+            # The tail server registers as PP rank 1 of this table; decode then
+            # waits for both stages of every room.
+            payload["pp_size"] = TAIL_STAGE_PP_SIZE
+        # The tail server's Hello carries this payload and the server's address.
+        self.bootstrap_registration = dict(payload)
 
         if envs.SGLANG_RUST_SERVER.get() and self.attn_dp_size > 1:
             topology_rows = get_parallel().world_group.all_gather_object(payload)
