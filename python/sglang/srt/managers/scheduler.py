@@ -6883,7 +6883,15 @@ def run_scheduler_process(
         # Run the event loop (blocks until a ShutdownReq sets gracefully_exit)
         scheduler.run_event_loop()
 
-    except Exception:
+    except Exception as e:
+        # Frames first, without source lines: formatting reads every source file and
+        # has stalled for minutes on a busy shared filesystem, hiding the error.
+        tb, frames = e.__traceback__, []
+        while tb is not None:
+            code = tb.tb_frame.f_code
+            frames.append(f"{code.co_filename}:{tb.tb_lineno} {code.co_name}")
+            tb = tb.tb_next
+        logger.error(f"Scheduler hit an exception: {e!r} at " + " <- ".join(reversed(frames)))
         traceback = get_exception_traceback()
         logger.error(f"Scheduler hit an exception: {traceback}")
         parent_process.send_signal(signal.SIGQUIT)

@@ -136,6 +136,8 @@ class SchedulerPPMixin:
     _pp_ce: Optional[pp_ce_push.PPCEPush] = None
     # SGLANG_PP_CHECK_PROXY_BATCH: proxy messages carry their batch's identity.
     _pp_check_proxy_batch: bool = False
+    # SGLANG_PP_DEBUG_INPUT_CHECK on PP0: the vocab size (negated once the first check logged).
+    _pp_debug_vocab: Optional[int] = None
     _pp_ce_in_use: Optional[Tuple[int, int]] = None
 
     @DynamicGradMode()
@@ -314,6 +316,15 @@ class SchedulerPPMixin:
             )
         decoupled = self._pp_maybe_init_decouple()
         self._pp_check_proxy_batch = envs.SGLANG_PP_CHECK_PROXY_BATCH.get()
+        self._pp_debug_vocab = None
+        if envs.SGLANG_PP_DEBUG_INPUT_CHECK.get() and self.pp_group.is_first_rank:
+            self._pp_debug_vocab = vocab = self.model_config.vocab_size
+            self.tp_worker.model_runner.model.get_input_embeddings().register_forward_pre_hook(
+                lambda _m, args: torch._assert_async(
+                    ((args[0] >= 0) & (args[0] < vocab)).all(), "PP0 token id out of range"
+                )
+            )
+            logger.info("PP debug input check on (vocab %d)", vocab)
         overlap_input_wait = (
             decoupled and early_send and not self.pp_group.is_first_rank
         )
@@ -1406,6 +1417,22 @@ class SchedulerPPMixin:
             pp_proxy_tensors = PPProxyTensors(tensor_dict)
         return pp_proxy_tensors
 
+    def _pp_debug_check_input_ids(self: Scheduler, batch: ScheduleBatch) -> None:
+        ids = batch.prefill_input_ids_cpu
+        if ids is None or ids.numel() == 0:
+            return
+        if self._pp_debug_vocab > 0:
+            logger.info("PP debug input check: first host check of %d token ids", ids.numel())
+            self._pp_debug_vocab = -self._pp_debug_vocab
+        vocab = -self._pp_debug_vocab
+        lo, hi = int(ids.min()), int(ids.max())
+        if lo < 0 or hi >= vocab:
+            bad = ((ids < 0) | (ids >= vocab)).nonzero().flatten()[:8].tolist()
+            raise RuntimeError(
+                f"PP0 host token ids out of range [{lo}, {hi}] at {bad} (forward {self.forward_ct}, "
+                f"batch {pp_decouple.proxy_batch_tag(batch)}, extend_lens {batch.extend_lens})"
+            )
+
     def _pp_assert_proxy_batch(
         self: Scheduler, pp_proxy_tensors: Optional[PPProxyTensors], batch: ScheduleBatch
     ) -> None:
@@ -2181,6 +2208,8 @@ class SchedulerPPMixin:
                     "set_run_batch_cpu_start_time",
                     trace_only=True,
                 )
+                if self._pp_debug_vocab is not None:
+                    self._pp_debug_check_input_ids(cur_batch)
                 result = self.run_batch(cur_batch, pp_proxy_tensors)
                 set_time_batch(
                     cur_batch.reqs,
