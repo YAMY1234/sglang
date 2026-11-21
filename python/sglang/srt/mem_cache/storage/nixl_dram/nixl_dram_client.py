@@ -517,6 +517,8 @@ class NixlDramClient:
         self._first = {"put": False, "get": False, "verify": False}
         # Diagnostics: per-op round trips over a 60 s window, logged by whichever thread closes it.
         self._timing: Dict[str, List[float]] = {}
+        # Staged transfers per op: [n, lock wait s, max lock wait s, host<->staging copy s].
+        self._stage_timing: Dict[str, List[float]] = {}
         self._timing_logged = time.monotonic()
         self._verify_logged = time.monotonic()
         logger.info(
@@ -576,15 +578,22 @@ class NixlDramClient:
             if now - self._timing_logged < 60.0:
                 return
             window, self._timing = self._timing, {}
+            stage, self._stage_timing = self._stage_timing, {}
             self._timing_logged = now
             counters = dict(self.counters)
         logger.info(
-            "HiCache NIXL DRAM L3 timing (60 s): %s; counters %s",
+            "HiCache NIXL DRAM L3 timing (60 s): %s; staging %s; counters %s",
             "; ".join(
                 f"{k} n={v[0]} keys={v[1]} mean={1e3 * v[2] / v[0]:.1f}ms max={1e3 * v[3]:.1f}ms "
                 f"rpc={1e3 * v[4] / v[0]:.1f}ms xfer={1e3 * v[5] / v[0]:.1f}ms"
                 for k, v in sorted(window.items())
             ),
+            "; ".join(
+                f"{k} n={v[0]} lock_wait_mean={1e3 * v[1] / v[0]:.2f}ms lock_wait_max={1e3 * v[2]:.1f}ms "
+                f"copy_mean={1e3 * v[3] / v[0]:.2f}ms"
+                for k, v in sorted(stage.items())
+            )
+            or "-",
             counters,
         )
 
@@ -623,8 +632,19 @@ class NixlDramClient:
     ) -> Dict[int, str]:
         if self._staging is None:
             return self._transfer_direct(op, plans, ptr_parts, size_parts)
+        t0 = time.perf_counter()
         with self._staging_lock:  # one staged transfer at a time per client bounds in-flight bytes
-            return self._transfer_staged(op, plans, ptr_parts, size_parts)
+            waited = time.perf_counter() - t0
+            self._stage_copy_s = 0.0
+            state = self._transfer_staged(op, plans, ptr_parts, size_parts)
+            copied = self._stage_copy_s
+        with self._lock:
+            t = self._stage_timing.setdefault(op, [0, 0.0, 0.0, 0.0])
+            t[0] += 1
+            t[1] += waited
+            t[2] = max(t[2], waited)
+            t[3] += copied
+        return state
 
     def _transfer_staged(self, op, plans, ptr_parts, size_parts) -> Dict[int, str]:
         """Bounce through the registered staging region in chunks. Host parts are grouped by (host buffer, size) and
@@ -668,7 +688,9 @@ class NixlDramClient:
             svc, ptr, size, raddr = (np.asarray(x, dtype=np.int64) for x in (svc, ptr, size, raddr))
             dst = self._stage_layout(ptr, size)  # staging offset per part
             if op == "WRITE":
+                c0 = time.perf_counter()
                 self._stage_copy(True, ptr, size, dst)
+                self._stage_copy_s += time.perf_counter() - c0
             descs = {}
             for s in np.unique(svc):
                 m = svc == s
@@ -679,7 +701,9 @@ class NixlDramClient:
             if op == "READ":
                 done = np.isin(svc, [s for s, v in st.items() if v == "DONE"])
                 if done.any():
+                    c0 = time.perf_counter()
                     self._stage_copy(False, ptr[done], size[done], dst[done])
+                    self._stage_copy_s += time.perf_counter() - c0
             for s, v in st.items():
                 if rank.get(v, 2) > rank.get(state.get(s, "DONE"), 2):
                     state[s] = v
