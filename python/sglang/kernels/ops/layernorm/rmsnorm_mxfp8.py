@@ -42,12 +42,19 @@ def _rmsnorm_mxfp8_kernel(
     BLOCK: tl.constexpr,
     GROUPS: tl.constexpr,
     ORDER_8WARP: tl.constexpr,
+    USE_PDL: tl.constexpr = False,
 ):
     row = tl.program_id(0)
     if row < M:
         h = tl.arange(0, BLOCK)
-        v = tl.load(X + row * SX + h, h < K, 0).to(tl.float32)
-        weight = tl.load(W + h, h < K, 0).to(tl.float32)
+        if USE_PDL:
+            # Only the static weight is read before the wait; nothing is stored before it.
+            weight = tl.load(W + h, h < K, 0).to(tl.float32)
+            tl.extra.cuda.gdc_wait()
+            v = tl.load(X + row * SX + h, h < K, 0).to(tl.float32)
+        else:
+            v = tl.load(X + row * SX + h, h < K, 0).to(tl.float32)
+            weight = tl.load(W + h, h < K, 0).to(tl.float32)
         if ORDER_8WARP:
             ss = _sumsq_8warp_order(v)
         else:
@@ -57,11 +64,20 @@ def _rmsnorm_mxfp8_kernel(
         tl.store(Y + row * K + h, y, h < K)
         mxfp8_epilogue(y, row, Q, S, K, BLOCK, GROUPS, 0, GROUPS)
     else:
+        if USE_PDL:
+            tl.extra.cuda.gdc_wait()
         # Padding scale entries are disjoint from the live rows above.
         last = (tl.cdiv(M, 128) - 1) * 128
         local = (row - M) * 512 + tl.arange(0, 512)
         pad_row = last + ((local // 4) % 4) * 32 + ((local // 16) % 32)
         tl.store(S + last * GROUPS + local, 0, (local < GROUPS * 128) & (pad_row >= M))
+
+
+def _use_pdl() -> bool:
+    from sglang.kernels.jit.utils.arch import is_arch_support_pdl
+    from sglang.srt.environ import envs
+
+    return envs.SGLANG_OPT_DSV4_Q_NORM_PDL.get() and is_arch_support_pdl()
 
 
 def _num_warps(m: int, block: int) -> int:
@@ -84,6 +100,8 @@ def rmsnorm_mxfp8(
     )
     block = triton.next_power_of_2(k)
     num_warps = _num_warps(m, block)
+    use_pdl = _use_pdl()
+    pdl_kwargs = {"USE_PDL": True, "launch_pdl": True} if use_pdl else {}
     _rmsnorm_mxfp8_kernel[(m + triton.cdiv((k // 32) * 128, 512),)](
         x,
         weight,
@@ -99,5 +117,6 @@ def rmsnorm_mxfp8(
         ORDER_8WARP=num_warps != 8,
         num_warps=num_warps,
         enable_fp_fusion=False,
+        **pdl_kwargs,
     )
     return y, q, s

@@ -1964,6 +1964,8 @@ class PrefillAdder:
         assert req.prefix_len == admission.prefix_len
         req.extend_end = admission.prefix_len + admission.extend_len
         req.lock = self.tree_cache.lock(req.last_node)
+        # The request's own lock now covers a prefetched prefix.
+        self.tree_cache.release_prefetch_hold(req.cache_request_handle, req.prefix_len)
         self.can_run_list.append(req)
         if admission.is_chunked:
             self.new_chunked_req = req

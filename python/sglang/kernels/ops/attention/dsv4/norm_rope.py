@@ -8,6 +8,7 @@ from sglang.kernels.jit.utils import (
     load_jit,
     make_cpp_args,
 )
+from sglang.srt.environ import envs
 from sglang.srt.utils import is_hip, is_xpu
 
 from .kv_layout import KVLayout
@@ -29,6 +30,17 @@ def _jit_fused_rope_module():
         *args,
         cuda_files=["deepseek_v4/rope.cuh"],
         cuda_wrappers=[("forward", f"FusedQKRopeKernel<{args}>::forward")],
+    )
+
+
+@cache_once
+def _jit_fused_rope_rows_module():
+    args = make_cpp_args(is_arch_support_pdl())
+    return load_jit(
+        make_name("fused_rope_rows"),
+        *args,
+        cuda_files=["deepseek_v4/rope_rows.cuh"],
+        cuda_wrappers=[("forward", f"RopeRowsKernel<{args}>::forward")],
     )
 
 
@@ -166,6 +178,9 @@ def fused_rope_inplace(
         return
 
     freqs_real = torch.view_as_real(freqs_cis).flatten(-2).contiguous()
+    if k is None and envs.SGLANG_OPT_DSV4_ROPE_ROW_LAUNCH.get():
+        _jit_fused_rope_rows_module().forward(q, freqs_real, positions, inverse)
+        return
     module = _jit_fused_rope_module()
     module.forward(q, k, freqs_real, positions, inverse)
 

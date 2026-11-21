@@ -684,6 +684,7 @@ class Scheduler(
                 cache_controller.write_fence_stream = (
                     self.tp_worker.model_runner.forward_stream
                 )
+                cache_controller.forward_on_fence_stream = self.enable_overlap
         self.emit_metrics_constants()
         self.maybe_init_hccl_dp_prewarm()
 
@@ -1628,9 +1629,11 @@ class Scheduler(
                 transfer_backend=self.transfer_backend,
             )
 
+        # Encoder-only prefill sends no draft state; decode's tail extend fills it.
         draft_token_to_kv_pool = (
             self.draft_worker.primary_draft_kv_pool
             if self.draft_worker is not None
+            and not get_disagg().dsv41_encoder_only_prefill
             else None
         )
 
@@ -3788,6 +3791,16 @@ class Scheduler(
         self._retry_storage_prefetch(req)
         return True
 
+    def _linker_requery_after_device_loss(self, req: Req) -> bool:
+        """Re-query an external-linker range lost to device eviction while queued."""
+        max_attempts = get_memory().hicache_storage_prefetch_retry_max_attempts
+        if req.storage_prefetch_retry_attempts >= max_attempts:
+            return False
+        if not self.tree_cache.requery_prefetch_after_device_loss(req):
+            return False
+        req.storage_prefetch_retry_attempts += 1
+        return True
+
     def _add_request_to_queue(
         self,
         req: Req,
@@ -3818,6 +3831,10 @@ class Scheduler(
             req.time_stats.set_wait_queue_entry_time()
             req.arrival_processed_tokens = self.processed_tokens_counter
         elif self.disaggregation_mode == DisaggregationMode.PREFILL:
+            if get_disagg().dsv41_encoder_only_prefill and not (
+                self.prepare_dsv41_encoder_only_req(req)
+            ):
+                return
             self._prefetch_kvcache(req)
             self.disagg_prefill_bootstrap_queue.add(
                 req, self.model_config.num_key_value_heads
@@ -4691,6 +4708,12 @@ class Scheduler(
                 break
             if self.enable_hicache_storage and (
                 self._prefetch_after_device_hit_loss(req)
+            ):
+                if defer_cow_slot:
+                    self._drop_unadmitted_match(req)
+                continue
+            if self.enable_unified_cache_external_linker and (
+                self._linker_requery_after_device_loss(req)
             ):
                 if defer_cow_slot:
                     self._drop_unadmitted_match(req)
@@ -5902,7 +5925,7 @@ class Scheduler(
                 or self.deferred_responses.has_pending()
                 or (
                     self.enable_unified_cache_external_linker
-                    and self.tree_cache.linker.prefetches
+                    and self.tree_cache.linker.has_pending_prefetch()
                 )
             ):
                 # Storage, transfer, and deferred-output workers need the GIL
@@ -6026,7 +6049,7 @@ class Scheduler(
                 idle &= not self.tree_cache.has_pending_cache_operations()
 
             if self.enable_unified_cache_external_linker:
-                idle &= not self.tree_cache.linker.prefetches
+                idle &= not self.tree_cache.linker.has_pending_prefetch()
 
         return idle
 

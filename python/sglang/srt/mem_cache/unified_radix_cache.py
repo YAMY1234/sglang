@@ -7,6 +7,7 @@ import threading
 import time
 import zlib
 from array import array
+from collections import deque
 from contextlib import ExitStack, nullcontext
 from dataclasses import replace
 from http import HTTPStatus
@@ -180,6 +181,7 @@ COMPONENT_REGISTRY: dict[str, type[TreeComponent]] = {
 
 
 logger = logging.getLogger(__name__)
+
 device_module = get_device_module()
 
 
@@ -375,6 +377,8 @@ class UnifiedRadixCache(BasePrefixCache):
         # constructs the pipeline collaborator (None = cache mode).
         self.host_memory_mode = "cache"
         self.buffer_pipeline: Optional[BufferModePipeline] = None
+        # write_back eviction copies ordered on the forward stream instead of by a host wait.
+        self.device_ordered_write_back = False
         # Session of the insert whose actions are being applied (see ``insert``).
         self.insert_session_id: Optional[str] = None
         # Write-side dedupe: beliefs about what storage already holds, so
@@ -499,6 +503,7 @@ class UnifiedRadixCache(BasePrefixCache):
         # Reset Controller.
         self.session.slots.clear()
         self.ongoing_write_through: dict[int, _OngoingWriteThrough] = {}
+        self._fenced_write_acks: deque[HiCacheAck] = deque()
         self.ongoing_load_back: dict[
             int, _OngoingLoadBack | list[_OngoingLoadBack]
         ] = {}
@@ -631,6 +636,7 @@ class UnifiedRadixCache(BasePrefixCache):
             self.cache_controller is not None
             and self.cache_controller.write_policy == "write_back"
         )
+        self.device_ordered_write_back = self._resolve_device_ordered_write_back()
         # Pre-seed the logical dropped-tokens series.
         if self.metrics_collector is not None and self.cache_controller is not None:
             reasons = ["host_pressure"]
@@ -1331,7 +1337,10 @@ class UnifiedRadixCache(BasePrefixCache):
         """Wait once for the queued copies, then demote the nodes in order."""
         if not node_ids:
             return
-        self.writing_check(write_back=True)
+        if self._can_fence_write_back_on_streams():
+            self._fence_write_back_on_streams()
+        else:
+            self.writing_check(write_back=True)
         for node_id in node_ids:
             self._demote(node_id, tracker)
         node_ids.clear()
@@ -2945,6 +2954,18 @@ class UnifiedRadixCache(BasePrefixCache):
             return staged.matched_len, staged.matched_len + staged.num_tokens
         return None
 
+    # Drops a tree lock: every rank must release the same hold in the same order.
+    @rank_consensus(same_params=True)
+    def release_prefetch_hold(self, request: CacheRequestHandle, prefix_len: int) -> None:
+        if self.linker is not None and self.linker.load_mode == "prefetch":
+            self.linker.release_hold(request, admitted=True, prefix_len=prefix_len)
+
+    @rank_consensus(same_params=["req.rid"], same_results=True)
+    def requery_prefetch_after_device_loss(self, req: Req) -> bool:
+        if self.linker is None or self.linker.load_mode != "prefetch":
+            return False
+        return self.linker.requery_after_device_loss(req)
+
     @rank_consensus(same_params=True, same_results=True)
     def check_prefetch_progress(self, request: CacheRequestHandle) -> bool:
         if self.linker is not None and self.linker.load_mode == "prefetch":
@@ -4179,6 +4200,8 @@ class UnifiedRadixCache(BasePrefixCache):
         cc = self.cache_controller
         if cc is None:
             return
+        if self._fenced_write_acks:
+            self._log_fenced_write_acks()
 
         if write_back:
             # Blocking: submit what is still queued, then wait for every ack.
@@ -4214,6 +4237,69 @@ class UnifiedRadixCache(BasePrefixCache):
                 self._finish_write_through_ack(ack_id)
             self._log_write_ack_metrics(ack)
             finish_count -= 1
+
+    def _resolve_device_ordered_write_back(self) -> bool:
+        if not envs.SGLANG_OPT_HICACHE_DEVICE_ORDERED_WRITE_BACK.get():
+            return False
+        reason = None
+        if not self.is_write_back:
+            reason = "the write policy is not write_back"
+        elif get_memory().enable_unified_memory:
+            reason = "the unified memory pool moves and zeroes pages outside stream order"
+        elif get_memory().enable_hisparse:
+            reason = "HiSparse reads the host pool outside stream order"
+        elif get_disagg().disaggregation_mode == "decode":
+            reason = "PD decode writes freed slots from KV transfers"
+        if reason is not None:
+            logger.warning(
+                "SGLANG_OPT_HICACHE_DEVICE_ORDERED_WRITE_BACK ignored: %s.", reason
+            )
+            return False
+        logger.info(
+            "HiCache write_back: eviction copies are fenced on the forward stream, "
+            "the scheduler does not wait for them (SGLANG_OPT_HICACHE_DEVICE_ORDERED_WRITE_BACK)."
+        )
+        return True
+
+    def _can_fence_write_back_on_streams(self) -> bool:
+        # Freed slots must only be rewritten in current/forward/load stream
+        # order, and host pages must not be read by the CPU before their copy lands.
+        cc = self.cache_controller
+        return (
+            self.device_ordered_write_back
+            and cc is not None
+            and cc.write_fence_stream is not None
+            and cc.load_fence_stream is cc.write_fence_stream
+            and not self.enable_storage
+            and self.buffer_pipeline is None
+            and self.linker is None
+        )
+
+    def _fence_write_back_on_streams(self) -> None:
+        """Submit queued write-backs and order the forward stream (and through it
+        the load stream) behind them instead of blocking the host on the copies."""
+        cc = self.cache_controller
+        cc.start_writing()
+        # Without overlap the forward and state copies run on the current stream.
+        current_stream = (
+            None if cc.forward_on_fence_stream else device_module.current_stream()
+        )
+        for ack in cc.ack_write_queue:
+            if current_stream is not None:
+                current_stream.wait_event(ack.finish_event)
+            cc.write_fence_stream.wait_event(ack.finish_event)
+            for ack_id in ack.node_ids:
+                if ack_id in self.ongoing_write_through:
+                    self._finish_write_through_ack(ack_id)
+            self._fenced_write_acks.append(ack)
+        cc.ack_write_queue.clear()
+        assert len(self.ongoing_write_through) == 0
+        self._log_fenced_write_acks()
+
+    def _log_fenced_write_acks(self) -> None:
+        acks = self._fenced_write_acks
+        while acks and acks[0].finish_event.query():
+            self._log_write_ack_metrics(acks.popleft())
 
     def _log_write_ack_metrics(self, ack: HiCacheAck) -> None:
         """Record D->H backup volume and duration for a completed write ack."""
