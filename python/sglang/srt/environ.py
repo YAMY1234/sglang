@@ -842,6 +842,9 @@ class Envs:
     # Under overlap, publish decode KV destinations one iteration later instead of
     # reading them back inline; False restores the inline publish.
     SGLANG_ENABLE_DISAGG_DECODE_DEFERRED_PUBLISH = EnvBool(True)
+    # With the deferred publish, read the destination ids back through pinned copies
+    # and send them once landed, instead of one blocking D2H per payload.
+    SGLANG_DISAGG_DECODE_ASYNC_PUBLISH_READBACK = EnvBool(False)
 
     # ===================================================================
     # Distributed and model-parallel runtime
@@ -1773,8 +1776,13 @@ class Envs:
         SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get,
         deprecated_name="SGLANG_Q35MF_EDGE_MULTIHOST_TCP",
     )
+    # The DP-attention MLP sync rows through the same per-host shared-memory table; across
+    # hosts only the host leaders meet, over TCP (one link, or a mesh beyond two hosts).
+    SGLANG_DP_SYNC_SHM_EXCHANGE = EnvBool(False)
     # PD decode optimizations follow the shared switch unless explicitly disabled.
     SGLANG_ENABLE_NV_MEGA_PDDEC_RUNTIME_OPTIMIZATION = EnvBool(True)
+    # Preallocate queued PD-decode requests after the batch launch, beside the forward.
+    SGLANG_DISAGG_DECODE_DEFER_PREALLOC = EnvBool(False)
     # Reuse the resolved CPU sequence lengths for FlashInfer draft planning,
     # avoiding a second blocking readback after generating the same indptr.
     SGLANG_OPT_FLASHINFER_DRAFT_HOST_INDPTR = EnvBool(False)

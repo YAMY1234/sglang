@@ -466,12 +466,28 @@ class _PendingReceive(msgspec.Struct, frozen=True):
     refresh: Callable[[], Tuple[Any, Optional[List]]]
 
 
+# State types whose publish payloads are host-built or device tensors read back
+# together with the page ids (SGLANG_DISAGG_DECODE_ASYNC_PUBLISH_READBACK).
+_ASYNC_READBACK_STATE_TYPES = frozenset(
+    {
+        StateType.MAMBA,
+        StateType.SWA,
+        StateType.SWA_RING,
+        StateType.DSV4_REQUEST_STATE,
+        StateType.REQUEST_ROW,
+        StateType.BLOCK_SCALE,
+        StateType.BLOCK_SCALE_SWA,
+    }
+)
+
+
 class DecodePreallocQueue(DecodeHiCachePreallocMixin):
     """
     Store the requests that are preallocating.
     """
 
     _defer_publish: bool = False
+    _async_publish_readback: bool = False
 
     def __init__(
         self,
@@ -517,6 +533,12 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             and not transfer_queue.enable_staging
             and torch.cuda.is_available()
             and is_war_barrier_enabled()
+        )
+        # The deferred publish's readback waits only on its allocation; with this
+        # it also stops blocking the host on each payload's D2H.
+        self._async_publish_readback = (
+            self._defer_publish
+            and envs.SGLANG_DISAGG_DECODE_ASYNC_PUBLISH_READBACK.get()
         )
         self._pending_publish: List[_PendingPublish] = []
         # Assumes nothing else in-process draws priority -1 (true for srt on CUDA),
@@ -565,6 +587,17 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         self.kv_manager = self._init_kv_manager()
         if self.enable_staging:
             self.transfer_queue._init_staging_handler(self.kv_manager)
+        if self._async_publish_readback:
+            state_types = self.kv_manager.kv_args.state_types
+            logger.info(
+                "PD decode async publish readback %s (state types: %s)",
+                (
+                    "engaged"
+                    if set(state_types) <= _ASYNC_READBACK_STATE_TYPES
+                    else "inert: unsupported state types"
+                ),
+                ", ".join(str(t.value) for t in state_types) or "none",
+            )
 
         if (
             self.scheduler.tp_worker.is_hybrid_swa
@@ -2113,7 +2146,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             and torch.cuda.is_available()
             and set(state_types) <= {StateType.MAMBA}
             and not _is_fake_transfer(decode_req.req)
-        )
+        ) or self._reads_back_async(decode_req, state_types)
 
         def _mamba_payload():
             state_ids = self.token_to_kv_pool_allocator.state_ids(
@@ -2138,6 +2171,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 token_start=total_prefix_len,
                 token_boundary=seq_len,
             )
+            if non_blocking_metadata:
+                return resume.unit_ids
             return resume.unit_ids.cpu().numpy()
 
         def _full_kv_pages_payload():
@@ -2146,6 +2181,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             ]
             # Indexer lives on device pool; always use device page_size
             device_page_size = self.token_to_kv_pool.page_size
+            if non_blocking_metadata:
+                return kv_indices_full[::device_page_size] // device_page_size
             return kv_to_page_indices(kv_indices_full, device_page_size)
 
         def _minimax_payload():
@@ -2331,6 +2368,15 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         storage.end_receive_hold(decode_req.req)
         return page_indices, metadata_index, state_indices
 
+    def _reads_back_async(self, decode_req: DecodeRequest, state_types) -> bool:
+        """Whether this deferred publish reads its ids back through pinned copies
+        and leaves the send to the transfer queue once they land."""
+        return (
+            self._async_publish_readback
+            and set(state_types) <= _ASYNC_READBACK_STATE_TYPES
+            and not _is_fake_transfer(decode_req.req)
+        )
+
     def _send_kv_metadata(
         self,
         decode_req,
@@ -2354,9 +2400,14 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         readback_ready = None
         if non_blocking:
 
-            def to_host(indices):
-                host = torch.empty(indices.shape, dtype=indices.dtype, pin_memory=True)
-                host.copy_(indices, non_blocking=True)
+            def to_host(payload):
+                # A payload is a tensor, a list of them, or already host-built.
+                if isinstance(payload, list):
+                    return [to_host(part) for part in payload]
+                if not isinstance(payload, torch.Tensor):
+                    return payload
+                host = torch.empty(payload.shape, dtype=payload.dtype, pin_memory=True)
+                host.copy_(payload, non_blocking=True)
                 return host.numpy()
 
             # The receive is recorded by the device ids: the host copies are
@@ -2364,11 +2415,10 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             device_pages = (kv_indices[::page_size] // page_size).int()
             device_state_indices = state_indices
             page_indices = to_host(device_pages)
-            state_indices = [
-                [to_host(indices) for indices in payload] for payload in state_indices
-            ]
-            # Fence both the D2H and the prior forward before exposing reused pages.
-            if self.scheduler.enable_overlap:
+            state_indices = [to_host(payload) for payload in state_indices]
+            # Fence both the D2H and the prior forward before exposing reused pages;
+            # a deferred publish's stream already waits on its allocation's forwards.
+            if self.scheduler.enable_overlap and not self._defer_publish:
                 forward_done = self.scheduler.device_module.Event()
                 forward_done.record(stream=self.scheduler.forward_stream)
                 torch.cuda.current_stream().wait_event(forward_done)
@@ -4019,6 +4069,15 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             )
 
 
+def defer_decode_prealloc() -> bool:
+    """Whether the overlap loop preallocates after launching its batch, so the
+    allocation runs beside the forward instead of ahead of the DP shape sync."""
+    return envs.SGLANG_DISAGG_DECODE_DEFER_PREALLOC.get() or (
+        envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get()
+        and envs.SGLANG_ENABLE_NV_MEGA_PDDEC_RUNTIME_OPTIMIZATION.get()
+    )
+
+
 class SchedulerDisaggregationDecodeMixin:
     @torch.no_grad()
     def event_loop_normal_disagg_decode(self: Scheduler):
@@ -4069,10 +4128,7 @@ class SchedulerDisaggregationDecodeMixin:
     def event_loop_overlap_disagg_decode(self: Scheduler):
         self.result_queue = deque()
         self.last_batch: Optional[ScheduleBatch] = None
-        defer_prealloc = (
-            envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get()
-            and envs.SGLANG_ENABLE_NV_MEGA_PDDEC_RUNTIME_OPTIMIZATION.get()
-        )
+        defer_prealloc = defer_decode_prealloc()
 
         def pop_and_process():
             tmp_batch, tmp_result = self.result_queue.popleft()
