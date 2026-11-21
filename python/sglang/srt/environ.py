@@ -673,6 +673,9 @@ class Envs:
     # The same trigger in the MXFP8-output variant, whose consumer is the wqkv_a GEMM: the PDL
     # SM107 table kernel waits after its weight prefetch; stock FlashInfer launches without PDL.
     SGLANG_OPT_MHC_POST_QUANT_PDL_TRIGGER = EnvBool(False)
+    # MegaAttention reads fork the attention mix's side stream at the read (beside the q/kv
+    # projections) instead of deferring it to the attention core. Scheduling only.
+    SGLANG_OPT_DSV41_ATTN_STATS_FORK_AT_READ = EnvBool(False)
     # DSpark draft forward: the bonus-into-block-ids write and the positions / cache-loc
     # column slices in one Triton launch instead of three torch copies. Same values.
     SGLANG_OPT_DSPARK_FUSED_DRAFT_INPUTS = EnvBool(False)
