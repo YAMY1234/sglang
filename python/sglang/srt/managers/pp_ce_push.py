@@ -176,12 +176,15 @@ class PPCEPush:
         device_id: int,
         slots: int,
         slot_bytes: int,
+        peer_slot_bytes: int,
         has_prev: bool,
         has_next: bool,
     ) -> None:
         self.device_id = device_id
         self.slots = slots
+        # This stage's input ring slots, and the next stage's, which bound what a push carries.
         self.slot_bytes = slot_bytes
+        self.peer_slot_bytes = peer_slot_bytes
         self.has_prev = has_prev
         self.has_next = has_next
         self.drv = _Drv()
@@ -192,6 +195,10 @@ class PPCEPush:
         self._exports: Dict[str, Tuple[bytes, int]] = {}
         self.send_seq = 0
         self.recv_seq = 0
+        # Since the last take_stats(): messages that did not fit the next stage's slot (sent over
+        # NCCL), and the largest message.
+        self.fallbacks = 0
+        self.max_bytes = 0
         self.ring_bytes = slots * slot_bytes
         # Local staging words for signal(): [0] the push stream's full flags, [1] the release's free flags.
         self._scratch = torch.zeros(64, dtype=torch.int32, device=f"cuda:{device_id}")
@@ -241,7 +248,15 @@ class PPCEPush:
         _, used = pack_layout(
             [(k, t.dtype, tuple(t.shape), t.numel() * t.element_size()) for k, t in ts.items()]
         )
-        return used <= self.slot_bytes and all(t.is_contiguous() for t in ts.values())
+        self.max_bytes = max(self.max_bytes, used)
+        ok = used <= self.peer_slot_bytes and all(t.is_contiguous() for t in ts.values())
+        self.fallbacks += not ok
+        return ok
+
+    def take_stats(self) -> Dict[str, int]:
+        stats = {"fallbacks": self.fallbacks, "max_mib": -(-self.max_bytes >> 20)}
+        self.fallbacks = self.max_bytes = 0
+        return stats
 
     def push(
         self, tensors: Dict[str, torch.Tensor], ready_event: Optional[torch.cuda.Event]
@@ -262,7 +277,7 @@ class PPCEPush:
             target = free_target(seq, self.slots)
             if target > 0:
                 self.drv.wait_geq(self.stream, self.free_va + 4 * slot, target)
-            base = self.peer_ring_va + slot * self.slot_bytes
+            base = self.peer_ring_va + slot * self.peer_slot_bytes
             for (key, ce), t in zip(layout, tensors.values()):
                 self.drv.copy(self.stream, base + ce.offset, t.data_ptr(), t.numel() * t.element_size())
             self.drv.signal(self.stream, self.peer_full_va + 4 * slot, self._scratch.data_ptr(), seq + 1)
@@ -327,18 +342,21 @@ def _warm_ring_p2p(pp_group, device_id: int) -> None:
     torch.cuda.synchronize(device_id)
 
 
-def setup_ce_push(*, pp_group, device_id: int, slots: int, slot_bytes: int) -> Optional[PPCEPush]:
+def setup_ce_push(*, pp_group, device_id: int, slots: int, slot_mb: Sequence[int]) -> Optional[PPCEPush]:
     """Collective over the PP group (every stage calls it once, before any relay receive thread starts):
     allocate, exchange FABRIC handles with both neighbours, map. Returns None on every stage if any stage fails,
-    so all stages keep NCCL."""
+    so all stages keep NCCL. slot_mb: one slot size for every stage's input ring, or one per stage."""
     from sglang.srt.distributed.communication_tags import P2PTag
     from sglang.srt.utils.cuda_vmm_utils import all_ranks_ok
 
     rank, size = pp_group.rank_in_group, pp_group.world_size
+    slot_mb = list(slot_mb) * size if len(slot_mb) == 1 else list(slot_mb)
+    assert len(slot_mb) == size, (slot_mb, size)
     ce = PPCEPush(
         device_id=device_id,
         slots=slots,
-        slot_bytes=slot_bytes,
+        slot_bytes=slot_mb[rank] << 20,
+        peer_slot_bytes=slot_mb[(rank + 1) % size] << 20,
         has_prev=rank > 0,
         has_next=rank + 1 < size,
     )
@@ -377,10 +395,11 @@ def setup_ce_push(*, pp_group, device_id: int, slots: int, slot_bytes: int) -> O
         return None
     _warm_ring_p2p(pp_group, device_id)
     logger.info(
-        "PP CE push on PP%d: %d slots x %.0f MiB input ring, copy-engine pushes to PP%s",
+        "PP CE push on PP%d: %d slots x %.0f MiB input ring, copy-engine pushes to PP%s (%s MiB slots)",
         rank,
         slots,
-        slot_bytes / (1 << 20),
+        ce.slot_bytes / (1 << 20),
         rank + 1 if rank + 1 < size else "-",
+        slot_mb[rank + 1] if rank + 1 < size else "-",
     )
     return ce

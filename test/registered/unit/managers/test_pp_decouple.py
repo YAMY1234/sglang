@@ -237,6 +237,19 @@ class TestPPCEPush(CustomTestCase):
         self.assertEqual((slot_of(2, 2), free_target(2, 2)), (0, 1))
         self.assertLessEqual(free_target(1, 2), 0)
 
+    def test_a_message_must_fit_the_next_stages_slot_and_a_fallback_is_counted(self):
+        """Stages may size their input rings differently (the proxy grows with depth): a push is
+        checked against the next stage's slot, and messages that go over NCCL are counted."""
+        from sglang.srt.managers.pp_ce_push import PPCEPush
+
+        ce = PPCEPush.__new__(PPCEPush)
+        ce.slot_bytes, ce.peer_slot_bytes, ce.fallbacks, ce.max_bytes = 128, 512, 0, 0
+        self.assertTrue(ce.fits({"hidden_states": torch.zeros(64, dtype=torch.uint8), "tag": "b"}))
+        big = {k: torch.zeros(300, dtype=torch.uint8) for k in ("hidden_states", "attn_res_bank")}
+        self.assertFalse(ce.fits(big))
+        self.assertEqual(ce.take_stats(), {"fallbacks": 1, "max_mib": 1})
+        self.assertEqual(ce.take_stats(), {"fallbacks": 0, "max_mib": 0})
+
     def _scheduler(self, last, log):
         from sglang.srt.managers.pp_ce_push import CEWait
 

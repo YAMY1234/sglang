@@ -893,7 +893,10 @@ class Envs:
     # PP PD prefill: every proxy message carries its micro-batch's identity (request count, new
     # tokens, a hash of the rids) and the next stage asserts it is the batch it is about to run.
     SGLANG_PP_CHECK_PROXY_BATCH = EnvBool(False)
-    SGLANG_PP_CE_PUSH_SLOT_MB = EnvInt(1600)
+    # MiB per slot of a stage's CE input ring: one value for every stage, or one per stage (indexed
+    # by the receiving stage; PP0's entry is unused). Size each for the largest proxy its previous
+    # stage sends (it grows with depth), or those messages go over NCCL.
+    SGLANG_PP_CE_PUSH_SLOT_MB = EnvTuple(("1600",))
     # PP PD prefill: log a digest of allocator and radix tree state every N loop
     # epochs (0 = off); every stage must log the same digest at the same epoch.
     SGLANG_DEBUG_PP_STATE_DIGEST_EVERY = EnvInt(0)
