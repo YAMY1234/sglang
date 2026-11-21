@@ -592,6 +592,18 @@ impl InsertParamsBinding {
     }
 }
 
+/// S2b-alpha KV-fill candidate across the boundary: (anchor node, state node, start_len, end_len,
+/// state_pages, state node ids, fill node ids).
+type KvFillTuple = (
+    NodeId,
+    NodeId,
+    usize,
+    usize,
+    Vec<usize>,
+    Vec<NodeId>,
+    Vec<NodeId>,
+);
+
 /// Python-visible match result; actions are Python-held.
 #[pyclass(get_all)]
 pub struct MatchResultBinding {
@@ -607,6 +619,7 @@ pub struct MatchResultBinding {
     mamba_host_hit_length: usize,
     mamba_branching_seqlen: Option<usize>,
     full_kv_hit_length: usize,
+    kv_fill: Option<KvFillTuple>,
     cache_actions: Py<PyList>,
 }
 
@@ -626,6 +639,17 @@ impl MatchResultBinding {
             mamba_host_hit_length: result.mamba_host_hit_length,
             mamba_branching_seqlen: result.mamba_branching_seqlen,
             full_kv_hit_length: result.full_kv_hit_length,
+            kv_fill: result.kv_fill.map(|f| {
+                (
+                    f.anchor_node_id,
+                    f.state_node_id,
+                    f.start_len,
+                    f.end_len,
+                    f.state_pages,
+                    f.state_node_ids,
+                    f.fill_node_ids,
+                )
+            }),
             cache_actions: cache_actions_to_py(py, result.cache_actions)?,
         })
     }
@@ -2075,6 +2099,18 @@ macro_rules! tree_core_methods {
                 py.detach(move || self.core().set_write_ahead_spare(node_ids));
             }
 
+            fn set_s2ba_modes(&self, py: Python<'_>, kv_evict_keep_state: bool, kv_fill_match: bool) {
+                py.detach(move || self.core().set_s2ba_modes(kv_evict_keep_state, kv_fill_match));
+            }
+
+            fn kv_in_storage_stats(&self, py: Python<'_>) -> (u64, u64, u64, u64, usize, usize) {
+                py.detach(|| self.core().kv_in_storage_stats())
+            }
+
+            fn commit_kv_fill(&self, py: Python<'_>, node_ids: Vec<NodeId>, host_value: PyTensor) -> PyResult<usize> {
+                py.detach(move || self.core().commit_kv_fill(&node_ids, &host_value.0)).map_err(node_access_error)
+            }
+
             /// Full host leaves in drive_host_eviction's order, read-only.
             fn peek_host_eviction_candidates(
                 &self,
@@ -2764,6 +2800,7 @@ macro_rules! tree_core_methods {
                     mamba_host_hit_length,
                     mamba_branching_seqlen,
                     full_kv_hit_length,
+                    kv_fill: None,
                     cache_actions: Vec::new(),
                 };
                 let value_chunks = value_chunks
@@ -3520,6 +3557,21 @@ macro_rules! tree_core_binding {
             /// Replace the device-tail set that Full duplicate reclaim never takes.
             fn set_write_ahead_spare(&self, py: Python<'_>, node_ids: Vec<NodeId>) -> PyResult<()> {
                 catch_native_panic(|| { self.inner.set_write_ahead_spare(py, node_ids); Ok(()) })
+            }
+
+            /// S2b-alpha switches: host KV eviction keeps state nodes; match reports a KV-fill candidate.
+            fn set_s2ba_modes(&self, py: Python<'_>, kv_evict_keep_state: bool, kv_fill_match: bool) -> PyResult<()> {
+                catch_native_panic(|| { self.inner.set_s2ba_modes(py, kv_evict_keep_state, kv_fill_match); Ok(()) })
+            }
+
+            /// S2b-alpha counters: (created, refilled, pruned, reinserted, kv_in_storage nodes, of them with a host state).
+            fn kv_in_storage_stats(&self, py: Python<'_>) -> PyResult<(u64, u64, u64, u64, usize, usize)> {
+                catch_native_panic(|| Ok(self.inner.kv_in_storage_stats(py)))
+            }
+
+            /// S2b-alpha: attach KV read back from L3 to kv_in_storage nodes (path order); returns tokens used.
+            fn commit_kv_fill(&self, py: Python<'_>, node_ids: Vec<NodeId>, host_value: PyTensor) -> PyResult<usize> {
+                catch_native_panic(|| self.inner.commit_kv_fill(py, node_ids, host_value))
             }
 
             /// Full host leaves in the order drive_host_eviction takes them, until

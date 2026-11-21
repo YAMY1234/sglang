@@ -7,7 +7,7 @@ use std::collections::{BinaryHeap, HashMap};
 use tch::{Kind, Tensor};
 
 use crate::components::TreeComponent;
-use crate::components::{ComponentType, FULL};
+use crate::components::{ComponentType, FULL, MAMBA};
 use crate::node::ChildKeyType;
 use crate::node::Node;
 use crate::node::{NodeId, NodeIdx_, TreeCoreRuntimeError, ValueSlotIdx};
@@ -272,7 +272,12 @@ impl<K: ChildKeyType> TreeComponent<K> for FullComponent {
             }
             // The parent id is captured before the eviction frees the leaf.
             let parent = tree_core.arena.node(x).try_parent();
-            tree_core.evict_host_leaf_(x, tracker, device_frees, host_frees, cache_actions);
+            if tree_core.kv_evict_keep_state && tree_core.arena.has_host_value(x, MAMBA) {
+                // S2b-alpha: KV is the trigger; drop it, keep the node and its state for a KV fill.
+                tree_core.evict_host_kv_(x, /* keep_mamba = */ true, tracker, device_frees, host_frees, cache_actions);
+            } else {
+                tree_core.evict_host_leaf_(x, tracker, device_frees, host_frees, cache_actions);
+            }
             if let Some(parent) = parent
                 && tree_core.evictable_host_leaves.contains(parent)
             {

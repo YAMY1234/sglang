@@ -821,6 +821,8 @@ impl<K: ChildKeyType> TreeComponent<K> for MambaComponent {
                     cache_actions,
                     EvictLayer::Host,
                 );
+                // S2b-alpha: a kv_in_storage node kept only for this state goes with it.
+                tree_core.prune_kv_in_storage_(cur, tracker, device_frees, host_frees, cache_actions);
             }
             x = x_next;
         }

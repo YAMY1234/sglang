@@ -162,8 +162,28 @@ pub struct MatchResult {
     /// Longest Full-KV prefix available on either device or host, independent
     /// of other components.
     pub full_kv_hit_length: usize,
+    /// S2b-alpha: KV-fill candidate below the Full-KV end (only under `kv_fill_match`).
+    pub kv_fill: Option<KvFillMatch>,
     /// Actions for the controller to apply.
     pub cache_actions: CacheActions,
+}
+
+/// S2b-alpha KV-fill candidate: the Full KV ends at `anchor_node_id` (`start_len` tokens); below it only
+/// `kv_in_storage` nodes lead to states the request could resume from once their KV is read back from L3.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KvFillMatch {
+    pub anchor_node_id: NodeId,
+    /// The deepest state on the run (the fill target).
+    pub state_node_id: NodeId,
+    pub start_len: usize,
+    /// End of `state_node_id`, page-aligned (node keys are).
+    pub end_len: usize,
+    /// Pages after `start_len` at which a state ends, ascending, 1-based; the last ends at `end_len`.
+    pub state_pages: Vec<usize>,
+    /// The state-bearing nodes, matching `state_pages`.
+    pub state_node_ids: Vec<NodeId>,
+    /// The `kv_in_storage` nodes from the anchor's child down to `state_node_id`, path order.
+    pub fill_node_ids: Vec<NodeId>,
 }
 
 /// Params for a prefix match; the key is borrowed from the caller.
@@ -626,6 +646,14 @@ pub struct UnifiedTreeCore<K: ChildKeyType> {
     /// Full duplicate-reclaim pass spares them like the imminent demotes. Ids guard against slot reuse.
     pub(crate) write_ahead_spare: HashMap<NodeIdx_, NodeId>,
     pub(crate) write_back_coexist_reclaim_digest: i64,
+    /// S2b-alpha (SGLANG_HICACHE_KV_EVICT_KEEP_STATE): host Full eviction drops KV but keeps nodes that
+    /// hold or lead to a Mamba state (`Node::kv_in_storage`).
+    pub(crate) kv_evict_keep_state: bool,
+    /// S2b-alpha (SGLANG_HICACHE_L3_KV_FILL): match walks through `kv_in_storage` nodes and reports a
+    /// KV-fill candidate (`MatchResult::kv_fill`).
+    pub(crate) kv_fill_match: bool,
+    /// S2b-alpha counters (lifetime): kv_in_storage nodes created / refilled / pruned / reinserted.
+    pub(crate) kv_in_storage_counts: [u64; 4],
     /// Present only during a device-eviction step, including its cascades.
     tracked_unbacked_tokens: Option<usize>,
     /// Per-slot LRU lists, indexed by `ValueSlotIdx::idx`.
@@ -977,6 +1005,9 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             full_coexisting_host_nodes: NodeSet::new(),
             write_ahead_spare: HashMap::new(),
             write_back_coexist_reclaim_digest: 0,
+            kv_evict_keep_state: false,
+            kv_fill_match: false,
+            kv_in_storage_counts: [0; 4],
             tracked_unbacked_tokens: None,
             // Disabled components keep harmless empty lists, like component_states.
             lru_lists: Self::new_lru_lists(),
@@ -1364,7 +1395,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             validators,
             device_validators,
         );
-        self.match_post_processor_(
+        let mut result = self.match_post_processor_(
             params,
             root_id,
             value,
@@ -1374,7 +1405,89 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             full_kv_hit_length,
             last_visited_node_id,
             action,
-        )
+        );
+        if self.kv_fill_match {
+            result.kv_fill = self.kv_fill_candidate_(params.namespace, key, aligned_key_len);
+        }
+        result
+    }
+
+    /// S2b-alpha: the KV-fill candidate for `key`. Walks the live Full-KV prefix (device or host, every node
+    /// matched whole), then only `kv_in_storage` nodes, recording the states on that run. Read-only: the
+    /// match walk has already split the last node it entered.
+    pub(crate) fn kv_fill_candidate_(
+        &self,
+        namespace: KeyNamespaceRef<'_>,
+        key: &K,
+        aligned_key_len: usize,
+    ) -> Option<KvFillMatch> {
+        let mut node_id = self.arena.root();
+        let mut offset = 0;
+        loop {
+            if offset >= aligned_key_len {
+                return None;
+            }
+            let child_id = self.arena.child_on_page_in_namespace(
+                node_id,
+                namespace,
+                key.page_at(offset, self.page_size),
+            )?;
+            let child = self.arena.node(child_id);
+            if child.kv_in_storage {
+                break;
+            }
+            if child.evicted() && !child.backuped() {
+                return None;
+            }
+            let prefix_len = key.match_len(offset, &child.key, self.page_size);
+            if prefix_len < child.key.atom_len() {
+                return None;
+            }
+            offset += prefix_len;
+            node_id = child_id;
+        }
+        let anchor_node_id = self.arena.node(node_id).id;
+        let start_len = offset;
+        let mut fill_node_ids = Vec::new();
+        let mut state_pages = Vec::new();
+        let mut state_node_ids = Vec::new();
+        while offset < aligned_key_len {
+            let Some(child_id) = self.arena.child_on_page_in_namespace(
+                node_id,
+                namespace,
+                key.page_at(offset, self.page_size),
+            ) else {
+                break;
+            };
+            let child = self.arena.node(child_id);
+            if !child.kv_in_storage {
+                break;
+            }
+            let prefix_len = key.match_len(offset, &child.key, self.page_size);
+            if prefix_len < child.key.atom_len() {
+                break;
+            }
+            offset += prefix_len;
+            node_id = child_id;
+            fill_node_ids.push(child.id);
+            if self.arena.has_host_value(child_id, MAMBA) || self.arena.has_device_value(child_id, MAMBA) {
+                state_pages.push((offset - start_len) / self.page_size);
+                state_node_ids.push(child.id);
+            }
+        }
+        let state_node_id = *state_node_ids.last()?;
+        let end_len = start_len + state_pages.last()? * self.page_size;
+        let keep = fill_node_ids.iter().position(|&id| id == state_node_id)? + 1;
+        fill_node_ids.truncate(keep);
+        Some(KvFillMatch {
+            anchor_node_id,
+            state_node_id,
+            start_len,
+            end_len,
+            state_pages,
+            state_node_ids,
+            fill_node_ids,
+        })
     }
 
     /// Read-only FULL-device match, independent of auxiliary components.
@@ -1689,6 +1802,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             swa_host_hit_length: 0,
             swa_branching_seqlen: None,
             full_kv_hit_length,
+            kv_fill: None,
             cache_actions: Vec::new(),
         };
         for i in 0..self.components.len() {
@@ -1726,6 +1840,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             full_kv_hit_length: 0,
             mamba_host_hit_length: 0,
             mamba_branching_seqlen: None,
+            kv_fill: None,
             cache_actions: Vec::new(),
         }
     }
@@ -2357,6 +2472,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         let parent_id = child.parent();
         let child_namespace = child.namespace.clone();
         let child_external_cache_stored = child.external_cache_stored;
+        let child_kv_in_storage = child.kv_in_storage;
         let child_rotation_base = child.rotation_base;
         let child_tlru_history_len = child.tlru_history_len;
         let (key_head, key_tail) = child.key.split_at(split_len);
@@ -2375,6 +2491,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             child_id,
         );
         self.arena.node_mut(new_node_id).external_cache_stored = child_external_cache_stored;
+        self.arena.node_mut(new_node_id).kv_in_storage = child_kv_in_storage;
         self.arena.node_mut(new_node_id).rotation_base = child_rotation_base;
         if self.tlru_bookkeeping {
             // Splitting preserves the suffix's depth and branch history.
@@ -2549,6 +2666,10 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
     ) {
         self.arena
             .set_device_value(node_id, FULL, fresh_value.copy());
+        if self.arena.node(node_id).kv_in_storage {
+            self.arena.node_mut(node_id).kv_in_storage = false;
+            self.kv_in_storage_counts[3] += 1;
+        }
         let tokens = self.component_reclaimable_value_len_(node_id, FULL);
         // A value materialized under lock is protected; the last release
         // moves it to evictable.
@@ -3077,6 +3198,8 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
                     &mut result.host_frees, &mut result.cache_actions, EvictLayer::Host, Some(&mut result.tracker));
                 self.cascade_evict_(idx, MAMBA, &mut result.tracker, &mut result.device_frees,
                                    &mut result.host_frees, &mut result.cache_actions, EvictLayer::Host);
+                self.prune_kv_in_storage_(idx, &mut result.tracker, &mut result.device_frees,
+                                          &mut result.host_frees, &mut result.cache_actions);
             }
             current = next;
         }
@@ -3098,6 +3221,8 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             Some("state_tombstone_written"));
         self.cascade_evict_(idx, MAMBA, &mut result.tracker, &mut result.device_frees,
                            &mut result.host_frees, &mut result.cache_actions, EvictLayer::Host);
+        self.prune_kv_in_storage_(idx, &mut result.tracker, &mut result.device_frees,
+                                  &mut result.host_frees, &mut result.cache_actions);
         Ok(result)
     }
 
@@ -3187,7 +3312,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             covered += tokens;
             if let Some(p) = node.try_parent() {
                 let parent = arena.node(p);
-                let left = children_left.entry(p).or_insert(parent.children.len());
+                let left = children_left.entry(p).or_insert(self.kv_children_count_(parent));
                 *left = left.saturating_sub(1);
                 if *left == 0 && self.is_host_leaf_once_childless_(parent) {
                     heap.push(Reverse((strategy.get_priority(parent), p)));
@@ -3399,6 +3524,11 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             self.is_evictable_host_leaf_(self.arena.node(node_id)),
             "node {node_id} is not an H-leaf"
         );
+        if !self.arena.node(node_id).children.is_empty() {
+            // Only under kv_evict_keep_state: every child is kv_in_storage, so this node stays as their spine.
+            self.evict_host_kv_(node_id, /* keep_mamba = */ false, tracker, device_frees, host_frees, cache_actions);
+            return;
+        }
         self.record_remove_event_(node_id, StorageMedium::Cpu);
         for i in 0..self.components.len() {
             let component_type = self.components[i].component_type();
@@ -3423,6 +3553,144 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             host_frees,
             cache_actions,
         );
+    }
+
+    /// S2b-alpha: drop a host leaf's Full KV and every other component's values (Mamba too unless
+    /// `keep_mamba`), keeping the node as `kv_in_storage` (its KV is expected in L3): either its own state
+    /// or the `kv_in_storage` children below it still need it. A node with neither is deleted.
+    pub fn evict_host_kv_(
+        &mut self,
+        node_id: NodeIdx_,
+        keep_mamba: bool,
+        tracker: &mut HashMap<ComponentType, usize>,
+        device_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
+        host_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
+        cache_actions: &mut CacheActions,
+    ) {
+        assert!(
+            self.is_evictable_host_leaf_(self.arena.node(node_id)),
+            "node {node_id} is not an H-leaf"
+        );
+        self.record_remove_event_(node_id, StorageMedium::Cpu);
+        for i in 0..self.components.len() {
+            let component_type = self.components[i].component_type();
+            if keep_mamba && component_type == MAMBA {
+                continue;
+            }
+            let (_, host_freed) = self.evict_component_and_detach_lru_(
+                node_id,
+                component_type,
+                device_frees,
+                host_frees,
+                cache_actions,
+                EvictLayer::All,
+                None,
+            );
+            *tracker.entry(component_type).or_insert(0) += host_freed;
+        }
+        self.arena.node_mut(node_id).kv_in_storage = true;
+        self.kv_in_storage_counts[0] += 1;
+        self.evictable_host_leaves.discard(node_id);
+        self.update_full_coexisting_host_tracking_(node_id);
+        self.record_l3_lifetime_event_(node_id, FULL, "host_evict_keep_state", "host", "kv_in_storage");
+        let parent = self.arena.node(node_id).parent();
+        self.update_evictable_leaf_sets_(parent);
+        self.prune_kv_in_storage_(node_id, tracker, device_frees, host_frees, cache_actions);
+    }
+
+    /// S2b-alpha: delete `kv_in_storage` nodes that no longer hold a value or lead to one, walking up;
+    /// a childless plain tombstone left above them goes through the usual cascade.
+    pub(crate) fn prune_kv_in_storage_(
+        &mut self,
+        node_id: NodeIdx_,
+        tracker: &mut HashMap<ComponentType, usize>,
+        device_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
+        host_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
+        cache_actions: &mut CacheActions,
+    ) {
+        let mut cur = node_id;
+        loop {
+            {
+                let node = self.arena.node(cur);
+                if node.is_root()
+                    || !node.kv_in_storage
+                    || !node.children.is_empty()
+                    || node.is_device_locked()
+                    || node.is_host_locked()
+                {
+                    return;
+                }
+            }
+            let holds_value = (0..self.components.len()).any(|i| {
+                let ct = self.components[i].component_type();
+                self.arena.has_host_value(cur, ct) || self.arena.has_device_value(cur, ct)
+            });
+            if holds_value {
+                return;
+            }
+            let parent = self.arena.node(cur).parent();
+            self.evictable_host_leaves.discard(cur);
+            self.evictable_device_leaves.discard(cur);
+            self.remove_leaf_from_parent_(cur);
+            self.kv_in_storage_counts[2] += 1;
+            self.update_evictable_leaf_sets_(parent);
+            if !self.arena.node(parent).kv_in_storage {
+                self.iteratively_delete_tombstone_leaf_(parent, tracker, device_frees, host_frees, cache_actions);
+                return;
+            }
+            cur = parent;
+        }
+    }
+
+    /// S2b-alpha: attach host KV read back from L3 to the `kv_in_storage` nodes `node_ids` (path order, the
+    /// first a child of the fill anchor). `host_value` holds their tokens back to back; stops at the first
+    /// node that is no longer `kv_in_storage` or that `host_value` does not cover. Returns the tokens used.
+    pub fn commit_kv_fill(&mut self, node_ids: &[NodeId], host_value: &Tensor) -> Result<usize, NodeAccessError> {
+        let total = host_value.size()[0] as usize;
+        let mut used = 0usize;
+        for &node_handle in node_ids {
+            let idx = self.arena.resolve(node_handle)?;
+            let len = self.arena.node(idx).key.atom_len();
+            if !self.arena.node(idx).kv_in_storage || used + len > total {
+                break;
+            }
+            self.arena
+                .set_host_value(idx, FULL, host_value.narrow(0, used as i64, len as i64).copy());
+            self.arena.node_mut(idx).kv_in_storage = false;
+            self.kv_in_storage_counts[1] += 1;
+            used += len;
+            self.update_evictable_leaf_sets_(idx);
+            if let Some(parent_id) = self.arena.node(idx).try_parent() {
+                self.update_evictable_leaf_sets_(parent_id);
+            }
+            self.update_full_coexisting_host_tracking_(idx);
+            self.record_l3_lifetime_event_(idx, FULL, "create", "host", "kv_fill");
+            self.record_store_event_(idx, StorageMedium::Cpu, /* session_id = */ None);
+        }
+        Ok(used)
+    }
+
+    /// S2b-alpha switches (SGLANG_HICACHE_KV_EVICT_KEEP_STATE, SGLANG_HICACHE_L3_KV_FILL).
+    pub fn set_s2ba_modes(&mut self, kv_evict_keep_state: bool, kv_fill_match: bool) {
+        self.kv_evict_keep_state = kv_evict_keep_state;
+        self.kv_fill_match = kv_fill_match;
+    }
+
+    /// S2b-alpha counters: (created, refilled, pruned, reinserted, kv_in_storage nodes now, of them holding
+    /// a Mamba host state).
+    pub fn kv_in_storage_stats(&self) -> (u64, u64, u64, u64, usize, usize) {
+        let mut nodes = 0;
+        let mut with_state = 0;
+        for idx in self.collect_all_nodes_() {
+            if self.arena.node(idx).kv_in_storage {
+                nodes += 1;
+                if self.arena.has_host_value(idx, MAMBA) {
+                    with_state += 1;
+                }
+            }
+        }
+        let c = self.kv_in_storage_counts;
+        (c[0], c[1], c[2], c[3], nodes, with_state)
     }
 
     /// Release a node's device KV once its host copy exists; the node stays in the
@@ -3728,6 +3996,10 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         loop {
             let node = self.arena.node(cur);
             if node.is_root() || !node.children.is_empty() {
+                if self.kv_evict_keep_state && !node.is_root() {
+                    // S2b-alpha: the remaining children may all be kv_in_storage, making this a host leaf.
+                    self.update_evictable_leaf_sets_(cur);
+                }
                 break;
             }
             if node.is_device_locked() || node.is_host_locked() {
@@ -3759,6 +4031,12 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
 
             if has_host {
                 self.update_evictable_leaf_sets_(cur);
+                break;
+            }
+
+            if self.arena.node(cur).kv_in_storage {
+                // S2b-alpha: kept for a state; deleted only once it holds and leads to none.
+                self.prune_kv_in_storage_(cur, tracker, device_frees, host_frees, cache_actions);
                 break;
             }
 
@@ -3817,7 +4095,19 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
 
     /// Whether the node is an evictable Full host leaf.
     fn is_evictable_host_leaf_(&self, node: &Node<K>) -> bool {
-        self.is_host_leaf_once_childless_(node) && node.children.is_empty()
+        self.is_host_leaf_once_childless_(node) && self.kv_children_count_(node) == 0
+    }
+
+    /// Children that still hold Full KV; under `kv_evict_keep_state` the `kv_in_storage` ones do not count,
+    /// so host KV eviction can continue above a kept state.
+    pub(crate) fn kv_children_count_(&self, node: &Node<K>) -> usize {
+        if !self.kv_evict_keep_state {
+            return node.children.len();
+        }
+        node.children
+            .values()
+            .filter(|&&child_id| !self.arena.node(child_id).kv_in_storage)
+            .count()
     }
 
     /// The H-leaf rule without the no-children clause: whether the node becomes
@@ -4251,6 +4541,29 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
                 if let Some(action) = action {
                     cache_actions.push(Box::new(action));
                 }
+            }
+
+            if self.arena.node(node_id).kv_in_storage {
+                // S2b-alpha: storage KV coming back on this path refills the kept node.
+                self.arena.set_host_value(
+                    node_id,
+                    FULL,
+                    host_value
+                        .narrow(0, matched_start as i64, prefix_len as i64)
+                        .copy(),
+                );
+                self.arena.node_mut(node_id).kv_in_storage = false;
+                self.kv_in_storage_counts[1] += 1;
+                self.update_evictable_leaf_sets_(node_id);
+                if let Some(parent_id) = self.arena.node(node_id).try_parent() {
+                    self.update_evictable_leaf_sets_(parent_id);
+                }
+                self.update_full_coexisting_host_tracking_(node_id);
+                self.record_l3_lifetime_event_(node_id, FULL, "create", "host", "kv_fill_insert_host");
+                self.record_store_event_(node_id, StorageMedium::Cpu, /* session_id = */ None);
+                inserted_host_node = Some(self.arena.node(node_id).id);
+                host_prefix_len = matched_length;
+                continue;
             }
 
             if !self.is_write_back {
@@ -5583,19 +5896,38 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
                         "node {node_id} {ct:?} device present but Full.value=None"
                     ));
                 }
-                // Auxiliary host data may outlive Full host data under write-back.
-                if node.has_host_value(ct) && !full_hst && !(self.is_write_back && full_dev) {
+                // Auxiliary host data may outlive Full host data under write-back, and
+                // a kv_in_storage node keeps a state whose KV is in L3 (S2b-alpha).
+                if node.has_host_value(ct)
+                    && !full_hst
+                    && !(self.is_write_back && full_dev)
+                    && !node.kv_in_storage
+                {
                     errors.push(format!(
                         "node {node_id} {ct:?} host present but Full.host_value=None"
                     ));
                 }
             }
 
-            // Every node must keep Full data on at least one layer.
-            if !full_dev && !full_hst {
+            // Every node must keep Full data on at least one layer (or, S2b-alpha, be kv_in_storage).
+            if !full_dev && !full_hst && !node.kv_in_storage {
                 errors.push(format!(
                     "node {node_id} dead: no Full device and no Full host"
                 ));
+            }
+            // S2b-alpha: a kv_in_storage node holds no Full KV and is kept only for a state at or below it.
+            if node.kv_in_storage {
+                if full_dev || full_hst {
+                    errors.push(format!("node {node_id} kv_in_storage but holds Full KV"));
+                }
+                if node.children.is_empty()
+                    && !node.has_host_value(MAMBA)
+                    && !node.has_device_value(MAMBA)
+                    && !node.is_device_locked()
+                    && !node.is_host_locked()
+                {
+                    errors.push(format!("node {node_id} kv_in_storage leaf holds no state"));
+                }
             }
 
             // Parent prefixes must keep data whenever the child does.

@@ -2695,3 +2695,238 @@ fn l3_within_tree_restore_splits_without_replacing_full_or_suffix_state() {
     let (missing, _) = tc.prepare_mamba_host_restore(&vec![1, 2, 9], Default::default(), 3);
     assert!(missing.is_none());
 }
+
+// ---- S2b-alpha: kv_in_storage nodes (host KV evicted, state kept for a KV fill) ----
+
+// A host-only chain [1] -> [2] under the root (write-back, HiCache on), the leaf holding a Mamba host state.
+fn s2ba_host_chain(tc: &mut UnifiedTreeCore<Vec<i64>>) -> (NodeIdx_, NodeIdx_) {
+    tc.set_hicache_enabled();
+    tc.is_write_back = true;
+    tc.set_s2ba_modes(/* kv_evict_keep_state = */ true, /* kv_fill_match = */ true);
+    let root = tc.arena.node(tc.arena.root()).id;
+    let a = tc
+        .insert_host(root, None, vec![1], Tensor::from_slice(&[100i64]), vec!["h1".to_string()])
+        .expect("live test node")
+        .inserted_host_node
+        .unwrap();
+    let b = tc
+        .insert_host(root, None, vec![1, 2], Tensor::from_slice(&[100i64, 101]), vec!["h1".into(), "h2".into()])
+        .expect("live test node")
+        .inserted_host_node
+        .unwrap();
+    let (a, b) = (tc.arena.resolve(a).unwrap(), tc.arena.resolve(b).unwrap());
+    set_mamba_host(tc, b, 8);
+    tc.host_lru_list_mut(MAMBA).insert_mru(b);
+    (a, b)
+}
+
+#[test]
+fn s2ba_full_host_eviction_keeps_the_state_node_then_its_spine() {
+    let mut tc = mamba_core(/* page_size = */ 1);
+    let (a, b) = s2ba_host_chain(&mut tc);
+    assert!(tc.evictable_host_leaves.contains(b));
+    let step = tc.drive_host_eviction_with_options(FULL, /* num_tokens = */ 1, true);
+    assert_eq!(step.tracker[&FULL], 1);
+    assert!(step.host_frees[&FULL][0].equal(&Tensor::from_slice(&[101i64])));
+    let node = tc.arena.node(b);
+    assert!(node.kv_in_storage && !node.has_host_value(FULL) && node.has_host_value(MAMBA));
+    assert!(tc.host_lru_list(MAMBA).in_list(Some(b)));
+    // The parent's only child no longer holds KV, so the parent is a host leaf now.
+    assert!(tc.evictable_host_leaves.contains(a));
+    tc.sanity_check(&[], &[]);
+    // Evicting the parent's KV keeps it as the state's spine (it has no state of its own).
+    let step = tc.drive_host_eviction_with_options(FULL, /* num_tokens = */ 1, true);
+    assert_eq!(step.tracker[&FULL], 1);
+    assert!(tc.arena.node(a).kv_in_storage);
+    assert_eq!(tc.arena.len(), 3);
+    assert_eq!(tc.kv_in_storage_stats(), (2, 0, 0, 0, 2, 1));
+    tc.sanity_check(&[], &[]);
+}
+
+#[test]
+fn s2ba_mamba_eviction_prunes_the_kv_in_storage_chain() {
+    let mut tc = mamba_core(/* page_size = */ 1);
+    let (_a, _b) = s2ba_host_chain(&mut tc);
+    tc.drive_host_eviction_with_options(FULL, /* num_tokens = */ 2, true);
+    assert_eq!(tc.kv_in_storage_stats().4, 2);
+    let mut tracker = HashMap::from([(MAMBA, 0)]);
+    let (mut device_frees, mut host_frees) = (HashMap::new(), HashMap::new());
+    mamba_component().drive_host_eviction(
+        &mut tc,
+        /* num_tokens = */ 1,
+        &mut tracker,
+        &mut device_frees,
+        &mut host_frees,
+        &mut Vec::new(),
+    );
+    assert_eq!(tracker[&MAMBA], 1);
+    // The state was the only reason to keep either node: both go, leaving the root.
+    assert_eq!(tc.arena.len(), 1);
+    assert_eq!(tc.kv_in_storage_stats(), (2, 0, 2, 0, 0, 0));
+    tc.sanity_check(&[], &[]);
+}
+
+#[test]
+fn s2ba_storage_backed_mamba_eviction_prunes_too() {
+    let mut tc = mamba_core(/* page_size = */ 1);
+    let (_a, _b) = s2ba_host_chain(&mut tc);
+    tc.drive_host_eviction_with_options(FULL, /* num_tokens = */ 2, true);
+    // A kv_in_storage state has no Full host copy, so the storage walk drops it directly.
+    let step = tc.begin_mamba_host_eviction(/* num_states = */ 1, /* min_depth = */ 0);
+    assert_eq!(step.tracker[&MAMBA], 1);
+    assert!(step.mamba_storage_backup_node_id.is_none());
+    assert_eq!(tc.arena.len(), 1);
+    tc.sanity_check(&[], &[]);
+}
+
+#[test]
+fn s2ba_match_reports_the_kv_fill_candidate_and_the_fill_restores_it() {
+    let mut tc = mamba_core(/* page_size = */ 1);
+    let root = tc.arena.node(tc.arena.root()).id;
+    let (_a, b) = s2ba_host_chain(&mut tc);
+    // Only the leaf's KV leaves: [1] stays host-backed, [2] becomes kv_in_storage with its state.
+    tc.drive_host_eviction_with_options(FULL, /* num_tokens = */ 1, true);
+    let key = vec![1, 2, 3];
+    let result = tc.match_prefix(&match_params(&key));
+    assert_eq!(result.full_kv_hit_length, 1);
+    let fill = result.kv_fill.expect("a kv_in_storage state below the KV end");
+    let (a_id, b_id) = (tc.arena.node(_a).id, tc.arena.node(b).id);
+    assert_eq!(fill.anchor_node_id, a_id);
+    assert_eq!((fill.start_len, fill.end_len), (1, 2));
+    assert_eq!(fill.state_pages, vec![1]);
+    assert_eq!(fill.state_node_ids, vec![b_id]);
+    assert_eq!(fill.fill_node_ids, vec![b_id]);
+    // Off: no candidate.
+    tc.set_s2ba_modes(true, /* kv_fill_match = */ false);
+    assert!(tc.match_prefix(&match_params(&key)).kv_fill.is_none());
+    tc.set_s2ba_modes(true, true);
+    // The KV read back from L3 is attached; the node is an ordinary host node again.
+    let used = tc.commit_kv_fill(&[b_id], &Tensor::from_slice(&[201i64, 202])).unwrap();
+    assert_eq!(used, 1);
+    let node = tc.arena.node(b);
+    assert!(!node.kv_in_storage && node.has_host_value(FULL) && node.has_host_value(MAMBA));
+    assert_eq!(tc.kv_in_storage_stats(), (1, 1, 0, 0, 0, 0));
+    let result = tc.match_prefix(&match_params(&key));
+    assert_eq!(result.full_kv_hit_length, 2);
+    assert!(result.kv_fill.is_none());
+    let _ = root;
+    tc.sanity_check(&[], &[]);
+}
+
+#[test]
+fn s2ba_insert_reinserts_a_kv_in_storage_node() {
+    let mut tc = mamba_core(/* page_size = */ 1);
+    let (_a, b) = s2ba_host_chain(&mut tc);
+    tc.drive_host_eviction_with_options(FULL, /* num_tokens = */ 2, true);
+    // The request recomputed the prefix and inserts it with fresh device KV.
+    let key = vec![1, 2];
+    tc.insert(&insert_params_mamba(&key, &[300, 301], Some(9)));
+    assert!(!tc.arena.node(b).kv_in_storage);
+    assert!(tc.arena.node(b).has_device_value(FULL));
+    let (created, _, _, reinserted, now, _) = tc.kv_in_storage_stats();
+    assert_eq!((created, reinserted, now), (2, 2, 0));
+    tc.sanity_check(&[], &[]);
+}
+
+#[test]
+fn s2ba_off_keeps_todays_atomic_host_leaf_eviction() {
+    let mut tc = mamba_core(/* page_size = */ 1);
+    let (_a, _b) = s2ba_host_chain(&mut tc);
+    tc.set_s2ba_modes(false, false);
+    tc.drive_host_eviction_with_options(FULL, /* num_tokens = */ 2, true);
+    assert_eq!(tc.arena.len(), 1);
+    assert_eq!(tc.kv_in_storage_stats(), (0, 0, 0, 0, 0, 0));
+    tc.sanity_check(&[], &[]);
+}
+
+#[test]
+fn s2ba_insert_host_refills_a_kv_in_storage_node_on_its_path() {
+    let mut tc = mamba_core(/* page_size = */ 1);
+    let root = tc.arena.node(tc.arena.root()).id;
+    let (a, b) = s2ba_host_chain(&mut tc);
+    tc.drive_host_eviction_with_options(FULL, /* num_tokens = */ 2, true);
+    // An L3 prefetch completing from the root re-materializes the whole path.
+    tc.insert_host(root, None, vec![1, 2, 3], Tensor::from_slice(&[400i64, 401, 402]), vec!["h1".into(), "h2".into(), "h3".into()])
+        .expect("live test node");
+    assert!(!tc.arena.node(a).kv_in_storage && tc.arena.node(a).has_host_value(FULL));
+    assert!(!tc.arena.node(b).kv_in_storage && tc.arena.node(b).has_host_value(FULL));
+    assert_eq!(tc.kv_in_storage_stats(), (2, 2, 0, 0, 0, 0));
+    tc.sanity_check(&[], &[]);
+}
+
+fn s2ba_xorshift(state: &mut u64) -> u64 {
+    *state ^= *state << 13;
+    *state ^= *state >> 7;
+    *state ^= *state << 17;
+    *state
+}
+
+#[test]
+fn s2ba_random_host_ops_hold_the_sanity_invariants() {
+    for seed in 1..=60u64 {
+        let mut tc = mamba_core(/* page_size = */ 1);
+        tc.set_hicache_enabled();
+        tc.is_write_back = true;
+        tc.set_s2ba_modes(true, true);
+        let root = tc.arena.node(tc.arena.root()).id;
+        let mut st = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+        let mut slot = 1000i64;
+        for step in 0..400 {
+            let op = s2ba_xorshift(&mut st) % 7;
+            let len = 1 + (s2ba_xorshift(&mut st) % 6) as usize;
+            let key: Vec<i64> = (0..len).map(|_| (s2ba_xorshift(&mut st) % 3) as i64 + 1).collect();
+            match op {
+                0 | 1 => {
+                    let vals: Vec<i64> = (0..len as i64).map(|i| slot + i).collect();
+                    slot += len as i64;
+                    let hashes = (0..len).map(|i| format!("{seed}-{step}-{i}")).collect();
+                    let res = tc
+                        .insert_host(root, None, key, Tensor::from_slice(&vals), hashes)
+                        .expect("live root");
+                    if let Some(n) = res.inserted_host_node {
+                        let idx = tc.arena.resolve(n).unwrap();
+                        // Host-only states only (a device-resident node keeps its state on the device LRU).
+                        if !tc.arena.has_host_value(idx, MAMBA)
+                            && !tc.arena.has_device_value(idx, MAMBA)
+                            && tc.arena.node(idx).evicted()
+                            && s2ba_xorshift(&mut st) % 2 == 0
+                        {
+                            set_mamba_host(&mut tc, idx, slot);
+                            slot += 1;
+                            tc.host_lru_list_mut(MAMBA).insert_mru(idx);
+                        }
+                    }
+                }
+                2 => {
+                    tc.drive_host_eviction_with_options(FULL, len, true);
+                }
+                3 => {
+                    let mut tracker = HashMap::from([(MAMBA, 0)]);
+                    let (mut df, mut hf) = (HashMap::new(), HashMap::new());
+                    mamba_component().drive_host_eviction(&mut tc, 1, &mut tracker, &mut df, &mut hf, &mut Vec::new());
+                }
+                4 => {
+                    let _ = tc.begin_mamba_host_eviction(1, /* min_depth = */ 1 << 20);
+                }
+                5 if step % 5 == 0 => {
+                    // A recomputed request inserts device KV over whatever the path holds (kv_in_storage too).
+                    let vals: Vec<i64> = (0..len as i64).map(|i| slot + i).collect();
+                    slot += len as i64 + 1;
+                    tc.insert(&insert_params_mamba(&key, &vals, Some(slot)));
+                }
+                _ => {
+                    if let Some(fill) = tc.match_prefix(&match_params(&key)).kv_fill {
+                        let n = fill.end_len - fill.start_len;
+                        let vals: Vec<i64> = (0..n as i64).map(|i| slot + i).collect();
+                        slot += n as i64;
+                        let used = tc.commit_kv_fill(&fill.fill_node_ids, &Tensor::from_slice(&vals)).unwrap();
+                        assert_eq!(used, n, "seed {seed} step {step}: a candidate fills whole");
+                    }
+                }
+            }
+            if let Err(message) = tc.try_sanity_check(&[], &[]) {
+                panic!("seed {seed} step {step} op {op}: {message}");
+            }
+        }
+    }
+}

@@ -185,6 +185,9 @@ pub struct Node<K: ChildKeyType> {
     pub hash_value: Option<Vec<String>>,
     /// Whether this node is available through the direct external-cache linker.
     pub external_cache_stored: bool,
+    /// S2b-alpha: Full KV left device and host (it is expected in L3); the node stays for a Mamba state
+    /// at or below it. Set only under `kv_evict_keep_state`; cleared when KV is refilled or reinserted.
+    pub kv_in_storage: bool,
     /// Chain-wide logical-page owner rotation, retained across node splits.
     pub rotation_base: Option<i64>,
     /// The in-flight write-through backup's ack id.
@@ -239,6 +242,11 @@ impl<K: ChildKeyType> Node<K> {
     /// Tree-level: Full KV present on host.
     pub fn backuped(&self) -> bool {
         self.has_host_value(FULL)
+    }
+
+    /// S2b-alpha: Full KV only in L3, node kept for a state (see `kv_in_storage`).
+    pub fn is_kv_in_storage(&self) -> bool {
+        self.kv_in_storage
     }
 
     /// The last page's hash value, or None when the node was never hashed.
@@ -424,6 +432,7 @@ impl<K: ChildKeyType> Node<K> {
             full_host_uuid: None,
             hash_value: Some(Vec::new()),
             external_cache_stored: false,
+            kv_in_storage: false,
             rotation_base: None,
             write_through_pending_id: None,
             load_back_pending_id: None,
@@ -451,6 +460,7 @@ impl<K: ChildKeyType> Node<K> {
             full_host_uuid: None,
             hash_value: None,
             external_cache_stored: false,
+            kv_in_storage: false,
             rotation_base: None,
             write_through_pending_id: None,
             load_back_pending_id: None,
