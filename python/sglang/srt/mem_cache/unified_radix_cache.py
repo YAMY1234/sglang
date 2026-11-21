@@ -782,7 +782,8 @@ class UnifiedRadixCache(BasePrefixCache):
                 self.host_memory_mode != "cache"
                 or not self.is_mamba_enabled
                 or self.supports_swa()
-                or not self.enable_storage
+                or self.cache_controller is None
+                or not self.cache_controller.enable_storage
             ):
                 raise ValueError(
                     "SGLANG_HICACHE_KV_EVICT_KEEP_STATE / SGLANG_HICACHE_L3_KV_FILL need a "
