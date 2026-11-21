@@ -901,6 +901,9 @@ class Envs:
     SGLANG_PP_SCHED_WAR_FENCE = EnvBool(False)
     # Debug: log every PP tensor-dict send / receive (kind, batch tag, stash) and every launch.
     SGLANG_PP_DEBUG_TRACE = EnvBool(False)
+    # Debug: "FCT:SECONDS" makes every PP rank's scheduler sleep SECONDS once when its forward count
+    # reaches FCT, a stall cascade like a profiler export's without the profiler.
+    SGLANG_PP_DEBUG_STALL = EnvStr("")
     SGLANG_PP_CE_PUSH_SLOT_MB = EnvInt(1600)
     # PP PD prefill: log a digest of allocator and radix tree state every N loop
     # epochs (0 = off); every stage must log the same digest at the same epoch.

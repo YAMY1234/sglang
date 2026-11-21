@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from collections import defaultdict, deque
 from contextlib import nullcontext
 from dataclasses import dataclass
@@ -341,9 +342,15 @@ class SchedulerPPMixin:
         epoch = 0
 
         diag = self.pp_bubble_diag
+        stall = envs.SGLANG_PP_DEBUG_STALL.get()
+        stall_fct, stall_s = (int(stall.split(":")[0]), float(stall.split(":")[1])) if stall else (-1, 0.0)
         while True:
             server_is_idle = True
             for mb_id in range(self.pp_loop_size):
+                if stall_fct >= 0 and self.forward_ct >= stall_fct:
+                    logger.info("PP debug stall: %.1f s at forward %d", stall_s, self.forward_ct)
+                    time.sleep(stall_s)
+                    stall_fct = -1
                 self.running_batch = self.running_mbs[mb_id]
                 self.last_batch = self.last_mbs[mb_id]
                 next_first_rank_mb_id = (
