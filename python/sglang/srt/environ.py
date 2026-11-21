@@ -897,6 +897,9 @@ class Envs:
     # by the receiving stage; PP0's entry is unused). Size each for the largest proxy its previous
     # stage sends (it grows with depth), or those messages go over NCCL.
     SGLANG_PP_CE_PUSH_SLOT_MB = EnvTuple(("1600",))
+    # Debug: per stage, checksum the first N copy-engine messages on both sides of each push (pp_ce_push._CEChecksum).
+    SGLANG_DEBUG_PP_CE_CHECKSUM = EnvInt(0)
+    SGLANG_DEBUG_PP_CE_CHECKSUM_DIR = EnvStr(".")
     # PP PD prefill: log a digest of allocator and radix tree state every N loop
     # epochs (0 = off); every stage must log the same digest at the same epoch.
     SGLANG_DEBUG_PP_STATE_DIGEST_EVERY = EnvInt(0)
