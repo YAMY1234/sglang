@@ -4224,6 +4224,7 @@ class UnifiedRadixCache(BasePrefixCache):
                 query_end_hash=chain[-1] if chain else None,
                 checkpoint_hash=chain[hit_pages - 1] if hit_pages else None,
                 pool_hit_pages=dict(operation.query_pool_hit_pages or {}),
+                query_keys=list(chain),
             )
         pools = (operation.query_pool_hit_pages or {}) if requested >= 8192 else {}
         kv_pages = pools.get(PoolName.KV, 0)
