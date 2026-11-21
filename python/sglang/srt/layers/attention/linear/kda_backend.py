@@ -72,6 +72,14 @@ def _validate_flashinfer_kda_prefill(
         raise ValueError(
             "FlashInfer KDA prefill requires eager linear attention; use disabled or breakable prefill CUDA graphs"
         )
+    if (
+        envs.SGLANG_MAMBA_BRANCH_TRACK_DUAL.get()
+        and prefill_cuda_graph_backend != CudaGraphBackend.DISABLED
+    ):
+        raise ValueError(
+            "SGLANG_MAMBA_BRANCH_TRACK_DUAL tracks fork states in the eager KDA "
+            "prefill only; disable the prefill CUDA graph"
+        )
 
 
 def flashinfer_kda_prefill_default(model_runner: ModelRunner) -> Optional[str]:
@@ -650,6 +658,10 @@ class KDAAttnBackend(MambaAttnBackendBase):
     def prefill_graph_extend_active(self) -> bool:
         return self.prefill_graph_metadata is not None
 
+    def supports_mamba_fork_tracks(self) -> bool:
+        # The checkpoint plan maps any chunk boundary to a snapshot row.
+        return self.kernel_dispatcher.extend_kernel.uses_state_checkpoints
+
     def init_prefill_graph_metadata(
         self, forward_batch: ForwardBatch
     ) -> KDAPrefillGraphMetadata:
@@ -705,6 +717,9 @@ class KDAAttnBackend(MambaAttnBackendBase):
                 forward_batch.mamba_track_indices
             )
         track_rows = None
+        assert forward_batch.mamba_fork_tracks is None, (
+            "SGLANG_MAMBA_BRANCH_TRACK_DUAL fork states replayed on a prefill graph"
+        )
         if forward_batch.mamba_track_mask is not None:
             assert meta.track, (
                 "prefix-cache track batch replayed on a bucket captured without "
@@ -775,6 +790,16 @@ class KDAAttnBackend(MambaAttnBackendBase):
                     self.forward_metadata.mamba_track_mask_indices
                 ]
             )
+            if self.forward_metadata.track_fork_dst is not None:
+                # Fork conv windows follow the per-row windows in track_conv_indices.
+                self.forward_metadata.conv_states_mask_indices = torch.cat(
+                    [
+                        self.forward_metadata.conv_states_mask_indices,
+                        self.forward_metadata.track_fork_dst.to(
+                            self.forward_metadata.conv_states_mask_indices.dtype
+                        ),
+                    ]
+                )
             if (
                 self.kernel_dispatcher.extend_kernel.uses_state_checkpoints
                 and forward_batch.forward_mode.is_extend_without_speculative()
@@ -1204,8 +1229,13 @@ class KDAAttnBackend(MambaAttnBackendBase):
                 f"--linear-attn-prefill-backend triton or "
                 f"--mamba-radix-cache-strategy no_buffer"
             )
+            fork_dst = self.forward_metadata.track_fork_dst
+            # Fork snapshot rows follow the batch rows.
+            num_rows = track_chunk_idx.shape[0] + (
+                fork_dst.shape[0] if fork_dst is not None else 0
+            )
             h_track_buf = torch.empty(
-                (track_chunk_idx.shape[0], *ssm_states.shape[1:]),
+                (num_rows, *ssm_states.shape[1:]),
                 dtype=torch.float32,
                 device=ssm_states.device,
             )

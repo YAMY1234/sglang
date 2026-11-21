@@ -681,6 +681,67 @@ class UnifiedRadixCacheCoreSuite(UnifiedRadixCacheCoreFixtures):
         cache.unlock(req.lock)
         cache.sanity_check()
 
+    def _fork_tracked_req(self, cache, allocator, req_to_token_pool, sibling_pages):
+        """A request sharing two pages of KV with a cached sibling that has a state
+        only at its own end, holding the fork state an extend tracked at that
+        branching depth (SGLANG_MAMBA_BRANCH_TRACK_DUAL)."""
+        if not (self.cfg.has_mamba and self.cfg.enable_mamba_extra_buffer):
+            self.skipTest("fork states ride the mamba extra buffer")
+        depth = 2 * self.cfg.page_size
+        sibling = self._make_seq(1, sibling_pages)
+        self._insert(cache, allocator, req_to_token_pool, sibling)
+        tokens = sibling[:depth] + self._make_seq(5000, 2)
+        req, _ = self._make_inflight_req(cache, allocator, req_to_token_pool, tokens)
+        req.kv.mamba_last_track_seqlen = len(tokens)
+        req.kv.mamba_fork_track_idx = req_to_token_pool.mamba_allocator.alloc(1)
+        req.kv.mamba_fork_track_seqlen = depth
+        return req, tokens, depth
+
+    def test_checkpoint_inserts_the_fork_state_at_the_branching_depth(self):
+        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
+        req, tokens, depth = self._fork_tracked_req(
+            cache, allocator, req_to_token_pool, sibling_pages=4
+        )
+        fork_slot = req.kv.mamba_fork_track_idx
+        probe = tokens[:depth] + self._make_seq(9000, 1)
+        self.assertEqual(match_prefix(cache, probe).device_prefix_len, 0)
+
+        cache.checkpoint(req, up_to=req.extend_end)
+
+        self.assertIsNone(req.kv.mamba_fork_track_idx)
+        m = match_prefix(cache, probe)
+        self.assertEqual(m.device_prefix_len, depth)
+        node_value = cache.tree_core.get_component_device_value(
+            m.last_device_node, ComponentType.MAMBA
+        )
+        self.assertTrue(torch.equal(node_value.reshape(-1), fork_slot.reshape(-1)))
+        # The request's own end state still follows, past the fork.
+        self.assertEqual(match_prefix(cache, tokens).device_prefix_len, len(tokens))
+        self.assertEqual(req.kv.cache_protected_len, len(tokens))
+        cache.unlock(req.lock)
+        cache.sanity_check()
+
+    def test_fork_state_returns_to_the_pool_when_not_inserted(self):
+        for case in ("state_exists", "released"):
+            with self.subTest(case=case):
+                cache, allocator, req_to_token_pool = build_fixture(self.cfg)
+                req, tokens, depth = self._fork_tracked_req(
+                    cache, allocator, req_to_token_pool, sibling_pages=4
+                )
+                fork_slot = int(req.kv.mamba_fork_track_idx)
+                if case == "state_exists":
+                    # The branching depth already carries a state.
+                    self._insert(cache, allocator, req_to_token_pool, tokens[:depth])
+                    cache.checkpoint(req, up_to=req.extend_end)
+                    cache.unlock(req.lock)
+                else:
+                    release_kv_cache(req, cache, checkpoint=False)
+                self.assertIsNone(req.kv.mamba_fork_track_idx)
+                self.assertIn(
+                    fork_slot, req_to_token_pool.mamba_allocator.free_slots.tolist()
+                )
+                cache.sanity_check()
+
     @requires_swa_only
     @requires_ps1_window4
     def test_swa_unfinished_req_repoints_whole_insert_below_window(self):

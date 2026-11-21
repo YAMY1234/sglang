@@ -78,7 +78,11 @@ if TYPE_CHECKING:
     from sglang.srt.layers.engram_staging import StagedRows
     from sglang.srt.layers.layer_boundary.residual.stream import ResidualStream
     from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-    from sglang.srt.managers.schedule_batch import MultimodalInputs, ScheduleBatch
+    from sglang.srt.managers.schedule_batch import (
+        MambaForkTracks,
+        MultimodalInputs,
+        ScheduleBatch,
+    )
     from sglang.srt.mem_cache.kv_loc_plan import Cols, KVLocPlan
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
@@ -546,6 +550,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     mamba_track_seqlens: Optional[torch.Tensor] = None  # shape: [b], int64
     mamba_prefill_track_mask_cpu: Optional[List[bool]] = None
     mamba_track_seqlens_cpu: Optional[List[int]] = None
+    # Extra branching-point states this extend tracks (SGLANG_MAMBA_BRANCH_TRACK_DUAL).
+    mamba_fork_tracks: Optional[MambaForkTracks] = None
     # Deferred mamba init ops: COW pairs and clear indices (performed on forward stream)
     mamba_cow_src_indices: Optional[torch.Tensor] = None
     mamba_cow_dst_indices: Optional[torch.Tensor] = None
@@ -1073,6 +1079,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 if batch.mamba_track_seqlens_cpu is not None
                 else None
             ),
+            mamba_fork_tracks=batch.mamba_fork_tracks,
             mamba_cow_src_indices=batch.mamba_cow_src_indices,
             mamba_cow_dst_indices=batch.mamba_cow_dst_indices,
             mamba_clear_indices=batch.mamba_clear_indices,

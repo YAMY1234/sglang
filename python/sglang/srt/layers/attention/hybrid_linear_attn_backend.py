@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from itertools import accumulate
 from typing import TYPE_CHECKING, Optional, Union
 
 import torch
@@ -181,6 +182,7 @@ class MambaAttnBackendBase(AttentionBackend):
         track_ssm_seq_idx = None
         track_ssm_end_locs = None
         track_ssm_recompute_dst = None
+        track_fork_dst = None
         logical_num_tokens = None
         track_mask_indices = None
 
@@ -324,6 +326,10 @@ class MambaAttnBackendBase(AttentionBackend):
                     track_conv_indices = self._init_track_conv_indices(
                         query_start_loc, forward_batch, track_mask_indices
                     )
+                    if forward_batch.mamba_fork_tracks is not None:
+                        track_fork_dst, track_conv_indices = self._init_fork_tracks(
+                            forward_batch, track_conv_indices
+                        )
 
                     (
                         track_chunk_idx,
@@ -335,7 +341,9 @@ class MambaAttnBackendBase(AttentionBackend):
                         track_ssm_seq_idx,
                         track_ssm_end_locs,
                         track_ssm_recompute_dst,
-                    ) = self._init_track_ssm_indices(mamba_cache_indices, forward_batch)
+                    ) = self._init_track_ssm_indices(
+                        mamba_cache_indices, forward_batch, track_fork_dst
+                    )
         else:
             raise ValueError(f"Invalid forward mode: {forward_batch.forward_mode=}")
 
@@ -354,6 +362,7 @@ class MambaAttnBackendBase(AttentionBackend):
             track_ssm_h_src=track_ssm_h_src,
             track_ssm_h_dst=track_ssm_h_dst,
             track_ssm_h_batch_src=track_ssm_h_batch_src,
+            track_fork_dst=track_fork_dst,
             track_ssm_final_src=track_ssm_final_src,
             track_ssm_final_dst=track_ssm_final_dst,
             track_chunk_idx=track_chunk_idx,
@@ -442,8 +451,46 @@ class MambaAttnBackendBase(AttentionBackend):
 
         return torch.minimum(indices.clamp_min(0), query_start_loc[-1] - 1)
 
+    def supports_mamba_fork_tracks(self) -> bool:
+        """Whether one extend can snapshot a second chunk-boundary state of the
+        same request (SGLANG_MAMBA_BRANCH_TRACK_DUAL)."""
+        return False
+
+    def _init_fork_tracks(
+        self, forward_batch: ForwardBatch, track_conv_indices: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """The forks' physical slots, and the conv windows ending at their depths
+        appended after the per-row windows (the order of their destinations)."""
+        if not (
+            self.supports_mamba_fork_tracks()
+            and self._has_cpu_prefill_track_metadata(forward_batch)
+        ):
+            raise NotImplementedError(
+                f"{type(self).__name__}: SGLANG_MAMBA_BRANCH_TRACK_DUAL needs the "
+                "FlashInfer KDA prefill kernel and host prefill track metadata"
+            )
+        fork = forward_batch.mamba_fork_tracks
+        starts = list(accumulate(forward_batch.extend_seq_lens_cpu, initial=0))
+        prefix_lens = forward_batch.extend_prefix_lens_cpu
+        ends = self._track_indices_to_device(
+            [
+                starts[row] + depth - prefix_lens[row]
+                for row, depth in zip(fork.rows, fork.seqlens)
+            ]
+        )
+        conv_state_len = self.conv_states_shape[-1]
+        windows = ends.unsqueeze(-1) + torch.arange(
+            -conv_state_len, 0, device=self.device, dtype=ends.dtype
+        )
+        return self._translate_mamba_indices(fork.slots), torch.cat(
+            [track_conv_indices, windows.to(track_conv_indices.dtype)]
+        )
+
     def _init_track_ssm_indices(
-        self, mamba_cache_indices: torch.Tensor, forward_batch: ForwardBatch
+        self,
+        mamba_cache_indices: torch.Tensor,
+        forward_batch: ForwardBatch,
+        fork_dst: Optional[torch.Tensor] = None,
     ):
         """src/dst indices to track SSM states for prefix caching: aligned seqs
         cache last_recurrent_state, unaligned cache intermediate `h` at the last
@@ -452,7 +499,7 @@ class MambaAttnBackendBase(AttentionBackend):
         buffer on the KDA path so the copy stays free of GPU syncs."""
         if self._has_cpu_prefill_track_metadata(forward_batch):
             return self._init_track_ssm_indices_from_cpu(
-                mamba_cache_indices, forward_batch
+                mamba_cache_indices, forward_batch, fork_dst
             )
         state_chunk_size = self.mamba_chunk_size
         # CPU to avoid kernel launches for the masking ops
@@ -534,21 +581,32 @@ class MambaAttnBackendBase(AttentionBackend):
             values, dtype=dtype, pin_memory=is_pin_memory_available(self.device)
         ).to(self.device, non_blocking=True)
 
-    def _init_track_ssm_indices_from_cpu(self, mamba_cache_indices, forward_batch):
+    def _init_track_ssm_indices_from_cpu(
+        self, mamba_cache_indices, forward_batch, fork_dst=None
+    ):
         is_mamba2 = isinstance(self, Mamba2AttnBackend)
+        mask = forward_batch.mamba_prefill_track_mask_cpu
+        fork = forward_batch.mamba_fork_tracks if fork_dst is not None else None
         plan = build_prefill_track_plan(
-            forward_batch.mamba_prefill_track_mask_cpu,
+            mask,
             forward_batch.mamba_track_seqlens_cpu,
             forward_batch.extend_seq_lens_cpu,
             forward_batch.extend_prefix_lens_cpu,
             self.mamba_chunk_size,
             mamba2=is_mamba2,
+            fork_rows=fork.rows if fork is not None else (),
+            fork_lens=fork.seqlens if fork is not None else (),
         )
         to_device = self._track_indices_to_device
         final_rows = to_device(plan.final_rows)
         h_rows = to_device(plan.h_rows)
         recompute_rows = to_device(plan.recompute_rows) if is_mamba2 else None
         destinations = forward_batch.mamba_track_indices
+        if fork is not None:
+            # Plan items past the batch rows are the forks.
+            destinations = torch.cat(
+                [destinations[: len(mask)], fork_dst.to(destinations.dtype)]
+            )
         return (
             to_device(plan.chunk_indices, torch.int32),
             to_device(plan.h_src),

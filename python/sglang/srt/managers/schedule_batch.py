@@ -995,6 +995,11 @@ class ReqKvInfo:
     mamba_cow_src_index: Optional[torch.Tensor] = None
     # Deferred clear: newly allocated mamba slot needs zeroing on forward stream
     mamba_needs_clear: bool = False
+    # SGLANG_MAMBA_BRANCH_TRACK_DUAL: extra slot (shape (1)) the last extend
+    # tracked the branching-point state into, and its depth; the next tree
+    # checkpoint inserts it.
+    mamba_fork_track_idx: Optional[torch.Tensor] = None
+    mamba_fork_track_seqlen: Optional[int] = None
 
     def swa_dead_lo(self, page_size: int) -> int:
         # Lowest SWA position this request may free itself: above the tree-owned
@@ -2332,6 +2337,16 @@ class _MambaRadixCacheV2TrackEntry(NamedTuple):
     track_mask: bool
     track_position: int
     track_seqlen: int
+    # Depth of an extra branching-point state this forward also tracks; -1: none.
+    fork_seqlen: int = -1
+
+
+class MambaForkTracks(NamedTuple):
+    """Extra branching-point states an extend tracks (SGLANG_MAMBA_BRANCH_TRACK_DUAL)."""
+
+    rows: List[int]  # batch row of each fork
+    seqlens: List[int]  # absolute depth of each fork state
+    slots: torch.Tensor  # Mamba slot (virtual id) each fork state goes to
 
 
 def _gather_mamba_track_indices(
@@ -2603,6 +2618,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # TBO rejects Mamba tracking; enabling it must also slice these CPU lists.
     mamba_track_seqlens_cpu: Optional[List[int]] = None
     mamba_prefill_track_mask_cpu: Optional[List[bool]] = None
+    mamba_fork_tracks: Optional[MambaForkTracks] = None
     mamba_track_mask_cpu: Optional[List[bool]] = None  # shape: [b]
     mamba_track_mask_next_cpu: Optional[List[bool]] = None  # shape: [b]
     mamba_decode_batch_idx_cpu: Optional[List[int]] = None  # shape: [b]
@@ -2964,6 +2980,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         mamba_track_mask_cpu = []
         mamba_track_positions_cpu = []
         mamba_track_seqlens_cpu = []
+        fork_rows, fork_seqlens, fork_slots = [], [], []
 
         for i, (req, seq_len, pre_len) in enumerate(zip(reqs, seq_lens, prefix_lens)):
             req.extend_batch_idx += 1
@@ -3037,6 +3054,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 mamba_track_mask_cpu.append(track_entry.track_mask)
                 mamba_track_positions_cpu.append(track_entry.track_position)
                 mamba_track_seqlens_cpu.append(track_entry.track_seqlen)
+                if track_entry.fork_seqlen >= 0:
+                    fork_rows.append(i)
+                    fork_seqlens.append(track_entry.fork_seqlen)
+                    fork_slots.append(req.kv.mamba_fork_track_idx)
 
             if self.return_logprob:
                 # Find input logprob token ids.
@@ -3157,6 +3178,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.mamba_track_seqlens = torch.tensor(
                 mamba_track_seqlens_cpu, dtype=torch.int64, pin_memory=_pin
             ).to(self.device, non_blocking=True)
+            self.mamba_fork_tracks = (
+                MambaForkTracks(fork_rows, fork_seqlens, torch.cat(fork_slots))
+                if fork_rows
+                else None
+            )
 
         # Collect mamba init info for deferred ops on forward stream
         if any(req.kv.holds_mamba for req in reqs):
@@ -3220,6 +3246,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             )
         track_position = req.kv.mamba_next_track_idx
         mamba_track_seqlen = -1
+        fork_seqlen = -1
         if mask:
             # mamba_track_seqlen is used to calculate the indices to track in
             # hybrid_linear_attn_backend's _init_track_ssm_indices. Due to the
@@ -3278,13 +3305,33 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     # See _force_track_h() for more details.
                     mamba_track_seqlen = _force_track_h(req.mamba_branching_seqlen)
                     mamba_track_seqlen_aligned = req.mamba_branching_seqlen
+                elif (
+                    branch_in_forward
+                    # At the end's own checkpoint the end state is the fork state.
+                    and req.mamba_branching_seqlen < mamba_track_seqlen_aligned
+                    and envs.SGLANG_MAMBA_BRANCH_TRACK_DUAL.get()
+                ):
+                    fork_seqlen = self._alloc_mamba_fork_track(req)
             req.kv.mamba_last_track_seqlen = mamba_track_seqlen_aligned
 
         return _MambaRadixCacheV2TrackEntry(
             track_mask=mask,
             track_position=track_position,
             track_seqlen=mamba_track_seqlen,
+            fork_seqlen=fork_seqlen,
         )
+
+    def _alloc_mamba_fork_track(self, req: Req) -> int:
+        """SGLANG_MAMBA_BRANCH_TRACK_DUAL: an extra Mamba slot for the branching-point
+        state; -1 (track the end only, as without it) when the pool has none free."""
+        if req.kv.mamba_fork_track_idx is not None or req.skip_radix_cache_insert:
+            return -1
+        slot = self.req_to_token_pool.mamba_allocator.alloc(1)
+        if slot is None:
+            return -1
+        req.kv.mamba_fork_track_idx = slot
+        req.kv.mamba_fork_track_seqlen = req.mamba_branching_seqlen
+        return req.mamba_branching_seqlen
 
     def _collect_deferred_mamba_cow_and_clear(self, reqs):
         """Collect deferred COW/clear info from requests."""
@@ -3380,12 +3427,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 self.mamba_track_seqlens,
                 self.mamba_prefill_track_mask_cpu,
                 self.mamba_track_seqlens_cpu,
+                self.mamba_fork_tracks,
             )
 
         self.merge_batch(running_batch)
         self.out_cache_loc = out_cache_loc
         if prefill_track is not None:
-            indices, mask, seqlens, mask_cpu, seqlens_cpu = prefill_track
+            indices, mask, seqlens, mask_cpu, seqlens_cpu, fork_tracks = prefill_track
             untracked = torch.full(
                 (running_bs,), -1, dtype=torch.int64, device=indices.device
             )
@@ -3394,6 +3442,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.mamba_track_seqlens = torch.cat([seqlens, untracked])
             self.mamba_prefill_track_mask_cpu = mask_cpu + [False] * running_bs
             self.mamba_track_seqlens_cpu = seqlens_cpu + [-1] * running_bs
+            # Prefill rows lead the merged batch, so fork rows keep their index.
+            self.mamba_fork_tracks = fork_tracks
         if merged_seq_lens_cpu is not None:
             self.seq_lens_cpu = merged_seq_lens_cpu
         if tail_base is not None:
@@ -3786,6 +3836,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.forward_mode = ForwardMode.DECODE
         self.mamba_track_seqlens_cpu = None
         self.mamba_prefill_track_mask_cpu = None
+        self.mamba_fork_tracks = None
         # Decode embeds the last output token via embed_tokens; clear the stale
         # prefill-time tensors so they don't leak into ForwardBatch.
         self.input_embeds = None
@@ -3942,6 +3993,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.mamba_track_seqlens = None
         self.mamba_track_seqlens_cpu = None
         self.mamba_prefill_track_mask_cpu = None
+        self.mamba_fork_tracks = None
         self.mamba_track_mask_cpu = None
         self.mamba_track_mask_next_cpu = None
         self.mamba_decode_batch_idx_cpu = None
@@ -4010,6 +4062,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.mamba_track_seqlens = None
         self.mamba_track_seqlens_cpu = None
         self.mamba_prefill_track_mask_cpu = None
+        self.mamba_fork_tracks = None
         self.mamba_track_mask_cpu = None
         self.mamba_track_mask_next_cpu = None
         self.mamba_decode_batch_idx_cpu = None
@@ -4079,6 +4132,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             mamba_track_seqlens=self.mamba_track_seqlens,
             mamba_track_seqlens_cpu=self.mamba_track_seqlens_cpu,
             mamba_prefill_track_mask_cpu=self.mamba_prefill_track_mask_cpu,
+            mamba_fork_tracks=self.mamba_fork_tracks,
             mamba_track_mask_cpu=self.mamba_track_mask_cpu,
             mamba_track_mask_next_cpu=self.mamba_track_mask_next_cpu,
             mamba_decode_batch_idx_cpu=self.mamba_decode_batch_idx_cpu,

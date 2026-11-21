@@ -666,6 +666,15 @@ class MambaComponent(TreeComponent):
         token_ids_len: int,
         is_finished: bool,
     ) -> Optional[int]:
+        if insert_params.mamba_fork:
+            # The tracked fork state; this insert stops at its depth.
+            slot, req.kv.mamba_fork_track_idx = req.kv.mamba_fork_track_idx, None
+            if self.int8_ckpt_pool is not None:
+                insert_params.mamba_value = self._commit_int8_checkpoint(slot)
+                self.cache.req_to_token_pool.mamba_allocator.free(slot)
+            else:
+                insert_params.mamba_value = slot
+            return req.kv.mamba_fork_track_seqlen
         if self.cache.enable_mamba_extra_buffer:
             cache_len = req.kv.mamba_last_track_seqlen
         else:
@@ -746,6 +755,13 @@ class MambaComponent(TreeComponent):
         insert_result: Optional[InsertResult] = None,
         insert_params: Optional[InsertParams] = None,
     ) -> None:
+        if insert_params is not None and insert_params.mamba_fork:
+            # The request's own track state is untouched; it is inserted next.
+            if insert_params.mamba_value is not None and (
+                insert_result is None or insert_result.mamba_exist
+            ):
+                self._free_mamba_value(insert_params.mamba_value)
+            return
         if is_finished:
             mamba_value_inserted = (
                 insert_result is not None and not insert_result.mamba_exist

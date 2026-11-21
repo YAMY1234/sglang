@@ -64,6 +64,9 @@ class ForwardMetadata:
     # h_track_buf snapshot (KDA path) with plain integer indexing, so the
     # copy into the track slots does not nonzero()-sync the stream.
     track_ssm_h_batch_src: Optional[torch.Tensor] = None
+    # PHYSICAL slots of the extra branching-point states (SGLANG_MAMBA_BRANCH_TRACK_DUAL);
+    # their snapshot rows follow the batch rows in track_ssm_h_batch_src.
+    track_fork_dst: Optional[torch.Tensor] = None
     state_checkpoint_cu_starts: Optional[torch.Tensor] = None
     num_state_checkpoints: int = 0
     state_checkpoint_every_n_tokens: int = 0

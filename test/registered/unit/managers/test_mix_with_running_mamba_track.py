@@ -7,6 +7,7 @@ mixed forward must still carry the track fields, or the donated checkpoint is
 whatever the slot held before.
 """
 
+import contextlib
 import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -18,6 +19,7 @@ from sglang.test.test_utils import maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
+from sglang.srt.environ import envs  # noqa: E402
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import (  # noqa: E402
     MambaAttnBackendBase,
 )
@@ -120,7 +122,7 @@ class TestMixWithRunningMambaTrack(unittest.TestCase):
             p.start()
             self.addCleanup(p.stop)
 
-    def _mix(self, lazy):
+    def _mix(self, lazy, fork_slot=None):
         pool = _Pool()
         # Prefill rows: a 300-token extend after a 128-token prefix tracks at 384;
         # a 40-token extend tracks nothing.
@@ -129,6 +131,16 @@ class TestMixWithRunningMambaTrack(unittest.TestCase):
         tracked.set_extend_range(128, 428)
         short = _Req("p1", 40, 0, [9, -1 if lazy else 10], next_idx=0)
         short.set_extend_range(0, 40)
+        env = contextlib.ExitStack()
+        if fork_slot is not None:
+            # SGLANG_MAMBA_BRANCH_TRACK_DUAL: p0 branches at 256 inside this
+            # forward, which ends its input and so tracks the end at 384.
+            tracked.mamba_branching_seqlen = 256
+            tracked.skip_radix_cache_insert = False
+            tracked.kv.mamba_fork_track_idx = None
+            pool.mamba_allocator.alloc = lambda n: torch.tensor([fork_slot])
+            env.enter_context(envs.SGLANG_MAMBA_BRANCH_TRACK_PREFER_END.override(True))
+            env.enter_context(envs.SGLANG_MAMBA_BRANCH_TRACK_DUAL.override(True))
         extend = _batch(
             [tracked, short],
             pool,
@@ -143,7 +155,7 @@ class TestMixWithRunningMambaTrack(unittest.TestCase):
             return_logprob=False,
             is_prefill_only=True,
         )
-        with patch.object(sb, "get_exec", return_value=_settings(lazy)):
+        with env, patch.object(sb, "get_exec", return_value=_settings(lazy)):
             entries = [
                 extend._mamba_radix_cache_v2_req_prepare_for_extend(r)
                 for r in extend.reqs
@@ -158,6 +170,13 @@ class TestMixWithRunningMambaTrack(unittest.TestCase):
         )
         extend.mamba_track_mask = torch.tensor([e.track_mask for e in entries])
         extend.mamba_track_seqlens = torch.tensor([e.track_seqlen for e in entries])
+        forks = [i for i, e in enumerate(entries) if e.fork_seqlen >= 0]
+        if forks:
+            extend.mamba_fork_tracks = sb.MambaForkTracks(
+                forks,
+                [entries[i].fork_seqlen for i in forks],
+                torch.cat([extend.reqs[i].kv.mamba_fork_track_idx for i in forks]),
+            )
 
         # Decode tails after prepare_for_decode. d0 sits on a track boundary
         # (seq_len 640); in lazy mode the prealloc handed it slot 11 and moved
@@ -226,6 +245,46 @@ class TestMixWithRunningMambaTrack(unittest.TestCase):
                 )
                 h_dst, final_dst = plan[2], plan[5]
                 self.assertEqual(sorted(h_dst.tolist() + final_dst.tolist()), [donated])
+
+    def test_mixed_batch_tracks_the_fork_state_into_its_own_slot(self):
+        batch, _ = self._mix(lazy=False, fork_slot=21)
+        fork = batch.mamba_fork_tracks
+        self.assertEqual(
+            (fork.rows, fork.seqlens, fork.slots.tolist()), ([0], [256], [21])
+        )
+        tracked = batch.reqs[0]
+        self.assertEqual(tracked.kv.mamba_last_track_seqlen, 384)
+        self.assertEqual(tracked.kv.mamba_fork_track_seqlen, 256)
+
+        backend = object.__new__(MambaAttnBackendBase)
+        backend.device = "cpu"
+        backend._mamba_chunk_size = STATE_CHUNK
+        backend.conv_states_shape = (1, 8, 3)
+        backend.req_to_token_pool = SimpleNamespace(translate_mamba_indices=lambda x: x)
+        backend.supports_mamba_fork_tracks = lambda: True
+        view = SimpleNamespace(
+            batch_size=4,
+            forward_mode=batch.forward_mode,
+            mamba_prefill_track_mask_cpu=batch.mamba_prefill_track_mask_cpu,
+            mamba_track_seqlens_cpu=batch.mamba_track_seqlens_cpu,
+            extend_seq_lens_cpu=batch.extend_lens,
+            extend_prefix_lens_cpu=batch.prefix_lens,
+            mamba_track_indices=batch.mamba_track_indices,
+            mamba_fork_tracks=fork,
+        )
+        row_windows = torch.tensor([[253, 254, 255]])
+        fork_dst, conv = backend._init_fork_tracks(view, row_windows)
+        # The fork's conv window ends at its depth, 256 - 128 tokens into row 0.
+        self.assertEqual(conv.tolist(), [[253, 254, 255], [125, 126, 127]])
+        self.assertEqual(fork_dst.tolist(), [21])
+        _, h_src, h_dst, h_batch_src, *_ = backend._init_track_ssm_indices_from_cpu(
+            torch.arange(100, 104), view, fork_dst
+        )
+        # Row 0's end state at chunk 4 goes to its ping-pong slot 7; the state
+        # at chunk 2 goes to the fork slot, from the snapshot row after the batch.
+        self.assertEqual(h_dst.tolist(), [7, 21])
+        self.assertEqual(h_src.tolist(), [4, 2])
+        self.assertEqual(h_batch_src.tolist(), [0, 4])
 
     def test_lazy_decode_tails_give_back_the_boundary_slot(self):
         batch, pool = self._mix(lazy=True)

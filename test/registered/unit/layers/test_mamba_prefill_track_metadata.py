@@ -14,7 +14,10 @@ from sglang.srt.layers.attention.mamba.mamba2_metadata import (
     ForwardMetadata,
     Mamba2Metadata,
 )
-from sglang.srt.managers.schedule_batch import ScheduleBatch
+from sglang.srt.layers.attention.mamba.prefill_track_metadata import (
+    build_prefill_track_plan,
+)
+from sglang.srt.managers.schedule_batch import MambaForkTracks, ScheduleBatch
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
@@ -162,6 +165,47 @@ class TestMambaPrefillTrackMetadata(unittest.TestCase):
                                 self.assertIsNone(result)
                             else:
                                 torch.testing.assert_close(result, reference)
+
+    def test_fork_item_reads_what_tracking_its_depth_would(self):
+        """A fork state (SGLANG_MAMBA_BRANCH_TRACK_DUAL) is planned exactly like
+        its row tracking that depth alone (seqlen + 1, as _force_track_h passes
+        it), into the fork slot and the snapshot row after the batch rows."""
+        backend = object.__new__(MambaAttnBackendBase)
+        backend.device = "cpu"
+        backend._mamba_chunk_size = 64
+        lengths, prefix = [130, 320, 64], [64, 0, 0]
+        track, mask = [194, 257, 64], [True, True, True]
+        fork_rows, fork_lens = [1, 0], [128, 128]
+        fork_dst = torch.tensor([900, 901])
+        batch = make_batch(lengths, prefix, track, mask, True)
+        batch.mamba_fork_tracks = MambaForkTracks(fork_rows, fork_lens, fork_dst)
+        _, h_src, h_dst, h_batch_src, *_ = backend._init_track_ssm_indices_from_cpu(
+            torch.arange(3), batch, fork_dst
+        )
+        self.assertEqual(h_dst.tolist()[2:], [900, 901])
+        self.assertEqual(h_batch_src.tolist()[2:], [3, 4])
+        for j, (row, depth) in enumerate(zip(fork_rows, fork_lens)):
+            alone = [depth + 1 if i == row else t for i, t in enumerate(track)]
+            only = [i == row for i in range(len(mask))]
+            reference = backend._init_track_ssm_indices_from_cpu(
+                torch.arange(3), make_batch(lengths, prefix, alone, only, True)
+            )
+            self.assertEqual(h_src.tolist()[2 + j], reference[1].item())
+
+    def test_fork_off_the_chunk_grid_or_outside_the_extend_is_rejected(self):
+        for depth in (100, 320, 0):
+            with self.subTest(depth=depth):
+                with self.assertRaisesRegex(AssertionError, "fork state"):
+                    build_prefill_track_plan(
+                        [True],
+                        [257],
+                        [320],
+                        [0],
+                        64,
+                        mamba2=False,
+                        fork_rows=[0],
+                        fork_lens=[depth],
+                    )
 
     def test_verify_and_incomplete_mirrors_use_existing_planner(self):
         batch = make_batch([64], [0], [64], [True], True)

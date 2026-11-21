@@ -265,6 +265,84 @@ class TestFlashInferKDAPrefillPolicy(CustomTestCase):
                 else:
                     _validate_flashinfer_kda_prefill(**kwargs)
 
+    def test_fork_tracks_need_an_eager_prefill(self):
+        from sglang.srt.environ import envs
+        from sglang.srt.layers.attention.linear.kda_backend import (
+            _validate_flashinfer_kda_prefill,
+        )
+
+        with envs.SGLANG_MAMBA_BRANCH_TRACK_DUAL.override(True):
+            _validate_flashinfer_kda_prefill(
+                chunk_size=64,
+                enable_two_batch_overlap=False,
+                prefill_cuda_graph_backend="disabled",
+            )
+            with self.assertRaisesRegex(ValueError, "BRANCH_TRACK_DUAL"):
+                _validate_flashinfer_kda_prefill(
+                    chunk_size=64,
+                    enable_two_batch_overlap=False,
+                    prefill_cuda_graph_backend="breakable",
+                )
+
+    def test_fork_states_take_the_snapshot_rows_after_the_batch(self):
+        import torch
+
+        from sglang.srt.layers.attention.linear.kernels import (
+            kda_flashinfer_prefill,
+        )
+        from sglang.srt.layers.attention.mamba.prefill_track_metadata import (
+            build_prefill_track_plan,
+        )
+        from sglang.srt.managers.schedule_batch import MambaForkTracks
+
+        tensor = torch.tensor
+
+        def unpinned(*args, pin_memory=False, **kwargs):
+            return tensor(*args, **kwargs)
+
+        # Row 0 extends 320 tokens and tracks its end state at the 256 boundary
+        # (seqlen 257 forces h); its fork state sits at 128. Row 1 is untracked.
+        for fork_depth, destinations in ((128, [-1, 1, -1, 0, -1, -1]), (256, None)):
+            with self.subTest(fork_depth=fork_depth):
+                fork = MambaForkTracks([0], [fork_depth], torch.tensor([9]))
+                plan = build_prefill_track_plan(
+                    [True, False],
+                    [257, -1],
+                    [320, 64],
+                    [0, 0],
+                    64,
+                    mamba2=False,
+                    fork_rows=fork.rows,
+                    fork_lens=fork.seqlens,
+                )
+                # Item 2 (= batch size + fork 0) is the fork's destination and
+                # snapshot row; h_src counts chunks from row 0's first chunk.
+                self.assertEqual(plan.h_rows, [0, 2])
+                self.assertEqual(plan.unaligned_rows, [0, 2])
+                self.assertEqual(plan.h_src, [4, fork_depth // 64])
+                batch = SimpleNamespace(
+                    extend_seq_lens_cpu=[320, 64],
+                    extend_prefix_lens_cpu=[0, 0],
+                    mamba_track_seqlens_cpu=[257, -1],
+                    mamba_prefill_track_mask_cpu=[True, False],
+                    mamba_fork_tracks=fork,
+                )
+                metadata = SimpleNamespace(
+                    track_ssm_h_batch_src=torch.tensor(plan.unaligned_rows)
+                )
+                build = kda_flashinfer_prefill.build_flashinfer_kda_checkpoint_plan
+                with patch.object(kda_flashinfer_prefill.torch, "tensor", unpinned):
+                    if destinations is None:
+                        # The end state's boundary cannot also be the fork's.
+                        with self.assertRaisesRegex(AssertionError, "fork row"):
+                            build(batch, metadata, "cpu", 64)
+                        continue
+                    build(batch, metadata, "cpu", 64)
+                self.assertEqual(
+                    metadata.state_checkpoint_indices.tolist(), destinations
+                )
+                self.assertEqual(metadata.num_state_checkpoints, 2)
+
     def test_invalid_checkpoint_metadata_fails_instead_of_falling_back(self):
         import torch
 
@@ -283,6 +361,7 @@ class TestFlashInferKDAPrefillPolicy(CustomTestCase):
                     extend_prefix_lens_cpu=[0],
                     mamba_track_seqlens_cpu=[track_len],
                     mamba_prefill_track_mask_cpu=[True],
+                    mamba_fork_tracks=None,
                 )
                 metadata = SimpleNamespace(
                     track_ssm_h_batch_src=torch.tensor(rows, dtype=torch.int32)

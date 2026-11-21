@@ -104,6 +104,22 @@ def build_flashinfer_kda_checkpoint_plan(
             num_tracked_checkpoints
         )
         num_tracked_checkpoints += 1
+    # Fork states (SGLANG_MAMBA_BRANCH_TRACK_DUAL) take the snapshot rows after
+    # the batch's, in fork order, as build_prefill_track_plan lists them.
+    fork = forward_batch.mamba_fork_tracks
+    for row, depth in zip(fork.rows, fork.seqlens) if fork is not None else ():
+        completed_chunks, rem = divmod(depth - prefix_lens[row], chunk_size)
+        boundary = checkpoint_starts[row] + completed_chunks - 1
+        assert (
+            rem == 0
+            and 0 < completed_chunks <= checkpoint_counts[row]
+            and checkpoint_destinations[boundary] == -1
+        ), (
+            f"Invalid KDA checkpoint metadata: fork row={row}, depth={depth}, "
+            f"prefix={prefix_lens[row]}, extend_len={extend_lens[row]}"
+        )
+        checkpoint_destinations[boundary] = num_tracked_checkpoints
+        num_tracked_checkpoints += 1
 
     assert num_tracked_checkpoints == metadata.track_ssm_h_batch_src.numel(), (
         "KDA checkpoint rows disagree with the prefill tracking metadata"

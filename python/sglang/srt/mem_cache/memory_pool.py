@@ -1832,6 +1832,10 @@ class HybridReqToTokenPool(ReqToTokenPool):
         assert mamba_index is not None, "double free? mamba_index is None"
         self.mamba_allocator.free(mamba_index.unsqueeze(0))
         req.kv.mamba_pool_idx = None
+        if req.kv.mamba_fork_track_idx is not None:
+            # A fork state no tree checkpoint took (SGLANG_MAMBA_BRANCH_TRACK_DUAL).
+            self.mamba_allocator.free(req.kv.mamba_fork_track_idx)
+            req.kv.mamba_fork_track_idx = None
 
         if self.enable_mamba_extra_buffer:
             size = self.mamba_ping_pong_track_buffer_size

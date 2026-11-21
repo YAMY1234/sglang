@@ -6,6 +6,7 @@ before these row indices gather physical source and destination slots.
 
 from dataclasses import dataclass
 from itertools import accumulate
+from typing import Sequence
 
 
 @dataclass
@@ -28,8 +29,14 @@ def build_prefill_track_plan(
     chunk_size: int,
     *,
     mamba2: bool,
+    fork_rows: Sequence[int] = (),
+    fork_lens: Sequence[int] = (),
 ) -> PrefillTrackPlan:
-    """Use the backend's actual chunk size, including Mamba2's flat grid."""
+    """Use the backend's actual chunk size, including Mamba2's flat grid.
+
+    Fork ``j`` (an extra chunk-boundary state of batch row ``fork_rows[j]``) is
+    item ``len(mask) + j``: ``h_rows`` and ``unaligned_rows`` index the batch's
+    track destinations followed by the fork slots, and the snapshot rows."""
     assert len(mask) == len(track_lens) == len(extend_lens) == len(prefix_lens)
     starts = list(accumulate(extend_lens, initial=0))
     h_offsets = list(
@@ -54,4 +61,14 @@ def build_prefill_track_plan(
         else:
             plan.h_rows.append(row)
             plan.h_src.append(end // chunk_size if mamba2 else h_offsets[row] + chunk)
+    assert len(fork_rows) == len(fork_lens) and not (fork_rows and mamba2)
+    for j, (row, fork_len) in enumerate(zip(fork_rows, fork_lens)):
+        chunk, rem = divmod(fork_len - prefix_lens[row], chunk_size)
+        assert rem == 0 and 0 < chunk * chunk_size < extend_lens[row], (
+            f"fork state off the chunk grid or outside the extend: {row=} "
+            f"{fork_len=} prefix={prefix_lens[row]} extend={extend_lens[row]}"
+        )
+        plan.unaligned_rows.append(len(mask) + j)
+        plan.h_rows.append(len(mask) + j)
+        plan.h_src.append(h_offsets[row] + chunk)
     return plan

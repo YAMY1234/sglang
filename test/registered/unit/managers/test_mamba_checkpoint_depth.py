@@ -14,6 +14,7 @@ from array import array
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import (
     Req,
     ScheduleBatch,
@@ -41,6 +42,8 @@ def _prepare_extend(
     extend_len: int,
     dcp_enabled: bool = False,
     next_idx: int = 0,
+    branching_seqlen: int | None = None,
+    free_mamba_slot=None,
 ) -> tuple[_MambaRadixCacheV2TrackEntry, Req]:
     """Run one extend through the tracker; return its track entry and the request."""
     server_args = ServerArgs(model_path="dummy", page_size=CHUNK)
@@ -60,7 +63,7 @@ def _prepare_extend(
     req.prefix_len = prefix_len
     req.extend_end = prefix_len + extend_len
     req.kv.mamba_next_track_idx = next_idx
-    req.mamba_branching_seqlen = None
+    req.mamba_branching_seqlen = branching_seqlen
 
     batch = ScheduleBatch(reqs=[req])
     batch.model_config = SimpleNamespace(
@@ -69,6 +72,7 @@ def _prepare_extend(
     batch.tree_cache = SimpleNamespace(page_size=tree_page)
     batch.req_to_token_pool = MagicMock()
     batch.req_to_token_pool.get_mamba_ping_pong_other_idx.return_value = 1 - next_idx
+    batch.req_to_token_pool.mamba_allocator.alloc.return_value = free_mamba_slot
 
     with patch(
         "sglang.srt.managers.schedule_batch.get_parallel",
@@ -243,6 +247,46 @@ class TestMambaTrackPosition(unittest.TestCase):
                 self.assertTrue(entry.track_mask)
                 self.assertEqual(entry.track_position, next_idx)
                 self.assertEqual(req.kv.mamba_next_track_idx, 1 - next_idx)
+
+
+class TestMambaBranchTrackDual(unittest.TestCase):
+    """With PREFER_END the forward that ends the input tracks the input end; DUAL
+    also tracks the branching-point state, in an extra Mamba slot."""
+
+    def _prepare(self, *, branching_seqlen=512, dual=True, free_mamba_slot="slot"):
+        with (
+            envs.SGLANG_MAMBA_BRANCH_TRACK_PREFER_END.override(True),
+            envs.SGLANG_MAMBA_BRANCH_TRACK_DUAL.override(dual),
+        ):
+            return _prepare_extend(
+                tree_page=CHUNK,
+                prefix_len=0,
+                extend_len=1000,
+                branching_seqlen=branching_seqlen,
+                free_mamba_slot=free_mamba_slot,
+            )
+
+    def test_the_fork_is_tracked_beside_the_input_end(self):
+        entry, req = self._prepare()
+        self.assertEqual(entry.fork_seqlen, 512)
+        self.assertEqual(req.kv.mamba_fork_track_idx, "slot")
+        self.assertEqual(req.kv.mamba_fork_track_seqlen, 512)
+        # The end state keeps its own checkpoint at the last chunk boundary.
+        self.assertEqual(entry.track_seqlen, 1000)
+        self.assertEqual(req.kv.mamba_last_track_seqlen, 960)
+
+    def test_no_fork_when_off_without_a_free_slot_or_at_the_end_checkpoint(self):
+        for kwargs in (
+            dict(dual=False),
+            dict(free_mamba_slot=None),
+            # The end's own checkpoint already is the branching-point state.
+            dict(branching_seqlen=960),
+        ):
+            with self.subTest(**kwargs):
+                entry, req = self._prepare(**kwargs)
+                self.assertEqual(entry.fork_seqlen, -1)
+                self.assertIsNone(req.kv.mamba_fork_track_idx)
+                self.assertEqual(req.kv.mamba_last_track_seqlen, 960)
 
 
 class TestMambaTrackGrid(unittest.TestCase):
