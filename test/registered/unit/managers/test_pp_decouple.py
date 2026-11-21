@@ -23,6 +23,7 @@ maybe_stub_sgl_kernel()
 
 import torch  # noqa: E402
 
+from sglang.srt.distributed import parallel_state  # noqa: E402
 from sglang.srt.managers import pp_decouple  # noqa: E402
 from sglang.srt.managers.pp_decouple import PPSendWindow, PPSendWindows  # noqa: E402
 from sglang.srt.managers.schedule_batch import (  # noqa: E402
@@ -151,6 +152,19 @@ class TestPPSendWindow(CustomTestCase):
         self.assertEqual(log, ["proxy1.0", "proxy1.1"])
         self.assertEqual(scheduler.pp_send_done_event, "event")
         self.assertEqual(len(scheduler.pp_send_windows.proxy), 1)
+
+
+class _CountedWork:
+    """A gloo send Work: is_completed() turns true only once it is waited."""
+
+    def __init__(self):
+        self.waits = 0
+
+    def wait(self):
+        self.waits += 1
+
+    def is_completed(self):
+        return self.waits > 0
 
 
 class TestPPLateRecv(CustomTestCase):
