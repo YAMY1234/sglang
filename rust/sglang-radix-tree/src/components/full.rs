@@ -221,7 +221,12 @@ impl<K: ChildKeyType> TreeComponent<K> for FullComponent {
                     tree_core.full_coexisting_host_nodes.discard(node_id);
                     continue;
                 }
-                if spare_imminent_demotes && tree_core.evictable_device_leaves.contains(node_id) {
+                // The written-ahead tail is never reclaimed: host eviction falls
+                // to host-only leaves instead of discarding those copies.
+                if tree_core.is_write_ahead_spared_(node_id)
+                    || (spare_imminent_demotes
+                        && tree_core.evictable_device_leaves.contains(node_id))
+                {
                     continue;
                 }
                 if !tree_core.can_reclaim_coexisting_host_value_(node_id, FULL) {
@@ -503,6 +508,7 @@ impl<K: ChildKeyType> TreeComponent<K> for FullComponent {
                     tree_core
                         .arena
                         .set_host_value(node_id, FULL, host_indices.copy());
+                    tree_core.record_l3_lifetime_event_(node_id, FULL, "create", "host", "D2H_reserve");
                 }
             }
             CacheTransferPhase::LoadBack => {
