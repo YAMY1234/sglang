@@ -351,6 +351,10 @@ class _ProfilerTorch(_ProfilerConcreteBase):
     def stop(self):
         Path(self.output_dir).mkdir(parents=True, exist_ok=True)
 
+        if torch.cuda.is_available():
+            # A pipeline stage's host can run several forwards ahead of its GPU; let every kernel
+            # launched under the profiler finish before Kineto finalizes its activity buffers.
+            torch.cuda.synchronize()
         self.torch_profiler.stop()
         if not _is_npu:
             # Build filename with only non-zero ranks to maintain backward compatibility
