@@ -906,6 +906,10 @@ class Envs:
     SGLANG_PP_DEBUG_STALL = EnvStr("")
     # Debug: synchronize the device before the torch profiler stops, so no profiled kernel is still queued.
     SGLANG_PROFILER_SYNC_BEFORE_STOP = EnvBool(False)
+    # Debug: skip the full gc.collect() after a profile stops (it runs at a rank-local time).
+    SGLANG_PROFILER_SKIP_GC = EnvBool(False)
+    # Debug: run gc.collect() at the end of each SGLANG_PP_DEBUG_STALL sleep.
+    SGLANG_PP_DEBUG_STALL_GC = EnvBool(False)
     SGLANG_PP_CE_PUSH_SLOT_MB = EnvInt(1600)
     # PP PD prefill: log a digest of allocator and radix tree state every N loop
     # epochs (0 = off); every stage must log the same digest at the same epoch.

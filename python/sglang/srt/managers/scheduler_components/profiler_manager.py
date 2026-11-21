@@ -338,6 +338,9 @@ class SchedulerProfilerManager:
         stage_suffix = f"-{stage.name}" if stage else ""
         logger.info("Stop profiling" + stage_suffix + "...")
         if self.torch_profiler is not None:
+            if envs.SGLANG_PROFILER_SYNC_BEFORE_STOP.get() and torch.cuda.is_available():
+                # Kernels launched while profiling must finish before the activity buffers are released.
+                torch.cuda.synchronize()
             self.torch_profiler.stop()
             if not _is_npu:
                 # Build filename with only non-zero ranks to maintain backward compatibility
@@ -402,7 +405,8 @@ class SchedulerProfilerManager:
 
         if self.torch_profiler is not None:
             self.torch_profiler = None
-            gc.collect()
+            if not envs.SGLANG_PROFILER_SKIP_GC.get():
+                gc.collect()
 
         self.profile_in_progress = False
         self.profiler_start_forward_ct = None

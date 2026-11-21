@@ -373,6 +373,10 @@ class SchedulerPPMixin:
                 if stall_fct >= 0 and self.forward_ct >= stall_fct:
                     logger.info("PP debug stall: %.1f s at forward %d", stall_s, self.forward_ct)
                     time.sleep(stall_s)
+                    if envs.SGLANG_PP_DEBUG_STALL_GC.get():
+                        import gc
+
+                        logger.info("PP debug stall: gc.collect() -> %d", gc.collect())
                     stall_fct = -1
                 self.running_batch = self.running_mbs[mb_id]
                 self.last_batch = self.last_mbs[mb_id]
