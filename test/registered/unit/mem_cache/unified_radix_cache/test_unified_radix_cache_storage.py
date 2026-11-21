@@ -1,6 +1,7 @@
 """L3 storage, buffer-only host memory and prefetch tests for UnifiedRadixCache."""
 
 import os
+import shutil
 import time
 import unittest
 from array import array
@@ -394,6 +395,121 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheStorageFixtures):
         self.assertTrue(torch.equal(loaded_k, expected_k))
         self.assertTrue(torch.equal(loaded_v, expected_v))
         cons.sanity_check()
+
+    def _s2ba_kept_state_fixture(self, seqs):
+        """S2b-alpha: insert ``seqs`` (each a prefix of the last, each end holding a
+        state), back the path up to host and L3, then evict device and host KV: the
+        nodes stay as kv_in_storage with their host states."""
+        for env, value in (
+            (envs.SGLANG_HICACHE_KV_EVICT_KEEP_STATE, True),
+            (envs.SGLANG_HICACHE_L3_KV_FILL, True),
+            (envs.SGLANG_HICACHE_L3_KV_FILL_MIN_TOKENS, 1),
+            (envs.SGLANG_HICACHE_L3_WRITE_ON_HOST_EVICT, True),
+            (envs.SGLANG_HICACHE_L3_WRITE_MAMBA_HOST_LEAVES, True),
+        ):
+            override = env.override(value)
+            override.__enter__()
+            self.addCleanup(override.__exit__, None, None, None)
+        storage_dir = self._make_storage_dir()
+        cache, allocator, req_to_token_pool = build_fixture(
+            self.cfg, tree_core_backend="rust"
+        )
+        self._init_hicache(
+            cache,
+            write_policy="write_back",
+            storage_backend="file",
+            storage_dir=storage_dir,
+            prefetch_threshold=1,
+        )
+        seq = seqs[-1]
+        for tokens in seqs:
+            self._insert(cache, allocator, req_to_token_pool, tokens)
+        leaf = match_prefix(cache, seq).last_device_node
+        indices = cache.path_device_indices(leaf)
+        self._fill_full_kv(allocator, indices, marker=7)
+        expected = self._snapshot_full_kv(allocator, indices)
+        self._backup_node(cache, leaf)
+        self.assertIsNotNone(node_host_value(cache, leaf, ComponentType.MAMBA))
+        self._write_path_to_l3(cache, leaf)
+        self._flush_l3_backups(cache)
+        cache.evict(EvictParams(num_tokens=len(seq)))
+        self.assertEqual(cache.evict_host(len(seq)), len(seq))
+        stats = cache.tree_core.kv_in_storage_stats()
+        self.assertEqual(stats[0], len(seqs), stats)
+        self.assertEqual(stats[-2:], (len(seqs), len(seqs)), stats)
+        return cache, allocator, seq, storage_dir, expected
+
+    @requires_hicache
+    @requires(
+        lambda cfg: cfg.has_mamba and cfg.page_size == 1,
+        "S2b-alpha KV fill: one Full+Mamba config",
+    )
+    def test_s2ba_kv_fill_refills_the_kept_state_then_rematches(self):
+        """A KV fill reads the KV in front of a kept host state back from L3; its
+        continuation sees the longer prefix, so today's path would start past the
+        restored pages instead of fetching them again."""
+        seq = self._make_seq(1, 8)
+        cache, allocator, seq, _, expected = self._s2ba_kept_state_fixture([seq])
+        fill = match_prefix(cache, seq).kv_fill
+        self.assertIsNotNone(fill)
+        self.assertEqual((fill.start_len, fill.end_len, fill.state_pages), (0, 8, (8,)))
+
+        rematched = []
+        req_id = CacheRequestHandle("s2ba-kv-fill", 0)
+        self.assertTrue(
+            cache.prefetch_kv_fill_from_storage(
+                req_id,
+                fill,
+                seq[fill.start_len : fill.end_len],
+                on_complete=lambda: rematched.append(match_prefix(cache, seq)),
+            )
+        )
+        self._run_prefetch_to_completion(cache, req_id)
+
+        self.assertEqual(len(rematched), 1)
+        after = rematched[0]
+        self.assertEqual(after.device_prefix_len + after.host_hit_length, len(seq))
+        self.assertIsNone(after.kv_fill)
+        self.assertEqual(cache.tree_core.kv_in_storage_stats()[1], 1)
+        self.assertFalse(cache._kv_fill_pending)
+        self._load_back_node(cache, after.last_host_node)
+        loaded = cache.path_device_indices(match_prefix(cache, seq).last_device_node)
+        loaded_k, loaded_v = self._snapshot_full_kv(allocator, loaded)
+        self.assertTrue(torch.equal(loaded_k, expected[0]))
+        self.assertTrue(torch.equal(loaded_v, expected[1]))
+        cache.sanity_check()
+
+    @requires_hicache
+    @requires(
+        lambda cfg: cfg.has_mamba and cfg.page_size == 1,
+        "S2b-alpha KV fill: one Full+Mamba config",
+    )
+    def test_s2ba_kv_fill_miss_invalidates_the_unfillable_states(self):
+        """L3 lost the KV after the states were kept: the agreed fill is empty, so the
+        states go (lazy invalidation) and the kv_in_storage nodes are pruned."""
+        seq = self._make_seq(1, 8)
+        cache, _, seq, storage_dir, _ = self._s2ba_kept_state_fixture([seq[:4], seq])
+        for name in os.listdir(storage_dir):
+            path = os.path.join(storage_dir, name)
+            shutil.rmtree(path) if os.path.isdir(path) else os.remove(path)
+        fill = match_prefix(cache, seq).kv_fill
+        self.assertEqual(fill.state_pages, (4, 8))
+        rematched = []
+        req_id = CacheRequestHandle("s2ba-kv-fill-miss", 0)
+        cache.prefetch_kv_fill_from_storage(
+            req_id,
+            fill,
+            seq[fill.start_len : fill.end_len],
+            on_complete=lambda: rematched.append(match_prefix(cache, seq)),
+        )
+        self._run_prefetch_to_completion(cache, req_id)
+
+        self.assertEqual(len(rematched), 1)
+        self.assertIsNone(rematched[0].kv_fill)
+        stats = cache.tree_core.kv_in_storage_stats()
+        self.assertEqual(stats[5], 2, stats)
+        self.assertEqual(stats[-2:], (0, 0), stats)
+        cache.sanity_check()
 
     @requires_hicache
     @requires(
