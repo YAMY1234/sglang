@@ -4500,6 +4500,26 @@ class Scheduler(
 
         return NextBatchPlan(batch_to_run=ret, running_batch=running_batch)
 
+    def _pp_debug_trace_admission(self, chunked_prefill_size: int) -> None:
+        """SGLANG_PP_DEBUG_TRACE: every input of this admission pass, to compare across PP ranks."""
+        import hashlib
+
+        wq = self.waiting_queue
+        order = hashlib.blake2b("|".join(r.rid for r in wq).encode(), digest_size=6).hexdigest()
+        top = [
+            (r.rid[:6], r.num_matched_prefix_tokens, len(r.origin_input_ids), r.extend_end)
+            for r in wq[:6]
+        ]
+        logger.info(
+            "PPT admit fct=%d wq=%d order=%s chunked=%s chunk=%d avail=%d evictable=%d protected=%d "
+            "reqpool=%d processed=%d top=%s",
+            self.forward_ct, len(wq), order,
+            None if self.chunked_req is None else self.chunked_req.rid[:6],
+            chunked_prefill_size, self.token_to_kv_pool_allocator.available_size(),
+            self.tree_cache.evictable_size(), self.tree_cache.protected_size(),
+            self.req_to_token_pool.available_size(), self.processed_tokens_counter, top,
+        )
+
     def _get_new_batch_prefill_raw(
         self,
         prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor],
@@ -4588,6 +4608,8 @@ class Scheduler(
         else:
             prefill_tile_block_m = 64  # Fallback for non-Triton backends
 
+        if envs.SGLANG_PP_DEBUG_TRACE.get() and get_parallel().pp_size > 1:
+            self._pp_debug_trace_admission(chunked_prefill_size)
         adder = self.get_prefill_adder_class()(
             self.page_size,
             self.tree_cache,
