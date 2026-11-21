@@ -820,6 +820,7 @@ def build_mega_moe_experts_weights(experts) -> None:
 
     mma_type = _mega_moe_mma_type(experts)
     w13 = experts.w13_weight.data
+    _mm_loc_log_load_memory(w13)
     w13_sf_fp32 = _mega_moe_sf_as_fp32(experts.w13_weight_scale_inv.data)
     w2 = experts.w2_weight.data
     w2_sf_fp32 = _mega_moe_sf_as_fp32(experts.w2_weight_scale_inv.data)
@@ -1113,3 +1114,23 @@ def _dec_b136_dump_weights(moe) -> None:
         out["sl1"], out["sl2"] = cpu(moe.mega_shared_l1_weights), cpu(moe.mega_shared_l2_weights)
     torch.save(out, f"{d}/sglang-layer{l}.pt")
     logger.warning("dec-b136 dumped MegaMoE layer %s weights to %s", l, d)
+
+
+_MM_LOC_LOGGED = []
+
+
+def _mm_loc_log_load_memory(w13) -> None:
+    """mm-loc rig-only: memory at the first MegaMoE build, i.e. after the whole checkpoint loaded."""
+    if _MM_LOC_LOGGED:
+        return
+    _MM_LOC_LOGGED.append(1)
+    free, total = torch.cuda.mem_get_info()
+    st = torch.cuda.memory_stats()
+    logger.warning(
+        "mm-loc load memory: w13 %s %s; allocated %.2f GiB, peak allocated %.2f GiB, "
+        "reserved %.2f GiB, peak reserved %.2f GiB, device used %.2f GiB, num_alloc_retries %d",
+        tuple(w13.shape), tuple(w13.stride()),
+        torch.cuda.memory_allocated() / 2**30, torch.cuda.max_memory_allocated() / 2**30,
+        torch.cuda.memory_reserved() / 2**30, st.get("reserved_bytes.all.peak", 0) / 2**30,
+        (total - free) / 2**30, st.get("num_alloc_retries", 0),
+    )
