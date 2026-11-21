@@ -886,6 +886,11 @@ class Envs:
     # forward ends. A receive kernel waits on the GPU for its sender, and resident there it
     # blocks the forward's cooperative kernels (MoE routing).
     SGLANG_PP_DECOUPLE_LATE_RECV = EnvBool(False)
+    # Under SGLANG_PP_DECOUPLE_HOST: hand activations to the next stage by copy-engine push into its
+    # input ring (CUDA VMM FABRIC memory, stream wait/write value) instead of NCCL; no kernel stays
+    # resident while a side waits. A message larger than a slot falls back to NCCL.
+    SGLANG_PP_CE_PUSH = EnvBool(False)
+    SGLANG_PP_CE_PUSH_SLOT_MB = EnvInt(1600)
     # PP PD prefill: log a digest of allocator and radix tree state every N loop
     # epochs (0 = off); every stage must log the same digest at the same epoch.
     SGLANG_DEBUG_PP_STATE_DIGEST_EVERY = EnvInt(0)

@@ -15,3 +15,4 @@ class P2PTag(IntEnum):
     GRAMMAR_PP_SYNC = int.from_bytes(b"PpGr", byteorder="big")
     DISAGG_BOOTSTRAP_PP_SYNC = int.from_bytes(b"PpBs", byteorder="big")
     DISAGG_RELEASE_PP_SYNC = int.from_bytes(b"PpRl", byteorder="big")
+    PP_CE_PUSH_SETUP = int.from_bytes(b"PpCe", byteorder="big")

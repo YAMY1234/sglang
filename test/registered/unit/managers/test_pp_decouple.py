@@ -180,6 +180,75 @@ class TestPPLateRecv(CustomTestCase):
         self.assertEqual(log, [("recv",)])
 
 
+class TestPPCEPush(CustomTestCase):
+    def test_layout_is_aligned_and_the_slot_reuse_waits_for_the_previous_user(self):
+        from sglang.srt.managers.pp_ce_push import CESlice, free_target, pack_layout, slot_of
+
+        layout, used = pack_layout(
+            [("hidden_states", torch.bfloat16, (3, 5), 30), ("residual", torch.bfloat16, (3, 5), 30)]
+        )
+        self.assertEqual(
+            [(k, v.offset) for k, v in layout], [("hidden_states", 0), ("residual", 256)]
+        )
+        self.assertEqual(used, 512)
+        self.assertIsInstance(layout[0][1], CESlice)
+        # Two slots: seq 2 reuses slot 0 and waits until seq 0 was released (released value = seq + 1).
+        self.assertEqual((slot_of(2, 2), free_target(2, 2)), (0, 1))
+        self.assertLessEqual(free_target(1, 2), 0)
+
+    def _scheduler(self, last, log):
+        from sglang.srt.managers.pp_ce_push import CEWait
+
+        scheduler = SchedulerPPMixin()
+        scheduler.pp_comm_stream_ctx = nullcontext()
+        scheduler.forward_stream = "forward"
+        scheduler.pp_send_done_event = None
+        scheduler.schedule_stream = "schedule"
+        scheduler.forward_stream = SimpleNamespace(
+            name="forward",
+            wait_stream=lambda s: None,
+            wait_event=lambda e: log.append(("fwd_wait_event", e)),
+        )
+        scheduler.pp_group = SimpleNamespace(is_last_rank=last)
+        scheduler._pp_record_comm_event = lambda: "comm-tail"
+        ce = SimpleNamespace(
+            stream=SimpleNamespace(name="push", wait_event=lambda e: log.append(("push_wait", e))),
+            wait_full=lambda stream, ss: log.append(("wait_full", stream.name, ss)),
+            release=lambda stream, ss: log.append(("release", stream.name, ss)),
+        )
+        scheduler._pp_ce = ce
+        scheduler.pp_proxy_recv_event = CEWait((1, 7))
+        return scheduler
+
+    def test_forward_waits_on_the_slot_and_releases_it_after_its_own_push(self):
+        """The slot may be read in place by the stage's outgoing send (an in-place residual): a
+        non-last stage releases it on the push stream after that push, an NCCL fallback after the
+        fallback send's work; the last stage releases it on the forward stream."""
+        log = []
+        s = self._scheduler(False, log)
+        s._pp_wait_forward_dependencies()
+        self.assertEqual(log, [("wait_full", "forward", (1, 7))])
+        s._pp_ce_release_input()
+        self.assertEqual(log[1:], [("release", "push", (1, 7))])
+        s._pp_ce_release_input()
+        self.assertEqual(len(log), 2)
+
+        log.clear()
+        s = self._scheduler(False, log)
+        s._pp_wait_forward_dependencies()
+        sent = _round("nccl", log)
+        s._pp_ce_release_input(nccl_send_work=sent)
+        self.assertEqual(
+            log[1:], ["nccl.0", "nccl.1", ("push_wait", "comm-tail"), ("release", "push", (1, 7))]
+        )
+
+        log.clear()
+        s = self._scheduler(True, log)
+        s._pp_wait_forward_dependencies()
+        s._pp_ce_release_input()
+        self.assertEqual(log[1:], [("release", "forward", (1, 7))])
+
+
 class _StageModel:
     """One PP stage's allocator and radix tree, driven by per-epoch operations."""
 
