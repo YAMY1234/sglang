@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 from functools import partial
 from typing import TYPE_CHECKING, Any, Callable, Optional
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.dcp.layout import dsa_shards_index_k
 from sglang.srt.mem_cache.device_pool_info import (
     IndexKeyLayout,
@@ -230,6 +231,25 @@ def _split_hicache_size(
         hicache_size * size_bytes / total_device_pool_size
         for size_bytes in device_pool_sizes
     )
+
+
+def _mamba_host_ratio_scale() -> float:
+    scale = envs.SGLANG_HICACHE_MAMBA_HOST_RATIO_SCALE.get()
+    if not scale > 0:
+        raise ValueError(
+            f"SGLANG_HICACHE_MAMBA_HOST_RATIO_SCALE must be positive, got {scale}"
+        )
+    return scale
+
+
+def _rebalance_mamba_host_size(
+    kv_host_size: float, mamba_host_size: float
+) -> tuple[float, float]:
+    # --hicache-size is a byte budget split by device pool size. Scale the Mamba
+    # share inside it; the KV share gives or takes the difference.
+    extra = mamba_host_size * (_mamba_host_ratio_scale() - 1.0)
+    extra = min(extra, kv_host_size)
+    return kv_host_size - extra, mamba_host_size + extra
 
 
 def build_pool_entry(
@@ -1122,7 +1142,7 @@ def build_mamba_host_pool(
 
     return MambaPoolHost(
         pool_info.buffer_info,
-        mamba_host_ratio(get_memory().hicache_ratio),
+        mamba_host_ratio(get_memory().hicache_ratio * _mamba_host_ratio_scale()),
         host_size,
         device_capacity=device_capacity_tokens(mamba_pool),
         mtp_draft_buffer_infos=draft_buffer_infos,
@@ -1219,7 +1239,9 @@ def build_hybrid_mamba_stack(
             hicache_size=get_memory().hicache_size,
             kv_pools=(kv_pool, mamba_pool, *params.mtp_draft_mamba_pools),
         )
-        mamba_host_size = sum(mamba_shares)
+        kv_host_size, mamba_host_size = _rebalance_mamba_host_size(
+            kv_host_size=kv_host_size, mamba_host_size=sum(mamba_shares)
+        )
     index_bytes = _kv_budget_index_bytes(config)
     if index_bytes and kv_host_size is not None:
         kv_bytes = sum(kv_pool.get_kv_size_bytes())
@@ -1299,7 +1321,9 @@ def build_hybrid_mamba_swa_stack(
                 *params.mtp_draft_mamba_pools,
             ),
         )
-        mamba_host_size = sum(mamba_shares)
+        kv_host_size, mamba_host_size = _rebalance_mamba_host_size(
+            kv_host_size=kv_host_size, mamba_host_size=sum(mamba_shares)
+        )
     host_pool_group = build_hybrid_swa_group(
         page_size=params.page_size,
         full_kv_pool=full_kv_pool,
