@@ -57,6 +57,7 @@ from sglang.srt.model_executor.runner_utils.prefill_graph import (
 from sglang.srt.models.deepseek_v2 import MoEOutput
 from sglang.srt.runtime_context import get_forward, get_parallel, get_platform
 from sglang.srt.utils import is_gfx95_supported, is_hip, is_npu, is_xpu
+from sglang.srt.utils.log_utils import print_info_once
 
 _is_gfx95_supported = is_gfx95_supported()
 _is_hip = is_hip()
@@ -503,6 +504,10 @@ def defer_attn_stats_fork(stats_stream: torch.cuda.Stream) -> None:
     instead of beside the full-grid projection GEMMs."""
     global _deferred_attn_fork
     assert _deferred_attn_fork is None
+    if envs.SGLANG_OPT_DSV41_ATTN_STATS_FORK_AT_READ.get():
+        print_info_once("mHC attention mix: side stream forked at the read")
+        fork_stats_stream(stats_stream)
+        return
     _deferred_attn_fork = stats_stream
 
 
