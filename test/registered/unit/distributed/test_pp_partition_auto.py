@@ -71,6 +71,15 @@ class TestBestPartition(CustomTestCase):
         self.assertGreaterEqual(part[0], 2)
         self.assertTrue(all(any(tiny[st : st + n]) for st, n in zip(starts, part)), part)
 
+    def test_no_stage_is_left_without_a_linear_attention_layer(self):
+        """In a hybrid model a stage of full-attention layers only has an empty Mamba pool, and the HiCache host
+        split rejects a 0 GB Mamba share at boot (a slow PP3 once got the split 2,2,3,1,2,2,2,2 and PP3 kept one
+        full-attention layer alone)."""
+        tiny = [i % 2 == 1 for i in range(16)]
+        part, _ = ppa.best_partition(tiny, [1.0] * 3 + [1.4] + [1.0] * 4, ppa.KIMI_K31_PREFILL)
+        starts = [sum(part[:s]) for s in range(8)]
+        self.assertTrue(all(not all(tiny[st : st + n]) for st, n in zip(starts, part)), part)
+
 
 class TestResolve(CustomTestCase):
     def run_ranks(self, speeds_by_rank, pp_of_rank, chosen_by_rank0=None):
