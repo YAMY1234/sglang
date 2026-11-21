@@ -676,6 +676,9 @@ class Envs:
     # MegaAttention reads fork the attention mix's side stream at the read (beside the q/kv
     # projections) instead of deferring it to the attention core. Scheduling only.
     SGLANG_OPT_DSV41_ATTN_STATS_FORK_AT_READ = EnvBool(False)
+    # With the fork deferred (FORK_AT_READ off): release it right after the fused q/kv norm
+    # (beside wq_b) instead of at the attention core. Scheduling only.
+    SGLANG_OPT_DSV41_ATTN_STATS_FORK_AFTER_QKV_NORM = EnvBool(False)
     # The decode candidate-table publish (block amax, block top-k, sort, schedule) on the main
     # stream after the source's own top-k, instead of on the indexer side stream. Same values.
     SGLANG_OPT_DSV41_SERIAL_CANDIDATE_PUBLISH = EnvBool(False)

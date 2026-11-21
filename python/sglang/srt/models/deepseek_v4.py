@@ -1926,6 +1926,10 @@ class MqaAttentionBase(nn.Module):
         if out is None:
             return None
         print_info_once("DSV4 fused q/kv norm: on")
+        if envs.SGLANG_OPT_DSV41_ATTN_STATS_FORK_AFTER_QKV_NORM.get():
+            # the deferred attention-mix fork, released here instead of at the core
+            print_info_once("mHC attention mix: fork released after the fused q/kv norm")
+            mhc.run_deferred_attn_stats_fork()
         y, quant, scale = out
         return y, Mxfp8SwizzledInput(quant, scale)
 
