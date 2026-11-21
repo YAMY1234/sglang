@@ -691,7 +691,9 @@ class UnifiedRadixCacheCoreSuite(UnifiedRadixCacheCoreFixtures):
         sibling = self._make_seq(1, sibling_pages)
         self._insert(cache, allocator, req_to_token_pool, sibling)
         tokens = sibling[:depth] + self._make_seq(5000, 2)
-        req, _ = self._make_inflight_req(cache, allocator, req_to_token_pool, tokens)
+        req, _ = self._make_inflight_req(
+            cache, allocator, req_to_token_pool, tokens, allocated=True
+        )
         req.kv.mamba_last_track_seqlen = len(tokens)
         req.kv.mamba_fork_track_idx = req_to_token_pool.mamba_allocator.alloc(1)
         req.kv.mamba_fork_track_seqlen = depth
