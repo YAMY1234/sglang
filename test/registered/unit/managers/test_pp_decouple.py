@@ -470,6 +470,31 @@ class TestPPRankInvariantDigest(CustomTestCase):
         )
         self.assertEqual(len(log.hexdigest()), 16)
 
+    def test_a_proxy_from_another_micro_batch_stops_the_stage(self):
+        """A stage that ran its forward on another batch's activations would corrupt KV silently when
+        the token counts happen to match; the batch identity in the proxy makes it fail loudly."""
+        from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
+
+        def batch(rids, tokens):
+            b = ScheduleBatch(
+                reqs=[Req(r, "", array("q", [1, 2]), SamplingParams()) for r in rids],
+                batch_is_full=False,
+            )
+            b.extend_num_tokens = tokens
+            return b
+
+        scheduler = SchedulerPPMixin()
+        scheduler.forward_ct = 3
+        a, b = batch(["r1", "r2"], 16384), batch(["r3", "r4"], 16384)
+        proxy = PPProxyTensors({"hidden_states": None, pp_decouple.PROXY_BATCH_KEY: pp_decouple.proxy_batch_tag(a)})
+        scheduler._pp_assert_proxy_batch(proxy, a)
+        self.assertNotIn(pp_decouple.PROXY_BATCH_KEY, proxy.tensors)
+        proxy.tensors[pp_decouple.PROXY_BATCH_KEY] = pp_decouple.proxy_batch_tag(a)
+        with get_parallel().override(pp_rank=4), self.assertRaisesRegex(
+            RuntimeError, "arrived for batch"
+        ):
+            scheduler._pp_assert_proxy_batch(proxy, b)
+
     def test_an_informational_part_does_not_make_stages_mismatch(self):
         records = [
             _record(

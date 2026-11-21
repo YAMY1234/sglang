@@ -315,3 +315,14 @@ def find_digest_mismatches(
     }
     incomplete = [key for key, stages in groups if len(stages) < pp_size]
     return PPDigestReport(mismatched=mismatched, incomplete=incomplete)
+
+
+PROXY_BATCH_KEY = "__pp_batch__"
+
+
+def proxy_batch_tag(batch: Any) -> Tuple[int, int, str]:
+    """Identity of the micro-batch a proxy message belongs to: request count, new tokens and a hash of
+    the rids in order. Stages build the same batches, so the receiving stage's own batch must match."""
+    rids = "\x00".join(req.rid for req in batch.reqs)
+    digest = hashlib.blake2b(rids.encode(), digest_size=6).hexdigest()
+    return (len(batch.reqs), int(batch.extend_num_tokens or 0), digest)
