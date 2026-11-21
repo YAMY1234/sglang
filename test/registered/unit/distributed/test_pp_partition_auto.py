@@ -45,7 +45,7 @@ class TestBestPartition(CustomTestCase):
     def test_ties_break_on_running_max_then_prefix(self):
         """Uniform layers and GPUs: many splits reach 12; the one with the smallest running max, then prefix, wins."""
         uniform = ppa.StageCostModel(dsa_ms=1.0, kda_ms=1.0)
-        part, value = ppa.best_partition([False] * 93, [1.0] * 8, uniform)
+        part, value = ppa.best_partition([True] * 93, [1.0] * 8, uniform)
         self.assertEqual((part, value), ((11, 11, 11, 12, 12, 12, 12, 12), 12.0))
 
     def test_every_stage_keeps_the_reference_kv_capacity(self):
@@ -59,6 +59,17 @@ class TestBestPartition(CustomTestCase):
             self.assertLessEqual(part[7], 10)
         with self.assertRaises(RuntimeError):
             ppa.best_partition(IS_DSA, PAIRS["A"], m, BUDGETS, floor * 2)
+
+
+    def test_no_stage_is_left_without_a_full_attention_layer(self):
+        """A stage of KDA layers only has no KV pool and the hybrid HiCache split divides by zero at boot; a slow
+        first GPU must not shed layer 1 (its only full-attention layer) and keep KDA layer 0 alone."""
+        tiny = [i % 2 == 1 for i in range(16)]  # 16 layers, KDA/DSA alternating, two per stage by default
+        uniform = ppa.StageCostModel(dsa_ms=1.0, kda_ms=1.0)
+        part, _ = ppa.best_partition(tiny, [1.6] + [1.0] * 7, uniform)
+        starts = [sum(part[:s]) for s in range(8)]
+        self.assertGreaterEqual(part[0], 2)
+        self.assertTrue(all(any(tiny[st : st + n]) for st, n in zip(starts, part)), part)
 
 
 class TestResolve(CustomTestCase):

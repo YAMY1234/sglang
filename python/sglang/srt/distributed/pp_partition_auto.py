@@ -117,6 +117,9 @@ def best_partition(
     best: List[List[Tuple[float, Tuple[int, ...]]]] = [[INF] * (L + 1) for _ in range(P)]
 
     def ok(s: int, start: int, n: int) -> bool:
+        # A stage without a full-attention layer has an empty KV pool, which the hybrid HiCache split cannot size.
+        if not any(is_dsa[start : start + n]):
+            return False
         return budgets is None or stage_kv_capacity(m, is_dsa, s, start, n, P, budgets[s]) >= min_tokens
 
     for j in range(1, min(max_layers, L) + 1):
