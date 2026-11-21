@@ -801,7 +801,7 @@ class SchedulerPPMixin:
                 pp_group=self.pp_group,
                 device_id=self.device_module.current_device(),
                 slots=max(2, tensor_bound),
-                slot_mb=[int(mb) for mb in envs.SGLANG_PP_CE_PUSH_SLOT_MB.get()],
+                slot_mb=self._pp_ce_slot_mb(),
             )
         pp_rank = get_parallel().pp_rank
         # Proxy and output dicts from the previous stage (PP0: outputs from the last);
@@ -854,6 +854,20 @@ class SchedulerPPMixin:
             self._pp_late_recv,
         )
         return True
+
+    def _pp_ce_slot_mb(self: Scheduler) -> List[int]:
+        """SGLANG_PP_CE_PUSH_SLOT_MB, or with "auto" one slot per stage sized for the largest proxy its previous
+        stage sends at the prefill token budget (stages all-gather their own size; PP0's entry is unused)."""
+        slot_mb = envs.SGLANG_PP_CE_PUSH_SLOT_MB.get()
+        if slot_mb != ("auto",):
+            return [int(mb) for mb in slot_mb]
+        runner = self.tp_worker.model_runner
+        tokens = max(self.max_prefill_tokens, self.chunked_prefill_size or 0)
+        out_bytes = tokens * runner.model.pp_proxy_bytes_per_token(runner.model_config.dtype.itemsize)
+        sizes = [None] * self.pp_group.world_size
+        torch.distributed.all_gather_object(sizes, out_bytes, group=self.pp_group.cpu_group)
+        # +2 MiB: per-tensor 256-byte alignment and the batch-tag entry.
+        return [0] + [(b >> 20) + 2 for b in sizes[:-1]]
 
     def _pp_decouple_stats(self: Scheduler) -> dict:
         """Per-interval proof the decoupled path runs: peak un-waited send rounds per

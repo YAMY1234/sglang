@@ -3758,6 +3758,19 @@ class KimiK3LinearModel(nn.Module):
             return hidden_states, aux_hidden_states
         return hidden_states
 
+    def pp_proxy_bytes_per_token(self, itemsize: int) -> int:
+        """Bytes per token of the proxy this stage sends on: hidden states, the attention-residual bank (every block
+        up to end_layer) or else the residual, and the captures made so far (one hidden width each)."""
+        blocks = (
+            _cdiv(self.end_layer, self.config.attn_res_block_size)
+            if self.attn_bank is not None
+            else 1
+        )
+        captured = sum(
+            c < self.end_layer - 1 for c in (self.dspark_layers_to_capture or ())
+        )
+        return (1 + blocks + captured) * self.config.hidden_size * itemsize
+
     @property
     def packs_aux_hidden_states(self) -> bool:
         # PP stages keep the list: inherited captures arrive pre-concatenated.
@@ -3880,6 +3893,9 @@ class KimiK3LinearForCausalLM(nn.Module):
         if not self.model.packs_aux_hidden_states:
             return 0
         return len(self.model.dspark_layers_to_capture) * self.config.hidden_size
+
+    def pp_proxy_bytes_per_token(self, itemsize: int) -> int:
+        return self.model.pp_proxy_bytes_per_token(itemsize)
 
     def set_dspark_layers_to_capture(self, layer_ids: list[int]) -> None:
         if layer_ids is None:
@@ -4509,6 +4525,9 @@ class KimiK3ForConditionalGeneration(nn.Module):
         if self.language_model is None:
             return 0
         return self.language_model.get_aux_hidden_states_width()
+
+    def pp_proxy_bytes_per_token(self, itemsize: int) -> int:
+        return self.language_model.pp_proxy_bytes_per_token(itemsize)
 
     def preprocess_mm_for_encoder(
         self,

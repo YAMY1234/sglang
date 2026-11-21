@@ -896,10 +896,21 @@ class Envs:
     # input ring (CUDA VMM FABRIC memory, stream wait/write value) instead of NCCL; no kernel stays
     # resident while a side waits. A message larger than a slot falls back to NCCL.
     SGLANG_PP_CE_PUSH = EnvBool(False)
-    # MiB per slot of a stage's CE input ring: one value for every stage, or one per stage (indexed
-    # by the receiving stage; PP0's entry is unused). Size each for the largest proxy its previous
-    # stage sends (it grows with depth), or those messages go over NCCL.
+    # MiB per slot of a stage's CE input ring: one value for every stage, one per stage (indexed
+    # by the receiving stage; PP0's entry is unused), or "auto" (each stage's previous stage's
+    # largest proxy at the prefill token budget). A larger message goes over NCCL.
     SGLANG_PP_CE_PUSH_SLOT_MB = EnvTuple(("1600",))
+    # PP layer split: comma list of layers per stage (read by distributed.utils.get_pp_indices).
+    SGLANG_PP_LAYER_PARTITION = EnvStr(None)
+    # PP: choose the layer split at boot from each GPU's measured speed (distributed.pp_partition_auto); the speed
+    # comes from a concurrent burn of BURN_S seconds, or from SPEED (one factor per stage, for rigs and tests).
+    SGLANG_PP_PARTITION_AUTO = EnvBool(False)
+    SGLANG_PP_PARTITION_AUTO_SPEED = EnvTuple(tuple())
+    SGLANG_PP_PARTITION_AUTO_BURN_S = EnvFloat(20.0)
+    # Fraction of the reference split's KV token capacity the chosen split must keep (capacity is the stage minimum).
+    SGLANG_PP_PARTITION_AUTO_KV_FLOOR = EnvFloat(1.0)
+    # JSON StageCostModel (per-layer costs and memory); empty = the built-in Kimi-K3.1 prefill model.
+    SGLANG_PP_PARTITION_AUTO_MODEL = EnvStr("")
     # Debug: per stage, checksum the first N copy-engine messages on both sides of each push (pp_ce_push._CEChecksum).
     SGLANG_DEBUG_PP_CE_CHECKSUM = EnvInt(0)
     SGLANG_DEBUG_PP_CE_CHECKSUM_DIR = EnvStr(".")
