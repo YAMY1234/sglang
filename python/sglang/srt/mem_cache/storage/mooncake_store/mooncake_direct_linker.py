@@ -12,6 +12,7 @@ from queue import Empty, Queue
 import numpy as np
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorageConfig,
@@ -21,6 +22,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolTransfer,
 )
 from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import (
+    attach_cpu_indices,
     resolve_hybrid_device_pool_group,
 )
 from sglang.srt.mem_cache.unified_cache.linker_mla_dedup import (
@@ -158,6 +160,9 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             1, int(extra_config.get("linker_load_threads", DEFAULT_LOAD_THREADS))
         )
         self.load_mode = extra_config.pop("load_mode", "layer_wise")
+        self.cpu_indices = envs.SGLANG_EXTERNAL_LINKER_CPU_INDICES.get()
+        if self.cpu_indices:
+            logger.info("Mooncake direct linker: slot indices copied to CPU on the scheduler thread")
         # TODO: unlike `HiCacheController._generate_storage_config`, this sets no
         # `dp_rank`. Aligning the storage-config producers changes persisted
         # storage keys, so it waits for a storage-key format change.
@@ -344,6 +349,8 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         if not expanded:
             return None
         self.freeze_gc_once()
+        if self.cpu_indices:
+            expanded = attach_cpu_indices(expanded)
         ready = self.record_transfer_ready()
         future = Future()
         self.load_queue.put((future, expanded, ready))
@@ -651,6 +658,8 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             return True
         kv = next(transfer for transfer in transfers if transfer.name == PoolName.KV)
         tokens = len(kv.keys) * self.page_size
+        if self.cpu_indices:
+            expanded = attach_cpu_indices(expanded)
         ready = self.record_transfer_ready()
         self.offload_queue.put((expanded, tokens, ready, session_id))
         return True
