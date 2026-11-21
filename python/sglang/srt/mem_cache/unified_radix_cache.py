@@ -780,11 +780,12 @@ class UnifiedRadixCache(BasePrefixCache):
             if (
                 self.host_memory_mode != "cache"
                 or not self.is_mamba_enabled
+                or self.supports_swa()
                 or not self.enable_storage
             ):
                 raise ValueError(
                     "SGLANG_HICACHE_KV_EVICT_KEEP_STATE / SGLANG_HICACHE_L3_KV_FILL need a "
-                    "Mamba host cache and a storage backend"
+                    "Full + Mamba tree with a Mamba host cache and a storage backend"
                 )
             if self._s2ba_kv_fill and not self._s2ba_keep_state:
                 raise ValueError(
