@@ -750,11 +750,12 @@ class UnifiedRadixCacheCoreSuite(UnifiedRadixCacheCoreFixtures):
             )
         )
         self.assertEqual(m.device_prefix_len, depth)
-        slot = int(sibling.kv.mamba_pool_idx)
+        # The sibling's state is copied from the fork slot on the forward stream.
+        self.assertEqual(int(sibling.kv.mamba_cow_src_index), fork_slot)
         for state, expected in zip(
             (*mamba_cache.conv, mamba_cache.temporal), fork_state
         ):
-            self.assertTrue(torch.equal(state[:, slot], expected))
+            self.assertTrue(torch.equal(state[:, fork_slot], expected))
         cache.sanity_check()
 
     def test_fork_state_returns_to_the_pool_when_not_inserted(self):
