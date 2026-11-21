@@ -218,6 +218,7 @@ def resolve(
     reference: Tuple[int, ...],
     fixed_speed: Sequence[float] = (),
     kv_floor: float = 1.0,
+    burn_scale: float = 1.0,
 ) -> Tuple[Tuple[int, ...], dict]:
     """Collective over the world group: gather (pp_rank, speed, GPU memory) from every rank, take each stage's
     slowest rank, search the split, broadcast rank 0's, assert agreement. Returns the split and a report."""
@@ -231,7 +232,9 @@ def resolve(
     logits = min(static_free) * logits_fraction
     headroom = (static_free, logits) if m.hidden_bytes_per_token > 0 else None
     mean = sum(stage_speed) / pp_size
-    factors = [v / mean for v in stage_speed]
+    # The burn ranks GPUs like serving does but compresses the spread; burn_scale stretches it to the serving fit.
+    scale = 1.0 if fixed_speed else burn_scale
+    factors = [1.0 + scale * (v / mean - 1.0) for v in stage_speed]
     # KV token capacity is the minimum over the stages; keep it >= kv_floor x the reference split's.
     floor = kv_floor * min_capacity(m, is_dsa, reference, budgets) if m.dsa_kv_bytes_per_token > 0 else 0.0
     part, value = best_partition(is_dsa, factors, m, budgets if floor > 0 else None, floor, headroom=headroom)
@@ -242,7 +245,7 @@ def resolve(
     )
     return part, {
         "factors": [round(x, 4) for x in factors],
-        "source": "fixed" if fixed_speed else "burn",
+        "source": "fixed" if fixed_speed else f"burn x{burn_scale:g}",
         "reference": list(reference),
         "reference_max_ms": round(ref_value, 2),
         "split": list(part),
@@ -312,6 +315,7 @@ def maybe_apply(*, model_config, is_draft_worker: bool, mem_fraction_static: flo
         reference=reference,
         fixed_speed=[float(x) for x in envs.SGLANG_PP_PARTITION_AUTO_SPEED.get()],
         kv_floor=envs.SGLANG_PP_PARTITION_AUTO_KV_FLOOR.get(),
+        burn_scale=envs.SGLANG_PP_PARTITION_AUTO_BURN_SCALE.get(),
     )
     envs.SGLANG_PP_LAYER_PARTITION.set(",".join(map(str, part)))
     report["seconds"] = round(time.time() - t0, 1)

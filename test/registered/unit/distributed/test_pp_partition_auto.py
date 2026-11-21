@@ -132,7 +132,7 @@ class TestResolve(CustomTestCase):
         self.assertEqual(len(parts), 1)
         report = out[0][1]
         self.assertAlmostEqual(report["factors"][2], max(report["factors"]))
-        self.assertEqual(report["source"], "burn")
+        self.assertEqual(report["source"], "burn x1")
 
     def test_a_rank_that_disagrees_with_rank_0_stops(self):
         with self.assertRaises(AssertionError):
