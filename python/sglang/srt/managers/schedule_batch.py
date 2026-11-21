@@ -1035,6 +1035,14 @@ class ReqKvInfo:
         self.component_evicted_seqlens.clear()
 
 
+def debug_ids_crc(ids) -> Tuple[int, int]:
+    """(length, crc32) of a token id sequence, as int64."""
+    import zlib
+
+    a = ids if isinstance(ids, array) and ids.typecode == "q" else array("q", ids)
+    return len(a), zlib.crc32(a)
+
+
 class Req(ReqDllmMixin):
     """The input and output status of a request."""
 
@@ -1093,6 +1101,10 @@ class Req(ReqDllmMixin):
         self.rid = rid
         self.cache_request_handle = CacheRequestHandle(rid=rid, attempt_id=0)
         self.origin_input_ids = origin_input_ids
+        # SGLANG_PP_DEBUG_TRACE: the token ids as created, re-checked at admission and launch.
+        self.dbg_ids_crc = (
+            debug_ids_crc(origin_input_ids) if envs.SGLANG_PP_DEBUG_TRACE.get() else None
+        )
         self.origin_input_ids_unpadded = (
             origin_input_ids_unpadded
             if origin_input_ids_unpadded

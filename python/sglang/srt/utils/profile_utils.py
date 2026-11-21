@@ -33,6 +33,8 @@ if _is_npu:
     apply_torch_npu_patches(torch_npu, patches)
 
 logger = logging.getLogger(__name__)
+# Debug: where the torch profiler is, for logs that correlate host corruption with it.
+PROFILER_STATE = {"state": "idle", "t": 0.0}
 
 # Single source of truth for the CUDA-graph capture trace output directory,
 # shared by both the original single-trace export and the per-batch-size
@@ -141,6 +143,7 @@ class ProfileManager:
         raise NotImplementedError("manually stop is only supported yet")
 
     def _do_start(self, stage: Optional[str] = None):
+        PROFILER_STATE.update(state="active", t=time.monotonic())
         logger.info(
             f"Profiling starts{f' for {stage}' if stage else ''}. "
             f"Traces will be saved to: {self.profiler_kwargs['output_dir']} "
@@ -161,7 +164,9 @@ class ProfileManager:
 
     def _do_stop(self):
         logger.info("Stop profiling...")
+        PROFILER_STATE.update(state="stopping", t=time.monotonic())
         self.profiler.stop()
+        PROFILER_STATE.update(state="stopped", t=time.monotonic())
         logger.info(
             f"Profiling done. Traces are saved to: {self.profiler_kwargs['output_dir']}"
         )
@@ -351,6 +356,9 @@ class _ProfilerTorch(_ProfilerConcreteBase):
     def stop(self):
         Path(self.output_dir).mkdir(parents=True, exist_ok=True)
 
+        if envs.SGLANG_PROFILER_SYNC_BEFORE_STOP.get() and torch.cuda.is_available():
+            # Kernels launched while profiling must finish before the activity buffers are released.
+            torch.cuda.synchronize()
         self.torch_profiler.stop()
         if not _is_npu:
             # Build filename with only non-zero ranks to maintain backward compatibility

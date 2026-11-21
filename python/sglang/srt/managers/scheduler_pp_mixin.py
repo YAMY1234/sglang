@@ -68,6 +68,25 @@ if TYPE_CHECKING:
 _PP_TRACE = envs.SGLANG_PP_DEBUG_TRACE.get()
 
 
+def pp_debug_verify_ids(reqs, where: str, forward_ct: int) -> None:
+    """SGLANG_PP_DEBUG_TRACE: a request's token ids must still hash as created; the first
+    change stops the server with the profiler's state, to localize the write."""
+    from sglang.srt.managers.schedule_batch import debug_ids_crc
+    from sglang.srt.utils.profile_utils import PROFILER_STATE
+
+    for req in reqs:
+        want = req.dbg_ids_crc
+        if want is None or len(req.origin_input_ids) != want[0]:
+            continue
+        got = debug_ids_crc(req.origin_input_ids)
+        if got != want:
+            raise RuntimeError(
+                f"PP rank {get_parallel().pp_rank}: token ids of {req.rid} changed since creation "
+                f"(len {want[0]}, crc {want[1]:#x} -> {got[1]:#x}) at {where}, forward {forward_ct}; "
+                f"profiler {PROFILER_STATE['state']} {time.monotonic() - PROFILER_STATE['t']:.1f} s ago"
+            )
+
+
 def _pp_can_skip_output_comm(batch: ScheduleBatch) -> bool:
     """Check if output send/recv can be skipped for this batch."""
     return (
@@ -2245,6 +2264,7 @@ class SchedulerPPMixin:
                         "PPT launch mb=%d fct=%d tag=%s local=%s", mb_id, self.forward_ct,
                         pp_decouple.proxy_batch_tag(cur_batch), self._pp_pd_local_result(cur_batch),
                     )
+                    pp_debug_verify_ids(cur_batch.reqs, "launch", self.forward_ct)
                 result = self.run_batch(cur_batch, pp_proxy_tensors)
                 set_time_batch(
                     cur_batch.reqs,

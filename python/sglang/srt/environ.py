@@ -904,6 +904,8 @@ class Envs:
     # Debug: "FCT:SECONDS" makes every PP rank's scheduler sleep SECONDS once when its forward count
     # reaches FCT, a stall cascade like a profiler export's without the profiler.
     SGLANG_PP_DEBUG_STALL = EnvStr("")
+    # Debug: synchronize the device before the torch profiler stops, so no profiled kernel is still queued.
+    SGLANG_PROFILER_SYNC_BEFORE_STOP = EnvBool(False)
     SGLANG_PP_CE_PUSH_SLOT_MB = EnvInt(1600)
     # PP PD prefill: log a digest of allocator and radix tree state every N loop
     # epochs (0 = off); every stage must log the same digest at the same epoch.

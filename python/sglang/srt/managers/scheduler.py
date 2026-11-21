@@ -4510,6 +4510,9 @@ class Scheduler(
             (r.rid[:6], r.num_matched_prefix_tokens, len(r.origin_input_ids), r.extend_end)
             for r in wq[:6]
         ]
+        from sglang.srt.managers.scheduler_pp_mixin import pp_debug_verify_ids
+
+        pp_debug_verify_ids(wq[:6], "admission", self.forward_ct)
         logger.info(
             "PPT admit fct=%d wq=%d order=%s chunked=%s chunk=%d avail=%d evictable=%d protected=%d "
             "reqpool=%d processed=%d top=%s",
