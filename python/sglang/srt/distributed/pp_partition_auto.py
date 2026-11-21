@@ -112,13 +112,16 @@ def best_partition(
     smallest running max, then the smallest prefix, so the result depends only on the inputs. Returns (split, its max
     cost)."""
     L, P = len(is_dsa), len(speed)
+    hybrid = not all(is_dsa)
     INF = (math.inf, ())
     # best[s][j]: (max cost, split) placing the first j layers on stages 0..s.
     best: List[List[Tuple[float, Tuple[int, ...]]]] = [[INF] * (L + 1) for _ in range(P)]
 
     def ok(s: int, start: int, n: int) -> bool:
-        # A stage without a full-attention layer has an empty KV pool, which the hybrid HiCache split cannot size.
-        if not any(is_dsa[start : start + n]):
+        # The hybrid HiCache host split sizes a KV and a Mamba pool per stage and fails on an empty one: every stage
+        # keeps a full-attention layer, and in a hybrid model a linear-attention layer too.
+        nd, nk = stage_layers(is_dsa, start, n)
+        if nd == 0 or (hybrid and nk == 0):
             return False
         return budgets is None or stage_kv_capacity(m, is_dsa, s, start, n, P, budgets[s]) >= min_tokens
 
