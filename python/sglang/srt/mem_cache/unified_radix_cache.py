@@ -1266,7 +1266,14 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def _drain_l3_lifetime_events(self) -> None:
         if self._l3_lifetime_ledger is not None:
+            # Scheduler-thread cost of the ledger (the Rust event take and the hand-off).
+            t0 = time.perf_counter()
             self._l3_lifetime_ledger.drain_tree(self.tree_core)
+            stats = self._prefetch_outcome_stats
+            stats["ledger_drain_us"] = stats.get("ledger_drain_us", 0) + int(
+                (time.perf_counter() - t0) * 1e6
+            )
+            stats["ledger_drains"] = stats.get("ledger_drains", 0) + 1
 
     def _accumulate_tracker(
         self,
@@ -4361,6 +4368,8 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def prefetch_outcome_stats_snapshot(self) -> dict:
         stats = self._prefetch_outcome_stats.copy()
+        if self._l3_lifetime_ledger is not None:
+            stats["ledger_backlog"] = self._l3_lifetime_ledger.backlog()
         if self._l3_write_on_host_evict:
             stats.update(self._l3_tier_stats)
             stats["wb_inflight_tokens"] = sum(self._write_behind_inflight.values())

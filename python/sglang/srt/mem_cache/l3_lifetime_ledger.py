@@ -51,6 +51,10 @@ class L3LifetimeLedger:
         if events:
             self._queue.put((time.time_ns(), time.monotonic_ns(), None, (events, context)))
 
+    def backlog(self) -> int:
+        """Queued items the writer has not taken yet (a tree drain counts as one)."""
+        return self._queue.qsize()
+
     def _write_loop(self):
         last_flush = time.monotonic()
         while True:
