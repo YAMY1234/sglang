@@ -676,6 +676,9 @@ class Envs:
     # MegaAttention reads fork the attention mix's side stream at the read (beside the q/kv
     # projections) instead of deferring it to the attention core. Scheduling only.
     SGLANG_OPT_DSV41_ATTN_STATS_FORK_AT_READ = EnvBool(False)
+    # The decode candidate-table publish (block amax, block top-k, sort, schedule) on the main
+    # stream after the source's own top-k, instead of on the indexer side stream. Same values.
+    SGLANG_OPT_DSV41_SERIAL_CANDIDATE_PUBLISH = EnvBool(False)
     # DSpark draft forward: the bonus-into-block-ids write and the positions / cache-loc
     # column slices in one Triton launch instead of three torch copies. Same values.
     SGLANG_OPT_DSPARK_FUSED_DRAFT_INPUTS = EnvBool(False)

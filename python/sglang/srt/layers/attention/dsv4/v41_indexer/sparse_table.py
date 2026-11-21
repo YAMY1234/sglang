@@ -32,8 +32,10 @@ from sglang.srt.layers.attention.dsv4.indexer import (
     topk_transform_paged_bf16,
     topk_transform_paged_from_metadata,
 )
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsv4.metadata import expand_index_page_table
 from sglang.srt.utils.device import async_h2d
+from sglang.srt.utils.log_utils import print_info_once
 
 from .scoring import (
     DeepGEMMDecodeData,
@@ -292,9 +294,14 @@ class SparseTableBackend:
             indices=indices,
         )
         main_stream = torch.cuda.current_stream()
-        self.alt_stream.wait_stream(main_stream)
-        # The block-selection chain reads logits after the main stream moves on.
-        logits.record_stream(self.alt_stream)
+        serial = envs.SGLANG_OPT_DSV41_SERIAL_CANDIDATE_PUBLISH.get()
+        side_stream = main_stream if serial else self.alt_stream
+        if serial:
+            print_info_once("candidate-table publish on the main stream")
+        else:
+            self.alt_stream.wait_stream(main_stream)
+            # The block-selection chain reads logits after the main stream moves on.
+            logits.record_stream(self.alt_stream)
         # TODO(candidate): one kernel for both selections below (dense logits read once)
         if logits.dtype == torch.bfloat16:
             topk_transform_paged_bf16(
@@ -314,7 +321,7 @@ class SparseTableBackend:
                 metadata.topk_metadata,
             )
         # per row: block count for the block top-k, sparse-row length for the consumers
-        with torch.cuda.stream(self.alt_stream):
+        with torch.cuda.stream(side_stream):
             nblocks, row_valid_lens = candidate_row_lens(seq_lens, self.topk_blocks)
             blocks = amax_topk_blocks(logits, seq_lens, nblocks, self.topk_blocks)
             # in place: ascending, INT32_MAX padded, plus the blocks as pool slots / 8
@@ -333,10 +340,11 @@ class SparseTableBackend:
                 self._get_request_ids(inputs, data.q_fp4.shape[0], blocks.device),
             )
             # consume_decode reads these on the main stream
-            for t in (blocks, schedule, phys_blocks, row_valid_lens):
-                t.record_stream(main_stream)
+            if not serial:
+                for t in (blocks, schedule, phys_blocks, row_valid_lens):
+                    t.record_stream(main_stream)
             ready = torch.cuda.Event()
-            ready.record(self.alt_stream)
+            ready.record(side_stream)
             return _SparseTable(
                 blocks=blocks,
                 schedule=schedule,
