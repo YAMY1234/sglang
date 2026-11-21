@@ -883,7 +883,24 @@ class SchedulerPPMixin:
         }
         if self._pp_ce is not None:
             stats["ce_push"] = self._pp_ce.take_stats()
+        stats["mem"] = self._pp_mem_stats()
         return {"decouple": stats}
+
+    def _pp_mem_stats(self: Scheduler) -> Dict[str, int]:
+        """Free device memory now, the least since boot (free now less the caching allocator's reserved peak above
+        its current reservation), and the indexer-logits budget that must fit in it."""
+        from sglang.srt.layers.attention.mqa_logits_utils import (
+            mqa_logits_static_budget_bytes,
+        )
+
+        device = torch.cuda.current_device()
+        free, _ = torch.cuda.mem_get_info(device)
+        peak_extra = torch.cuda.max_memory_reserved(device) - torch.cuda.memory_reserved(device)
+        return {
+            "free_mib": free >> 20,
+            "min_free_mib": (free - peak_extra) >> 20,
+            "logits_budget_mib": mqa_logits_static_budget_bytes(device_index=device) >> 20,
+        }
 
     def _pp_overlap_input_wait(self: Scheduler, inbox: Optional[PPRecvInbox]) -> None:
         """While the next input is still upstream, send the early KV chunks whose
