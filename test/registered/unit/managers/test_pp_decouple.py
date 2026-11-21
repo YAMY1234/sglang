@@ -23,6 +23,7 @@ maybe_stub_sgl_kernel()
 
 import torch  # noqa: E402
 
+from sglang.srt.distributed import parallel_state  # noqa: E402
 from sglang.srt.managers import pp_decouple  # noqa: E402
 from sglang.srt.managers.pp_decouple import PPSendWindow, PPSendWindows  # noqa: E402
 from sglang.srt.managers.schedule_batch import (  # noqa: E402
@@ -151,6 +152,37 @@ class TestPPSendWindow(CustomTestCase):
         self.assertEqual(log, ["proxy1.0", "proxy1.1"])
         self.assertEqual(scheduler.pp_send_done_event, "event")
         self.assertEqual(len(scheduler.pp_send_windows.proxy), 1)
+
+
+class _CountedWork:
+    def __init__(self):
+        self.waits = 0
+
+    def wait(self):
+        self.waits += 1
+
+
+class TestHostSendsBeforeProfilerStop(CustomTestCase):
+    def test_waits_each_main_thread_send_once_and_later_waits_do_not_reach_gloo(self):
+        """torch.profiler.stop() frees the events of RecordFunctions that gloo sends opened
+        under it; a send waited after the stop writes into that memory. The stop path waits
+        them first, and a later window wait must not wait a gloo send a second time (hangs)."""
+        parallel_state.wait_host_sends()
+        works = [_CountedWork() for _ in range(3)]
+        sends = [parallel_state.host_send(w, torch.zeros(1)) for w in works]
+        other = []
+        thread = threading.Thread(
+            target=lambda: other.append(parallel_state.host_send(_CountedWork(), None))
+        )
+        thread.start()
+        thread.join()
+
+        self.assertEqual(parallel_state.wait_host_sends(), 3)
+        for send in sends:
+            send.work.wait()
+        self.assertEqual([w.waits for w in works], [1, 1, 1])
+        self.assertEqual(other[0].work.waits, 0)
+        self.assertEqual(parallel_state.wait_host_sends(), 0)
 
 
 class TestPPLateRecv(CustomTestCase):

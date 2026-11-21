@@ -2798,7 +2798,7 @@ def point_to_point_pyobj(
     async_send: bool = False,
 ):
     """Send data from src to dst in group."""
-    from sglang.srt.distributed.parallel_state import P2PWork
+    from sglang.srt.distributed.parallel_state import host_send
 
     if async_send:
         send_func = dist.isend
@@ -2813,7 +2813,7 @@ def point_to_point_pyobj(
             )
             work = send_func(tensor_size, dst, group=group)
             if async_send:
-                p2p_works.append(P2PWork(work, tensor_size))
+                p2p_works.append(host_send(work, tensor_size))
         else:
             serialized_data = pickle.dumps(data)
             size = len(serialized_data)
@@ -2824,10 +2824,10 @@ def point_to_point_pyobj(
 
             work = send_func(tensor_size, dst, group=group)
             if async_send:
-                p2p_works.append(P2PWork(work, tensor_size))
+                p2p_works.append(host_send(work, tensor_size))
             work = send_func(tensor_data, dst, group=group)
             if async_send:
-                p2p_works.append(P2PWork(work, tensor_data))
+                p2p_works.append(host_send(work, tensor_data))
         return p2p_works
 
     elif rank == dst:

@@ -24,6 +24,7 @@ import msgspec
 import torch
 
 from sglang.srt.distributed.communication_tags import P2PTag
+from sglang.srt.distributed.parallel_state import P2PWork, host_send
 from sglang.srt.environ import envs
 from sglang.srt.managers import pp_bubble_diag
 from sglang.srt.managers.cache_controller import CacheOperation
@@ -359,7 +360,7 @@ class UnifiedRadixCache(BasePrefixCache):
         )
         self.pp_rank = params.pp_rank
         self.pp_size = params.pp_size
-        self.work_list: list[torch.distributed.Work] = []
+        self.work_list: list[P2PWork] = []
         self.pp_sync_window = 1
         if envs.SGLANG_PP_SYNC_WINDOW.get() and self.pp_size > 1:
             self.pp_sync_window = self.pp_size + get_parallel().pp_async_batch_depth
@@ -367,7 +368,7 @@ class UnifiedRadixCache(BasePrefixCache):
                 "HiCache PP-sync window: %d rounds (SGLANG_PP_SYNC_WINDOW).",
                 self.pp_sync_window,
             )
-        self.pp_sync_rounds: deque[list[torch.distributed.Work]] = deque()
+        self.pp_sync_rounds: deque[list[P2PWork]] = deque()
 
         # HiCache D↔H defaults (overridden by init_hicache)
         self.cache_controller: Optional[HybridCacheController] = None
@@ -542,11 +543,11 @@ class UnifiedRadixCache(BasePrefixCache):
                 self.pp_sync_rounds.append(self.work_list)
                 self.work_list = []
                 while len(self.pp_sync_rounds) >= self.pp_sync_window:
-                    for work in self.pp_sync_rounds.popleft():
-                        work.wait()
+                    for p2p_work in self.pp_sync_rounds.popleft():
+                        p2p_work.work.wait()
                 return
-            for work in self.work_list:
-                work.wait()
+            for p2p_work in self.work_list:
+                p2p_work.work.wait()
             self.work_list.clear()
 
     def _all_reduce(self, data: torch.Tensor, tp_reduce_op: torch.distributed.ReduceOp):
@@ -591,7 +592,7 @@ class UnifiedRadixCache(BasePrefixCache):
                 group=self.pp_group,
                 tag=P2PTag.HICACHE_PP_SYNC,
             )
-            self.work_list.append(send_work)
+            self.work_list.append(host_send(send_work, copy_of_data))
 
     def init_cache_linker(self, cache_linker: UnifiedCacheLinker) -> None:
         """Attach an external KV store directly to the device pools."""

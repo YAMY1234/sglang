@@ -30,6 +30,7 @@ import logging
 import os
 import pickle
 import sys
+import threading
 import warnings
 import weakref
 from collections import namedtuple
@@ -127,10 +128,46 @@ class GraphCaptureContext:
     stream: torch.Stream
 
 
-@dataclass
+@dataclass(eq=False)
 class P2PWork:
     work: Optional[torch.distributed.Work]
     payload: Optional[torch.Tensor]
+
+
+class _WaitedHostSend:
+    """Stands in for a gloo send Work that wait_host_sends() already waited: waiting a
+    gloo send twice blocks for a second completion that never comes."""
+
+    def wait(self, timeout=None) -> bool:
+        return True
+
+    def is_completed(self) -> bool:
+        return True
+
+
+_WAITED_HOST_SEND = _WaitedHostSend()
+# Async CPU-group sends of the scheduler (main) thread that wait_host_sends() has not waited.
+_host_sends: "weakref.WeakSet[P2PWork]" = weakref.WeakSet()
+
+
+def host_send(work: torch.distributed.Work, payload: torch.Tensor) -> P2PWork:
+    """An async CPU-group (gloo) send; the main thread's are tracked for wait_host_sends()."""
+    p2p_work = P2PWork(work, payload)
+    if threading.current_thread() is threading.main_thread():
+        _host_sends.add(p2p_work)
+    return p2p_work
+
+
+def wait_host_sends() -> int:
+    """Wait the main thread's outstanding gloo sends; returns how many. Called before
+    torch.profiler stops: a gloo send started under the profiler ends its RecordFunction
+    at wait(), and after stop() that end writes into freed event storage (heap corruption)."""
+    pending = [w for w in _host_sends if w.work is not _WAITED_HOST_SEND]
+    for p2p_work in pending:
+        p2p_work.work.wait()
+        p2p_work.work = _WAITED_HOST_SEND
+    _host_sends.clear()
+    return len(pending)
 
 
 class HostTensorDictPart(msgspec.Struct, frozen=True):
@@ -1657,7 +1694,7 @@ class GroupCoordinator:
             tag=tag,
         )
         if async_send:
-            p2p_work.append(P2PWork(size_work, size_tensor))
+            p2p_work.append(host_send(size_work, size_tensor))
 
         object_work = send_func(
             object_tensor,
@@ -1666,7 +1703,7 @@ class GroupCoordinator:
             tag=tag,
         )
         if async_send:
-            p2p_work.append(P2PWork(object_work, object_tensor))
+            p2p_work.append(host_send(object_work, object_tensor))
 
         return p2p_work
 
@@ -1841,7 +1878,9 @@ class GroupCoordinator:
             comm_group = metadata_group if tensor.is_cpu else group
             work = send_func(tensor, self.ranks[dst], group=comm_group)
             if async_send:
-                p2p_works.append(P2PWork(work, tensor))
+                p2p_works.append(
+                    host_send(work, tensor) if tensor.is_cpu else P2PWork(work, tensor)
+                )
         return p2p_works
 
     def recv_tensor_dict_host_part(
