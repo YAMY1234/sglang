@@ -4397,12 +4397,12 @@ def test_s2ba_host_kv_eviction_keeps_state_and_kv_fill_restores_it():
     core.insert_host(
         state_node, _key(list(range(9, 13))), torch.arange(108, 112), [f"h{i}" for i in range(8, 12)]
     )
-    assert core.kv_in_storage_stats() == (0, 0, 0, 0, 0, 0)
+    assert core.kv_in_storage_stats() == (0,) * 8
 
     result = core.drive_host_eviction(ComponentType.FULL, 12)
     assert sorted(torch.cat(result.host_frees[ComponentType.FULL]).tolist()) == list(range(100, 112))
     assert ComponentType.MAMBA not in result.host_frees or not result.host_frees[ComponentType.MAMBA]
-    assert core.kv_in_storage_stats() == (1, 0, 0, 0, 1, 1)
+    assert core.kv_in_storage_stats() == (1, 0, 0, 0, 0, 0, 1, 1)
     core.sanity_check([], [])
 
     matched = core.match_prefix(MatchPrefixParams(key=_key(list(range(1, 13)))))
@@ -4414,7 +4414,7 @@ def test_s2ba_host_kv_eviction_keeps_state_and_kv_fill_restores_it():
     assert fill.fill_nodes == (state_node,)
 
     assert core.commit_kv_fill(list(fill.fill_nodes), torch.arange(200, 208)) == 8
-    assert core.kv_in_storage_stats() == (1, 1, 0, 0, 0, 0)
+    assert core.kv_in_storage_stats() == (1, 1, 0, 0, 0, 0, 0, 0)
     matched = core.match_prefix(MatchPrefixParams(key=_key(list(range(1, 13)))))
     assert matched.best_match_node == state_node and matched.kv_fill is None
     core.sanity_check([], [])
@@ -4429,7 +4429,7 @@ def test_s2ba_modes_off_evict_the_state_node_with_its_kv():
     assert core.commit_mamba_host_restore(state_node, torch.tensor([5]))
     result = core.drive_host_eviction(ComponentType.FULL, 2)
     assert torch.cat(result.host_frees[ComponentType.MAMBA]).tolist() == [5]
-    assert core.kv_in_storage_stats() == (0, 0, 0, 0, 0, 0)
+    assert core.kv_in_storage_stats() == (0,) * 8
     assert core.match_prefix(MatchPrefixParams(key=_key([1, 2]))).kv_fill is None
 
 

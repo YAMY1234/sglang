@@ -3763,7 +3763,7 @@ class UnifiedRadixCache(BasePrefixCache):
     @rank_consensus(same_params=True, same_results=True)
     def check_prefetch_progress(self, request: CacheRequestHandle) -> bool:
         done = self._check_prefetch_progress(request)
-        if done and request in self._kv_fill_pending:
+        if done and request in getattr(self, "_kv_fill_pending", ()):
             if self.prefetch_stop_policy == "best_effort":
                 # Admission cuts any new fetch at once under best_effort: admit now.
                 self._end_kv_fill(request)
@@ -4229,7 +4229,7 @@ class UnifiedRadixCache(BasePrefixCache):
     @rank_consensus(same_params=True)
     def release_aborted_request(self, request: CacheRequestHandle) -> None:
         self._cancel_mamba_state_restore(request)
-        if request in self._kv_fill_pending:
+        if request in getattr(self, "_kv_fill_pending", ()):
             self._end_kv_fill(request)
         rid = request.rid
         self._storage_prefetch_wait.pop(request, None)
