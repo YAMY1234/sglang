@@ -1017,6 +1017,10 @@ class Envs:
     # Keep each queued request's storage page hashes, so a re-query hashes only
     # the pages before its last lookup's start instead of the whole tail again.
     SGLANG_EXTERNAL_LINKER_REQUERY_HASH_CACHE = EnvBool(False)
+    # Prefetch and offload: copy the host-pool slot indices to pinned CPU memory on
+    # the scheduler thread (non-blocking, before the ready event), so the linker's
+    # load and offload threads never D2H-copy indices against the forward.
+    SGLANG_EXTERNAL_LINKER_CPU_INDICES = EnvBool(False)
     # Seconds between L3 lease renewals of a prefix the device serves: an
     # existence query renews its pages' leases, so Mooncake (oldest lease
     # evicted first) keeps hot prefixes. 0 disables.
