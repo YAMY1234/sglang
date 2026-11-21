@@ -1242,6 +1242,8 @@ class Req(ReqDllmMixin):
         self.full_kv_end_node: Optional[Any] = None
         # S2b-alpha KV-fill candidate of the latest match (KvFillMatch or None).
         self.kv_fill: Optional[Any] = None
+        # A KV fill was issued for this request; its continuation runs today's path.
+        self.kv_fill_tried = False
         # Total cached prefix length (on-device prefix_len + host_hit_length),
         # capped at the max allowed prefix. Set during prefix matching at schedule
         # time and used to estimate uncached tokens / sort by longest prefix for

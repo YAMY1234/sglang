@@ -653,7 +653,7 @@ pub struct UnifiedTreeCore<K: ChildKeyType> {
     /// KV-fill candidate (`MatchResult::kv_fill`).
     pub(crate) kv_fill_match: bool,
     /// S2b-alpha counters (lifetime): kv_in_storage nodes created / refilled / pruned / reinserted.
-    pub(crate) kv_in_storage_counts: [u64; 4],
+    pub(crate) kv_in_storage_counts: [u64; 6],
     /// Present only during a device-eviction step, including its cascades.
     tracked_unbacked_tokens: Option<usize>,
     /// Per-slot LRU lists, indexed by `ValueSlotIdx::idx`.
@@ -1007,7 +1007,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             write_back_coexist_reclaim_digest: 0,
             kv_evict_keep_state: false,
             kv_fill_match: false,
-            kv_in_storage_counts: [0; 4],
+            kv_in_storage_counts: [0; 6],
             tracked_unbacked_tokens: None,
             // Disabled components keep harmless empty lists, like component_states.
             lru_lists: Self::new_lru_lists(),
@@ -2473,6 +2473,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         let child_namespace = child.namespace.clone();
         let child_external_cache_stored = child.external_cache_stored;
         let child_kv_in_storage = child.kv_in_storage;
+        let child_kv_l3 = child.kv_l3;
         let child_rotation_base = child.rotation_base;
         let child_tlru_history_len = child.tlru_history_len;
         let (key_head, key_tail) = child.key.split_at(split_len);
@@ -2492,6 +2493,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         );
         self.arena.node_mut(new_node_id).external_cache_stored = child_external_cache_stored;
         self.arena.node_mut(new_node_id).kv_in_storage = child_kv_in_storage;
+        self.arena.node_mut(new_node_id).kv_l3 = child_kv_l3;
         self.arena.node_mut(new_node_id).rotation_base = child_rotation_base;
         if self.tlru_bookkeeping {
             // Splitting preserves the suffix's depth and branch history.
@@ -3186,7 +3188,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             let Some(idx) = current else { break };
             if !self.host_lru_list(MAMBA).in_list(Some(idx)) { break; }
             let next = self.host_lru_list(MAMBA).get_prev_no_lock(idx, &self.arena);
-            if self.evictable_host_leaves.contains(idx) {
+            if self.evictable_host_leaves.contains(idx) && self.arena.node(idx).children.is_empty() {
                 self.evict_host_leaf_(idx, &mut result.tracker, &mut result.device_frees,
                                      &mut result.host_frees, &mut result.cache_actions);
             } else if self.arena.has_host_value(idx, FULL) && self.node_depth_(idx) >= min_depth {
@@ -3525,9 +3527,12 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             "node {node_id} is not an H-leaf"
         );
         if !self.arena.node(node_id).children.is_empty() {
-            // Only under kv_evict_keep_state: every child is kv_in_storage, so this node stays as their spine.
-            self.evict_host_kv_(node_id, /* keep_mamba = */ false, tracker, device_frees, host_frees, cache_actions);
-            return;
+            // Only under kv_evict_keep_state: every child is kv_in_storage. Its KV in L3, this node stays as
+            // their spine; otherwise the states below could never be filled, so they go first.
+            if self.arena.node(node_id).kv_l3 || !self.drop_kv_in_storage_subtree_(node_id, tracker, device_frees, host_frees, cache_actions) {
+                self.evict_host_kv_(node_id, /* keep_mamba = */ false, tracker, device_frees, host_frees, cache_actions);
+                return;
+            }
         }
         self.record_remove_event_(node_id, StorageMedium::Cpu);
         for i in 0..self.components.len() {
@@ -3676,9 +3681,91 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         self.kv_fill_match = kv_fill_match;
     }
 
-    /// S2b-alpha counters: (created, refilled, pruned, reinserted, kv_in_storage nodes now, of them holding
-    /// a Mamba host state).
-    pub fn kv_in_storage_stats(&self) -> (u64, u64, u64, u64, usize, usize) {
+    /// S2b-alpha: the Full KV of these nodes is in L3 (acknowledged storage write or covered beliefs).
+    /// Stale handles are skipped; returns the nodes marked.
+    pub fn mark_kv_in_l3(&mut self, node_ids: &[NodeId]) -> usize {
+        let mut marked = 0;
+        for &node_id in node_ids {
+            if let Ok(idx) = self.arena.resolve(node_id) {
+                self.arena.node_mut(idx).kv_l3 = true;
+                marked += 1;
+            }
+        }
+        marked
+    }
+
+    /// S2b-alpha: drop the states of the `kv_in_storage` subtree below `node_id` and delete it (its KV
+    /// was never written to L3, so no fill can reach those states). Leaves the tree untouched and returns
+    /// false if any node there is locked.
+    pub(crate) fn drop_kv_in_storage_subtree_(
+        &mut self,
+        node_id: NodeIdx_,
+        tracker: &mut HashMap<ComponentType, usize>,
+        device_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
+        host_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
+        cache_actions: &mut CacheActions,
+    ) -> bool {
+        let mut order = Vec::new();
+        let mut stack: Vec<NodeIdx_> = self.arena.node(node_id).children.values().copied().collect();
+        while let Some(idx) = stack.pop() {
+            let node = self.arena.node(idx);
+            if !node.kv_in_storage || node.is_device_locked() || node.is_host_locked() {
+                return false;
+            }
+            stack.extend(node.children.values().copied());
+            order.push(idx);
+        }
+        // Children before parents: each node is a leaf when it goes.
+        for &idx in order.iter().rev() {
+            if self.arena.has_host_value(idx, MAMBA) || self.arena.has_device_value(idx, MAMBA) {
+                self.kv_in_storage_counts[5] += 1;
+            }
+            for i in 0..self.components.len() {
+                let component_type = self.components[i].component_type();
+                let (_, host_freed) = self.evict_component_and_detach_lru_(
+                    idx, component_type, device_frees, host_frees, cache_actions, EvictLayer::All, None,
+                );
+                *tracker.entry(component_type).or_insert(0) += host_freed;
+            }
+            let parent = self.arena.node(idx).parent();
+            self.evictable_host_leaves.discard(idx);
+            self.evictable_device_leaves.discard(idx);
+            self.remove_leaf_from_parent_(idx);
+            self.kv_in_storage_counts[2] += 1;
+            self.update_evictable_leaf_sets_(parent);
+        }
+        true
+    }
+
+    /// S2b-alpha lazy invalidation: L3 lacks the KV in front of these `kv_in_storage` nodes' states (a KV
+    /// fill's rank-agreed hit stopped short of them), so drop the states and prune what is left. Pass them
+    /// deepest first; locked, stale or refilled nodes are skipped.
+    pub fn invalidate_kv_in_storage_states(&mut self, node_ids: &[NodeId]) -> EvictionStepResult {
+        let mut result = EvictionStepResult::default();
+        result.tracker.insert(MAMBA, 0);
+        for &node_id in node_ids {
+            let Ok(idx) = self.arena.resolve(node_id) else { continue };
+            let node = self.arena.node(idx);
+            if !node.kv_in_storage || node.is_device_locked() || node.is_host_locked() {
+                continue;
+            }
+            if self.arena.has_host_value(idx, MAMBA) || self.arena.has_device_value(idx, MAMBA) {
+                let (_, host_freed) = self.evict_component_and_detach_lru_(
+                    idx, MAMBA, &mut result.device_frees, &mut result.host_frees, &mut result.cache_actions,
+                    EvictLayer::All, None,
+                );
+                *result.tracker.entry(MAMBA).or_insert(0) += host_freed;
+                self.kv_in_storage_counts[5] += 1;
+            }
+            self.prune_kv_in_storage_(idx, &mut result.tracker, &mut result.device_frees, &mut result.host_frees,
+                                      &mut result.cache_actions);
+        }
+        result
+    }
+
+    /// S2b-alpha counters: (created, refilled, pruned, reinserted, unwritten spines whose subtree was dropped,
+    /// states invalidated, kv_in_storage nodes now, of them holding a Mamba host state).
+    pub fn kv_in_storage_stats(&self) -> (u64, u64, u64, u64, u64, u64, usize, usize) {
         let mut nodes = 0;
         let mut with_state = 0;
         for idx in self.collect_all_nodes_() {
@@ -3690,7 +3777,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             }
         }
         let c = self.kv_in_storage_counts;
-        (c[0], c[1], c[2], c[3], nodes, with_state)
+        (c[0], c[1], c[2], c[3], c[4], c[5], nodes, with_state)
     }
 
     /// Release a node's device KV once its host copy exists; the node stays in the
@@ -3780,7 +3867,10 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
     ) {
         let is_leaf = match target {
             EvictLayer::Device => self.evictable_device_leaves.contains(node_id),
-            EvictLayer::Host => self.evictable_host_leaves.contains(node_id),
+            // S2b-alpha: a host leaf above kv_in_storage nodes is internal here; its KV leads to their states.
+            EvictLayer::Host => {
+                self.evictable_host_leaves.contains(node_id) && self.arena.node(node_id).children.is_empty()
+            }
             EvictLayer::All => panic!("cascade_evict_: EvictLayer::All is not a single layer"),
         };
 
@@ -4555,6 +4645,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
                         .copy(),
                 );
                 self.arena.node_mut(node_id).kv_in_storage = false;
+                self.arena.node_mut(node_id).kv_l3 = true;
                 self.kv_in_storage_counts[1] += 1;
                 self.update_evictable_leaf_sets_(node_id);
                 if let Some(parent_id) = self.arena.node(node_id).try_parent() {
@@ -4674,6 +4765,8 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             displaced.is_none(),
             "insert_host: parent {node_id} already has a child on the new node's page"
         );
+        // The host value was read from L3.
+        self.arena.node_mut(new_node_id).kv_l3 = true;
         self.update_evictable_leaf_sets_(new_node_id);
         self.update_evictable_leaf_sets_(node_id);
         result.inserted_host_node = Some(self.arena.node(new_node_id).id);

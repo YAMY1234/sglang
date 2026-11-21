@@ -2103,8 +2103,17 @@ macro_rules! tree_core_methods {
                 py.detach(move || self.core().set_s2ba_modes(kv_evict_keep_state, kv_fill_match));
             }
 
-            fn kv_in_storage_stats(&self, py: Python<'_>) -> (u64, u64, u64, u64, usize, usize) {
+            fn kv_in_storage_stats(&self, py: Python<'_>) -> (u64, u64, u64, u64, u64, u64, usize, usize) {
                 py.detach(|| self.core().kv_in_storage_stats())
+            }
+
+            fn mark_kv_in_l3(&self, py: Python<'_>, node_ids: Vec<NodeId>) -> usize {
+                py.detach(move || self.core().mark_kv_in_l3(&node_ids))
+            }
+
+            fn invalidate_kv_in_storage_states(&self, py: Python<'_>, node_ids: Vec<NodeId>) -> PyResult<HostEvictionResultBinding> {
+                let result = py.detach(move || self.core().invalidate_kv_in_storage_states(&node_ids));
+                HostEvictionResultBinding::from_eviction_step(py, result)
             }
 
             fn commit_kv_fill(&self, py: Python<'_>, node_ids: Vec<NodeId>, host_value: PyTensor) -> PyResult<usize> {
@@ -3564,9 +3573,20 @@ macro_rules! tree_core_binding {
                 catch_native_panic(|| { self.inner.set_s2ba_modes(py, kv_evict_keep_state, kv_fill_match); Ok(()) })
             }
 
-            /// S2b-alpha counters: (created, refilled, pruned, reinserted, kv_in_storage nodes, of them with a host state).
-            fn kv_in_storage_stats(&self, py: Python<'_>) -> PyResult<(u64, u64, u64, u64, usize, usize)> {
+            /// S2b-alpha counters: (created, refilled, pruned, reinserted, KV evictions without an L3 copy
+            /// that cost states, states invalidated, kv_in_storage nodes, of them with a host state).
+            fn kv_in_storage_stats(&self, py: Python<'_>) -> PyResult<(u64, u64, u64, u64, u64, u64, usize, usize)> {
                 catch_native_panic(|| Ok(self.inner.kv_in_storage_stats(py)))
+            }
+
+            /// S2b-alpha: these nodes' Full KV is in L3 (acknowledged write or covered beliefs).
+            fn mark_kv_in_l3(&self, py: Python<'_>, node_ids: Vec<NodeId>) -> PyResult<usize> {
+                catch_native_panic(|| Ok(self.inner.mark_kv_in_l3(py, node_ids)))
+            }
+
+            /// S2b-alpha lazy invalidation: drop these kv_in_storage nodes' states (deepest first) and prune.
+            fn invalidate_kv_in_storage_states(&self, py: Python<'_>, node_ids: Vec<NodeId>) -> PyResult<HostEvictionResultBinding> {
+                catch_native_panic(|| self.inner.invalidate_kv_in_storage_states(py, node_ids))
             }
 
             /// S2b-alpha: attach KV read back from L3 to kv_in_storage nodes (path order); returns tokens used.

@@ -592,9 +592,21 @@ class UnifiedTreeCoreInterface(ABC):
         ...
 
     @abstractmethod
-    def kv_in_storage_stats(self) -> tuple[int, int, int, int, int, int]:
-        """S2b-alpha counters: (created, refilled, pruned, reinserted, kv_in_storage nodes, of them with a
-        host state)."""
+    def kv_in_storage_stats(self) -> tuple[int, int, int, int, int, int, int, int]:
+        """S2b-alpha counters: (created, refilled, pruned, reinserted, host KV evictions without an L3
+        copy that cost states, states invalidated, kv_in_storage nodes, of them with a host state)."""
+        ...
+
+    @abstractmethod
+    def mark_kv_in_l3(self, node_ids: list[NodeId]) -> int:
+        """S2b-alpha: these nodes' Full KV is in L3; only such KV may leave the host behind a kept state."""
+        ...
+
+    @abstractmethod
+    def invalidate_kv_in_storage_states(
+        self, node_ids: list[NodeId]
+    ) -> DriveHostEvictionResult:
+        """S2b-alpha lazy invalidation: drop these kv_in_storage nodes' states (deepest first), then prune."""
         ...
 
     @abstractmethod

@@ -2026,8 +2026,16 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         if kv_evict_keep_state or kv_fill_match:
             raise NotImplementedError("S2b-alpha kv_in_storage needs the Rust TreeCore backend")
 
-    def kv_in_storage_stats(self) -> tuple[int, int, int, int, int, int]:
-        return (0, 0, 0, 0, 0, 0)
+    def kv_in_storage_stats(self) -> tuple[int, int, int, int, int, int, int, int]:
+        return (0,) * 8
+
+    def mark_kv_in_l3(self, node_ids: list[NodeId]) -> int:
+        return 0
+
+    def invalidate_kv_in_storage_states(
+        self, node_ids: list[NodeId]
+    ) -> DriveHostEvictionResult:
+        raise NotImplementedError("S2b-alpha kv_in_storage needs the Rust TreeCore backend")
 
     def commit_kv_fill(self, node_ids: list[NodeId], host_value: torch.Tensor) -> int:
         raise NotImplementedError("S2b-alpha kv_in_storage needs the Rust TreeCore backend")

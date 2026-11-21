@@ -964,9 +964,20 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
             raise RuntimeError(_S2BA_REBUILD) from None
         set_modes(bool(kv_evict_keep_state), bool(kv_fill_match))
 
-    def kv_in_storage_stats(self) -> tuple[int, int, int, int, int, int]:
+    def kv_in_storage_stats(self) -> tuple[int, int, int, int, int, int, int, int]:
         stats = getattr(self._binding, "kv_in_storage_stats", None)
-        return tuple(stats()) if stats is not None else (0, 0, 0, 0, 0, 0)
+        return tuple(stats()) if stats is not None else (0,) * 8
+
+    def mark_kv_in_l3(self, node_ids: list[NodeId]) -> int:
+        return self._binding.mark_kv_in_l3(list(node_ids))
+
+    def invalidate_kv_in_storage_states(
+        self, node_ids: list[NodeId]
+    ) -> DriveHostEvictionResult:
+        return self._fill_evict_result(
+            self._binding.invalidate_kv_in_storage_states(list(node_ids)),
+            DriveHostEvictionResult(),
+        )
 
     def commit_kv_fill(self, node_ids: list[NodeId], host_value: torch.Tensor) -> int:
         try:

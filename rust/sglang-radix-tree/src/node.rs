@@ -188,6 +188,9 @@ pub struct Node<K: ChildKeyType> {
     /// S2b-alpha: Full KV left device and host (it is expected in L3); the node stays for a Mamba state
     /// at or below it. Set only under `kv_evict_keep_state`; cleared when KV is refilled or reinserted.
     pub kv_in_storage: bool,
+    /// S2b-alpha: this node's Full KV is known to be in L3 (a storage write of it was acknowledged, the
+    /// storage beliefs cover it, or it was read from L3). Host KV eviction keeps a state only behind it.
+    pub kv_l3: bool,
     /// Chain-wide logical-page owner rotation, retained across node splits.
     pub rotation_base: Option<i64>,
     /// The in-flight write-through backup's ack id.
@@ -433,6 +436,7 @@ impl<K: ChildKeyType> Node<K> {
             hash_value: Some(Vec::new()),
             external_cache_stored: false,
             kv_in_storage: false,
+            kv_l3: false,
             rotation_base: None,
             write_through_pending_id: None,
             load_back_pending_id: None,
@@ -461,6 +465,7 @@ impl<K: ChildKeyType> Node<K> {
             hash_value: None,
             external_cache_stored: false,
             kv_in_storage: false,
+            kv_l3: false,
             rotation_base: None,
             write_through_pending_id: None,
             load_back_pending_id: None,

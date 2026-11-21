@@ -2739,7 +2739,7 @@ fn s2ba_full_host_eviction_keeps_the_state_node_then_its_spine() {
     assert_eq!(step.tracker[&FULL], 1);
     assert!(tc.arena.node(a).kv_in_storage);
     assert_eq!(tc.arena.len(), 3);
-    assert_eq!(tc.kv_in_storage_stats(), (2, 0, 0, 0, 2, 1));
+    assert_eq!(tc.kv_in_storage_stats(), (2, 0, 0, 0, 0, 0, 2, 1));
     tc.sanity_check(&[], &[]);
 }
 
@@ -2748,7 +2748,7 @@ fn s2ba_mamba_eviction_prunes_the_kv_in_storage_chain() {
     let mut tc = mamba_core(/* page_size = */ 1);
     let (_a, _b) = s2ba_host_chain(&mut tc);
     tc.drive_host_eviction_with_options(FULL, /* num_tokens = */ 2, true);
-    assert_eq!(tc.kv_in_storage_stats().4, 2);
+    assert_eq!(tc.kv_in_storage_stats().6, 2);
     let mut tracker = HashMap::from([(MAMBA, 0)]);
     let (mut device_frees, mut host_frees) = (HashMap::new(), HashMap::new());
     mamba_component().drive_host_eviction(
@@ -2762,7 +2762,7 @@ fn s2ba_mamba_eviction_prunes_the_kv_in_storage_chain() {
     assert_eq!(tracker[&MAMBA], 1);
     // The state was the only reason to keep either node: both go, leaving the root.
     assert_eq!(tc.arena.len(), 1);
-    assert_eq!(tc.kv_in_storage_stats(), (2, 0, 2, 0, 0, 0));
+    assert_eq!(tc.kv_in_storage_stats(), (2, 0, 2, 0, 0, 0, 0, 0));
     tc.sanity_check(&[], &[]);
 }
 
@@ -2805,7 +2805,7 @@ fn s2ba_match_reports_the_kv_fill_candidate_and_the_fill_restores_it() {
     assert_eq!(used, 1);
     let node = tc.arena.node(b);
     assert!(!node.kv_in_storage && node.has_host_value(FULL) && node.has_host_value(MAMBA));
-    assert_eq!(tc.kv_in_storage_stats(), (1, 1, 0, 0, 0, 0));
+    assert_eq!(tc.kv_in_storage_stats(), (1, 1, 0, 0, 0, 0, 0, 0));
     let result = tc.match_prefix(&match_params(&key));
     assert_eq!(result.full_kv_hit_length, 2);
     assert!(result.kv_fill.is_none());
@@ -2823,7 +2823,7 @@ fn s2ba_insert_reinserts_a_kv_in_storage_node() {
     tc.insert(&insert_params_mamba(&key, &[300, 301], Some(9)));
     assert!(!tc.arena.node(b).kv_in_storage);
     assert!(tc.arena.node(b).has_device_value(FULL));
-    let (created, _, _, reinserted, now, _) = tc.kv_in_storage_stats();
+    let (created, _, _, reinserted, _, _, now, _) = tc.kv_in_storage_stats();
     assert_eq!((created, reinserted, now), (2, 2, 0));
     tc.sanity_check(&[], &[]);
 }
@@ -2835,7 +2835,7 @@ fn s2ba_off_keeps_todays_atomic_host_leaf_eviction() {
     tc.set_s2ba_modes(false, false);
     tc.drive_host_eviction_with_options(FULL, /* num_tokens = */ 2, true);
     assert_eq!(tc.arena.len(), 1);
-    assert_eq!(tc.kv_in_storage_stats(), (0, 0, 0, 0, 0, 0));
+    assert_eq!(tc.kv_in_storage_stats(), (0, 0, 0, 0, 0, 0, 0, 0));
     tc.sanity_check(&[], &[]);
 }
 
@@ -2854,7 +2854,7 @@ fn s2ba_insert_host_refills_a_kv_in_storage_node_on_its_path() {
     assert!(tc.arena.node(a).host_value(FULL).equal(&Tensor::from_slice(&[400i64])));
     assert!(!tc.arena.node(a).kv_in_storage && tc.arena.node(a).has_host_value(FULL));
     assert!(!tc.arena.node(b).kv_in_storage && tc.arena.node(b).has_host_value(FULL));
-    assert_eq!(tc.kv_in_storage_stats(), (2, 2, 0, 0, 0, 0));
+    assert_eq!(tc.kv_in_storage_stats(), (2, 2, 0, 0, 0, 0, 0, 0));
     tc.sanity_check(&[], &[]);
 }
 
@@ -2874,9 +2874,93 @@ fn s2ba_insert_host_frees_only_the_host_resident_prefix_before_a_refill() {
         assert_eq!(result.prefix_len, 1, "write_back={write_back}");
         assert!(tc.arena.node(a).host_value(FULL).equal(&Tensor::from_slice(&[100i64])));
         assert!(tc.arena.node(b).host_value(FULL).equal(&Tensor::from_slice(&[501i64])));
-        assert_eq!(tc.kv_in_storage_stats(), (1, 1, 0, 0, 0, 0));
+        assert_eq!(tc.kv_in_storage_stats(), (1, 1, 0, 0, 0, 0, 0, 0));
         tc.sanity_check(&[], &[]);
     }
+}
+
+#[test]
+fn s2ba_host_kv_never_written_to_l3_takes_its_state_with_it() {
+    let mut tc = mamba_core(/* page_size = */ 1);
+    let (a, b) = s2ba_host_chain(&mut tc);
+    tc.arena.node_mut(b).kv_l3 = false;
+    let step = tc.drive_host_eviction_with_options(FULL, /* num_tokens = */ 1, true);
+    // No L3 copy behind the state: atomic eviction, the state is freed, no kv_in_storage node.
+    assert!(step.host_frees[&MAMBA][0].equal(&Tensor::from_slice(&[8i64])));
+    assert_eq!(tc.arena.len(), 2);
+    assert!(!tc.arena.node(a).kv_in_storage);
+    assert_eq!(tc.kv_in_storage_stats(), (0, 0, 0, 0, 1, 0, 0, 0));
+    tc.sanity_check(&[], &[]);
+}
+
+#[test]
+fn s2ba_unwritten_spine_drops_the_states_below_it() {
+    let mut tc = mamba_core(/* page_size = */ 1);
+    let (a, _b) = s2ba_host_chain(&mut tc);
+    tc.drive_host_eviction_with_options(FULL, /* num_tokens = */ 1, true);
+    tc.arena.node_mut(a).kv_l3 = false;
+    let step = tc.drive_host_eviction_with_options(FULL, /* num_tokens = */ 1, true);
+    // [1]'s KV never reached L3: the kv_in_storage state below it can never be filled.
+    assert!(step.host_frees[&MAMBA][0].equal(&Tensor::from_slice(&[8i64])));
+    assert!(step.host_frees[&FULL][0].equal(&Tensor::from_slice(&[100i64])));
+    assert_eq!(tc.arena.len(), 1);
+    assert_eq!(tc.kv_in_storage_stats(), (1, 0, 1, 0, 1, 1, 0, 0));
+    tc.sanity_check(&[], &[]);
+}
+
+#[test]
+fn s2ba_invalidation_drops_unfillable_states_and_prunes() {
+    let mut tc = mamba_core(/* page_size = */ 1);
+    let (a, b) = s2ba_host_chain(&mut tc);
+    tc.drive_host_eviction_with_options(FULL, /* num_tokens = */ 2, true);
+    let (a_id, b_id) = (tc.arena.node(a).id, tc.arena.node(b).id);
+    // A locked state stays.
+    let lock = tc.inc_host_lock_ref(b_id).unwrap();
+    let step = tc.invalidate_kv_in_storage_states(&[b_id, a_id]);
+    assert_eq!(step.tracker[&MAMBA], 0);
+    assert_eq!(tc.arena.len(), 3);
+    tc.dec_host_lock_ref(b_id, &lock.to_dec_params()).unwrap();
+    let step = tc.invalidate_kv_in_storage_states(&[b_id, a_id]);
+    assert_eq!(step.tracker[&MAMBA], 1);
+    assert!(step.host_frees[&MAMBA][0].equal(&Tensor::from_slice(&[8i64])));
+    assert_eq!(tc.arena.len(), 1);
+    assert_eq!(tc.kv_in_storage_stats(), (2, 0, 2, 0, 0, 1, 0, 0));
+    tc.sanity_check(&[], &[]);
+}
+
+#[test]
+fn s2ba_mamba_eviction_keeps_kv_above_kv_in_storage_nodes() {
+    let mut tc = mamba_core(/* page_size = */ 1);
+    let (a, b) = s2ba_host_chain(&mut tc);
+    set_mamba_host(&mut tc, a, 9);
+    tc.host_lru_list_mut(MAMBA).insert_mru(a);
+    tc.host_lru_list_mut(MAMBA).reset_node_mru(b);
+    tc.drive_host_eviction_with_options(FULL, /* num_tokens = */ 1, true);
+    assert!(tc.arena.node(b).kv_in_storage && tc.evictable_host_leaves.contains(a));
+    let mut tracker = HashMap::from([(MAMBA, 0)]);
+    let (mut device_frees, mut host_frees) = (HashMap::new(), HashMap::new());
+    mamba_component().drive_host_eviction(
+        &mut tc, /* num_tokens = */ 1, &mut tracker, &mut device_frees, &mut host_frees, &mut Vec::new(),
+    );
+    // [1] is the LRU state; its KV still leads to [2]'s state, so only the state goes.
+    assert!(host_frees[&MAMBA][0].equal(&Tensor::from_slice(&[9i64])));
+    assert!(!host_frees.contains_key(&FULL));
+    assert!(tc.arena.node(a).has_host_value(FULL) && !tc.arena.node(a).has_host_value(MAMBA));
+    assert!(tc.arena.node(b).kv_in_storage && tc.arena.node(b).has_host_value(MAMBA));
+    tc.sanity_check(&[], &[]);
+}
+
+#[test]
+fn s2ba_mark_kv_in_l3_survives_a_split() {
+    let mut tc = mamba_core(/* page_size = */ 1);
+    let root = tc.arena.node(tc.arena.root()).id;
+    let (a, b) = s2ba_host_chain(&mut tc);
+    tc.arena.node_mut(b).kv_l3 = false;
+    assert_eq!(tc.mark_kv_in_l3(&[tc.arena.node(b).id, 987_654]), 1);
+    assert!(tc.arena.node(b).kv_l3 && tc.arena.node(a).kv_l3);
+    tc.insert_host(root, None, vec![1, 2, 5], Tensor::from_slice(&[0i64, 0, 7]), vec!["h1".into(), "h2".into(), "h5".into()])
+        .expect("live test node");
+    tc.sanity_check(&[], &[]);
 }
 
 fn s2ba_xorshift(state: &mut u64) -> u64 {
@@ -2888,6 +2972,7 @@ fn s2ba_xorshift(state: &mut u64) -> u64 {
 
 #[test]
 fn s2ba_random_host_ops_hold_the_sanity_invariants() {
+    let mut totals = [0u64; 6];
     for seed in 1..=60u64 {
         let mut tc = mamba_core(/* page_size = */ 1);
         tc.set_hicache_enabled();
@@ -2897,7 +2982,7 @@ fn s2ba_random_host_ops_hold_the_sanity_invariants() {
         let mut st = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
         let mut slot = 1000i64;
         for step in 0..400 {
-            let op = s2ba_xorshift(&mut st) % 7;
+            let op = s2ba_xorshift(&mut st) % 8;
             let len = 1 + (s2ba_xorshift(&mut st) % 6) as usize;
             let key: Vec<i64> = (0..len).map(|_| (s2ba_xorshift(&mut st) % 3) as i64 + 1).collect();
             match op {
@@ -2920,6 +3005,10 @@ fn s2ba_random_host_ops_hold_the_sanity_invariants() {
                             slot += 1;
                             tc.host_lru_list_mut(MAMBA).insert_mru(idx);
                         }
+                        // Some host KV never reached L3 (a write-behind miss).
+                        if s2ba_xorshift(&mut st) % 4 == 0 {
+                            tc.arena.node_mut(idx).kv_l3 = false;
+                        }
                     }
                 }
                 2 => {
@@ -2932,6 +3021,13 @@ fn s2ba_random_host_ops_hold_the_sanity_invariants() {
                 }
                 4 => {
                     let _ = tc.begin_mamba_host_eviction(1, /* min_depth = */ 1 << 20);
+                }
+                7 => {
+                    // L3 lost the KV in front of a candidate's states: lazy invalidation, deepest first.
+                    if let Some(fill) = tc.match_prefix(&match_params(&key)).kv_fill {
+                        let ids: Vec<NodeId> = fill.state_node_ids.iter().rev().copied().collect();
+                        tc.invalidate_kv_in_storage_states(&ids);
+                    }
                 }
                 5 if step % 5 == 0 => {
                     // A recomputed request inserts device KV over whatever the path holds (kv_in_storage too).
@@ -2953,5 +3049,11 @@ fn s2ba_random_host_ops_hold_the_sanity_invariants() {
                 panic!("seed {seed} step {step} op {op}: {message}");
             }
         }
+        let c = tc.kv_in_storage_stats();
+        for (total, n) in totals.iter_mut().zip([c.0, c.1, c.2, c.3, c.4, c.5]) {
+            *total += n;
+        }
     }
+    // Every S2b-alpha transition ran (created, refilled, pruned, reinserted, unwritten, invalidated).
+    assert!(totals.iter().all(|&n| n > 0), "{totals:?}");
 }

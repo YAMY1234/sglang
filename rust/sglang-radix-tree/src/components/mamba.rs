@@ -794,7 +794,8 @@ impl<K: ChildKeyType> TreeComponent<K> for MambaComponent {
                 .get_prev_no_lock(cur, &tree_core.arena);
             // The host LRU filters Mamba's own locks. A Full load-back pin may
             // cover an ancestor whose Mamba state is not being transferred.
-            if tree_core.evictable_host_leaves.contains(cur) {
+            // A host leaf above kv_in_storage nodes (S2b-alpha) keeps its KV for them: tombstone its state.
+            if tree_core.evictable_host_leaves.contains(cur) && tree_core.arena.node(cur).children.is_empty() {
                 // Host leaf: atomic eviction (all components host + delete)
                 tree_core.evict_host_leaf_(cur, tracker, device_frees, host_frees, cache_actions);
             } else {

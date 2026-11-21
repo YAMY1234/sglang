@@ -3605,10 +3605,13 @@ class Scheduler(
             if (
                 envs.SGLANG_HICACHE_L3_KV_FILL.get()
                 and not buffer_mode
+                and not req.kv_fill_tried
                 and req.kv_fill is not None
                 and req.kv_fill.end_len - req.kv_fill.start_len
                 >= envs.SGLANG_HICACHE_L3_KV_FILL_MIN_TOKENS.get()
             ):
+                # Once the fill ends, today's path runs from the rematched prefix:
+                # L3 may hold KV and states past the deepest local state.
                 decision = tree_cache.prefetch_kv_fill_from_storage(
                     req.cache_request_handle,
                     req.kv_fill,
@@ -3617,8 +3620,12 @@ class Scheduler(
                     ],
                     extra_key=req.extra_key,
                     cache_salt=req.cache_salt,
+                    on_complete=lambda: self._prefetch_kvcache(
+                        req, storage_hit_end, within_tree_done=within_tree_done
+                    ),
                 )
                 if decision is not None:
+                    req.kv_fill_tried = True
                     return decision
             matched_len = req.prefix_len + req.host_hit_length
             within_tree = (

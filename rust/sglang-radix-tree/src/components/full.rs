@@ -272,8 +272,16 @@ impl<K: ChildKeyType> TreeComponent<K> for FullComponent {
             }
             // The parent id is captured before the eviction frees the leaf.
             let parent = tree_core.arena.node(x).try_parent();
-            if tree_core.kv_evict_keep_state && tree_core.arena.has_host_value(x, MAMBA) {
-                // S2b-alpha: KV is the trigger; drop it, keep the node and its state for a KV fill.
+            let keeps_state = tree_core.kv_evict_keep_state && tree_core.arena.has_host_value(x, MAMBA);
+            if tree_core.kv_evict_keep_state
+                && !tree_core.arena.node(x).kv_l3
+                && (keeps_state || !tree_core.arena.node(x).children.is_empty())
+            {
+                // L3 never got this KV, so no fill could reach the states that need it: they go with it.
+                tree_core.kv_in_storage_counts[4] += 1;
+            }
+            if keeps_state && tree_core.arena.node(x).kv_l3 {
+                // S2b-alpha: KV is the trigger and L3 has it; drop it, keep the node and its state for a KV fill.
                 tree_core.evict_host_kv_(x, /* keep_mamba = */ true, tracker, device_frees, host_frees, cache_actions);
             } else {
                 tree_core.evict_host_leaf_(x, tracker, device_frees, host_frees, cache_actions);

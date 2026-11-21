@@ -51,6 +51,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     InitLoadBackParams,
     InsertParams,
     InsertResult,
+    KvFillMatch,
     MatchPrefixParams,
     MatchResult,
     TreeLock,
@@ -73,6 +74,7 @@ from sglang.srt.mem_cache.hicache_storage import (
 )
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
+    KvFillOperation,
     MambaStateRestoreOperation,
     PPPrefetchDecision,
     PrefetchOperation,
@@ -631,6 +633,11 @@ class UnifiedRadixCache(BasePrefixCache):
             CacheRequestHandle, MambaStateRestoreOperation
         ] = {}
         self._storage_prefetch_wait: dict[CacheRequestHandle, _StoragePrefetchWait] = {}
+        # S2b-alpha KV fills in flight: the state-node host locks and the continuation.
+        self._kv_fill_pending: dict[
+            CacheRequestHandle,
+            tuple[list[tuple[NodeId, DecLockRefParams]], Optional[Callable[[], None]]],
+        ] = {}
         # Rank-agreed L3-hit tokens not yet resolved as usable or unfulfilled.
         # Cache-mode entries survive L3->L2 until H2D succeeds or admission
         # fails; buffer-mode entries survive staging until the H2D ack.
@@ -782,6 +789,16 @@ class UnifiedRadixCache(BasePrefixCache):
             if self._s2ba_kv_fill and not self._s2ba_keep_state:
                 raise ValueError(
                     "SGLANG_HICACHE_L3_KV_FILL needs SGLANG_HICACHE_KV_EVICT_KEEP_STATE"
+                )
+            # A kept state is only as good as the L3 copy of the KV in front of it: host KV
+            # must reach L3 before it leaves, whichever pool's eviction takes it.
+            if not (
+                envs.SGLANG_HICACHE_L3_WRITE_ON_HOST_EVICT.get()
+                and envs.SGLANG_HICACHE_L3_WRITE_MAMBA_HOST_LEAVES.get()
+            ):
+                raise ValueError(
+                    "SGLANG_HICACHE_KV_EVICT_KEEP_STATE needs SGLANG_HICACHE_L3_WRITE_ON_HOST_EVICT "
+                    "and SGLANG_HICACHE_L3_WRITE_MAMBA_HOST_LEAVES"
                 )
             self.tree_core.set_s2ba_modes(self._s2ba_keep_state, self._s2ba_kv_fill)
             logger.info(
@@ -3066,6 +3083,8 @@ class UnifiedRadixCache(BasePrefixCache):
                 )
                 if spec is not None and self._storage_backup_is_covered(spec):
                     clean += num_tokens
+                    if self._s2ba_keep_state:
+                        self.tree_core.mark_kv_in_l3([node_id])
                     continue
             operation_id = self.write_backup_storage(node_id)
             if operation_id is None:
@@ -3294,6 +3313,121 @@ class UnifiedRadixCache(BasePrefixCache):
         storage_hit_count = storage_hit_count_tensor.item()
         storage_hit_count -= storage_hit_count % self.page_size
         return storage_hit_count
+
+    @rank_consensus(same_params=["request.rid", "fill.start_len", "fill.end_len"])
+    def prefetch_kv_fill_from_storage(
+        self,
+        request: CacheRequestHandle,
+        fill: KvFillMatch,
+        fill_tokens: list[int],
+        extra_key: Optional[str] = None,
+        cache_salt: Optional[str] = None,
+        on_complete: Optional[Callable[[], None]] = None,
+    ) -> Optional[bool]:
+        """S2b-alpha: read back from L3 the KV of the kv_in_storage nodes below
+        ``fill.anchor_node``, up to the deepest page where every rank holds a state
+        (KvFillOperation's MIN). insert_host refills the nodes on completion; then
+        ``on_complete`` (today's path from the longer prefix) runs from
+        check_prefetch_progress. None: not applicable, the caller goes on with today's path."""
+        if (
+            not self._s2ba_kv_fill
+            or self.cache_controller is None
+            or self.tree_core.is_eagle
+            or request in self.ongoing_prefetch
+            or request in self._kv_fill_pending
+        ):
+            return None
+        stats = self._prefetch_outcome_stats
+        if self.cache_controller.prefetch_rate_limited():
+            stats["kv_fill_rate_limited"] = stats.get("kv_fill_rate_limited", 0) + 1
+            return None
+        anchor = fill.anchor_node
+        last_hash = self.tree_core.get_last_hash_value(anchor)
+        key = RadixKey(
+            array("q", fill_tokens),
+            extra_key=extra_key,
+            cache_salt=cache_salt,
+            is_bigram=False,
+        ).page_aligned(self.page_size)
+        if len(key) != fill.end_len - fill.start_len or (
+            last_hash is None and not self.tree_core.is_root(anchor)
+        ):
+            stats["kv_fill_unkeyed"] = stats.get("kv_fill_unkeyed", 0) + 1
+            return None
+        prefix_keys = (
+            self.tree_core.get_prefix_hash_values(anchor)
+            if self.hicache_storage_pass_prefix_keys
+            else None
+        )
+        anchor_lock_params = self.inc_host_lock_ref(anchor).to_dec_params()
+        # The states stay out of the Mamba host LRU until the fill ends; a pending
+        # tombstone of one of them finishes as revived.
+        state_locks = [
+            (node_id, self.inc_host_lock_ref(node_id).to_dec_params())
+            for node_id in fill.state_nodes
+        ]
+        kv_xfer = PoolTransfer(name=PoolName.KV, host_indices=None)
+        # No Mamba transfer: the state is local. KV-derived sidecars (indexer) follow the KV.
+        sidecar_xfers = self._build_sidecar_transfers(
+            CacheTransferPhase.PREFETCH, kv_xfer, {}
+        )
+        operation = KvFillOperation(
+            request,
+            key,
+            fill.start_len,
+            fill.end_len,
+            fill.state_pages,
+            fill.fill_nodes,
+            last_hash,
+            prefix_keys=prefix_keys,
+            pool_transfers=sidecar_xfers or None,
+        )
+        operation.stats_tree_kv_tokens = 0
+        operation.stats_requested_tokens = len(key)
+        operation.storage_start = fill.start_len
+        self.cache_controller.prefetch_queue.put(operation)
+        self.ongoing_prefetch[request] = _OngoingPrefetch(
+            anchor, key, None, operation, anchor_lock_params, {}
+        )
+        self.cache_controller.prefetch_tokens_occupied += len(key)
+        self._kv_fill_pending[request] = (state_locks, on_complete)
+        stats["kv_fill_issued"] = stats.get("kv_fill_issued", 0) + 1
+        stats["kv_fill_requested_tokens"] = (
+            stats.get("kv_fill_requested_tokens", 0) + len(key)
+        )
+        return True
+
+    def _invalidate_unfillable_states(self, operation: KvFillOperation) -> None:
+        """Lazy invalidation: the rank-agreed fill stops short of a local state only
+        where L3 lacks the KV in front of it (ranks hold the same states in lockstep),
+        so no later fill reaches that state: drop it, deepest first."""
+        pending = self._kv_fill_pending.get(operation.handle)
+        if pending is None or operation.is_terminated() or operation.deadline_expired:
+            return
+        state_locks, _ = pending
+        # Below the fill threshold the agreed pages are still fillable later: keep them.
+        agreed_pages = operation.storage_hit_count // self.page_size
+        keep, drop = [], []
+        for page, entry in zip(operation.state_pages, state_locks):
+            (drop if page > agreed_pages else keep).append(entry)
+        if not drop:
+            return
+        for node_id, lock_params in reversed(drop):
+            self.dec_host_lock_ref(node_id, lock_params)
+        state_locks[:] = keep
+        result = self.tree_core.invalidate_kv_in_storage_states(
+            [node_id for node_id, _ in reversed(drop)]
+        )
+        self._apply_eviction_result(result)
+
+    def _end_kv_fill(
+        self, request: CacheRequestHandle
+    ) -> Optional[Callable[[], None]]:
+        """Release a finished or aborted KV fill's state locks; returns its continuation."""
+        state_locks, on_complete = self._kv_fill_pending.pop(request)
+        for node_id, lock_params in reversed(state_locks):
+            self.dec_host_lock_ref(node_id, lock_params)
+        return on_complete
 
     @rank_consensus(same_params=["request.rid", "len(new_input_tokens)"])
     def prefetch_from_storage(
@@ -3627,6 +3761,22 @@ class UnifiedRadixCache(BasePrefixCache):
 
     @rank_consensus(same_params=True, same_results=True)
     def check_prefetch_progress(self, request: CacheRequestHandle) -> bool:
+        done = self._check_prefetch_progress(request)
+        if done and request in self._kv_fill_pending:
+            # The fill ended (refilled, missed or revoked): go on with today's path
+            # from the rematched prefix, at the same step on every rank.
+            on_complete = self._end_kv_fill(request)
+            if on_complete is not None:
+                self.storage_prefetch_retries.cancel(request.rid)
+                on_complete()
+                return (
+                    request not in self.ongoing_prefetch
+                    and request not in self._mamba_state_restores
+                    and request not in self._kv_fill_pending
+                )
+        return done
+
+    def _check_prefetch_progress(self, request: CacheRequestHandle) -> bool:
         if request in getattr(self, "_mamba_state_restores", {}):
             return False
         if (
@@ -4071,6 +4221,8 @@ class UnifiedRadixCache(BasePrefixCache):
     @rank_consensus(same_params=True)
     def release_aborted_request(self, request: CacheRequestHandle) -> None:
         self._cancel_mamba_state_restore(request)
+        if request in self._kv_fill_pending:
+            self._end_kv_fill(request)
         rid = request.rid
         self._storage_prefetch_wait.pop(request, None)
         if self.linker is not None:
@@ -4358,14 +4510,23 @@ class UnifiedRadixCache(BasePrefixCache):
             stats["wb_inflight_tokens"] = sum(self._write_behind_inflight.values())
             stats["wb_mamba_inflight_ops"] = len(self._write_behind_mamba_inflight)
         if self._s2ba_keep_state:
-            created, refilled, pruned, reinserted, now, with_state = (
-                self.tree_core.kv_in_storage_stats()
-            )
+            (
+                created,
+                refilled,
+                pruned,
+                reinserted,
+                unwritten,
+                invalidated,
+                now,
+                with_state,
+            ) = self.tree_core.kv_in_storage_stats()
             stats.update(
                 kvis_created=created,
                 kvis_refilled=refilled,
                 kvis_pruned=pruned,
                 kvis_reinserted=reinserted,
+                kvis_unwritten_kv_evictions=unwritten,
+                kvis_states_invalidated=invalidated,
                 kvis_nodes=now,
                 kvis_nodes_with_host_state=with_state,
             )
@@ -4388,6 +4549,8 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def _storage_prefetch_min_hit_tokens(self, operation) -> int:
         """A positive L3 checkpoint remains mandatory even with tree KV credit."""
+        if isinstance(operation, KvFillOperation):
+            return max(self.page_size, envs.SGLANG_HICACHE_L3_KV_FILL_MIN_TOKENS.get())
         if not self._l3_saved_token_threshold:
             return self.prefetch_threshold
         tree_tokens = max(0, operation.stats_tree_kv_tokens)
@@ -4615,7 +4778,9 @@ class UnifiedRadixCache(BasePrefixCache):
                 allow_partial=not (
                     self._l3_saved_token_threshold
                     and ComponentType.MAMBA in info.comp_xfers
-                ),
+                )
+                # A KV fill ends where every rank holds a state; shorter KV reaches none.
+                and not isinstance(operation, KvFillOperation),
                 min_tokens=self._storage_prefetch_min_hit_tokens(operation),
                 evict_host=self.evict_host,
             )
@@ -4669,6 +4834,8 @@ class UnifiedRadixCache(BasePrefixCache):
                     self._finish_mamba_state_restore(operation)
                     continue
                 self._invalidate_absent_from_hit_query(operation)
+                if isinstance(operation, KvFillOperation):
+                    self._invalidate_unfillable_states(operation)
                 request = operation.handle
                 hit_tokens = operation.storage_hit_count
                 info = self.ongoing_prefetch.get(request)
@@ -4774,6 +4941,8 @@ class UnifiedRadixCache(BasePrefixCache):
                     # Every rank takes this ACK at the same step: unpin and free now.
                     self._check_mamba_tombstone_ack(operation, operation.id)
                     node_id, lock_params = self.ongoing_backup.pop(operation.id)
+                    if self._s2ba_keep_state and operation.hash_value:
+                        self.tree_core.mark_kv_in_l3([node_id])
                     self.dec_host_lock_ref(node_id, lock_params)
                     # A hit since the write may have revived it: then it stays.
                     self._finish_mamba_tombstone(tombstone, revived_ok=True)
@@ -4785,6 +4954,9 @@ class UnifiedRadixCache(BasePrefixCache):
                     entry = self.ongoing_backup.pop(operation.id, None)
                     if entry is not None:
                         node_id, lock_params = entry
+                        # Unconditional on completed_tokens, like the beliefs below: rank-replicated.
+                        if self._s2ba_keep_state and operation.hash_value:
+                            self.tree_core.mark_kv_in_l3([node_id])
                         self.dec_host_lock_ref(node_id, lock_params)
                     if write_back is not None:
                         write_back_acks.append(operation)
