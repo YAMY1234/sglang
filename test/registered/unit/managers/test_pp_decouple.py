@@ -25,8 +25,14 @@ import torch  # noqa: E402
 
 from sglang.srt.managers import pp_decouple  # noqa: E402
 from sglang.srt.managers.pp_decouple import PPSendWindow, PPSendWindows  # noqa: E402
+from sglang.srt.managers.schedule_batch import (  # noqa: E402
+    Req,
+    ReqKvInfo,
+    ScheduleBatch,
+)
 from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin  # noqa: E402
 from sglang.srt.runtime_context import get_parallel  # noqa: E402
+from sglang.srt.sampling.sampling_params import SamplingParams  # noqa: E402
 from sglang.srt.mem_cache.allocator.token import TokenToKVPoolAllocator  # noqa: E402
 from sglang.srt.mem_cache.base_prefix_cache import (  # noqa: E402
     EvictParams,
@@ -338,18 +344,35 @@ class TestPPRankInvariantDigest(CustomTestCase):
         self.assertNotEqual(logs[0].hexdigest(), logs[2].hexdigest())
 
     def test_slot_map_ignores_collection_order_duplicates_and_slotless_requests(self):
-        reqs = [SimpleNamespace(rid=f"r{i}", req_pool_idx=i) for i in range(4)]
-        waiting = SimpleNamespace(rid="w", req_pool_idx=None)
+        reqs = [SimpleNamespace(rid=f"r{i}", kv=ReqKvInfo(req_pool_idx=i)) for i in range(4)]
+        waiting = SimpleNamespace(rid="w", kv=ReqKvInfo())
         self.assertEqual(
             pp_decouple.slot_map_digest(reqs),
             pp_decouple.slot_map_digest(reqs[::-1] + reqs[:2] + [waiting]),
         )
         swapped = [
-            SimpleNamespace(rid=r.rid, req_pool_idx=3 - i) for i, r in enumerate(reqs)
+            SimpleNamespace(rid=r.rid, kv=ReqKvInfo(req_pool_idx=3 - i)) for i, r in enumerate(reqs)
         ]
         self.assertNotEqual(
             pp_decouple.slot_map_digest(reqs), pp_decouple.slot_map_digest(swapped)
         )
+
+    def test_digest_reads_fields_that_real_req_and_schedule_batch_have(self):
+        """The digest ran only against stand-ins and crashed at its first epoch on the
+        server (Req keeps its pool row under kv); exercise it on the real classes."""
+        reqs = [
+            Req(f"r{i}", "", array("q", [1, 2, 3]), SamplingParams()) for i in range(2)
+        ]
+        reqs[0].kv.req_pool_idx = 5
+        batch = ScheduleBatch(reqs=reqs, batch_is_full=False)
+        batch.prefix_lens, batch.extend_lens = [0, 64], [3, 3]
+        log = pp_decouple.PPBatchLog()
+        log.add(batch)
+        self.assertEqual(
+            pp_decouple.slot_map_digest(reqs),
+            pp_decouple.slot_map_digest([reqs[0]]),
+        )
+        self.assertEqual(len(log.hexdigest()), 16)
 
     def test_an_informational_part_does_not_make_stages_mismatch(self):
         records = [
@@ -373,10 +396,10 @@ class TestPPRankInvariantDigest(CustomTestCase):
         stage = _StageModel()
         stage.apply(("admit", "r0", [1, 2, 3, 4]))
         running = SimpleNamespace(
-            rid="r1", req_pool_idx=stage.req_pool.alloc_rows(1)[0]
+            rid="r1", kv=ReqKvInfo(req_pool_idx=stage.req_pool.alloc_rows(1)[0])
         )
         inflight = SimpleNamespace(
-            rid="r2", req_pool_idx=stage.req_pool.alloc_rows(1)[0]
+            rid="r2", kv=ReqKvInfo(req_pool_idx=stage.req_pool.alloc_rows(1)[0])
         )
         scheduler = SimpleNamespace(
             token_to_kv_pool_allocator=stage.allocator,

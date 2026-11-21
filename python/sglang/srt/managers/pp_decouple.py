@@ -241,9 +241,9 @@ def slot_map_digest(reqs: Iterable[Any]) -> str:
     """Request -> request-pool slot over the live requests, in any collection order."""
     slots = sorted(
         {
-            (req.rid, int(req.req_pool_idx))
+            (req.rid, int(req.kv.req_pool_idx))
             for req in reqs
-            if req.req_pool_idx is not None
+            if req.kv.req_pool_idx is not None
         }
     )
     return hashlib.blake2b(json.dumps(slots).encode(), digest_size=8).hexdigest()
