@@ -16,7 +16,7 @@ the stages already exchange; a message larger than a slot falls back to NCCL.
 from __future__ import annotations
 
 import logging
-from collections import namedtuple
+from collections import deque, namedtuple
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import torch
@@ -199,6 +199,8 @@ class PPCEPush:
         # NCCL), and the largest message.
         self.fallbacks = 0
         self.max_bytes = 0
+        # (copy start, done) timing events of recent pushes: how long the copy engine runs per message.
+        self._timed: deque = deque(maxlen=64)
         self.ring_bytes = slots * slot_bytes
         # Local staging words for signal(): [0] the push stream's full flags, [1] the release's free flags.
         self._scratch = torch.zeros(64, dtype=torch.int32, device=f"cuda:{device_id}")
@@ -253,8 +255,14 @@ class PPCEPush:
         self.fallbacks += not ok
         return ok
 
-    def take_stats(self) -> Dict[str, int]:
+    def take_stats(self) -> Dict[str, float]:
+        ms = []
+        while self._timed and self._timed[0][1].query():
+            start, done = self._timed.popleft()
+            ms.append(start.elapsed_time(done))
         stats = {"fallbacks": self.fallbacks, "max_mib": -(-self.max_bytes >> 20)}
+        if ms:
+            stats.update(push_n=len(ms), push_ms_mean=round(sum(ms) / len(ms), 2), push_ms_max=round(max(ms), 2))
         self.fallbacks = self.max_bytes = 0
         return stats
 
@@ -277,12 +285,15 @@ class PPCEPush:
             target = free_target(seq, self.slots)
             if target > 0:
                 self.drv.wait_geq(self.stream, self.free_va + 4 * slot, target)
+            start = torch.cuda.Event(enable_timing=True)
+            start.record(self.stream)
             base = self.peer_ring_va + slot * self.peer_slot_bytes
             for (key, ce), t in zip(layout, tensors.values()):
                 self.drv.copy(self.stream, base + ce.offset, t.data_ptr(), t.numel() * t.element_size())
             self.drv.signal(self.stream, self.peer_full_va + 4 * slot, self._scratch.data_ptr(), seq + 1)
-            done = torch.cuda.Event()
+            done = torch.cuda.Event(enable_timing=True)
             done.record(self.stream)
+            self._timed.append((start, done))
             for t in tensors.values():
                 t.record_stream(self.stream)
         meta: List[Tuple[str, object]] = list(layout) + others

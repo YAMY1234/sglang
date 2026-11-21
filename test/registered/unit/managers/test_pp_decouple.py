@@ -243,7 +243,7 @@ class TestPPCEPush(CustomTestCase):
         from sglang.srt.managers.pp_ce_push import PPCEPush
 
         ce = PPCEPush.__new__(PPCEPush)
-        ce.slot_bytes, ce.peer_slot_bytes, ce.fallbacks, ce.max_bytes = 128, 512, 0, 0
+        ce.slot_bytes, ce.peer_slot_bytes, ce.fallbacks, ce.max_bytes, ce._timed = 128, 512, 0, 0, []
         self.assertTrue(ce.fits({"hidden_states": torch.zeros(64, dtype=torch.uint8), "tag": "b"}))
         big = {k: torch.zeros(300, dtype=torch.uint8) for k in ("hidden_states", "attn_res_bank")}
         self.assertFalse(ce.fits(big))
