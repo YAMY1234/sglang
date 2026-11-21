@@ -1794,8 +1794,11 @@ class Scheduler(
             )
 
         elif self.disaggregation_mode == DisaggregationMode.PREFILL:
-            # *2 for the headroom.
-            buffer_size = self.max_running_requests * 2
+            # *2 for the headroom; prefill_complete holds a slot while a request is parked.
+            buffer_size = (
+                self.max_running_requests
+                * envs.SGLANG_DISAGG_PREFILL_METADATA_BUFFER_MULT.get()
+            )
             self.req_to_metadata_buffer_idx_allocator = ReqToMetadataIdxAllocator(
                 buffer_size
             )

@@ -917,6 +917,8 @@ class Envs:
     # With MIN_WORK_TOKENS > 0, decide at the request's first prefill batch instead of the
     # handshake, so decode reserves KV from launch rather than through the queue wait.
     SGLANG_PREFILL_COMPLETE_READY_AT_LAUNCH = EnvBool(False)
+    # Prefill PD metadata buffer slots per --max-running-requests (prefill only).
+    SGLANG_DISAGG_PREFILL_METADATA_BUFFER_MULT = EnvInt(2)
 
     # ===================================================================
     # Distributed and model-parallel runtime
