@@ -24,6 +24,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     IncLockRefResult,
     InsertParams,
     InsertResult,
+    KvFillMatch,
     MatchPrefixParams,
     MatchResult,
 )
@@ -284,6 +285,17 @@ _WRITE_AHEAD_REBUILD = (
     "peek_device_eviction_candidates and set_write_ahead_spare; rebuild "
     "rust/sglang-radix-tree or set SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND=python"
 )
+_S2BA_REBUILD = (
+    "the TreeCore extension predates S2b-alpha (kv_in_storage); rebuild it from k31-s2ba "
+    "or unset SGLANG_HICACHE_KV_EVICT_KEEP_STATE / SGLANG_HICACHE_L3_KV_FILL"
+)
+
+
+def _kv_fill_from_binding(fill):
+    if fill is None:
+        return None
+    anchor, state, start, end, pages, state_nodes, fill_nodes = fill
+    return KvFillMatch(anchor, state, start, end, tuple(pages), tuple(state_nodes), tuple(fill_nodes))
 
 
 class _RustKVCacheEventRecorder:
@@ -367,6 +379,7 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
             mamba_host_hit_length=result.mamba_host_hit_length,
             mamba_branching_seqlen=result.mamba_branching_seqlen,
             full_kv_hit_length=result.full_kv_hit_length,
+            kv_fill=_kv_fill_from_binding(getattr(result, "kv_fill", None)),
             cache_actions=self._cache_actions_from_tagged(result.cache_actions),
         )
 
@@ -943,6 +956,24 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
         except AttributeError:
             raise RuntimeError(_WRITE_AHEAD_REBUILD) from None
         set_spare(list(node_ids))
+
+    def set_s2ba_modes(self, kv_evict_keep_state: bool, kv_fill_match: bool) -> None:
+        try:
+            set_modes = self._binding.set_s2ba_modes
+        except AttributeError:
+            raise RuntimeError(_S2BA_REBUILD) from None
+        set_modes(bool(kv_evict_keep_state), bool(kv_fill_match))
+
+    def kv_in_storage_stats(self) -> tuple[int, int, int, int, int, int]:
+        stats = getattr(self._binding, "kv_in_storage_stats", None)
+        return tuple(stats()) if stats is not None else (0, 0, 0, 0, 0, 0)
+
+    def commit_kv_fill(self, node_ids: list[NodeId], host_value: torch.Tensor) -> int:
+        try:
+            commit = self._binding.commit_kv_fill
+        except AttributeError:
+            raise RuntimeError(_S2BA_REBUILD) from None
+        return commit(list(node_ids), host_value)
 
     def peek_mamba_host_eviction_leaves(
         self, max_states: int

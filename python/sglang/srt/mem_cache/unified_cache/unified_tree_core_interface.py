@@ -587,6 +587,23 @@ class UnifiedTreeCoreInterface(ABC):
         ...
 
     @abstractmethod
+    def set_s2ba_modes(self, kv_evict_keep_state: bool, kv_fill_match: bool) -> None:
+        """S2b-alpha: host KV eviction keeps state nodes (kv_in_storage); match reports a KV-fill candidate."""
+        ...
+
+    @abstractmethod
+    def kv_in_storage_stats(self) -> tuple[int, int, int, int, int, int]:
+        """S2b-alpha counters: (created, refilled, pruned, reinserted, kv_in_storage nodes, of them with a
+        host state)."""
+        ...
+
+    @abstractmethod
+    def commit_kv_fill(self, node_ids: list[NodeId], host_value: torch.Tensor) -> int:
+        """S2b-alpha: attach KV read back from L3 to kv_in_storage nodes (path order, the first a child of
+        the fill anchor); returns the tokens of ``host_value`` used."""
+        ...
+
+    @abstractmethod
     def peek_mamba_host_eviction_leaves(
         self, max_states: int
     ) -> list[tuple[NodeId, int, Optional[list[str]]]]:

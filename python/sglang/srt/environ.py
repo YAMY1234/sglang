@@ -1084,6 +1084,11 @@ class Envs:
     SGLANG_HICACHE_L3_SAVED_TOKEN_THRESHOLD = EnvBool(False)
     # Recover checkpoints inside the resident KV span, beyond the deepest live state.
     SGLANG_HICACHE_L3_READ_WITHIN_TREE_KV = EnvBool(False)
+    # S2b-alpha: host KV eviction keeps nodes that hold a KDA state (KV only in L3, kv_in_storage).
+    SGLANG_HICACHE_KV_EVICT_KEEP_STATE = EnvBool(False)
+    # S2b-alpha: match through kv_in_storage nodes and read their KV back from L3 under the local state.
+    SGLANG_HICACHE_L3_KV_FILL = EnvBool(False)
+    SGLANG_HICACHE_L3_KV_FILL_MIN_TOKENS = EnvInt(1024)
     # Keyed PP0 lifetime evidence; the output directory must be explicitly provided.
     SGLANG_HICACHE_L3_LIFETIME_LEDGER = EnvBool(False)
     SGLANG_HICACHE_L3_LIFETIME_LEDGER_DIR = EnvStr(None)

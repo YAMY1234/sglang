@@ -4383,6 +4383,56 @@ def _mamba_insert(core, token_ids, indices, mamba_slot):
     )
 
 
+def test_s2ba_host_kv_eviction_keeps_state_and_kv_fill_restores_it():
+    core = _mamba_tree_core()
+    core.set_hicache_enabled()
+    core.set_s2ba_modes(True, True)
+    root = core.root_node_handle()
+    state_node = core.insert_host(
+        root, _key(list(range(1, 9))), torch.arange(100, 108), [f"h{i}" for i in range(8)]
+    ).inserted_host_node
+    node_id, _ = core.prepare_mamba_host_restore(_key(list(range(1, 9))), 8)
+    assert node_id == state_node
+    assert core.commit_mamba_host_restore(state_node, torch.tensor([5]))
+    core.insert_host(
+        state_node, _key(list(range(9, 13))), torch.arange(108, 112), [f"h{i}" for i in range(8, 12)]
+    )
+    assert core.kv_in_storage_stats() == (0, 0, 0, 0, 0, 0)
+
+    result = core.drive_host_eviction(ComponentType.FULL, 12)
+    assert sorted(torch.cat(result.host_frees[ComponentType.FULL]).tolist()) == list(range(100, 112))
+    assert ComponentType.MAMBA not in result.host_frees or not result.host_frees[ComponentType.MAMBA]
+    assert core.kv_in_storage_stats() == (1, 0, 0, 0, 1, 1)
+    core.sanity_check([], [])
+
+    matched = core.match_prefix(MatchPrefixParams(key=_key(list(range(1, 13)))))
+    assert matched.best_match_node == root
+    fill = matched.kv_fill
+    assert fill is not None
+    assert (fill.anchor_node, fill.state_node, fill.start_len, fill.end_len) == (root, state_node, 0, 8)
+    assert fill.state_pages == (8,) and fill.state_nodes == (state_node,)
+    assert fill.fill_nodes == (state_node,)
+
+    assert core.commit_kv_fill(list(fill.fill_nodes), torch.arange(200, 208)) == 8
+    assert core.kv_in_storage_stats() == (1, 1, 0, 0, 0, 0)
+    matched = core.match_prefix(MatchPrefixParams(key=_key(list(range(1, 13)))))
+    assert matched.best_match_node == state_node and matched.kv_fill is None
+    core.sanity_check([], [])
+
+
+def test_s2ba_modes_off_evict_the_state_node_with_its_kv():
+    core = _mamba_tree_core()
+    core.set_hicache_enabled()
+    state_node = core.insert_host(
+        core.root_node_handle(), _key([1, 2]), torch.tensor([100, 101]), ["h0", "h1"]
+    ).inserted_host_node
+    assert core.commit_mamba_host_restore(state_node, torch.tensor([5]))
+    result = core.drive_host_eviction(ComponentType.FULL, 2)
+    assert torch.cat(result.host_frees[ComponentType.MAMBA]).tolist() == [5]
+    assert core.kv_in_storage_stats() == (0, 0, 0, 0, 0, 0)
+    assert core.match_prefix(MatchPrefixParams(key=_key([1, 2]))).kv_fill is None
+
+
 def test_kv_canary_rows_exclude_mamba_slots():
     core = _mamba_tree_core()
     _mamba_insert(core, [1, 2], [10, 11], 7)

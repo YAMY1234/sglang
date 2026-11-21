@@ -441,6 +441,9 @@ class UnifiedRadixCache(BasePrefixCache):
         # of eviction, not at L2 admission. Resolved in init_hicache.
         self._l3_write_on_host_evict = False
         self._l3_evict_write_reserve_fraction = 0.0
+        # S2b-alpha (kv_in_storage nodes, L3 KV fill). Resolved in init_hicache.
+        self._s2ba_keep_state = False
+        self._s2ba_kv_fill = False
         # op id -> tokens of write-behind backups not yet acked; they count as
         # covered reserve so a slow ack does not re-issue deeper into the tail.
         self._write_behind_inflight: dict[int, int] = {}
@@ -764,6 +767,28 @@ class UnifiedRadixCache(BasePrefixCache):
             )
             if self._l3_lifetime_ledger is not None:
                 self.tree_core.set_l3_lifetime_ledger_enabled(True)
+        self._s2ba_keep_state = bool(envs.SGLANG_HICACHE_KV_EVICT_KEEP_STATE.get())
+        self._s2ba_kv_fill = bool(envs.SGLANG_HICACHE_L3_KV_FILL.get())
+        if self._s2ba_keep_state or self._s2ba_kv_fill:
+            if (
+                self.host_memory_mode != "cache"
+                or not self.is_mamba_enabled
+                or not self.enable_storage
+            ):
+                raise ValueError(
+                    "SGLANG_HICACHE_KV_EVICT_KEEP_STATE / SGLANG_HICACHE_L3_KV_FILL need a "
+                    "Mamba host cache and a storage backend"
+                )
+            if self._s2ba_kv_fill and not self._s2ba_keep_state:
+                raise ValueError(
+                    "SGLANG_HICACHE_L3_KV_FILL needs SGLANG_HICACHE_KV_EVICT_KEEP_STATE"
+                )
+            self.tree_core.set_s2ba_modes(self._s2ba_keep_state, self._s2ba_kv_fill)
+            logger.info(
+                "HiCache S2b-alpha: host KV eviction keeps state nodes=%s, L3 KV fill=%s.",
+                self._s2ba_keep_state,
+                self._s2ba_kv_fill,
+            )
         if self._l3_write_on_host_evict:
             if self.host_memory_mode == "buffer_only":
                 raise ValueError(
@@ -4332,6 +4357,18 @@ class UnifiedRadixCache(BasePrefixCache):
             stats.update(self._l3_tier_stats)
             stats["wb_inflight_tokens"] = sum(self._write_behind_inflight.values())
             stats["wb_mamba_inflight_ops"] = len(self._write_behind_mamba_inflight)
+        if self._s2ba_keep_state:
+            created, refilled, pruned, reinserted, now, with_state = (
+                self.tree_core.kv_in_storage_stats()
+            )
+            stats.update(
+                kvis_created=created,
+                kvis_refilled=refilled,
+                kvis_pruned=pruned,
+                kvis_reinserted=reinserted,
+                kvis_nodes=now,
+                kvis_nodes_with_host_state=with_state,
+            )
         return stats
 
     def _prefetch_occupied_span(

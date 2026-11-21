@@ -271,6 +271,21 @@ class InitLoadBackParams:
     req: Optional[Req] = None
 
 
+class KvFillMatch(NamedTuple):
+    """S2b-alpha KV-fill candidate (SGLANG_HICACHE_L3_KV_FILL): the Full KV ends at ``anchor_node``
+    (``start_len`` tokens); below it only kv_in_storage nodes (KV in L3, kept for a state) lead to the
+    states in ``state_nodes``, which end ``state_pages`` pages (1-based) after ``start_len``. ``state_node``
+    / ``end_len`` are the deepest; ``fill_nodes`` are the nodes to refill, path order."""
+
+    anchor_node: Any
+    state_node: Any
+    start_len: int
+    end_len: int
+    state_pages: tuple[int, ...]
+    state_nodes: tuple[Any, ...]
+    fill_nodes: tuple[Any, ...]
+
+
 class MatchResult(NamedTuple):
     """Result of a prefix match operation.
 
@@ -325,6 +340,8 @@ class MatchResult(NamedTuple):
     # Reusable prefix length in FULL's device-value scan, before node-boundary
     # or auxiliary constraints. None means no shorter prefix was reported.
     full_device_match_len: Optional[int] = None
+    # S2b-alpha KV-fill candidate (None unless SGLANG_HICACHE_L3_KV_FILL finds one).
+    kv_fill: Optional[KvFillMatch] = None
 
 
 def zero_match_result(
@@ -346,6 +363,7 @@ def zero_match_result(
         full_kv_hit_length=0,
         last_visited_node_id=None,
         full_device_match_len=None,
+        kv_fill=None,
     )
 
 

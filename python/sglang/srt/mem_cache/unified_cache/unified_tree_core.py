@@ -2022,6 +2022,16 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
     def set_write_ahead_spare(self, node_ids: list[NodeId]) -> None:
         self.write_ahead_spare = set(node_ids)
 
+    def set_s2ba_modes(self, kv_evict_keep_state: bool, kv_fill_match: bool) -> None:
+        if kv_evict_keep_state or kv_fill_match:
+            raise NotImplementedError("S2b-alpha kv_in_storage needs the Rust TreeCore backend")
+
+    def kv_in_storage_stats(self) -> tuple[int, int, int, int, int, int]:
+        return (0, 0, 0, 0, 0, 0)
+
+    def commit_kv_fill(self, node_ids: list[NodeId], host_value: torch.Tensor) -> int:
+        raise NotImplementedError("S2b-alpha kv_in_storage needs the Rust TreeCore backend")
+
     def peek_mamba_host_eviction_leaves(
         self, max_states: int
     ) -> list[tuple[NodeId, int, Optional[list[str]]]]:

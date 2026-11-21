@@ -284,6 +284,7 @@ def match_kv_cache(
     req.swa_branching_seqlen = match_result.swa_branching_seqlen
     req.full_kv_hit_length = match_result.full_kv_hit_length
     req.full_kv_end_node = match_result.last_visited_node_id
+    req.kv_fill = match_result.kv_fill
     # A probe match keeps what it did not report; a new round resets both.
     if match_result.mamba_branching_seqlen is not None:
         req.mamba_branching_seqlen = match_result.mamba_branching_seqlen

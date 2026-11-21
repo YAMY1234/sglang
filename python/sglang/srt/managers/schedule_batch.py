@@ -1240,6 +1240,8 @@ class Req(ReqDllmMixin):
         # Full-KV match regardless of other components, and the tree node it ends at.
         self.full_kv_hit_length: int = 0
         self.full_kv_end_node: Optional[Any] = None
+        # S2b-alpha KV-fill candidate of the latest match (KvFillMatch or None).
+        self.kv_fill: Optional[Any] = None
         # Total cached prefix length (on-device prefix_len + host_hit_length),
         # capped at the max allowed prefix. Set during prefix matching at schedule
         # time and used to estimate uncached tokens / sort by longest prefix for
