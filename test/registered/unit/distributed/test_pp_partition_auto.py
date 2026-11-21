@@ -12,7 +12,8 @@ register_cpu_ci(est_time=6, suite="base-a-test-cpu")
 DSA = {i - 1 for i in list(range(4, 93, 4)) + [93]}
 IS_DSA = [i in DSA for i in range(93)]
 REFERENCE = (12, 12, 12, 12, 12, 12, 11, 10)
-BUDGETS = [286524 * 2**20 * 0.85] * 8
+TOTAL = 286524 * 2**20
+BUDGETS = [TOTAL * 0.85] * 8
 # Per-GPU factors fitted on three rig node pairs with the stages decoupled and P3 on (PP0..PP7 placement).
 PAIRS = {
     "A": [0.956, 0.991, 0.990, 0.996, 1.001, 1.043, 1.005, 0.979],
@@ -81,9 +82,28 @@ class TestBestPartition(CustomTestCase):
         self.assertTrue(all(not all(tiny[st : st + n]) for st, n in zip(starts, part)), part)
 
 
+    def test_a_stage_keeps_room_for_its_input_ring(self):
+        """The proxy grows with depth (attention-residual bank, captures), so a stage whose input boundary moves
+        deeper needs a bigger input ring outside the static pools; with too little room the split keeps PP7's
+        boundary where its ring still fits, even though a slow PP7 wants fewer layers."""
+        m = ppa.KIMI_K31_PREFILL
+        speed = [1.0] * 7 + [1.6]
+        free = [TOTAL * 0.15] * 8
+        logits = TOTAL * 0.15 * 0.1
+        part, _ = ppa.best_partition(IS_DSA, speed, m)
+        self.assertGreater(sum(part[:7]), 84)
+        free[7] = 2 * ppa.proxy_bytes(m, 84) + logits + m.act_margin
+        part, _ = ppa.best_partition(IS_DSA, speed, m, headroom=(free, logits))
+        starts = [sum(part[:s]) for s in range(8)]
+        self.assertLessEqual(starts[7], 84)
+        self.assertTrue(
+            all(ppa.stage_headroom(m, s, starts[s], part[s], 8, free[s], logits) >= 0 for s in range(8))
+        )
+
+
 class TestResolve(CustomTestCase):
     def run_ranks(self, speeds_by_rank, pp_of_rank, chosen_by_rank0=None):
-        rows = [(pp, speeds_by_rank[r], BUDGETS[0]) for r, pp in enumerate(pp_of_rank)]
+        rows = [(pp, speeds_by_rank[r], TOTAL) for r, pp in enumerate(pp_of_rank)]
         out = {}
         for r, pp in enumerate(pp_of_rank):
             out[r] = ppa.resolve(
@@ -94,7 +114,9 @@ class TestResolve(CustomTestCase):
                 all_gather=lambda _obj: rows,
                 broadcast_from_0=lambda obj: chosen_by_rank0 if chosen_by_rank0 is not None else obj,
                 measure=lambda r=r: speeds_by_rank[r],
-                budget=BUDGETS[0],
+                total_bytes=TOTAL,
+                mem_fraction_static=0.85,
+                logits_fraction=0.1,
                 m=ppa.KIMI_K31_PREFILL,
                 reference=REFERENCE,
             )

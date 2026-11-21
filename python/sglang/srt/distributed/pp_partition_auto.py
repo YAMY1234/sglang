@@ -36,6 +36,16 @@ class StageCostModel(msgspec.Struct, frozen=True, kw_only=True):
     last_weight: float = 0.0
     kda_state: float = 0.0
     dsa_kv_bytes_per_token: float = 0.0
+    # Activation headroom outside the static pools: the proxy a stage ending at layer `end` sends is
+    # proxy_tokens x hidden_bytes_per_token x (1 + ceil(end / bank_block) + captures below end - 1); a stage holds a
+    # 2-slot input ring of its predecessor's proxy and send_window of its own, plus the indexer-logits budget and
+    # act_margin. hidden_bytes_per_token = 0 turns the headroom check off.
+    hidden_bytes_per_token: float = 0.0
+    bank_block: int = 12
+    captures: Tuple[int, ...] = ()
+    proxy_tokens: int = 16384
+    send_window: int = 3
+    act_margin: float = 0.0
 
     @classmethod
     def from_json(cls, path: str) -> "StageCostModel":
@@ -56,7 +66,25 @@ KIMI_K31_PREFILL = StageCostModel(
     last_weight=7.8e9,
     kda_state=1.82e9,
     dsa_kv_bytes_per_token=708.0,
+    hidden_bytes_per_token=7168 * 2,
+    captures=(7, 23, 51, 67, 83, 91),
+    # Fragmentation seen at the counted point's OOM (17.6 GiB) plus one 16k-token layer's activations.
+    act_margin=20e9,
 )
+
+
+def proxy_bytes(m: StageCostModel, end: int) -> float:
+    """Bytes of the proxy a stage whose layers end at `end` sends at the prefill token budget."""
+    captured = sum(c < end - 1 for c in m.captures)
+    return m.proxy_tokens * m.hidden_bytes_per_token * (1 + math.ceil(end / m.bank_block) + captured)
+
+
+def stage_headroom(m: StageCostModel, s: int, start: int, n: int, pp_size: int, static_free: float, logits: float) -> float:
+    """Bytes left outside the static pools after the stage's input ring, its in-flight sends, the indexer-logits
+    budget and the margin (the KV pools take the static fraction, so static_free = total x (1 - mem_fraction))."""
+    ring = 2 * proxy_bytes(m, start) if s > 0 else 0.0
+    sends = m.send_window * proxy_bytes(m, start + n) if s < pp_size - 1 else 0.0
+    return static_free - ring - sends - logits - m.act_margin
 
 
 def stage_layers(is_dsa: Sequence[bool], start: int, n: int) -> Tuple[int, int]:
@@ -106,9 +134,11 @@ def best_partition(
     budgets: Optional[Sequence[float]] = None,
     min_tokens: float = 0.0,
     max_layers: int = 16,
+    headroom: Optional[Tuple[Sequence[float], float]] = None,
 ) -> Tuple[Tuple[int, ...], float]:
     """Contiguous split of len(is_dsa) layers over len(speed) stages minimizing max_s cost_s * speed_s, every stage
-    keeping >= min_tokens of KV capacity under budgets (bytes per stage; None = no constraint). Ties go to the
+    keeping >= min_tokens of KV capacity under budgets (bytes per stage; None = no constraint) and, with headroom =
+    (static free bytes per stage, logits budget), a non-negative stage_headroom. Ties go to the
     smallest running max, then the smallest prefix, so the result depends only on the inputs. Returns (split, its max
     cost)."""
     L, P = len(is_dsa), len(speed)
@@ -122,6 +152,8 @@ def best_partition(
         # keeps a full-attention layer, and in a hybrid model a linear-attention layer too.
         nd, nk = stage_layers(is_dsa, start, n)
         if nd == 0 or (hybrid and nk == 0):
+            return False
+        if headroom is not None and stage_headroom(m, s, start, n, P, headroom[0][s], headroom[1]) < 0:
             return False
         return budgets is None or stage_kv_capacity(m, is_dsa, s, start, n, P, budgets[s]) >= min_tokens
 
@@ -179,23 +211,30 @@ def resolve(
     all_gather: Callable[[object], List[object]],
     broadcast_from_0: Callable[[object], object],
     measure: Callable[[], float],
-    budget: float,
+    total_bytes: float,
+    mem_fraction_static: float,
+    logits_fraction: float,
     m: StageCostModel,
     reference: Tuple[int, ...],
     fixed_speed: Sequence[float] = (),
     kv_floor: float = 1.0,
 ) -> Tuple[Tuple[int, ...], dict]:
-    """Collective over the world group: gather (pp_rank, speed, budget) from every rank, take each stage's slowest
-    rank, search the split, broadcast rank 0's, assert agreement. Returns the split and a report."""
+    """Collective over the world group: gather (pp_rank, speed, GPU memory) from every rank, take each stage's
+    slowest rank, search the split, broadcast rank 0's, assert agreement. Returns the split and a report."""
     speed = float(fixed_speed[pp_rank]) if fixed_speed else measure()
-    rows = all_gather((pp_rank, speed, budget))
+    rows = all_gather((pp_rank, speed, total_bytes))
     stage_speed = [max(v for r, v, _ in rows if r == s) for s in range(pp_size)]
-    budgets = [min(b for r, _, b in rows if r == s) for s in range(pp_size)]
+    totals = [min(b for r, _, b in rows if r == s) for s in range(pp_size)]
+    budgets = [t * mem_fraction_static for t in totals]
+    static_free = [t * (1.0 - mem_fraction_static) for t in totals]
+    # The indexer-logits scratch budget (mqa_logits_static_budget_bytes): a fraction of the static free memory.
+    logits = min(static_free) * logits_fraction
+    headroom = (static_free, logits) if m.hidden_bytes_per_token > 0 else None
     mean = sum(stage_speed) / pp_size
     factors = [v / mean for v in stage_speed]
     # KV token capacity is the minimum over the stages; keep it >= kv_floor x the reference split's.
     floor = kv_floor * min_capacity(m, is_dsa, reference, budgets) if m.dsa_kv_bytes_per_token > 0 else 0.0
-    part, value = best_partition(is_dsa, factors, m, budgets if floor > 0 else None, floor)
+    part, value = best_partition(is_dsa, factors, m, budgets if floor > 0 else None, floor, headroom=headroom)
     chosen = broadcast_from_0(part)
     assert tuple(chosen) == part, f"rank {world_rank}: PP split {part} differs from rank 0's {tuple(chosen)}"
     ref_value = max(
@@ -209,6 +248,14 @@ def resolve(
         "split": list(part),
         "split_max_ms": round(value, 2),
         "kv_floor_tokens": None if floor <= 0 else int(floor),
+        "kv_tokens_min": None if floor <= 0 else int(min_capacity(m, is_dsa, part, budgets)),
+        "logits_budget_mib": int(logits) >> 20,
+        "headroom_mib": None
+        if headroom is None
+        else [
+            int(stage_headroom(m, s, sum(part[:s]), part[s], pp_size, static_free[s], logits)) >> 20
+            for s in range(pp_size)
+        ],
         "model": msgspec.structs.asdict(m),
     }
 
@@ -232,7 +279,7 @@ def maybe_apply(*, model_config, is_draft_worker: bool, mem_fraction_static: flo
     env_part = envs.SGLANG_PP_LAYER_PARTITION.get()
     reference = tuple(int(x) for x in env_part.split(",")) if env_part else even_partition(num_layers, par.pp_size)
     world = get_world_group()
-    budget = torch.cuda.get_device_properties(torch.cuda.current_device()).total_memory * mem_fraction_static
+    total = torch.cuda.get_device_properties(torch.cuda.current_device()).total_memory
     burn_s = envs.SGLANG_PP_PARTITION_AUTO_BURN_S.get()
 
     def gather(obj):
@@ -258,7 +305,9 @@ def maybe_apply(*, model_config, is_draft_worker: bool, mem_fraction_static: flo
         all_gather=gather,
         broadcast_from_0=bcast,
         measure=measure,
-        budget=budget,
+        total_bytes=total,
+        mem_fraction_static=mem_fraction_static,
+        logits_fraction=envs.SGLANG_DSA_MQA_LOGITS_FREE_MEM_FRACTION.get(),
         m=m,
         reference=reference,
         fixed_speed=[float(x) for x in envs.SGLANG_PP_PARTITION_AUTO_SPEED.get()],
