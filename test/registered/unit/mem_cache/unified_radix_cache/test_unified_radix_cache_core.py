@@ -723,6 +723,40 @@ class UnifiedRadixCacheCoreSuite(UnifiedRadixCacheCoreFixtures):
         cache.unlock(req.lock)
         cache.sanity_check()
 
+    def test_a_later_sibling_restores_the_fork_state(self):
+        if self.cfg.enable_int8_mamba_checkpoint:
+            self.skipTest("the tree holds an int8 copy, not the tracked slot")
+        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
+        req, tokens, depth = self._fork_tracked_req(
+            cache, allocator, req_to_token_pool, sibling_pages=4
+        )
+        mamba_cache = req_to_token_pool.mamba_pool.mamba_cache
+        fork_slot = int(req.kv.mamba_fork_track_idx)
+        # Stand-in for the state the extend snapshotted at the branching depth.
+        for state in (*mamba_cache.conv, mamba_cache.temporal):
+            state[:, fork_slot] = torch.randn_like(state[:, fork_slot])
+        fork_state = [
+            s[:, fork_slot].clone() for s in (*mamba_cache.conv, mamba_cache.temporal)
+        ]
+        cache.checkpoint(req, up_to=req.extend_end)
+        cache.unlock(req.lock)
+
+        sibling = self._make_req(req_to_token_pool)
+        m = cache.match_prefix(
+            MatchPrefixParams(
+                key=RadixKey(array("q", tokens[:depth] + self._make_seq(7000, 2))),
+                cow_mamba=True,
+                req=sibling,
+            )
+        )
+        self.assertEqual(m.device_prefix_len, depth)
+        slot = int(sibling.kv.mamba_pool_idx)
+        for state, expected in zip(
+            (*mamba_cache.conv, mamba_cache.temporal), fork_state
+        ):
+            self.assertTrue(torch.equal(state[:, slot], expected))
+        cache.sanity_check()
+
     def test_fork_state_returns_to_the_pool_when_not_inserted(self):
         for case in ("state_exists", "released"):
             with self.subTest(case=case):
