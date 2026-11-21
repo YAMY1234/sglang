@@ -6,12 +6,13 @@
 #   - MLA output gate (mla_use_output_gate)
 #   - Full-rank KDA gate (use_full_rank_gate)
 
+import json
 import logging
 import os
 import re
 from array import array
 from collections.abc import Iterable
-from functools import cached_property
+from functools import cached_property, lru_cache
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, List, Optional, Tuple
 
@@ -39,7 +40,11 @@ from sglang.srt.layers.aux_hidden_states import (
     AuxHiddenStateList,
     AuxHiddenStatePacker,
 )
-from sglang.srt.layers.communication import k3_ar_fusion, k3_sp_collective
+from sglang.srt.layers.communication import (
+    k3_ar_fusion,
+    k3_sp_collective,
+    k3_sp_rs_overlap,
+)
 from sglang.srt.layers.cp.interleave import (
     cp_interleave_to_sequence_order,
     cp_sequence_to_interleave_order,
@@ -229,15 +234,124 @@ def _k31_gb300_tuning(config) -> bool:
     )
 
 
-def _k3_side_stream_max_tokens(config) -> int:
+# Kimi-K3.1 on VR200 (SM107): the decode dense GEMM rows where a
+# fixed TGV tactic beats cuBLAS, through the PD-decode DFLASH verify rows
+# (M = 6 x graph bs, to 1152). This is the "table" / "side" content of
+# sm107_table-stable.json (sgl-project/sglang#50040,
+# benchmark/kimi_k31_vr200/sm107_tables): only the rows with the same tactic
+# at every swept M in two independent sweeps (CUDA graph, weights rotated past
+# L2, a minimum-win threshold); every changed pick was bitwise equal to cuBLAS
+# on SM107. SGLANG_K31_SM107_GEMM_TABLE replaces it with another sweep's JSON.
+_K31_SM107_TGV_M_RANGES = {
+    (6144, 7168): ((132, 192, 24), (624, 624, 24)),
+    (1536, 7168): ((168, 192, 21), (336, 480, 23)),
+    (7168, 1536): ((72, 96, 24),),
+    (2112, 7168): ((528, 528, 24), (912, 960, 28)),
+    (7168, 3584): ((52, 64, 23), (132, 144, 27)),
+}
+# Side-stream [f_a | b] beside qkvg on SM107 (the same file's "side"; per-M
+# intersection of both sweeps), used up to SGLANG_K31_SM107_BFA_SIDE_MAX_TOKENS.
+_K31_SM107_BFA_SIDE_TGV_M_RANGES = {
+    (144, 7168): (
+        (108, 120, 21),
+        (132, 132, 23),
+        (156, 192, 23),
+        (336, 336, 24),
+        (672, 768, 28),
+    ),
+}
+# Identifies the built-in table in the init log line.
+_K31_SM107_TABLE_ID = "built-in (sm107_table-stable sha256 358899b1)"
+# The shapes an SM107 table may route: the TP8 attention-side projections and
+# the latent projections; (144, 7168) only on the attention side stream.
+_K31_SM107_TABLE_SHAPES = frozenset(
+    {
+        (6144, 7168),  # KDA fused qkvg
+        (2112, 7168),  # MLA fused q_a + kv_a
+        (1536, 7168),  # MLA g_proj / output gate
+        (7168, 1536),  # KDA / MLA o_proj
+        (2304, 1536),  # MLA q_b
+        (896, 3584),  # TP-sharded latent-up slice
+        (7168, 3584),  # latent up_proj (replicated)
+    }
+)
+_K31_SM107_SIDE_SHAPES = frozenset({(144, 7168)})
+
+
+def _k31_sm107_tuning(config) -> bool:
+    """Kimi-K3.1 on VR200 under SGLANG_K31_SM107_GEMM_TACTICS (default off):
+    the SM107 tactics and the SGLANG_K31_SM107_*_SIDE_MAX_TOKENS side streams."""
+    return (
+        is_kimi_k31(config)
+        and get_platform().device_sm == 107
+        and envs.SGLANG_K31_SM107_GEMM_TACTICS.get()
+    )
+
+
+def _k31_sm107_parse_ranges(section: dict, allowed: frozenset) -> dict:
+    """``{"n,k": [[m_lo, m_hi, tactic], ...]}`` -> the TGV m-range dict; any
+    shape outside ``allowed`` or a range under _K31_TGV_M_RANGES raises."""
+    out = {}
+    for key, ranges in section.items():
+        n, k = (int(v) for v in key.split(","))
+        if (n, k) not in allowed:
+            raise ValueError(f"SM107 GEMM table: shape {(n, k)} is not allowed")
+        # The generic K3.1 ranges stay registered; an SM107 range must sit above.
+        floor = max((hi for _, hi, _ in _K31_TGV_M_RANGES.get((n, k), ())), default=0)
+        rows = []
+        for m_lo, m_hi, tactic in ranges:
+            if not (
+                type(m_lo) is int
+                and type(m_hi) is int
+                and floor < m_lo <= m_hi <= 4096
+                and (tactic is None or (type(tactic) is int and tactic >= 0))
+            ):
+                raise ValueError(
+                    f"SM107 GEMM table: bad range {(m_lo, m_hi, tactic)} for {(n, k)}"
+                )
+            rows.append((m_lo, m_hi, tactic))
+        out[(n, k)] = tuple(rows)
+    return out
+
+
+@lru_cache(maxsize=1)
+def _k31_sm107_tables() -> tuple:
+    """(dense-GEMM m ranges, side-stream [f_a | b] m ranges) for SM107: the JSON
+    at SGLANG_K31_SM107_GEMM_TABLE, else the built-in table."""
+    path = envs.SGLANG_K31_SM107_GEMM_TABLE.get()
+    if path:
+        with open(path) as f:
+            doc = json.load(f)
+        dense = _k31_sm107_parse_ranges(doc["table"], _K31_SM107_TABLE_SHAPES)
+        side = _k31_sm107_parse_ranges(doc.get("side", {}), _K31_SM107_SIDE_SHAPES)
+    else:
+        dense, side = _K31_SM107_TGV_M_RANGES, _K31_SM107_BFA_SIDE_TGV_M_RANGES
+    logger.info(
+        "K3.1 SM107 decode GEMM tactics on (SGLANG_K31_SM107_GEMM_TACTICS=1): "
+        "table=%s dense=%s side=%s side-stream rows bfa<=%d gate<=%d",
+        path or _K31_SM107_TABLE_ID,
+        {f"{n}x{k}": [r[:2] for r in v] for (n, k), v in dense.items()},
+        {f"{n}x{k}": [r[:2] for r in v] for (n, k), v in side.items()},
+        envs.SGLANG_K31_SM107_BFA_SIDE_MAX_TOKENS.get(),
+        envs.SGLANG_K31_SM107_GATE_SIDE_MAX_TOKENS.get(),
+    )
+    return dense, side
+
+
+def _k3_side_stream_max_tokens(config, sm107_max_tokens=None) -> int:
     """Largest graphed decode / verify batch whose attention side-stream GEMMs
     (MLA g_proj, KDA [f_a | b] -> f_b) overlap the main stream. Above it the
     attention core fills the SMs and the overlap only adds sync overhead; on
     K3.1 GB300 the TGV picks above keep the gate and [f_a | b] cheap enough to
-    hide up to 288 verify rows."""
+    hide up to 288 verify rows. ``sm107_max_tokens`` is the SM107 cap's env
+    field, read only under _k31_sm107_tuning."""
     if not get_platform().is_blackwell:
         return 64
-    return 288 if _k31_gb300_tuning(config) else 128
+    if _k31_gb300_tuning(config):
+        return 288
+    if sm107_max_tokens is not None and _k31_sm107_tuning(config):
+        return sm107_max_tokens.get()
+    return 128
 
 
 def _k3_bfa_side_gemm(
@@ -502,11 +616,12 @@ def _k3_reduce_scatter_add(hidden_states, residual, forward_batch):
     return k3_sp_collective.reduce_scatter_res(hidden_states, residual)
 
 
-def _route_sp_o_proj_output(o_proj: RowParallelLinear) -> None:
+def _route_sp_o_proj_output(o_proj: RowParallelLinear, wrapped: bool) -> None:
     """Under SP-MoE, write o_proj's TP-partial output into K3's persistent
     symmetric buffer whenever K3's tuned reduce-scatter for that row count
     reads through it (the bank's FFN read); otherwise the stage boundary
-    reduce-scatters it from regular memory."""
+    reduce-scatters it from regular memory. ``wrapped``: o_proj carries
+    k3_sp_rs_overlap's wrapper, whose fused GEMM-RS needs neither."""
     if k3_sp_collective.enabled():
         # The table selects NVLS pull RS for larger token buckets.
         # Only those o_proj outputs come from the persistent symmetric
@@ -515,7 +630,10 @@ def _route_sp_o_proj_output(o_proj: RowParallelLinear) -> None:
 
         def _sp_o_proj_forward(x, *args, **kwargs):
             output_rows = x.shape[0]
-            if k3_sp_collective.requires_symmetric_rs(
+            # A fused GEMM-RS of these rows reduces out of its own buffer.
+            if not (
+                wrapped and k3_sp_rs_overlap.takes_gemm_rs(o_proj, x)
+            ) and k3_sp_collective.requires_symmetric_rs(
                 output_rows, x.device, x.element_size()
             ):
                 output = k3_sp_collective.get_o_proj_output_buffer(
@@ -529,6 +647,16 @@ def _route_sp_o_proj_output(o_proj: RowParallelLinear) -> None:
             return _sp_inner_o_proj_forward(x, *args, **kwargs)
 
         o_proj.forward = _sp_o_proj_forward
+
+
+def _overlaps_sp_o_proj_rs(config: KimiLinearConfig, sp_moe: bool) -> bool:
+    """Whether an SP-MoE layer's o_proj overlaps its GEMM with the
+    reduce-scatter (k3_sp_rs_overlap), whose output the bank's FFN read takes."""
+    return (
+        sp_moe
+        and config.attn_res_block_size is not None
+        and k3_sp_rs_overlap.installs(config.hidden_size)
+    )
 
 
 def _k3_symm_o_proj_out(o_proj: RowParallelLinear, x: torch.Tensor) -> torch.Tensor:
@@ -561,6 +689,152 @@ def _uses_ep_a2a() -> bool:
     )
 
 
+class _K31MoEStart:
+    """Kimi-K3.1 MegaMoE decode block: start order of the routed and shared branches.
+
+    Default off.
+    ``SGLANG_K31_MOE_START`` (read here, at the call site) selects how
+    ``KimiK3MoE._forward_unfused`` issues its two branches inside a captured CUDA
+    graph when the routed experts run through DeepGEMM MegaMoE and the replicated
+    shared experts overlap them on the side stream (SBO):
+
+    - ``prio``: the routed chain (``mega_moe_pre_dispatch`` -> MegaMoE -> latent norm ->
+      latent up projection) runs on a stream of the greatest CUDA priority, forked
+      from and joined back to the current stream. Stream capture copies a stream's
+      priority into its kernel nodes, and torch instantiates graphs with
+      ``cudaGraphInstantiateFlagUseNodePriority`` (pytorch#167346), so the block
+      scheduler dispatches routed CTAs ahead of pending shared-expert CTAs.
+    - ``order``: the shared experts fork after ``mega_moe_pre_dispatch`` instead of
+      after the MoE front, so the MegaMoE launch (PDL-chained to the pre-dispatch)
+      is queued before the shared gate_up GEMM.
+    - ``early``: the shared experts fork before the MoE front, and the front and the
+      routed chain run on the priority stream (implies ``prio``): the shared GEMMs
+      fill the SMs the front's split-K reduce, epilogue and pre-dispatch leave idle.
+
+    Values: unset, ``0`` or ``off`` = off; ``1`` = ``prio,order``; otherwise a ``,``/``+``
+    separated subset of {prio, order, early} (``early`` excludes ``order``). Same
+    kernels, inputs and launch configurations; only graph edges and node priorities
+    change. Every other model, config and path behaves exactly as before.
+    """
+
+    ENV = "SGLANG_K31_MOE_START"
+    TAG = "default off"
+    TOKENS = frozenset({"prio", "order", "early"})
+    OFF = frozenset()
+
+    _streams = {}
+    _logged_on = False
+    _logged_off = False
+
+    @staticmethod
+    @lru_cache(maxsize=8)
+    def parse_mode(value: Optional[str]) -> frozenset:
+        """The set of start-order tokens for one ``SGLANG_K31_MOE_START`` value."""
+        cls = _K31MoEStart
+        if value is None:
+            return cls.OFF
+        text = value.strip().lower()
+        if text in ("", "0", "off", "false", "no", "none"):
+            return cls.OFF
+        if text in ("1", "on", "true", "yes"):
+            text = "prio,order"
+        tokens = frozenset(t for t in re.split(r"[,+\s]+", text) if t)
+        bad = tokens - cls.TOKENS
+        if bad:
+            raise ValueError(
+                f"{cls.ENV}={value!r}: unknown token(s) {sorted(bad)}; "
+                f"use 0/off, 1, or a subset of {sorted(cls.TOKENS)}"
+            )
+        if "early" in tokens and "order" in tokens:
+            raise ValueError(f"{cls.ENV}={value!r}: 'early' and 'order' are exclusive")
+        if "early" in tokens:
+            tokens = tokens | {"prio"}
+        return tokens
+
+    @staticmethod
+    def mode() -> frozenset:
+        return _K31MoEStart.parse_mode(os.environ.get(_K31MoEStart.ENV))
+
+    @staticmethod
+    def on_stream(stream):
+        """``torch.cuda.stream(stream)``, or a no-op that touches no device API."""
+        if stream is None:
+            from contextlib import nullcontext
+
+            return nullcontext()
+        return torch.cuda.stream(stream)
+
+    @staticmethod
+    def _greatest_priority() -> int:
+        try:
+            _least, greatest = torch.cuda.Stream.priority_range()
+            return int(greatest)
+        except Exception:  # older torch: any negative value maps to the top pool
+            return -1
+
+    @staticmethod
+    def routed_stream(create: bool = False):
+        """The process's high-priority routed-chain stream for the current device.
+
+        Created at model init (``create=True``), outside graph capture; a forward
+        that finds none falls back to the default order."""
+        if not torch.cuda.is_available():
+            return None
+        streams = _K31MoEStart._streams
+        device = torch.cuda.current_device()
+        stream = streams.get(device)
+        if stream is None and create:
+            stream = torch.cuda.Stream(priority=_K31MoEStart._greatest_priority())
+            streams[device] = stream
+        return stream
+
+    @staticmethod
+    def prepare_at_init() -> None:
+        """Validate the flag (raises on a bad value) and create the priority stream."""
+        if "prio" in _K31MoEStart.mode():
+            _K31MoEStart.routed_stream(create=True)
+
+    @staticmethod
+    def log_on_once(
+        layer_idx: int, num_tokens: int, tokens: frozenset, shared_stream
+    ) -> None:
+        cls = _K31MoEStart
+        if cls._logged_on:
+            return
+        cls._logged_on = True
+        stream = cls.routed_stream() if "prio" in tokens else None
+        logger.info(
+            "K31 MoE start order on (%s=%s, %s): layer %d, %d rows; routed chain stream "
+            "priority %s (shared-expert stream priority %s); shared experts fork %s",
+            cls.ENV,
+            ",".join(sorted(tokens)),
+            cls.TAG,
+            layer_idx,
+            num_tokens,
+            "unchanged" if stream is None else stream.priority,
+            "?" if shared_stream is None else shared_stream.priority,
+            "before the MoE front"
+            if "early" in tokens
+            else "after mega_moe_pre_dispatch"
+            if "order" in tokens
+            else "after the MoE front",
+        )
+
+    @staticmethod
+    def log_off_once(layer_idx: int, reason: str) -> None:
+        cls = _K31MoEStart
+        if cls._logged_off:
+            return
+        cls._logged_off = True
+        logger.warning(
+            "K31 MoE start order off (%s set, %s): layer %d: %s; the default order runs",
+            cls.ENV,
+            cls.TAG,
+            layer_idx,
+            reason,
+        )
+
+
 class KimiK3MoE(nn.Module):
     """K3 MoE with Latent MoE (experts run in moe_hidden_size space)."""
 
@@ -581,6 +855,9 @@ class KimiK3MoE(nn.Module):
         self.num_shared_experts = config.num_shared_experts
         self.layer_idx = layer_idx
         self.alt_stream = alt_stream
+        # Default off: SGLANG_K31_MOE_START.
+        if alt_stream is not None:
+            _K31MoEStart.prepare_at_init()
 
         self.use_latent_moe = _uses_latent_moe(config)
         # Merged front weight ([H, gate_up + E + latent]), built after weight
@@ -980,12 +1257,18 @@ class KimiK3MoE(nn.Module):
         topk_output,
         *,
         valid_token_count: Optional[torch.Tensor] = None,
+        after_pre_dispatch=None,
+        decode_tiles: bool = False,
     ) -> torch.Tensor:
         """Routed experts via deep_gemm MegaMoE: fused a2a dispatch + grouped
         GEMMs + SiTU + combine over the EP-group symmetric buffer. Semantically
         equivalent to `self.experts(routed_input, topk_output)` on an a2a
         backend (combine returns fully-summed rows; `_reduce_latent` then only
-        applies the norm)."""
+        applies the norm).
+
+        decode_tiles: this call is captured into a decode / target-verify CUDA
+        graph, so an FP8xFP4 launch takes the raised decode BLOCK_M
+        (_mega_moe_tiles_env, SGLANG_OPT_DEEPGEMM_MEGA_MOE_RAISE_DECODE_BLOCK_M)."""
         import deep_gemm
 
         from sglang.kernels.ops.moe.dsv4 import mega_moe_pre_dispatch
@@ -993,6 +1276,7 @@ class KimiK3MoE(nn.Module):
         from sglang.srt.layers.moe.mega_moe import (
             _configure_mega_moe_deep_gemm_num_sms,
             _mega_moe_mma_type,
+            _mega_moe_tiles_env,
         )
 
         # Under SP-MoE these rows are this rank's shard of the batch; an unpadded
@@ -1055,13 +1339,24 @@ class KimiK3MoE(nn.Module):
                 quant_group_size=32,
                 num_token_non_padded=valid_token_count,
             )
+        if after_pre_dispatch is not None:
+            # SGLANG_K31_MOE_START=order: fork the shared experts here, so the
+            # MegaMoE launch queues ahead of their gate_up GEMM.
+            after_pre_dispatch()
         # At least one row so the tvm-ffi binding sees a non-null data_ptr.
         y = torch.empty(
             (max(num_tokens, 1), self.moe_hidden_size),
             dtype=torch.bfloat16,
             device=routed_input.device,
         )
-        with _configure_mega_moe_deep_gemm_num_sms(deep_gemm):
+        # K3 fuses no shared experts into MegaMoE, so no shared-expert scale
+        # layout has to follow the remapped BLOCK_M; the scoped
+        # DG_MEGA_MOE_TILES only reaches this launch (and the graph it is
+        # captured into).
+        with (
+            _configure_mega_moe_deep_gemm_num_sms(deep_gemm),
+            _mega_moe_tiles_env(buf, num_tokens, decode_tiles and num_tokens > 0),
+        ):
             deep_gemm.fp8_fp4_mega_moe(
                 y,
                 self.experts.mega_l1_weights,
@@ -1292,12 +1587,44 @@ class KimiK3MoE(nn.Module):
             and not is_in_tc_piecewise_cuda_graph()
         )
 
+    def _k31_moe_start_mode(
+        self, hidden_states: torch.Tensor, fine_grained_overlap: bool
+    ) -> frozenset:
+        """SGLANG_K31_MOE_START tokens for this captured MegaMoE + SBO call, or empty.
+
+        Default off; eager calls keep the default order."""
+        tokens = _K31MoEStart.mode()
+        if not tokens or not torch.cuda.is_current_stream_capturing():
+            return _K31MoEStart.OFF
+        reason = None
+        if not (
+            self._use_mega_moe and self.use_latent_moe and self._sbo_shared_overlap
+        ):
+            reason = "needs MegaMoE, latent MoE and the side-stream shared experts"
+        elif _is_npu or _is_hip or fine_grained_overlap:
+            reason = "CUDA only"
+        elif self._shared_experts_tp_comm or self._routed_needs_reduce:
+            # Their collectives must stay on the current stream.
+            reason = "needs replicated shared experts and no latent all-reduce"
+        elif hidden_states.shape[0] == 0:
+            reason = "no rows"
+        elif "prio" in tokens and _K31MoEStart.routed_stream() is None:
+            reason = "no priority stream (created at model init)"
+        if reason is not None:
+            _K31MoEStart.log_off_once(self.layer_idx, reason)
+            return _K31MoEStart.OFF
+        _K31MoEStart.log_on_once(
+            self.layer_idx, hidden_states.shape[0], tokens, self.alt_stream
+        )
+        return tokens
+
     def _forward_unfused(
         self,
         hidden_states: torch.Tensor,
         *,
         prefix_sum: Optional[torch.Tensor],
         valid_token_count: Optional[torch.Tensor] = None,
+        mega_decode_tiles: bool = False,
     ) -> torch.Tensor:
         """Front section with three separate GEMMs, each reading
         hidden_states: shared-expert MLP, router gate, latent down-proj."""
@@ -1309,6 +1636,7 @@ class KimiK3MoE(nn.Module):
         #   current: front ---------- dispatch ---------- routed GEMMs -- tail
         #   alt:     all-gather ----- shared MLP -------- reduce-scatter
         fine_grained_overlap = self._can_overlap_shared_experts_npu(hidden_states)
+        k31_start = self._k31_moe_start_mode(hidden_states, fine_grained_overlap)
         shared_input = None
         shared_output = None
         shared_event = None
@@ -1342,11 +1670,15 @@ class KimiK3MoE(nn.Module):
             else:
                 shared_output = self._forward_shared_experts(hidden_states)
 
-        def run_experts(expert_input, topk_output):
+        def run_experts(expert_input, topk_output, after_pre_dispatch=None):
             if not fine_grained_overlap:
                 return (
                     self._forward_mega_experts(
-                        expert_input, topk_output, valid_token_count=valid_token_count
+                        expert_input,
+                        topk_output,
+                        valid_token_count=valid_token_count,
+                        after_pre_dispatch=after_pre_dispatch,
+                        decode_tiles=mega_decode_tiles,
                     )
                     if self._use_mega_moe
                     else self.experts(expert_input, topk_output)
@@ -1404,28 +1736,49 @@ class KimiK3MoE(nn.Module):
 
         # Give the NPU shared-expert branch a head start. At this point
         # hidden_states is the decoder layer's post-attention RMSNorm output.
-        if _is_npu and self._sbo_shared_overlap:
+        if (_is_npu and self._sbo_shared_overlap) or "early" in k31_start:
             issue_shared()
+
+        # SGLANG_K31_MOE_START: the routed chain (and under "early" the front)
+        # on the priority stream, forked where its first input is ready;
+        # off, both contexts are nullcontext.
+        k31_routed = None
+        if "prio" in k31_start:
+            k31_main = torch.cuda.current_stream()
+            k31_routed = _K31MoEStart.routed_stream()
+        k31_front_stream = None
+        if "early" in k31_start:
+            k31_front_stream = k31_routed
+            k31_routed.wait_stream(k31_main)
 
         # Front: gate + TopK (+ latent down-proj when merged). Strategy table:
         # kernels/ops/moe/moe_front.py.
-        routed_input = self._ep_front(hidden_states)
-        if routed_input is None and not fine_grained_overlap:
-            routed_input = self._ep_front_overlap(hidden_states)
-        topk_output = None
-        if routed_input is not None:
-            topk_output, routed_input = routed_input
-        elif hidden_states.shape[0] == 0:
-            # An idle DP-attention rank routes nothing but still enters the EP
-            # dispatch; like DeepseekV2MoE, skip the gate and TopK kernels.
-            topk_output = self.topk.empty_topk_output(hidden_states.device)
-        else:
-            # MoEGate produces fp32 router logits on CUDA (via linear_bf16_fp32
-            # or tiny_gemm_bf16); non-CUDA falls back to F.linear (bf16). The
-            # fp32 logits reach the radix router from moe_fused_gate.
-            router_logits = self.gate(hidden_states)
-            topk_output = self.topk(hidden_states, router_logits)
-        if not (_is_npu and self._sbo_shared_overlap):
+        with _K31MoEStart.on_stream(k31_front_stream):
+            routed_input = self._ep_front(hidden_states)
+            # _ep_front_overlap would queue the gate behind the shared experts
+            # on alt_stream; the plain gate below runs the same kernels.
+            if (
+                routed_input is None
+                and not fine_grained_overlap
+                and "early" not in k31_start
+            ):
+                routed_input = self._ep_front_overlap(hidden_states)
+            topk_output = None
+            if routed_input is not None:
+                topk_output, routed_input = routed_input
+            elif hidden_states.shape[0] == 0:
+                # An idle DP-attention rank routes nothing but still enters the EP
+                # dispatch; like DeepseekV2MoE, skip the gate and TopK kernels.
+                topk_output = self.topk.empty_topk_output(hidden_states.device)
+            else:
+                # MoEGate produces fp32 router logits on CUDA (via linear_bf16_fp32
+                # or tiny_gemm_bf16); non-CUDA falls back to F.linear (bf16). The
+                # fp32 logits reach the radix router from moe_fused_gate.
+                router_logits = self.gate(hidden_states)
+                topk_output = self.topk(hidden_states, router_logits)
+        if not (_is_npu and self._sbo_shared_overlap) and not (
+            k31_start & {"early", "order"}
+        ):
             issue_shared()
 
         if not self.use_latent_moe:
@@ -1442,25 +1795,35 @@ class KimiK3MoE(nn.Module):
                 and self.routed_expert_up_proj is not None
             )
 
-        if routed_input is None:
-            if hidden_states.shape[0] == 0:
-                # Idle DP ranks must still enter the EP dispatch below so the
-                # active replicas can exchange routed tokens.  Ascend's
-                # quantized matmul does not accept an empty activation, so
-                # materialize its shape-only result without launching GEMM.
-                routed_input = hidden_states.new_empty((0, self.moe_hidden_size))
+        if k31_routed is not None and "early" not in k31_start:
+            k31_routed.wait_stream(k31_main)
+        with _K31MoEStart.on_stream(k31_routed):
+            if routed_input is None:
+                if hidden_states.shape[0] == 0:
+                    # Idle DP ranks must still enter the EP dispatch below so the
+                    # active replicas can exchange routed tokens.  Ascend's
+                    # quantized matmul does not accept an empty activation, so
+                    # materialize its shape-only result without launching GEMM.
+                    routed_input = hidden_states.new_empty((0, self.moe_hidden_size))
+                else:
+                    routed_input, _ = self.routed_expert_down_proj(hidden_states)
+            expert_output = run_experts(
+                routed_input,
+                topk_output,
+                after_pre_dispatch=issue_shared if "order" in k31_start else None,
+            )
+            if expert_output.shape[0] == 0:
+                # The EP combine returns one row per source token.  Keep the
+                # source-side empty result while avoiding empty RMSNorm/up-proj
+                # launches; the collective itself has already completed above.
+                out = hidden_states.new_empty((0, hidden_states.shape[1]))
             else:
-                routed_input, _ = self.routed_expert_down_proj(hidden_states)
-        expert_output = run_experts(routed_input, topk_output)
-        if expert_output.shape[0] == 0:
-            # The EP combine returns one row per source token.  Keep the
-            # source-side empty result while avoiding empty RMSNorm/up-proj
-            # launches; the collective itself has already completed above.
-            out = hidden_states.new_empty((0, hidden_states.shape[1]))
-        else:
-            latent = self._reduce_latent(expert_output)
-            # up_proj is replicated, so the routed output is now fully reduced.
-            out, _ = self.routed_expert_up_proj(latent)
+                latent = self._reduce_latent(expert_output)
+                # up_proj is replicated, so the routed output is now fully reduced.
+                out, _ = self.routed_expert_up_proj(latent)
+        if k31_routed is not None:
+            k31_main.wait_stream(k31_routed)
+            out.record_stream(k31_main)
         wait_and_finalize_shared_experts()
         if shared_output is not None:
             # tp1 shared experts (SP-MoE) are complete per-rank; TP-sharded
@@ -1804,6 +2167,7 @@ class KimiK3MoE(nn.Module):
         prefix_sum: Optional[torch.Tensor] = None,
         cp_shard_rows: bool = False,
         valid_token_count: Optional[torch.Tensor] = None,
+        mega_decode_tiles: bool = False,
     ) -> torch.Tensor:
         """A latent MoE, which writes the next stream itself, takes the pending
         prefix_sum: folded into the 3-way JIT tail add when covered, plain adds
@@ -1823,6 +2187,7 @@ class KimiK3MoE(nn.Module):
                 hidden_states,
                 prefix_sum=prefix_sum,
                 valid_token_count=valid_token_count,
+                mega_decode_tiles=mega_decode_tiles,
             )
         return out.view(num_tokens, hidden_size)
 
@@ -1850,7 +2215,11 @@ class KimiK3DeltaAttention(nn.Module):
         # stream (graphed decode/verify only; SM bound as the MLA gate stream).
         self._bfa_alt_stream = bfa_alt_stream
         self._bfa_bs_limit = (
-            _k3_side_stream_max_tokens(config) if bfa_alt_stream is not None else 0
+            _k3_side_stream_max_tokens(
+                config, envs.SGLANG_K31_SM107_BFA_SIDE_MAX_TOKENS
+            )
+            if bfa_alt_stream is not None
+            else 0
         )
         # TGV m ranges of the side-stream [f_a | b] GEMM, set with _bfa_w.
         self._bfa_side_tgv_m_ranges: Optional[TGVMRanges] = None
@@ -2131,8 +2500,12 @@ class KimiK3DeltaAttention(nn.Module):
         # Set by _prepare_fused_decode() once weights are loaded.
         self._kda_fused_decode_ready = False
         self._kda_hip_fused_decode_ready = False
+        if _overlaps_sp_o_proj_rs(config, sp_moe):
+            k3_sp_rs_overlap.wrap_o_proj(self.o_proj)
         if sp_moe:
-            _route_sp_o_proj_output(self.o_proj)
+            _route_sp_o_proj_output(
+                self.o_proj, _overlaps_sp_o_proj_rs(config, sp_moe)
+            )
 
     def forward_qkvbfg(self, hidden_states: torch.Tensor):
         qkv, _ = self.qkv_proj(hidden_states)
@@ -2186,13 +2559,16 @@ class KimiK3DeltaAttention(nn.Module):
         self._bfa_fa_size, self._bfa_b_size = sizes
         from sglang.srt.layers.quantization.unquant import get_bf16_gemm_backend
 
-        if _k31_gb300_tuning(self.config) and get_bf16_gemm_backend().is_cutedsl():
+        side_tables = None
+        if _k31_gb300_tuning(self.config):
+            side_tables = _K31_GB300_BFA_SIDE_TGV_M_RANGES
+        elif _k31_sm107_tuning(self.config):
+            side_tables = _k31_sm107_tables()[1]
+        if side_tables is not None and get_bf16_gemm_backend().is_cutedsl():
             from sglang.kernels.ops.gemm.cutedsl_bf16_gemm import TGVMRanges
 
             m_ranges = TGVMRanges()
-            for m_lo, m_hi, tactic in _K31_GB300_BFA_SIDE_TGV_M_RANGES.get(
-                tuple(self._bfa_w.shape), ()
-            ):
+            for m_lo, m_hi, tactic in side_tables.get(tuple(self._bfa_w.shape), ()):
                 m_ranges.append(m_lo=m_lo, m_hi=m_hi, tactic=tactic)
             self._bfa_side_tgv_m_ranges = m_ranges
 
@@ -2633,6 +3009,9 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
             # Allocate o_proj's output in the attention-TP group's symmetric
             # memory, where the stage boundary sums it.
             self.o_proj.use_dp_attention_reduce = True
+        # Under the output-gate wrap below, so it sees the gated input.
+        if _overlaps_sp_o_proj_rs(config, sp_moe):
+            k3_sp_rs_overlap.wrap_o_proj(self.o_proj)
         if self.use_output_gate:
             projection_size = config.num_attention_heads * config.v_head_dim
             # Shard by attn-TP to match the attention output (DSV2 MLA shards
@@ -2653,7 +3032,9 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
             self._gate_pending_stream = None
             self._gate_alt_stream = gate_alt_stream
             self._gate_bs_limit = (
-                _k3_side_stream_max_tokens(config)
+                _k3_side_stream_max_tokens(
+                    config, envs.SGLANG_K31_SM107_GATE_SIDE_MAX_TOKENS
+                )
                 if self._gate_alt_stream is not None
                 else 0
             )
@@ -2680,7 +3061,9 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
 
             self.o_proj.forward = _gated_o_proj_forward
         if sp_moe:
-            _route_sp_o_proj_output(self.o_proj)
+            _route_sp_o_proj_output(
+                self.o_proj, _overlaps_sp_o_proj_rs(config, sp_moe)
+            )
 
     @staticmethod
     def _split_kv_b_weight_loader(param, loaded_weight) -> None:
@@ -2769,20 +3152,22 @@ def _fuses_attn_all_reduce(config: KimiLinearConfig) -> bool:
     )
 
 
-def _carries_bank_slices(config: KimiLinearConfig, sp_collective: bool) -> bool:
+def _carries_bank_slices(config: KimiLinearConfig) -> bool:
     """Whether consecutive SP-MoE layers keep the stream and the
     attention-residual bank on each rank's attention-TP shard of the rows
     (SGLANG_K3_SP_ATTN_RES): each layer reads its attention input there, then
-    gathers what it read. DSpark gathers the pre-norm mixture at its capture
-    layers, but other aux-capture and pipeline paths need the whole bank;
-    this is decided at construction. Nor can a
+    gathers what it read. The DSpark and DFLASH aux captures (DFLASH reuses
+    the DSpark taps, see set_dflash_layers_to_capture) mix this rank's bank
+    rows and gather the mixture, so they work on the shards; EAGLE3's capture
+    and pipeline paths need the whole bank. This is decided at construction.
+    Nor can a
     dense layer after an SP-MoE one, whose FFN reads every row of the bank:
-    every layer from the first MoE layer on must be one. ``sp_collective``:
-    whether K3's SP collective is enabled on this rank."""
+    every layer from the first MoE layer on must be one. This layout also
+    works with NCCL: custom collective kernels only fuse the local bank
+    read with the gather, and are not required to keep the bank sharded."""
     if not (
         _shards_moe_rows()
         and config.attn_res_block_size is not None
-        and sp_collective
         and envs.SGLANG_K3_SP_ATTN_RES.get()
         and get_parallel().pp_size == 1
     ):
@@ -2791,7 +3176,7 @@ def _carries_bank_slices(config: KimiLinearConfig, sp_collective: bool) -> bool:
     if True not in moe or not all(moe[moe.index(True) :]):
         return False
     spec = SpeculativeAlgorithm.from_string(get_spec().speculative_algorithm)
-    return spec.is_dspark() or not (spec.is_eagle3() or spec.is_dflash_family())
+    return not spec.is_eagle3()
 
 
 def _latent_moe_writes_stream(config: KimiLinearConfig, layer_idx: int) -> bool:
@@ -2830,9 +3215,7 @@ def _stage_facts(
     ffn_ops = dict(read=NormReadout(reads_before_dp_gather=True))
     if config.attn_res_block_size is not None:
         if bank is None:
-            bank = AttnBankState.facts(
-                reads_slices=_carries_bank_slices(config, sp_collective)
-            )
+            bank = AttnBankState.facts(reads_slices=_carries_bank_slices(config))
         attn_ops = dict(
             read=bank.attn_readout,
             update=bank.attn_update,
@@ -2906,6 +3289,7 @@ class KimiK3DecoderLayer(nn.Module):
         self._sp_moe = self._is_moe_layer and _shards_moe_rows()
 
         self.all_reduce_fusion = not self._sp_moe and _fuses_attn_all_reduce(config)
+        self._sp_rs_overlap = _overlaps_sp_o_proj_rs(config, self._sp_moe)
 
         # Attention
         if config.is_kda_layer(layer_idx):
@@ -3003,11 +3387,14 @@ class KimiK3DecoderLayer(nn.Module):
                 self.mlp_res_proj,
                 self.mlp_res_norm,
                 writes_block=self.is_block_write_layer,
+                leading_fusions=(
+                    (k3_sp_rs_overlap.presummed_fusion,) if self._sp_rs_overlap else ()
+                ),
                 ffn_input_fusions=self._ffn_input_fusions(),
                 fuses_slice_collectives=self._sp_moe
                 and sp_collective
                 and envs.SGLANG_K3_SP_ATTN_RES.get(),
-                reads_slices=_carries_bank_slices(config, sp_collective),
+                reads_slices=_carries_bank_slices(config),
             ).residual_ops()
         attn, ffn = _stage_facts(
             config, layer_idx, sp_collective=sp_collective, bank=bank
@@ -3097,6 +3484,8 @@ class KimiK3DecoderLayer(nn.Module):
                 # attention-TP size) would otherwise be routed: their stale
                 # contents pile onto a few experts that every rank then waits on.
                 valid_token_count = forward_batch.moe_num_token_non_padded()
+            from sglang.srt.layers.moe.mega_moe import _use_mega_moe_decode_tiles
+
             hidden_states = self.mlp(
                 hidden_states,
                 prefix_sum=(
@@ -3105,6 +3494,7 @@ class KimiK3DecoderLayer(nn.Module):
                     else None
                 ),
                 valid_token_count=valid_token_count,
+                mega_decode_tiles=_use_mega_moe_decode_tiles(forward_batch),
             )
         elif self._ffn_writes_stream:
             hidden_states = self.mlp(
@@ -3135,7 +3525,13 @@ class KimiK3LinearModel(nn.Module):
         # Whether K3's SP collective is enabled on this rank, which the layers'
         # stage declarations depend on: settled once, before any is built.
         sp_collective = k3_sp_collective.enabled()
-        self.carries_bank_slices = _carries_bank_slices(config, sp_collective)
+        self.carries_bank_slices = _carries_bank_slices(config)
+        if self.carries_bank_slices:
+            logger.info(
+                "K3 attention-residual bank kept on attention-TP shards "
+                "(SGLANG_K3_SP_ATTN_RES; gathers: %s)",
+                "K3 SP collective" if sp_collective else "NCCL",
+            )
 
         if self.pp_group.is_first_rank:
             embedding_quant_config = (
@@ -3310,6 +3706,7 @@ class KimiK3LinearModel(nn.Module):
                 aux_hidden_states.append(
                     self._dspark_capture_stream(i, hidden_states, forward_batch)
                 )
+        k3_sp_rs_overlap.check_consumed()
 
         if not self.pp_group.is_last_rank:
             if self.attn_bank is not None:
@@ -3418,6 +3815,8 @@ class KimiK3LinearForCausalLM(nn.Module):
             register_tgv_m_ranges(_K31_TGV_M_RANGES)
             if _k31_gb300_tuning(config):
                 register_tgv_m_ranges(_K31_GB300_TGV_M_RANGES)
+            elif _k31_sm107_tuning(config):
+                register_tgv_m_ranges(_k31_sm107_tables()[0])
         if quant_config is not None:
             if isinstance(quant_config, ModelSlimConfig):
                 model_mapping = {

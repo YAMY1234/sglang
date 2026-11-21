@@ -784,6 +784,15 @@ class Envs:
     SGLANG_DISAGGREGATION_NIXL_BACKEND = EnvStr("UCX")
     SGLANG_DISAGGREGATION_NIXL_BACKEND_PARAMS = EnvStr("{}")
     SGLANG_DISAGG_PREFILL_EARLY_SEND_CACHED_PREFIX = EnvBool(True)
+    # Prefill KV exhaustion. The two K31 switches are sgl-project/sglang#50040's
+    # (default off there): park a chunked continuation whose KV budget is spent
+    # (#44823) instead of forcing a full chunk into a full pool, and, under
+    # shortest-prefill-first, hold a truncated chunk's tail in the budget.
+    SGLANG_K31_PARK_CHUNKED_PREFILL = EnvBool(True)
+    SGLANG_K31_PF_SPF_RESERVE_CHUNKED_TAIL = EnvBool(True)
+    # PD prefill backstop: a built batch whose paged KV demand exceeds free plus
+    # evictable pages is undone and retried next step instead of raising.
+    SGLANG_PREFILL_DEFER_ON_KV_SHORTFALL = EnvBool(True)
     SGLANG_DISAGGREGATION_ZMQ_MAX_SOCKETS = EnvInt(16384)
     SGLANG_DISAGGREGATION_ALL_CP_RANKS_TRANSFER = EnvBool(False)
     SGLANG_DISAGGREGATION_FORCE_QUERY_PREFILL_DP_RANK = EnvBool(False)
@@ -794,6 +803,17 @@ class Envs:
     # (supports_deferred_decode_kv_release).
     SGLANG_DISAGGREGATION_DEFERRED_DECODE_KV_RELEASE = EnvBool(True)
     SGLANG_DISAGGREGATION_DEFERRED_DECODE_KV_RELEASE_TIMEOUT = EnvFloat(30.0)
+    # PP prefill: PP0 decides each KV transfer's release from every stage's status
+    # (PPConsensusStore) and relays it in one pass, instead of the two-pass ring.
+    SGLANG_PP_PD_PREFILL_RELEASE_RELAY = EnvBool(False)
+    # PP: leave pp_size + pp_async_batch_depth rounds of HiCache, PD bootstrap and
+    # PD release relay sends un-waited, not one (a gloo send completes on the recv).
+    SGLANG_PP_SYNC_WINDOW = EnvBool(False)
+    # PP PD prefill (Mooncake): each stage sends a request's last KV chunk when its
+    # own forward of that chunk completes, not when the result returns pp_size - 1
+    # micro-batches later; only the last stage, which samples the first token, sends
+    # the first-token metadata (aux).
+    SGLANG_PP_PD_PREFILL_EARLY_SEND = EnvBool(False)
 
     # ===================================================================
     # Distributed and model-parallel runtime
@@ -843,6 +863,25 @@ class Envs:
     SGLANG_HICACHE_HF3FS_CONFIG_PATH = EnvStr(None)
     SGLANG_HICACHE_DECODE_OFFLOAD_STRIDE = EnvInt(None)
     SGLANG_HICACHE_SKIP_HOST_DUPLICATE_RECLAIM = EnvBool(False)
+    # PD prefill + write_back: Full-leaf eviction backups (D2H) wait only for
+    # work issued before the in-flight forward; 0 (default) waits for that forward too.
+    SGLANG_HICACHE_WB_EVICT_RELAXED_FENCE = EnvBool(False)
+    # write_back device eviction: queue every victim's D2H copy and wait once per
+    # walk instead of once per victim (victims stay host-locked until the wait).
+    SGLANG_HICACHE_WB_EVICT_BATCH = EnvBool(False)
+    # Grid cap for HiCache host-to-device load kernels (MLA/DSA KV, DSA indexer,
+    # Mamba state); 0 keeps each kernel's default (2-4 blocks).
+    SGLANG_HICACHE_LOAD_BLOCK_QUOTA = EnvInt(0)
+    # Grid cap for the Mamba state device-to-host backup kernel; 0 keeps 2 blocks.
+    SGLANG_HICACHE_MAMBA_BACKUP_BLOCK_QUOTA = EnvInt(0)
+    # --mamba-max-states-per-path also counts host copies, and a capped state
+    # loses its host copy too (HiCache); 0 (default) caps device states only.
+    SGLANG_MAMBA_PATH_CAP_COUNTS_HOST = EnvBool(False)
+    # Scales the hierarchical Mamba host pool's share of --hicache-size (the KV
+    # host pools take the rest); unset (default) splits it as the device pools are.
+    SGLANG_HICACHE_MAMBA_HOST_SCALE = EnvFloat(None)
+    # Seconds between "HiCache host usage" log lines (KV and Mamba pools); 0 = off.
+    SGLANG_HICACHE_HOST_USAGE_LOG_INTERVAL = EnvFloat(0.0)
     SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR = EnvStr(None)
     # File-backend LRU eviction (opt-in; sizes accept SI/IEC suffixes, "0" disables).
     SGLANG_HICACHE_FILE_BACKEND_MAX_SIZE = EnvStr(None)
@@ -1502,6 +1541,15 @@ class Envs:
     SGLANG_OPT_DEEPGEMM_MEGA_MOE_RESERVED_SMS = EnvInt(2)
     SGLANG_OPT_DEEPGEMM_MEGA_MOE_FUSE_SHARED_EXPERTS = EnvBool(True)
     SGLANG_OPT_DEEPGEMM_MEGA_GATE = EnvBool(False)
+    # Opt-in: raise DeepGEMM's BLOCK_M (16/32 -> 64, 64 -> 96) for FP8xFP4 calls in
+    # decode and target-verify CUDA graphs.
+    SGLANG_OPT_DEEPGEMM_MEGA_MOE_RAISE_DECODE_BLOCK_M = EnvBool(False)
+    # With the raise on: keep BLOCK_M 64 (instead of 96) while the expected tokens per expert
+    # (rows per rank x ranks x top-k / experts) stay below this. 0: always raise.
+    SGLANG_OPT_DEEPGEMM_MEGA_MOE_DECODE_BLOCK_M_96_MIN_TOKENS = EnvFloat(0.0)
+    # Opt-in, SM107: split each FP8xFP4 MegaMoE weight between the GPU's two locality domains
+    # (deep_gemm.localize; DeepGEMM 0.2.5 or newer) so every SM streams die-local weights.
+    SGLANG_OPT_DEEPGEMM_MEGA_MOE_LOCALIZE = EnvBool(False)
 
     # ===================================================================
     # Top-k kernels
@@ -1673,6 +1721,12 @@ class Envs:
     SGLANG_OPT_DFLASH_BATCHED_SMALL_COPY = EnvBool(
         SGLANG_ENABLE_NV_MEGA_RUNTIME_K31_GB_OPTIMIZATION.get
     )
+    # KDA ReplaySSM spec commit: fold the accepted ring window with the CUDA
+    # row-parallel kernel (bit-identical to the Triton fold); off by default.
+    SGLANG_OPT_KDA_REPLAYSSM_FAST_FOLD = EnvBool(False)
+    # KDA CuTe DSpARK/DFLASH verify: the phase-1-hoisted kernel (backport of
+    # #49135, bit-identical outputs); off by default.
+    SGLANG_OPT_KDA_MTP_VERIFY_P1_HOIST = EnvBool(False)
     SGLANG_ENABLE_LILICORR_SAMPLING = EnvBool(False)
     SGLANG_LILICORR_REQUIRE_SAMPLING = EnvBool(False)
     SGLANG_RAGGED_VERIFY_MODE = EnvStr("static")
@@ -1780,6 +1834,19 @@ class Envs:
     # Sequences a captured KDA extend bucket accepts; a larger prefill batch on
     # any dp rank runs the step eagerly. Bounds the padded grids and scratch.
     SGLANG_KDA_PREFILL_GRAPH_MAX_SEQS = EnvInt(128)
+    # Admit SM107 (Rubin) to FlashInfer's CuTe DSL KDA prefill (flashinfer#6201), on
+    # FlashInfer v0.7.4's kernel module (#8684 hang and #8599 fixes; vendored).
+    SGLANG_K31_KDA_PREFILL_FI_SM107 = EnvBool(False)
+    # KDA prefill on FlashInfer: the causal conv writes Q, K and V as separate
+    # contiguous planes instead of one token-major tensor the kernel copies three
+    # times (backport of #46738).
+    SGLANG_KDA_PREFILL_CONV_QKV_PLANES = EnvBool(False)
+    # DSA prefill under sharded DCP: gather the KV and index-K rows with one pack
+    # kernel into the all-gather buffer and one reorder kernel out of it, instead
+    # of the cat / pad / transpose / split copies around the all-gather.
+    SGLANG_DSA_DCP_PREFILL_FUSED_GATHER = EnvBool(False)
+    # Build the PTX KDA prefill extension for sm_107a; not measured on SM107 upstream.
+    SGLANG_ENABLE_PTX_KDA_SM107 = EnvBool(False)
     # Experimental: breakable prefill CUDA graphs capture the Triton GDN extend
     # instead of breaking at every GDN layer (layers/attention/linear/
     # gdn_prefill_graph.py).
@@ -2096,6 +2163,18 @@ class Envs:
     # DSA backend (GLM 5 and DeepSeek V3.2)
     # ===================================================================
     SGLANG_DSA_FUSE_TOPK = EnvBool(True)
+    # DCP decode top-k: the local top-k selects only the merge's candidates and
+    # pushes them itself; the merge skips the local top-2048 and also returns the
+    # localized rows (dsa/dsa_dcp_sharded.py).
+    SGLANG_DSA_DCP_TOPK_PUSH = EnvBool(False)
+    # Decode steps between the DCP top-k merge's fallback-count log lines; 0 off.
+    SGLANG_DSA_DCP_TOPK_MERGE_LOG_INTERVAL = EnvInt(400)
+    # DCP sparse MLA split into workspace-bounded calls: each call writes its
+    # rows of one output in place of a cat (dsa/dsa_dcp.py).
+    SGLANG_DSA_DCP_ATTN_INPLACE_OUT = EnvBool(False)
+    # Admit SM107 (Rubin) to the prims_ts DSA backend, on FlashInfer prims_ts 784bfaf5
+    # (flashinfer#8186; vendored beside dsa/prims_ts.py for 26bb6dc9 images).
+    SGLANG_ENABLE_PRIMS_TS_SM107 = EnvBool(False)
     # Enabled for supported CUDA KPool geometry; set to 0 to use ordinary metadata.
     SGLANG_EXPERIMENTAL_DSA_KPOOL_METADATA_FUSION = EnvBool(True)
     SGLANG_DSA_TOPK_FLASHINFER_DETERMINISTIC = EnvBool(False)
@@ -2227,7 +2306,8 @@ class Envs:
     SGLANG_K3_AR_FUSION = EnvBool(SGLANG_ENABLE_NV_MEGA_RUNTIME_K31_GB_OPTIMIZATION.get)
     # K3 SP-MoE fused residual + reduce-scatter and matching all-gather over
     # CustomAllReduceV2's MNNVL push workspace. Auto-probed for checked-in
-    # TP4/TP8 GB300 and TP16 GB200/GB300 tuning; set 0/1 to override. See
+    # TP4/TP8 GB300 and TP16 GB200/GB300 tuning; set 0/1 to override. On SM107
+    # only an explicit 1 enables it, and only with a checked-in table. See
     # srt/layers/communication/k3_sp_collective.py.
     SGLANG_K3_SP_COLLECTIVE = EnvBool(False)
     # DCP MLA decode: push each peer's head partials straight into its
@@ -2240,8 +2320,22 @@ class Envs:
     # Keep K3's post-MoE residual stream token-sharded between consecutive
     # SP-MoE layers. The next attention-residual aggregation and snapshot
     # bank write run on the local shard, then only the normalized attention
-    # input is all-gathered. Requires SGLANG_K3_SP_COLLECTIVE.
+    # input is all-gathered. Works with NCCL or SGLANG_K3_SP_COLLECTIVE.
     SGLANG_K3_SP_ATTN_RES = EnvBool(False)
+    # SP-MoE prefill: compute o_proj's TP-partial output in N column chunks
+    # and reduce-scatter each chunk over attention TP on a side stream while
+    # the next chunk's GEMM runs (0: off). Taken only for eager batches of at
+    # least SGLANG_K3_SP_RS_OVERLAP_MIN_TOKENS rows whose reduce-scatter NCCL
+    # would run (not the K3 SP collective). See
+    # srt/layers/communication/k3_sp_rs_overlap.py.
+    SGLANG_K3_SP_RS_OVERLAP_CHUNKS = EnvInt(0)
+    SGLANG_K3_SP_RS_OVERLAP_MIN_TOKENS = EnvInt(8192)
+    # SP-MoE prefill: run o_proj's GEMM and its attention-TP reduce-scatter as
+    # one CUTLASS kernel whose epilogue reduces through NVLink multicast
+    # (sp_collective_gemm.matmul_reduce_scatter), for eager batches of at least
+    # this many rows (0: off). Takes precedence over the chunked overlap and the
+    # K3 SP collective's reduce-scatter. See k3_sp_rs_overlap.py.
+    SGLANG_K3_SP_GEMM_RS_MIN_TOKENS = EnvInt(0)
     # Merge the router gate and routed_expert_down_proj weights so the K3 MoE
     # front reads hidden_states once, and run the top-k plus the bf16 cast in one
     # epilogue kernel. See kernels/ops/moe/moe_front.py. Default on.
@@ -2254,6 +2348,21 @@ class Envs:
     # dense GEMMs, the side-stream [f_a | b] TGV, and attention side streams up
     # to 288 rows (kimi_k3._k31_gb300_tuning). 0 restores the generic picks.
     SGLANG_K31_DECODE_GEMM_TACTICS = EnvBool(True)
+    # Kimi-K3.1 on VR200 (SM107), default off: the per-M TGV tactics of the
+    # decode dense GEMMs measured on SM107 (through the PD-decode DFLASH verify
+    # rows), the side-stream [f_a | b] TGV, and the SM107 attention side-stream
+    # row caps below (kimi_k3._k31_sm107_tuning). Off: SM107 keeps the generic
+    # picks and the 128-row side streams.
+    SGLANG_K31_SM107_GEMM_TACTICS = EnvBool(False)
+    # Optional path of a JSON table that replaces the built-in SM107 table.
+    SGLANG_K31_SM107_GEMM_TABLE = EnvStr(None)
+    # Under SGLANG_K31_SM107_GEMM_TACTICS on SM107: the largest graphed rows
+    # whose KDA [f_a | b] GEMM runs on the side stream beside [q,k,v,g]
+    # (default 1152 = the largest verify rows, the stable table's
+    # side_cap_bfa), and whose MLA output gate runs on the side stream beside
+    # attention (default 128, today's cap: raising it measured no gain).
+    SGLANG_K31_SM107_BFA_SIDE_MAX_TOKENS = EnvInt(1152)
+    SGLANG_K31_SM107_GATE_SIDE_MAX_TOKENS = EnvInt(128)
     # Use the ROCm radix-4 router for covered K3 top-k workloads.
     SGLANG_K3_RADIX4_TOPK = EnvBool(False)
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_CACHE_CAPACITY = EnvInt(2)

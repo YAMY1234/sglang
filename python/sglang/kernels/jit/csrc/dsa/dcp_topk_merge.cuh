@@ -48,6 +48,10 @@ namespace dcp_topk_merge {
 
 // One warp per rank (warp q polls rank q's candidates), up to 16 ranks.
 constexpr int kMaxWarps = 16;
+// Running totals in `stats`: rows whose certificate failed, of them the rows
+// this rank published its keys for, of those the rows where it had to select
+// among more than kTopK keys, and all merged rows.
+enum { kStatFallback, kStatPublished, kStatSelected, kStatRows, kNumStats };
 constexpr uint32_t kEmptyPos = 0xFFFFFFu;  // 24-bit position field of an empty entry
 
 struct Smem {
@@ -223,6 +227,7 @@ struct Params {
   int32_t* __restrict__ out;             // [rows, kTopK] widened slots, -1 after
   int32_t* __restrict__ fallback;        // [rows] 1 when the certificate failed
   uint64_t* __restrict__ union_scratch;  // [max_rows, kNumRanks * kTopK] fallback union; global, so smem stays small
+  unsigned long long* __restrict__ stats;  // [4] running totals, see kStat*
   int32_t rank;
   int32_t span;  // page_size * kNumRanks
   int32_t max_rows;
@@ -369,7 +374,11 @@ __global__ void __launch_bounds__(32 * kNumRanks) merge_kernel(const __grid_cons
   for (int q = 0; q < kNumRanks; ++q) {
     if (want > 0 && s.kept[q] == s.sent[q] && local_len<kNumRanks, kSplit>(L, q) > s.sent[q]) fail |= 1u << q;
   }
-  if (tid == 0) p.fallback[row] = fail != 0;
+  if (tid == 0) {
+    p.fallback[row] = fail != 0;
+    if (fail) atomicAdd(&p.stats[kStatFallback], 1ull);
+    if (row == 0) atomicAdd(&p.stats[kStatRows], static_cast<unsigned long long>(gridDim.x));
+  }
   if (fail) t = fallback_kth<kNumRanks, kTopK, kCandK>(p, row, fail, full_off, tag, cand, s);
 
   int32_t* const out = p.out + static_cast<int64_t>(row) * kTopK;
@@ -414,6 +423,348 @@ __global__ void __launch_bounds__(32 * kNumRanks) merge_kernel(const __grid_cons
   if (tid == 0) p.counters[row] = c + 1;
 }
 
+// ---------------------------------------------------------------------------
+// Merge of pushed candidates. The local top-k kernel selects only the rank's
+// best kCandK keys and pushes them into this layout itself
+// (topk_v2.cuh, transform_candidates_dcp_push), so no rank selects, stores or
+// pushes from its full local top-k here. Token interleave only (no kSplit).
+//   1. poll the kNumRanks x kCandK candidates (warp q: rank q);
+//   2. t* and the certificate as merge_kernel; the select starts at the highest
+//      bit where the candidate keys differ;
+//   3. a rank that fails the certificate stores its keys >= t* (or, past kTopK
+//      of them, its local top-k), tagged, in its full slot, which every rank
+//      polls: the union of those and the other ranks' candidates holds the
+//      global top-k, as in merge_kernel's fallback (publish_local_topk);
+//   4. this rank's keys >= t* as widened slots and as local KV rows (slot /
+//      kNumRanks, what dcp_localize_compact computes), -1 after, and their count.
+// Buffer reuse is merge_kernel's argument: the pushes of call c + 2 into a
+// parity buffer come after the pusher read every rank's call c + 1 entries,
+// written by each rank after its call-c merge finished.
+// ---------------------------------------------------------------------------
+
+struct PushSmem : Smem {
+  uint64_t hi, lo;
+  int n_out;
+};
+
+SGL_DEVICE uint64_t shr64(uint64_t k, int n) {
+  return n >= 64 ? 0 : k >> n;
+}
+
+// select_kth with the first round on the highest bits where the keys differ:
+// candidate keys share their sign and top exponent bits, and a round there puts
+// every key into one or two bins (serialized shared atomics).
+template <class Visit>
+SGL_DEVICE uint64_t select_kth_adaptive(Visit visit, int rem, PushSmem& s) {
+  if (rem < 1) return 0;
+  const int tid = threadIdx.x, warp = tid / 32;
+  const uint32_t lane = device::get_lane_id();
+  uint64_t hi = 0, lo = ~uint64_t{0};
+  visit([&](uint64_t k) {
+    if (k) {
+      hi = k > hi ? k : hi;
+      lo = k < lo ? k : lo;
+    }
+  });
+  hi = device::warp::reduce_max(hi);
+  lo = device::warp::reduce_min(lo);
+  if (tid == 0) {
+    s.hi = 0;
+    s.lo = ~uint64_t{0};
+  }
+  for (int i = tid; i < 256; i += blockDim.x) {
+    s.hist[0][i] = 0;
+    s.hist[1][i] = 0;
+  }
+  __syncthreads();
+  if (lane == 0) {
+    atomicMax(reinterpret_cast<unsigned long long*>(&s.hi), hi);
+    atomicMin(reinterpret_cast<unsigned long long*>(&s.lo), lo);
+  }
+  __syncthreads();
+  hi = s.hi;
+  lo = s.lo;
+  if (hi == lo) return hi;  // a single key (keys are unique), so rem == 1
+  const int top = 63 - __clzll(static_cast<long long>(hi ^ lo));
+  int width = min(top + 1, 8);
+  int shift = top + 1 - width;
+  uint64_t prefix = shr64(hi, top + 1);  // the bits every key shares
+  for (int b = 0;; b ^= 1) {
+    int* h = s.hist[b];
+    const uint64_t mask = (uint64_t{1} << width) - 1;
+    visit([&](uint64_t k) {
+      if (k && shr64(k, shift + width) == prefix) atomicAdd(&h[(k >> shift) & mask], 1);
+    });
+    for (int i = tid; i < 256; i += blockDim.x)
+      s.hist[b ^ 1][i] = 0;  // its last reader finished before the previous round's last barrier
+    __syncthreads();
+    if (warp == 0) {
+      int c[8], tot = 0;
+#pragma unroll
+      for (int i = 0; i < 8; ++i) {
+        c[i] = h[255 - (lane * 8 + i)];
+        tot += c[i];
+      }
+      int run = device::warp::inclusive_sum(tot, lane) - tot;
+#pragma unroll
+      for (int i = 0; i < 8; ++i) {
+        const int excl = run;
+        run += c[i];
+        if (run >= rem && excl < rem) {
+          s.digit = 255 - (lane * 8 + i);
+          s.above = excl;
+          s.cnt = c[i];
+          s.min_key = ~uint64_t{0};
+        }
+      }
+    }
+    __syncthreads();
+    rem -= s.above;
+    prefix = (prefix << width) | static_cast<uint64_t>(s.digit);
+    if (shift == 0) return prefix;  // every bit decided
+    if (s.cnt == rem) {
+      const uint64_t pre = prefix;
+      uint64_t mk = ~uint64_t{0};
+      visit([&](uint64_t k) {
+        if (k && (k >> shift) == pre) mk = k < mk ? k : mk;
+      });
+      mk = device::warp::reduce_min(mk);
+      if (lane == 0) atomicMin(reinterpret_cast<unsigned long long*>(&s.min_key), mk);
+      __syncthreads();
+      return s.min_key;
+    }
+    width = min(shift, 8);
+    shift -= width;
+  }
+}
+
+struct PushedParams {
+  uint64_t* __restrict__ buffer;          // this rank's symmetric buffer
+  const int64_t* __restrict__ peer_ptrs;  // [kNumRanks] symmetric buffer of each rank
+  int64_t* __restrict__ counters;         // [max_rows] calls per row slot
+  const float* __restrict__ logits;       // [rows, logits_stride] this rank's scores, read on a fallback only
+  int64_t logits_stride;
+  const int32_t* __restrict__ local_lens;
+  const int32_t* __restrict__ global_lens;
+  const int32_t* __restrict__ page_table;
+  int64_t page_table_stride;
+  int32_t* __restrict__ out;          // [rows, kTopK] widened slots, -1 after
+  int32_t* __restrict__ out_local;    // [rows, kTopK] local KV rows, -1 after
+  int32_t* __restrict__ out_lengths;  // [rows]
+  int32_t* __restrict__ fallback;     // [rows] 1 when the certificate failed
+  unsigned long long* __restrict__ stats;  // [kNumStats] running totals
+  int32_t rank;
+  int32_t span;  // page_size * kNumRanks
+  int32_t max_rows;
+};
+
+// This rank failed the certificate: its keys >= t_lo, tagged into its full slot
+// (kTopK entries, empty-padded) for every rank to poll. t_lo, the k-th candidate
+// key, is at most the global k-th key, so these hold every global top-k key of
+// this rank, and the other ranks' candidates hold theirs (merge_kernel's
+// argument). One counting pass finds at most kTopK of them on almost every row;
+// otherwise the slot gets this rank's local top-k, selected among them.
+// Returns whether it had to select.
+template <int kNumRanks, int kTopK>
+SGL_DEVICE bool
+publish_local_topk(const PushedParams& p, int row, int64_t full_off, uint64_t tag, uint64_t t_lo, PushSmem& s) {
+  constexpr int kThreads = 32 * kNumRanks;
+  constexpr int kTile = 8;  // entries per thread per compaction round
+  const int tid = threadIdx.x;
+  const float* const scores = p.logits + static_cast<int64_t>(row) * p.logits_stride;
+  const int n = p.local_lens[row];
+  const auto key_at = [&](int l) { return make_topk_key(__float_as_int(scores[l]), l * kNumRanks + p.rank); };
+  int mine = 0, above;
+  for (int l = tid; l < n; l += kThreads)
+    mine += key_at(l) >= t_lo;
+  block_exclusive_sum<kNumRanks>(mine, above, s);
+  uint64_t t = t_lo;
+  const bool select = above > kTopK;
+  if (select) {
+    const auto visit = [&](auto f) {
+      for (int l = tid; l < n; l += kThreads) {
+        const uint64_t k = key_at(l);
+        f(k >= t_lo ? k : uint64_t{0});
+      }
+    };
+    t = select_kth_adaptive(visit, kTopK, s);
+  }
+  uint64_t* const dst = p.buffer + full_off;
+  int written = 0;
+  for (int l0 = 0; l0 < n; l0 += kThreads * kTile) {
+    int32_t bits[kTile];
+    bool sel[kTile];
+    int cnt = 0;
+#pragma unroll
+    for (int j = 0; j < kTile; ++j) {
+      const int l = l0 + j * kThreads + tid;
+      bits[j] = l < n ? __float_as_int(scores[l]) : 0;
+      sel[j] = l < n && make_topk_key(bits[j], l * kNumRanks + p.rank) >= t;
+      cnt += sel[j];
+    }
+    int total;
+    int at = written + block_exclusive_sum<kNumRanks>(cnt, total, s);
+#pragma unroll
+    for (int j = 0; j < kTile; ++j)
+      if (sel[j])
+        device::ptx::store_relaxed_sys(dst + at++, pack_entry(bits[j], (l0 + j * kThreads + tid) * kNumRanks + p.rank, tag));
+    written += total;
+  }
+  for (int e = written + tid; e < kTopK; e += kThreads)
+    device::ptx::store_relaxed_sys(dst + e, pack_entry(0, -1, tag));
+  return select;
+}
+
+template <int kNumRanks, int kTopK, int kCandK, bool kUsePDL>
+__global__ void __launch_bounds__(32 * kNumRanks, kNumRanks == 8 ? 4 : 1)
+    merge_pushed_kernel(const __grid_constant__ PushedParams p) {
+  static_assert(kNumRanks == 4 || kNumRanks == 8 || kNumRanks == 16, "one warp per rank: 4, 8 or 16 ranks");
+  constexpr int kThreads = 32 * kNumRanks;
+  static_assert(kCandK % 32 == 0 && kTopK % kThreads == 0 && kCandK <= kTopK);
+  constexpr int kPerThread = kTopK / kThreads;  // full-slot entries per thread
+  constexpr int kPerLane = kCandK / 32;         // candidates per lane
+  constexpr int64_t kSlot = static_cast<int64_t>(kNumRanks) * kCandK + kTopK;
+  __shared__ PushSmem s;
+
+  const int row = blockIdx.x, tid = threadIdx.x, warp = tid / 32;
+  const uint32_t lane = device::get_lane_id();
+  // the candidate push of this call, and the previous call's counter update
+  device::PDLWaitPrimary<kUsePDL>();
+  const int64_t c = p.counters[row];
+  const uint64_t tag = static_cast<uint64_t>(c % 255) + 1;
+  const int64_t base = ((c & 1) * p.max_rows + row) * kSlot;
+  const int64_t full_off = base + static_cast<int64_t>(kNumRanks) * kCandK;
+
+  // ---- threshold over the kNumRanks x kCandK candidates ----
+  uint64_t cand[kPerLane];
+  poll_tagged<kPerLane>(p.buffer + base + warp * kCandK + lane, 32, tag, cand);
+  int sent = 0;
+#pragma unroll
+  for (int i = 0; i < kPerLane; ++i) {
+    cand[i] = entry_key(cand[i]);
+    sent += __popc(__ballot_sync(0xffffffff, cand[i] != 0));
+  }
+  if (lane == 0) s.sent[warp] = sent;
+  __syncthreads();
+  int n_cand = 0;
+#pragma unroll
+  for (int q = 0; q < kNumRanks; ++q)
+    n_cand += s.sent[q];
+  const int want = min(n_cand, kTopK);
+  uint64_t t = select_kth_adaptive(visit_keys(cand), want, s);
+  int kept = 0;
+#pragma unroll
+  for (int i = 0; i < kPerLane; ++i)
+    kept += __popc(__ballot_sync(0xffffffff, cand[i] != 0 && cand[i] >= t));
+  if (lane == 0) s.kept[warp] = kept;
+  __syncthreads();
+
+  // ---- certificate and exact fallback ----
+  const int L = p.global_lens[row];
+  unsigned fail = 0;
+#pragma unroll
+  for (int q = 0; q < kNumRanks; ++q) {
+    if (want > 0 && s.kept[q] == s.sent[q] && local_len<kNumRanks, false>(L, q) > s.sent[q]) fail |= 1u << q;
+  }
+  if (tid == 0) {
+    p.fallback[row] = fail != 0;
+    if (fail) atomicAdd(&p.stats[kStatFallback], 1ull);
+    if (row == 0) atomicAdd(&p.stats[kStatRows], static_cast<unsigned long long>(gridDim.x));
+  }
+  if (fail) {
+    if (fail >> p.rank & 1) {
+      const bool selected = publish_local_topk<kNumRanks, kTopK>(p, row, full_off, tag, t, s);
+      if (tid == 0) {
+        atomicAdd(&p.stats[kStatPublished], 1ull);
+        if (selected) atomicAdd(&p.stats[kStatSelected], 1ull);
+      }
+    }
+    // every thread polls its entries of each failed rank's full slot once; the
+    // rounds below re-read them (unchanged until this rank's call c + 1)
+#pragma unroll 1
+    for (int q = 0; q < kNumRanks; ++q) {
+      if (fail >> q & 1) {
+        uint64_t tmp[kPerThread];
+        poll_tagged<kPerThread>(reinterpret_cast<const uint64_t*>(p.peer_ptrs[q]) + full_off + tid, kThreads, tag, tmp);
+      }
+    }
+    const bool drop = fail >> warp & 1;
+    const auto visit = [&](auto f) {
+#pragma unroll
+      for (int i = 0; i < kPerLane; ++i)
+        f(drop ? uint64_t{0} : cand[i]);
+#pragma unroll 1
+      for (int q = 0; q < kNumRanks; ++q) {
+        if (fail >> q & 1) {
+          const auto* src = reinterpret_cast<const uint64_t*>(p.peer_ptrs[q]) + full_off + tid;
+#pragma unroll
+          for (int j = 0; j < kPerThread; ++j)
+            f(entry_key(device::ptx::load_relaxed_sys(src + j * kThreads)));
+        }
+      }
+    };
+    int mine = 0, n_union;
+    visit([&](uint64_t k) { mine += k != 0; });
+    block_exclusive_sum<kNumRanks>(mine, n_union, s);
+    t = select_kth_adaptive(visit, min(n_union, kTopK), s);
+  }
+
+  // ---- this rank's keys >= t*, compacted ----
+  int32_t* const out = p.out + static_cast<int64_t>(row) * kTopK;
+  int32_t* const out_local = p.out_local + static_cast<int64_t>(row) * kTopK;
+  const auto to_slot = [&](uint64_t k) {
+    const int pos = static_cast<int>(0xFFFFFFFFu - static_cast<uint32_t>(k));
+    return p.page_table[row * p.page_table_stride + pos / p.span] * p.span + pos % p.span;
+  };
+  const auto emit = [&](int e, uint64_t k) {
+    const int slot = to_slot(k);
+    out[e] = slot;
+    out_local[e] = slot / kNumRanks;
+  };
+  int n;
+  if (fail >> p.rank & 1) {
+    // its keys >= t* are in its local top-k, in its own full slot
+    const uint64_t* const src = p.buffer + full_off + tid;
+    bool sel[kPerThread];
+    uint64_t k[kPerThread];
+#pragma unroll
+    for (int j = 0; j < kPerThread; ++j) {
+      k[j] = entry_key(device::ptx::load_relaxed_sys(src + j * kThreads));
+      sel[j] = t != 0 && k[j] != 0 && k[j] >= t;
+    }
+    int mine = 0;
+#pragma unroll
+    for (int j = 0; j < kPerThread; ++j)
+      mine += sel[j];
+    int at = block_exclusive_sum<kNumRanks>(mine, n, s);
+#pragma unroll
+    for (int j = 0; j < kPerThread; ++j)
+      if (sel[j]) emit(at++, k[j]);
+  } else {
+    // its keys >= t* are among its candidates, held by warp `rank`
+    if (warp == p.rank) {
+      int at = 0;
+#pragma unroll
+      for (int i = 0; i < kPerLane; ++i) {
+        const bool sel = t != 0 && cand[i] != 0 && cand[i] >= t;
+        const unsigned m = __ballot_sync(0xffffffff, sel);
+        if (sel) emit(at + __popc(m & ((1u << lane) - 1)), cand[i]);
+        at += __popc(m);
+      }
+      if (lane == 0) s.n_out = at;
+    }
+    __syncthreads();
+    n = s.n_out;
+  }
+  for (int e = n + tid; e < kTopK; e += kThreads) {
+    out[e] = -1;
+    out_local[e] = -1;
+  }
+  if (tid == 0) p.out_lengths[row] = n;
+  __syncthreads();
+  if (tid == 0) p.counters[row] = c + 1;
+}
+
 }  // namespace dcp_topk_merge
 
 template <int64_t kNumRanks, int64_t kTopK, int64_t kCandK, int64_t kSplit>
@@ -436,6 +787,7 @@ struct DcpTopKMergeKernel {
       tvm::ffi::TensorView out_slots,
       tvm::ffi::TensorView out_fallback,
       tvm::ffi::TensorView union_scratch,
+      tvm::ffi::TensorView stats,
       int64_t rank,
       int64_t span) {
     using namespace host;
@@ -453,6 +805,7 @@ struct DcpTopKMergeKernel {
     TensorMatcher({R, kTopK}).with_dtype<int32_t>().with_device(device_).verify(out_slots);
     TensorMatcher({R}).with_dtype<int32_t>().with_device(device_).verify(out_fallback);
     TensorMatcher({M, kNumRanks * kTopK}).with_dtype<int64_t>().with_device(device_).verify(union_scratch);
+    TensorMatcher({static_cast<int64_t>(dcp_topk_merge::kNumStats)}).with_dtype<int64_t>().with_device(device_).verify(stats);
 
     const auto rows = static_cast<int32_t>(R.unwrap());
     const auto max_rows = static_cast<int32_t>(M.unwrap());
@@ -478,11 +831,88 @@ struct DcpTopKMergeKernel {
         .out = static_cast<int32_t*>(out_slots.data_ptr()),
         .fallback = static_cast<int32_t*>(out_fallback.data_ptr()),
         .union_scratch = static_cast<uint64_t*>(union_scratch.data_ptr()),
+        .stats = static_cast<unsigned long long*>(stats.data_ptr()),
         .rank = static_cast<int32_t>(rank),
         .span = static_cast<int32_t>(span),
         .max_rows = max_rows,
     };
     LaunchKernel(rows, static_cast<int>(32 * kNumRanks), device_.unwrap())(kernel, params);
+  }
+};
+
+template <int64_t kNumRanks, int64_t kTopK, int64_t kCandK, bool kUsePDL>
+struct DcpTopKMergePushedKernel {
+  static constexpr auto kernel = dcp_topk_merge::merge_pushed_kernel<kNumRanks, kTopK, kCandK, kUsePDL>;
+
+  /**
+   * \brief Merges one batch of decode rows whose candidates the local top-k
+   * pushed (transform_candidates_dcp_push); every rank of the group calls it
+   * with the same rows in the same order. See dcp_topk_merge.py.
+   */
+  static void
+  run(tvm::ffi::TensorView logits,
+      tvm::ffi::TensorView local_lens,
+      tvm::ffi::TensorView buffer,
+      tvm::ffi::TensorView peer_ptrs,
+      tvm::ffi::TensorView counters,
+      tvm::ffi::TensorView global_lens,
+      tvm::ffi::TensorView page_table,
+      tvm::ffi::TensorView out_slots,
+      tvm::ffi::TensorView out_local,
+      tvm::ffi::TensorView out_lengths,
+      tvm::ffi::TensorView out_fallback,
+      tvm::ffi::TensorView stats,
+      int64_t rank,
+      int64_t span) {
+    using namespace host;
+
+    auto R = SymbolicSize{"rows"};
+    auto M = SymbolicSize{"max_rows"};
+    auto device_ = SymbolicDevice{};
+    device_.set_options<kDLCUDA>();
+    TensorMatcher({R, -1}).with_strides({-1, 1}).with_dtype<float>().with_device(device_).verify(logits);
+    TensorMatcher({R}).with_dtype<int32_t>().with_device(device_).verify(local_lens);
+    TensorMatcher({-1}).with_dtype<int64_t>().with_device(device_).verify(buffer);
+    TensorMatcher({kNumRanks}).with_dtype<int64_t>().with_device(device_).verify(peer_ptrs);
+    TensorMatcher({M}).with_dtype<int64_t>().with_device(device_).verify(counters);
+    TensorMatcher({R}).with_dtype<int32_t>().with_device(device_).verify(global_lens);
+    TensorMatcher({-1, -1}).with_strides({-1, 1}).with_dtype<int32_t>().with_device(device_).verify(page_table);
+    TensorMatcher({R, kTopK}).with_strides({kTopK, 1}).with_dtype<int32_t>().with_device(device_).verify(out_slots);
+    TensorMatcher({R, kTopK}).with_strides({kTopK, 1}).with_dtype<int32_t>().with_device(device_).verify(out_local);
+    TensorMatcher({R}).with_dtype<int32_t>().with_device(device_).verify(out_lengths);
+    TensorMatcher({R}).with_dtype<int32_t>().with_device(device_).verify(out_fallback);
+    TensorMatcher({static_cast<int64_t>(dcp_topk_merge::kNumStats)}).with_dtype<int64_t>().with_device(device_).verify(stats);
+
+    const auto rows = static_cast<int32_t>(R.unwrap());
+    const auto max_rows = static_cast<int32_t>(M.unwrap());
+    RuntimeCheck(rows <= max_rows, "dcp_topk_merge_pushed: rows ", rows, " > max_rows ", max_rows);
+    RuntimeCheck(page_table.size(0) >= rows, "dcp_topk_merge_pushed: page_table has fewer rows than ", rows);
+    const int64_t need = 2LL * max_rows * (kNumRanks * kCandK + kTopK);
+    RuntimeCheck(buffer.size(0) >= need, "dcp_topk_merge_pushed: buffer numel ", buffer.size(0), " < ", need);
+    const int64_t max_pos = page_table.size(1) * span;
+    RuntimeCheck(max_pos <= dcp_topk_merge::kEmptyPos, "dcp_topk_merge_pushed: positions exceed 24 bits");
+    if (rows == 0) return;
+
+    const auto params = dcp_topk_merge::PushedParams{
+        .buffer = static_cast<uint64_t*>(buffer.data_ptr()),
+        .peer_ptrs = static_cast<const int64_t*>(peer_ptrs.data_ptr()),
+        .counters = static_cast<int64_t*>(counters.data_ptr()),
+        .logits = static_cast<const float*>(logits.data_ptr()),
+        .logits_stride = logits.stride(0),
+        .local_lens = static_cast<const int32_t*>(local_lens.data_ptr()),
+        .global_lens = static_cast<const int32_t*>(global_lens.data_ptr()),
+        .page_table = static_cast<const int32_t*>(page_table.data_ptr()),
+        .page_table_stride = page_table.stride(0),
+        .out = static_cast<int32_t*>(out_slots.data_ptr()),
+        .out_local = static_cast<int32_t*>(out_local.data_ptr()),
+        .out_lengths = static_cast<int32_t*>(out_lengths.data_ptr()),
+        .fallback = static_cast<int32_t*>(out_fallback.data_ptr()),
+        .stats = static_cast<unsigned long long*>(stats.data_ptr()),
+        .rank = static_cast<int32_t>(rank),
+        .span = static_cast<int32_t>(span),
+        .max_rows = max_rows,
+    };
+    LaunchKernel(rows, static_cast<int>(32 * kNumRanks), device_.unwrap()).enable_pdl(kUsePDL)(kernel, params);
   }
 };
 

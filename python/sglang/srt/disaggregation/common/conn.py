@@ -2316,6 +2316,7 @@ class CommonKVSender(BaseKVSender):
         state_indices: Optional[List] = None,
         num_kv_tokens: Optional[int] = None,
         indices_event: Optional[object] = None,
+        send_aux: bool = True,
     ):
         if self.conclude_state in (KVPoll.Success, KVPoll.Failed):
             return
@@ -2336,6 +2337,9 @@ class CommonKVSender(BaseKVSender):
         # Mori workers synchronize on it before reading source KV.
         wait_event = self._early_send_wait_event
         self._early_send_wait_event = None
+        # Only Mooncake takes send_aux: a PP prefill stage that sends its last
+        # chunk before the first token reaches it leaves the aux to the last stage.
+        aux_kwargs = {} if send_aux else {"send_aux": False}
         self.kv_mgr.add_transfer_request(
             self.bootstrap_room,
             kv_indices,
@@ -2347,6 +2351,7 @@ class CommonKVSender(BaseKVSender):
             wait_event=wait_event,
             indices_event=indices_event,
             trace_ctx=self.trace_ctx.copy_for_thread(),
+            **aux_kwargs,
         )
         self._record_transfer_indices(kv_indices, state_indices)
 
