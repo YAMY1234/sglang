@@ -896,6 +896,9 @@ class Envs:
     # Debug: PP0 checks each batch's token ids on the host before launch, and on the
     # device right before the embedding (a distinct assert kernel names the culprit).
     SGLANG_PP_DEBUG_INPUT_CHECK = EnvBool(False)
+    # PP loop with a separate comm stream: the schedule stream waits on each launched
+    # forward (the WAR barrier the non-PP loop applies), since no send on it does.
+    SGLANG_PP_SCHED_WAR_FENCE = EnvBool(False)
     SGLANG_PP_CE_PUSH_SLOT_MB = EnvInt(1600)
     # PP PD prefill: log a digest of allocator and radix tree state every N loop
     # epochs (0 = off); every stage must log the same digest at the same epoch.

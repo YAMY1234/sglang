@@ -138,6 +138,7 @@ class SchedulerPPMixin:
     _pp_check_proxy_batch: bool = False
     # SGLANG_PP_DEBUG_INPUT_CHECK on PP0: the vocab size (negated once the first check logged).
     _pp_debug_vocab: Optional[int] = None
+    _pp_sched_war_fence: bool = False
     _pp_ce_in_use: Optional[Tuple[int, int]] = None
 
     @DynamicGradMode()
@@ -317,6 +318,9 @@ class SchedulerPPMixin:
         decoupled = self._pp_maybe_init_decouple()
         self._pp_check_proxy_batch = envs.SGLANG_PP_CHECK_PROXY_BATCH.get()
         self._pp_debug_vocab = None
+        self._pp_sched_war_fence = (
+            envs.SGLANG_PP_SCHED_WAR_FENCE.get() and self.pp_comm_stream is not None
+        )
         if envs.SGLANG_PP_DEBUG_INPUT_CHECK.get() and self.pp_group.is_first_rank:
             self._pp_debug_vocab = vocab = self.model_config.vocab_size
             self.tp_worker.model_runner.model.get_input_embeddings().register_forward_pre_hook(
@@ -2268,6 +2272,9 @@ class SchedulerPPMixin:
             self._hicache_fence_controller.record_war_barrier(
                 self.schedule_stream.record_event()
             )
+        if self._pp_sched_war_fence:
+            # Sends on the comm stream do not order the schedule stream after the forward.
+            self.schedule_stream.wait_event(event)
         return result, event
 
     def get_rids(
