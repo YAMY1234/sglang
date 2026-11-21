@@ -875,9 +875,29 @@ class Envs:
     # PP: leave pp_size + pp_async_batch_depth rounds of HiCache, PD bootstrap and
     # PD release relay sends un-waited, not one (a gloo send completes on the recv).
     SGLANG_PP_SYNC_WINDOW = EnvBool(False)
+    # PP PD prefill: stages stop waiting on each other's host progress every micro-batch.
+    # Sends stay un-waited up to a window and relay receives run on background threads;
+    # the relay window above is separate (SGLANG_PP_SYNC_WINDOW).
+    SGLANG_PP_DECOUPLE_HOST = EnvBool(False)
+    # Under SGLANG_PP_DECOUPLE_HOST: send rounds per channel left un-waited, and messages
+    # per relay channel received ahead (0 = pp_size + pp_async_batch_depth).
+    SGLANG_PP_DECOUPLE_SEND_WINDOW = EnvInt(0)
+    # Under SGLANG_PP_DECOUPLE_HOST: un-waited rounds for the proxy and output device-tensor
+    # sends, which keep their tensors alive until waited (0 = SGLANG_PP_DECOUPLE_SEND_WINDOW's).
+    SGLANG_PP_DECOUPLE_TENSOR_WINDOW = EnvInt(2)
+    # Under SGLANG_PP_DECOUPLE_HOST: post a stage's NCCL tensor receive only after its previous
+    # forward ends. A receive kernel waits on the GPU for its sender, and resident there it
+    # blocks the forward's cooperative kernels (MoE routing).
+    SGLANG_PP_DECOUPLE_LATE_RECV = EnvBool(False)
+    # PP PD prefill: log a digest of allocator and radix tree state every N loop
+    # epochs (0 = off); every stage must log the same digest at the same epoch.
+    SGLANG_DEBUG_PP_STATE_DIGEST_EVERY = EnvInt(0)
     # PP diagnostics: per-rank host / wait / forward-gap partition and admission
     # counts, logged every INTERVAL_S; FWD_DIR also writes one CSV row per forward.
     SGLANG_PP_BUBBLE_DIAG = EnvBool(False)
+    # PP PD prefill (Mooncake): no output ring. Earlier stages process a host
+    # placeholder; the last stage processes its own output and alone sends aux.
+    SGLANG_PP_PD_LOCAL_RESULT = EnvBool(False)
     SGLANG_PP_BUBBLE_DIAG_INTERVAL_S = EnvFloat(60.0)
     SGLANG_PP_BUBBLE_DIAG_FWD_DIR = EnvStr(None)
     # With the diag and its FWD_DIR on: sample the scheduler thread's Python stack at
