@@ -328,6 +328,12 @@ class NixlTransport:
         self.remotes.append(name)
         return name
 
+    def add_remote_md(self, remote: str, payload: bytes):
+        """Merge a service's later pool segment (its partial metadata) into the agent already loaded."""
+        name = self.agent.add_remote_agent(payload)
+        if name != remote:
+            raise NixlDramError(f"segment metadata names agent {name}, expected {remote}")
+
     def post(self, op: str, remote, local, remote_descs):
         import numpy as np
 
@@ -397,6 +403,9 @@ class NixlTransport:
 class ShmTransport:
     """Same-host transport for tests and smoke checks: maps a service's /dev/shm pool and copies with memmove. It
     enforces what NIXL does: local ranges must be registered, remote ranges must lie in the pool."""
+
+    def add_remote_md(self, remote, payload):
+        raise NixlDramError("the shm transport cannot map a later pool segment")
 
     def __init__(self, name: str, cfg: NixlDramConfig):
         self.local = []
@@ -476,7 +485,7 @@ class NixlDramClient:
         self.page_units: Dict[int, int] = {}  # buffer address -> bytes no transfer part crosses (set_page_units)
         replies, errors = self.rpc.call_many(
             {
-                i: ({"op": "hello", "proto": PROTO, "client": self.name}, None)
+                i: ({"op": "hello", "proto": PROTO, "client": self.name, "layout_aware": 1}, None)
                 for i in range(len(self.services))
             }
         )
@@ -496,6 +505,24 @@ class NixlDramClient:
         self.pool_bytes = sum(
             replies[i][0]["pool_bytes"] for i in range(len(self.services))
         )
+        # Pool segments a service adds later (layout_gen > 1): address-returning RPCs carry this client's
+        # layout_gen; a stale_layout reply makes it merge the missing segments' NIXL metadata, then retry once.
+        self.layout_gens = [replies[i][0].get("layout_gen", 1) for i in range(len(self.services))]
+        self.layout_refreshes = 0
+        self._layout_lock = threading.Lock()  # merging remote metadata vs posting transfers
+        self._rpc_raw = self.rpc.call_many
+        self.rpc.call_many = self._layout_call
+        post = self.transport.post
+
+        def locked_post(*a, **k):
+            with self._layout_lock:
+                return post(*a, **k)
+
+        self.transport.post = locked_post
+        for i, g in enumerate(self.layout_gens):
+            if g > 1:
+                self.layout_gens[i] = 1
+                self._refresh_layout(i)
         self._seq = itertools.count()
         self._lock = threading.Lock()
         self.counters = dict(
@@ -1138,6 +1165,45 @@ class NixlDramClient:
         if errors:
             self._rpc_failed("clear", errors)
         return sum(r["removed"] for r, _ in replies.values())
+
+    def _refresh_layout(self, s: int):
+        with self._layout_lock:
+            while True:
+                replies, errors = self._rpc_raw({s: ({"op": "layout", "have": self.layout_gens[s]}, None)})
+                if errors:
+                    raise NixlDramError(f"layout refresh of {self.services[s]['endpoint']}: {errors[s]}")
+                reply, md = replies[s]
+                if reply["gen"] <= self.layout_gens[s] or md is None:
+                    return
+                self.transport.add_remote_md(self.remotes[s], md)
+                self.layout_gens[s] = reply["gen"]
+                self.layout_refreshes += 1
+                logger.info("HiCache NIXL DRAM L3: service %s pool segment %d mapped (layout_gen %d of %d)",
+                            self.service_names[s], reply["gen"], reply["gen"], reply["current"])
+                if reply["gen"] >= reply["current"]:
+                    return
+
+    def _layout_call(self, requests):
+        for s, (req, _) in requests.items():
+            if req.get("op") in ("alloc", "lookup"):
+                req["layout_gen"] = self.layout_gens[s]
+        replies, errors = self._rpc_raw(requests)
+        retry = {}
+        for s in [s for s, e in errors.items() if e.endswith(": stale_layout")]:
+            try:
+                self._refresh_layout(s)
+            except NixlDramError as e:
+                errors[s] = str(e)
+                continue
+            del errors[s]
+            req, payload = requests[s]
+            req["layout_gen"] = self.layout_gens[s]
+            retry[s] = (req, payload)
+        if retry:
+            r2, e2 = self._rpc_raw(retry)
+            replies.update(r2)
+            errors.update(e2)
+        return replies, errors
 
     def service_stats(self) -> Dict[str, dict]:
         replies, errors = self.rpc.call_many(
