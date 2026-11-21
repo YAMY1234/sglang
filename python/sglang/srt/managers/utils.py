@@ -300,6 +300,14 @@ def validate_input_length(
     return None
 
 
+def _to_cpu_nested(values):
+    """PP pickles these nested lists into the output message; a CUDA slice there makes the
+    receiving stage open a CUDA context on the sender's GPU index (memory it does not own)."""
+    if values is None:
+        return None
+    return [v.cpu() if torch.is_tensor(v) and v.is_cuda else v for v in values]
+
+
 def get_logprob_dict_from_result(result: GenerationBatchResult) -> dict:
     """Build the tensor payload needed to reconstruct PP output processing state."""
 
@@ -314,10 +322,10 @@ def get_logprob_dict_from_result(result: GenerationBatchResult) -> dict:
         "extend_input_len_per_req": result.extend_input_len_per_req,
         "extend_logprob_start_len_per_req": result.extend_logprob_start_len_per_req,
         "next_token_logprobs": result.logits_output.next_token_logprobs,
-        "next_token_top_logprobs_val": result.logits_output.next_token_top_logprobs_val,
-        "next_token_top_logprobs_idx": result.logits_output.next_token_top_logprobs_idx,
-        "next_token_token_ids_logprobs_val": result.logits_output.next_token_token_ids_logprobs_val,
-        "next_token_token_ids_logprobs_idx": result.logits_output.next_token_token_ids_logprobs_idx,
+        "next_token_top_logprobs_val": _to_cpu_nested(result.logits_output.next_token_top_logprobs_val),
+        "next_token_top_logprobs_idx": _to_cpu_nested(result.logits_output.next_token_top_logprobs_idx),
+        "next_token_token_ids_logprobs_val": _to_cpu_nested(result.logits_output.next_token_token_ids_logprobs_val),
+        "next_token_token_ids_logprobs_idx": _to_cpu_nested(result.logits_output.next_token_token_ids_logprobs_idx),
         "sampling_mask_token_ids": (
             None if sampling_mask_output is None else sampling_mask_output.token_ids
         ),
