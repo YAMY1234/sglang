@@ -853,6 +853,88 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
         )
         return self._fill_evict_result(binding_result, DriveHostEvictionResult())
 
+    def set_l3_lifetime_ledger_enabled(self, enabled: bool) -> None:
+        self._binding.set_l3_lifetime_ledger_enabled(enabled)
+
+    def take_l3_lifetime_events(self):
+        return self._binding.take_l3_lifetime_events()
+
+    def begin_mamba_host_eviction(self, num_states: int, min_depth: int = 8192) -> DriveHostEvictionResult:
+        binding = self._binding.begin_mamba_host_eviction(num_states, min_depth)
+        result = self._fill_evict_result(binding, DriveHostEvictionResult())
+        result.mamba_storage_backup_node_id = binding.mamba_storage_backup_node_id
+        return result
+
+    def finish_mamba_host_eviction(self, node_id: NodeId) -> DriveHostEvictionResult:
+        return self._fill_evict_result(self._binding.finish_mamba_host_eviction(node_id), DriveHostEvictionResult())
+
+    def prepare_mamba_host_restore(self, key: RadixKey, end_tokens: int):
+        node_id, actions = self._binding.prepare_mamba_host_restore(
+            _radix_key_buffer(key), end_tokens, key.extra_key, key.cache_salt)
+        return node_id, self._cache_actions_from_tagged(actions)
+
+    def commit_mamba_host_restore(self, node_id: NodeId, host_indices: torch.Tensor) -> bool:
+        return self._binding.commit_mamba_host_restore(node_id, host_indices)
+
+    # ---- Storage write-back dirty pages (Rust only) ----
+
+    def supports_host_dirty(self) -> bool:
+        """Whether this extension build tracks dirty host pages."""
+        return hasattr(self._binding, "plan_host_eviction")
+
+    def mark_host_dirty(self, node_ids: list[NodeId]) -> int:
+        """Storage lacks these Full host values: host-leaf eviction skips them."""
+        return self._binding.mark_host_dirty(node_ids)
+
+    def mark_host_clean(self, node_ids: list[NodeId]) -> int:
+        return self._binding.mark_host_clean(node_ids)
+
+    def clear_host_dirty(self) -> int:
+        return self._binding.clear_host_dirty()
+
+    def is_host_dirty(self, node_id: NodeId) -> bool:
+        return self._binding.is_host_dirty(node_id)
+
+    def host_dirty_tokens(self) -> tuple[int, int]:
+        """(dirty Full host tokens, dirty tokens a coexisting-copy reclaim freed)."""
+        return self._binding.host_dirty_tokens()
+
+    def plan_host_eviction(
+        self, max_dirty_tokens: int, released: list[NodeId]
+    ) -> list[tuple[NodeId, int, bool]]:
+        """Host-leaf eviction order, as ``(node_id, tokens, dirty)``, if dirty
+        nodes were clean and ``released`` host locks dropped; read-only."""
+        return self._binding.plan_host_eviction(max_dirty_tokens, released)
+
+    def peek_host_eviction_candidates(
+        self, component_type: ComponentType, num_tokens: int
+    ) -> list[tuple[NodeId, int, Optional[list[str]]]]:
+        try:
+            peek = self._binding.peek_host_eviction_candidates
+        except AttributeError:
+            # An extension built before the binding existed (e.g. an image's).
+            raise RuntimeError(
+                "SGLANG_HICACHE_L3_WRITE_ON_HOST_EVICT needs a Rust TreeCore "
+                "extension that has peek_host_eviction_candidates; rebuild "
+                "rust/sglang-radix-tree or set "
+                "SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND=python"
+            ) from None
+        return peek(int(component_type), num_tokens)
+
+    def peek_mamba_host_eviction_leaves(
+        self, max_states: int
+    ) -> list[tuple[NodeId, int, Optional[list[str]]]]:
+        try:
+            peek = self._binding.peek_mamba_host_eviction_leaves
+        except AttributeError:
+            raise RuntimeError(
+                "SGLANG_HICACHE_L3_WRITE_MAMBA_HOST_LEAVES needs a Rust TreeCore "
+                "extension that has peek_mamba_host_eviction_leaves; rebuild "
+                "rust/sglang-radix-tree or set "
+                "SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND=python"
+            ) from None
+        return peek(max_states)
+
     def evict_excess_path_states(
         self,
         tail_node_id: NodeId,
@@ -876,6 +958,18 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
 
     def set_host_memory_buffer_only(self) -> None:
         self._binding.set_host_memory_buffer_only()
+
+    def set_mamba_path_cap_counts_host(self, enabled: bool) -> None:
+        try:
+            setter = self._binding.set_mamba_path_cap_counts_host
+        except AttributeError:
+            # An extension built before the switch existed (e.g. an image's).
+            raise RuntimeError(
+                "SGLANG_MAMBA_PATH_CAP_COUNTS_HOST needs a Rust TreeCore extension "
+                "that has set_mamba_path_cap_counts_host; rebuild "
+                "rust/sglang-radix-tree or set SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND=python"
+            ) from None
+        setter(enabled)
 
     @property
     def is_host_memory_buffer_only(self) -> bool:

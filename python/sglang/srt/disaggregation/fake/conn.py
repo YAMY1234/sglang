@@ -120,6 +120,11 @@ class FakeKVSender(BaseKVSender):
             f"FakeKVSender init with num_kv_indices: {num_kv_indices}, aux_index: {aux_index}"
         )
 
+    @property
+    def supports_host_tensor_indices(self) -> bool:
+        # Rig only: take Mooncake's async index readback and PP PD early send.
+        return envs.SGLANG_DISAGG_FAKE_SENDER_ASYNC_INDICES.get()
+
     def should_send_kv_chunk(self, num_pages: int, last_chunk: bool) -> bool:
         # A zero-page last chunk must still send: poll() only concludes after send().
         return num_pages > 0 or last_chunk
@@ -129,10 +134,14 @@ class FakeKVSender(BaseKVSender):
         kv_indices: npt.NDArray[np.int32],
         state_indices: Optional[List] = None,
         num_kv_tokens: Optional[int] = None,
+        indices_event: Optional[object] = None,
+        send_aux: bool = True,
     ):
         self.has_sent = True
         logger.debug(
-            f"FakeKVSender send with kv_indices: {kv_indices}, state_indices: {state_indices}"
+            "FakeKVSender send with kv_indices: %s, state_indices: %s",
+            kv_indices,
+            state_indices,
         )
 
     def failure_exception(self):

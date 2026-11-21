@@ -3,6 +3,7 @@ from __future__ import annotations
 import dataclasses
 import logging
 import math
+import sys
 import tempfile
 import time
 from collections import defaultdict, deque
@@ -279,6 +280,8 @@ class SchedulerMetricsReporter:
         self.num_generated_tokens = 0
         self.last_decode_stats_tic = time.perf_counter()
         self.last_prefill_stats_tic = time.perf_counter()
+        self.host_usage_log_interval = envs.SGLANG_HICACHE_HOST_USAGE_LOG_INTERVAL.get()
+        self.next_host_usage_log_tic = 0.0
         self.last_gen_throughput: float = 0.0
         self.last_input_throughput: float = 0.0
         self.step_time_dict = defaultdict(list)  # Dict[batch size -> step time]
@@ -803,6 +806,9 @@ class SchedulerMetricsReporter:
 
         if self.is_stats_logging_rank:
             logger.info(msg)
+            if self.host_usage_log_interval > 0 and now >= self.next_host_usage_log_tic:
+                self.next_host_usage_log_tic = now + self.host_usage_log_interval
+                self._log_hicache_host_usage()
         if self.current_scheduler_metrics_enabled:
             self.metrics_collector.increment_prefill_cuda_graph_pass(
                 value=can_run_cuda_graph
@@ -1069,6 +1075,12 @@ class SchedulerMetricsReporter:
 
         if self.is_stats_logging_rank:
             logger.info(msg)
+            # DSA DCP top-k merge fallback counts, when a DSA model loaded it
+            merge = sys.modules.get("sglang.srt.layers.attention.dsa.dsa_dcp_sharded")
+            if merge is not None and (
+                line := merge.topk_merge_log_line(self.forward_ct_decode)
+            ):
+                logger.info(line)
         if self.current_scheduler_metrics_enabled:
             priority_enabled = self.scheduler.enable_priority_scheduling
 
@@ -1255,6 +1267,24 @@ class SchedulerMetricsReporter:
                 mamba_total - mamba_host_pool.available_size()
             )
             self.stats.hicache_host_mamba_total_states = mamba_total
+
+    def _log_hicache_host_usage(self):
+        """SGLANG_HICACHE_HOST_USAGE_LOG_INTERVAL: one line on how full each
+        HiCache host pool is, plus the Mamba retention counters when enabled."""
+        if not self.scheduler.enable_hierarchical_cache:
+            return
+        self._log_hicache_stats()
+        stats = self.stats
+        msg = (
+            f"HiCache host usage: kv {stats.hicache_host_used_tokens}"
+            f"/{stats.hicache_host_total_tokens} tokens, "
+            f"mamba {stats.hicache_host_mamba_used_states}"
+            f"/{stats.hicache_host_mamba_total_states} states"
+        )
+        counts = getattr(self.scheduler.tree_cache, "mamba_retention_counts", None)
+        if counts:
+            msg += "".join(f", {name} {value}" for name, value in counts.items())
+        logger.info(msg)
 
     def _update_lora_metrics(self):
         """Update LoRA pool metrics for monitoring and autoscaling."""

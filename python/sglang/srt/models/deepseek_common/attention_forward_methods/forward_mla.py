@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
 
@@ -65,6 +66,12 @@ logger = logging.getLogger(__name__)
 _SGLANG_EXPERIMENTAL_LORA_OPTI = envs.SGLANG_EXPERIMENTAL_LORA_OPTI.get()
 _ENABLE_DSA_Q8KV8_BORN_FP8_Q = envs.SGLANG_ENABLE_DSA_Q8KV8_BORN_FP8_Q.get()
 _ENABLE_DSA_Q8KV8_QPREP_OVERLAP = envs.SGLANG_ENABLE_DSA_Q8KV8_QPREP_OVERLAP.get()
+# SGLANG_K31_DRAFT_SWA_INPLACE_Q (default off): sliding-window layers hand
+# the a2a / fi_a2a reduce strided [rows, heads, 512] partials (see
+# trtllm_mla_backend._forward_sliding_window); the pack reads them as is.
+_DRAFT_SWA_STRIDED_PARTIALS = os.environ.get(
+    "SGLANG_K31_DRAFT_SWA_INPLACE_Q", "0"
+).strip().lower() in ("1", "true", "yes", "on")
 
 from sglang.srt.model_executor.runner_utils.forward_batch import get_forward_batch
 from sglang.srt.model_executor.runner_utils.prefill_graph import (
@@ -1026,8 +1033,12 @@ class DeepseekMLAForwardMixin:
                         )
                     else:
                         # A2A exchange of head partials + LSE, then local Triton combine.
-                        if not (self.use_dsa and dsa_shards_index_k()):
+                        if not (self.use_dsa and dsa_shards_index_k()) and not (
+                            _DRAFT_SWA_STRIDED_PARTIALS
+                            and self.attn_mqa_for_dcp_decode.sliding_window_size >= 0
+                        ):
                             # K3.1's DSA partials are strided views the pack reads as is
+                            # (so are a sliding-window draft's under SGLANG_K31_DRAFT_SWA_INPLACE_Q)
                             attn_output = attn_output.contiguous()
                             lse = lse.contiguous()
                         attn_output = dcp_a2a_lse_reduce(
