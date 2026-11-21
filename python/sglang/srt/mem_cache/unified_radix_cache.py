@@ -2873,6 +2873,7 @@ class UnifiedRadixCache(BasePrefixCache):
         """
         t0 = time.perf_counter() if pmicro_hoststats.ON else 0.0
         self._wa_step += 1
+        trace_evicted = self._wa_evicted_tokens
         self._wa_peak_evicted = max(
             self._wa_peak_evicted * 0.99, float(self._wa_evicted_tokens)
         )
@@ -2895,6 +2896,11 @@ class UnifiedRadixCache(BasePrefixCache):
             len(self._wa_issue_steps)
             >= envs.SGLANG_HICACHE_DEVICE_WRITE_AHEAD_MAX_INFLIGHT.get()
         ):
+            if envs.SGLANG_PP_DEBUG_TRACE.get():
+                logger.info(
+                    "PPT wa walk=%d evicted=%d target=%d tail=%d gated inflight=%d",
+                    self._wa_step, trace_evicted, target, len(tail), len(self._wa_issue_steps),
+                )
             return
         cc = self.cache_controller
         # Writes queued by others keep their own ack queue and fence.
@@ -2940,6 +2946,12 @@ class UnifiedRadixCache(BasePrefixCache):
                 ack_queue=cc.ack_write_ahead_queue, stream=self._write_ahead_stream()
             )
             self._wa_issue_steps.append(self._wa_step)
+        if envs.SGLANG_PP_DEBUG_TRACE.get():
+            logger.info(
+                "PPT wa walk=%d evicted=%d target=%d tail=%d batch=%d issued=%d host_avail=%d inflight=%d",
+                self._wa_step, trace_evicted, target, len(tail), len(batch), issued,
+                cc.mem_pool_host.available_size(), len(self._wa_issue_steps),
+            )
         if pmicro_hoststats.ON:
             pmicro_hoststats.OPS["write_ahead"].add(time.perf_counter() - t0, issued)
 
