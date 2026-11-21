@@ -882,6 +882,10 @@ class Envs:
     # Under SGLANG_PP_DECOUPLE_HOST: un-waited rounds for the proxy and output device-tensor
     # sends, which keep their tensors alive until waited (0 = SGLANG_PP_DECOUPLE_SEND_WINDOW's).
     SGLANG_PP_DECOUPLE_TENSOR_WINDOW = EnvInt(2)
+    # Under SGLANG_PP_DECOUPLE_HOST: post a stage's NCCL tensor receive only after its previous
+    # forward ends. A receive kernel waits on the GPU for its sender, and resident there it
+    # blocks the forward's cooperative kernels (MoE routing).
+    SGLANG_PP_DECOUPLE_LATE_RECV = EnvBool(False)
     # PP PD prefill: log a digest of allocator and radix tree state every N loop
     # epochs (0 = off); every stage must log the same digest at the same epoch.
     SGLANG_DEBUG_PP_STATE_DIGEST_EVERY = EnvInt(0)

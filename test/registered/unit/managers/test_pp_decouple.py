@@ -12,7 +12,7 @@ import time
 import unittest
 import weakref
 from array import array
-from collections import deque
+from collections import defaultdict, deque
 from contextlib import nullcontext
 from types import SimpleNamespace
 
@@ -151,6 +151,33 @@ class TestPPSendWindow(CustomTestCase):
         self.assertEqual(log, ["proxy1.0", "proxy1.1"])
         self.assertEqual(scheduler.pp_send_done_event, "event")
         self.assertEqual(len(scheduler.pp_send_windows.proxy), 1)
+
+
+class TestPPLateRecv(CustomTestCase):
+    def _scheduler(self, late, log):
+        scheduler = SchedulerPPMixin()
+        scheduler.pp_comm_stream_ctx = nullcontext()
+        scheduler._pp_tensor_dict_inbox = defaultdict(deque)
+        scheduler._pp_late_recv = late
+        scheduler.launch_event = "fwd-end"
+        scheduler.pp_comm_stream = SimpleNamespace(
+            wait_event=lambda event: log.append(("wait", event))
+        )
+        scheduler.pp_group = SimpleNamespace(
+            recv_tensor_dict=lambda **kw: log.append(("recv",)) or {"__msg_type__": "proxy"}
+        )
+        scheduler._pp_record_comm_event = lambda: None
+        return scheduler
+
+    def test_late_receive_is_posted_behind_the_previous_forward(self):
+        """A receive kernel posted during a forward spins there until its sender sends and
+        blocks the forward's cooperative kernels; late receive orders it after that forward."""
+        log = []
+        self._scheduler(True, log)._pp_recv_typed_dict(expected_kind="proxy")
+        self.assertEqual(log, [("wait", "fwd-end"), ("recv",)])
+        log.clear()
+        self._scheduler(False, log)._pp_recv_typed_dict(expected_kind="proxy")
+        self.assertEqual(log, [("recv",)])
 
 
 class _StageModel:

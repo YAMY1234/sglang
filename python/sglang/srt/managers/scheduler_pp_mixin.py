@@ -130,6 +130,7 @@ class SchedulerPPMixin:
     # SGLANG_PP_DECOUPLE_HOST; the PD prefill loop replaces both when it is on.
     pp_send_windows: PPSendWindows = PPSendWindows()
     _pp_dict_inbox: Optional[PPRecvInbox] = None
+    _pp_late_recv: bool = False
 
     @DynamicGradMode()
     def event_loop_pp(self: Scheduler):
@@ -818,13 +819,17 @@ class SchedulerPPMixin:
                     name=f"pp{pp_rank}-relay-recv",
                 )
             )
+        self._pp_late_recv = (
+            envs.SGLANG_PP_DECOUPLE_LATE_RECV.get() and self.pp_comm_stream is not None
+        )
         if self.pp_bubble_diag is not None:
             self.pp_bubble_diag.extra_stats = self._pp_decouple_stats
         logger.info(
             "PP PD prefill: stages decoupled (SGLANG_PP_DECOUPLE_HOST); %d send "
-            "rounds per channel un-waited, relay window %d.",
+            "rounds per channel un-waited, relay window %d, late receive %s.",
             bound,
             pp_sync_window(),
+            self._pp_late_recv,
         )
         return True
 
@@ -1299,6 +1304,8 @@ class SchedulerPPMixin:
 
         while True:
             with self.pp_comm_stream_ctx:
+                if self._pp_late_recv and self.launch_event is not None:
+                    self.pp_comm_stream.wait_event(self.launch_event)
                 with pp_bubble_diag.wait("dict_recv." + expected_kind):
                     host_part = None
                     if self._pp_dict_inbox is not None:
