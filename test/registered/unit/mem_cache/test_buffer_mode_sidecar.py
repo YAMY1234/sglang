@@ -104,11 +104,18 @@ class TestBufferModeSidecar(unittest.TestCase):
         operation = PrefetchOperation(CacheRequestHandle("unread", 0), list(range(4)))
         operation.storage_hit_count = 4
         operation.query_pool_hit_pages = {PoolName.KV: 2}
-        chain = operation.all_hash_values
+        chain = operation.all_hash_values = ["h0", "h1"]
         for invalidate_only, written in ((False, False), (True, True)):
             with self.subTest(invalidate_only=invalidate_only):
                 cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
-                cache.page_size, cache.components = 2, {}
+                cache.tree_core = SimpleNamespace(
+                    page_size=2,
+                    peek_host_eviction_candidates=lambda *_: [(7, 4, chain)],
+                    build_storage_backup_spec=lambda *_: SimpleNamespace(
+                        hash_value=chain, host_value=None, comp_xfers={}
+                    ),
+                )
+                cache.components = {}
                 cache.storage_existence_cache = StorageExistenceCache()
                 with envs.SGLANG_HICACHE_L3_QUERY_HEAL_INVALIDATE_ONLY.override(
                     invalidate_only
@@ -123,12 +130,6 @@ class TestBufferModeSidecar(unittest.TestCase):
                 cache._l3_last_write_has_state = False
                 cache.cache_controller = SimpleNamespace(
                     mem_pool_host=SimpleNamespace(size=16, available_size=lambda: 0)
-                )
-                cache.tree_core = SimpleNamespace(
-                    peek_host_eviction_candidates=lambda *_: [(7, 4, chain)],
-                    build_storage_backup_spec=lambda *_: SimpleNamespace(
-                        hash_value=chain, host_value=None, comp_xfers={}
-                    ),
                 )
                 cache.hicache_storage_pass_prefix_keys = False
                 cache._build_sidecar_transfers = lambda *_: []
