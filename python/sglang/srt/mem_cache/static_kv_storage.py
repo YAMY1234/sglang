@@ -909,7 +909,10 @@ def _static_state_entries(
     draft's state rides in the target's entries where the pool family shares
     them."""
     from sglang.srt.disaggregation.base.conn import StateType
-    from sglang.srt.disaggregation.utils import remap_draft_layer_ids
+    from sglang.srt.disaggregation.utils import (
+        dsv41_encoder_only_prefill_enabled,
+        remap_draft_layer_ids,
+    )
     from sglang.srt.hardware_backend.npu.memory_pool_npu import (
         NPUMHATokenToKVPool,
         NPUMLATokenToKVPool,
@@ -994,7 +997,15 @@ def _static_state_entries(
         if dense_ptrs:
             add(StateType.MINIMAX_DENSE_KV, dense_ptrs, dense_lens, dense_item_lens)
     elif hasattr(token_to_kv_pool, "get_state_buf_infos"):
-        data_ptrs, data_lens, item_lens = token_to_kv_pool.get_state_buf_infos()
+        encoder_only = dsv41_encoder_only_prefill_enabled()
+        if encoder_only:
+            # Decode floors the layers from the last KV source on at its tail
+            # start, so only the encoder layers' SWA is ever read.
+            data_ptrs, data_lens, item_lens = token_to_kv_pool.get_state_buf_infos(
+                swa_layer_end=max(token_to_kv_pool.kv_source_layers)
+            )
+        else:
+            data_ptrs, data_lens, item_lens = token_to_kv_pool.get_state_buf_infos()
 
         router = token_to_kv_pool.layer_router
         has_window_sub_pool = router.sub_pool(IdSpaceKind.SLIDING_WINDOW) is not None
@@ -1043,7 +1054,12 @@ def _static_state_entries(
                         ring_lens,
                         ring_item_lens,
                     )
-            if hasattr(token_to_kv_pool, "get_request_state_buf_infos"):
+            # An encoder-only split leaves no request-scoped state; see
+            # dsv41_encoder_prefix_len.
+            if (
+                hasattr(token_to_kv_pool, "get_request_state_buf_infos")
+                and not encoder_only
+            ):
                 c128_ptrs, c128_lens, c128_item_lens = (
                     token_to_kv_pool.get_request_state_buf_infos()
                 )

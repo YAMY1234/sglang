@@ -77,6 +77,10 @@ class DropSubtreeNoHostResult(BaseEvictionResult):
     is_dropped: bool = False
 
 
+class ReleaseHostValueResult(BaseEvictionResult):
+    is_released: bool = False
+
+
 class DriveHostEvictionResult(BaseEvictionResult):
     pass
 
@@ -448,6 +452,18 @@ class UnifiedTreeCoreInterface(ABC):
     def drop_subtree_no_host(self, node_id: NodeId) -> DropSubtreeNoHostResult:
         """Drop an unbacked D-leaf's subtree when its write-back backup failed
         under host pressure; declines (is_dropped=False) if any node is locked."""
+        ...
+
+    @abstractmethod
+    def release_host_value(self, node_id: NodeId) -> ReleaseHostValueResult:
+        """Free a device-resident node's Full host copy that the external store
+        also holds; declines (is_released=False) while a copy, load-back or
+        host lock needs it."""
+        ...
+
+    @abstractmethod
+    def is_external_cache_stored(self, node_id: NodeId) -> bool:
+        """Whether the node is known to be stored in the external cache."""
         ...
 
     @abstractmethod

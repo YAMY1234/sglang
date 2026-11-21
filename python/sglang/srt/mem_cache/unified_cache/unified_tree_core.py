@@ -72,6 +72,7 @@ from sglang.srt.mem_cache.unified_cache.components import (
     windows_stand_alone,
 )
 from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import (
+    BaseEvictionResult,
     BufferBackupSnapshot,
     BufferBackupState,
     DecSwaLockOnlyResult,
@@ -83,6 +84,7 @@ from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import (
     InsertStepResult,
     NodeId,
     RadixCacheWalkResult,
+    ReleaseHostValueResult,
     TreePathNodeInfo,
     UnifiedTreeCoreInterface,
     uses_joint_lru,
@@ -1270,9 +1272,11 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                 and node.hit_count >= self.write_through_threshold
             )
 
+        # A node restored from the external store keeps its copy there, not on host.
         return (
             self.enable_hicache
             and not node.backuped
+            and not node.external_cache_stored
             and node.hit_count >= self.write_through_threshold
         )
 
@@ -2088,7 +2092,15 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                         node, write_back=True
                     )
                     return result
-                # Write-through: node has no backup, delete entirely.
+                # Write-through: node has no backup, delete entirely. Below a node
+                # whose host copy was released (it is in the external store) a
+                # later turn's backed child can be host-only; it goes with the
+                # node. A host lock (a storage prefetch anchored here), or a lock
+                # or copy below, defers it.
+                if self._is_host_locked(node) or not self._drop_host_only_descendants(
+                    node, result
+                ):
+                    return result
                 self._delete_unbacked_device_leaf(
                     node,
                     result.tracker,
@@ -2123,6 +2135,23 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             cd.lock_ref > 0 or cd.host_lock_ref > 0 for cd in node.component_data
         ):
             return result
+        if not self._drop_host_only_descendants(node, result):
+            return result
+        self._delete_unbacked_device_leaf(
+            node,
+            result.tracker,
+            device_frees=result.device_frees,
+            host_frees=result.host_frees,
+            cache_actions=result.cache_actions,
+        )
+        result.is_dropped = True
+        return result
+
+    def _drop_host_only_descendants(
+        self, node: UnifiedTreeNode, result: BaseEvictionResult
+    ) -> bool:
+        """Free the host-only subtree below a D-leaf, deepest first; False, with
+        nothing freed, when a node in it is locked or has a copy in flight."""
         descendants: list[UnifiedTreeNode] = []
         stack = list(node.children.values())
         while stack:
@@ -2134,7 +2163,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                     cd.lock_ref > 0 or cd.host_lock_ref > 0 for cd in cur.component_data
                 )
             ):
-                return result
+                return False
             descendants.append(cur)
             stack.extend(cur.children.values())
         for desc in reversed(descendants):
@@ -2151,15 +2180,32 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                 cache_actions=result.cache_actions,
             )
             self._remove_leaf_from_parent(desc)
-        self._delete_unbacked_device_leaf(
+        return True
+
+    @staticmethod
+    def _is_host_locked(node: UnifiedTreeNode) -> bool:
+        return any(cd.host_lock_ref > 0 for cd in node.component_data)
+
+    def release_host_value(self, node_id: NodeId) -> ReleaseHostValueResult:
+        """Free a device-resident node's Full host copy that the external store
+        also holds; not released while a copy, load-back or lock needs it."""
+        result = ReleaseHostValueResult()
+        node = self.node_by_id(node_id)
+        if not self._can_reclaim_full_host_duplicate(node):
+            return result
+        self._release_full_host_duplicate(
             node,
             result.tracker,
-            device_frees=result.device_frees,
-            host_frees=result.host_frees,
+            result.device_frees,
+            result.host_frees,
             cache_actions=result.cache_actions,
         )
-        result.is_dropped = True
+        self.full_host_duplicates.pop(node.id, None)
+        result.is_released = True
         return result
+
+    def is_external_cache_stored(self, node_id: NodeId) -> bool:
+        return self.node_by_id(node_id).external_cache_stored
 
     def _release_all_component_layers(
         self,
@@ -2807,8 +2853,14 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                 result.inserted_host_node = node.id
             return result
 
-        # Drop the refill only under write-through (a non-write-back policy).
-        if node is not self.root_node and not node.backuped and not self.is_write_back:
+        # Drop the refill only under write-through (a non-write-back policy),
+        # unless the external store holds the device-only parent.
+        if (
+            node is not self.root_node
+            and not node.backuped
+            and not node.external_cache_stored
+            and not self.is_write_back
+        ):
             logger.info(
                 "HiCache prefetch dropped %d-token refill under un-backed-up node %d",
                 len(host_value),
@@ -3439,7 +3491,12 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                 p_hst = node.parent.component_data[FCT].host_value is not None
                 if full_dev and not p_dev:
                     E(f"node {nid} device present but parent {node.parent.id} evicted")
-                if full_hst and not p_hst and not self.is_write_back:
+                if (
+                    full_hst
+                    and not p_hst
+                    and not self.is_write_back
+                    and not node.parent.external_cache_stored
+                ):
                     E(f"node {nid} backed up but parent {node.parent.id} not backed up")
 
             # Lock hierarchy and counters must stay sane.

@@ -1758,9 +1758,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         exist_result = self._batch_exist([key])
         return exist_result[0] == 1
 
-    def batch_exists(
-        self, keys, extra_info: Optional[HiCacheStorageExtraInfo] = None
-    ) -> int:
+    def _kv_exist_keys(self, keys: List[str]) -> Tuple[List[str], int]:
         # Apply config prefix if available.
         keys = self._tag_keys(keys)
 
@@ -1780,6 +1778,30 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                     query_keys.append(f"{key}_{self.mha_suffix}_k")
                     query_keys.append(f"{key}_{self.mha_suffix}_v")
                 key_multiplier = 2
+        return query_keys, key_multiplier
+
+    def lease_refresh_keys(
+        self, page_keys: List[str], *, pool_names: Sequence[str]
+    ) -> List[str]:
+        """The object keys that batch_exists_v2 reads for these pages and pools."""
+        keys = []
+        if self.mem_pool_host.kv_buffer is not None:
+            keys.extend(self._kv_exist_keys(page_keys)[0])
+        for pool_name in pool_names:
+            component_keys, _ = self._get_hybrid_page_component_keys(
+                page_keys, PoolTransfer(name=pool_name)
+            )
+            keys.extend(self._tag_keys(component_keys))
+        return keys
+
+    def renew_leases(self, keys: List[str]) -> List[int]:
+        """Existence query whose master side grants each present key a read lease."""
+        return self._batch_exist(keys)
+
+    def batch_exists(
+        self, keys, extra_info: Optional[HiCacheStorageExtraInfo] = None
+    ) -> int:
+        query_keys, key_multiplier = self._kv_exist_keys(keys)
 
         with self.request_context(**self._request_context_from_extra_info(extra_info)):
             exist_result = self._batch_exist(query_keys)

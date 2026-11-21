@@ -566,5 +566,6 @@ POSITIONAL_FIELD_ORDER = (
     "speculative_dspark_lm_head_dtype",
     "media_url_timeout",
     "allow_local_media_files",
+    "dsv41_encoder_only_prefill",
 )
 # fmt: on

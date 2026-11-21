@@ -1628,9 +1628,11 @@ class Scheduler(
                 transfer_backend=self.transfer_backend,
             )
 
+        # Encoder-only prefill sends no draft state; decode's tail extend fills it.
         draft_token_to_kv_pool = (
             self.draft_worker.primary_draft_kv_pool
             if self.draft_worker is not None
+            and not get_disagg().dsv41_encoder_only_prefill
             else None
         )
 
@@ -3694,10 +3696,12 @@ class Scheduler(
 
             matched_len = req.prefix_len + req.host_hit_length
             req.storage_prefetch_last_match_len = matched_len
+            tree_cache.refresh_storage_leases(last_host_node)
 
             if (
                 tree_cache.is_backuped(last_host_node)
                 or tree_cache.is_root(last_host_node)
+                or tree_cache.is_storage_backed(last_host_node)
                 or (
                     buffer_mode
                     and tree_cache.get_last_hash_value(last_host_node) is not None
@@ -3818,6 +3822,10 @@ class Scheduler(
             req.time_stats.set_wait_queue_entry_time()
             req.arrival_processed_tokens = self.processed_tokens_counter
         elif self.disaggregation_mode == DisaggregationMode.PREFILL:
+            if get_disagg().dsv41_encoder_only_prefill and not (
+                self.prepare_dsv41_encoder_only_req(req)
+            ):
+                return
             self._prefetch_kvcache(req)
             self.disagg_prefill_bootstrap_queue.add(
                 req, self.model_config.num_key_value_heads

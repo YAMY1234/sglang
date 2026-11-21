@@ -73,6 +73,7 @@ from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import (
     InsertStepResult,
     NodeId,
     RadixCacheWalkResult,
+    ReleaseHostValueResult,
     TreePathNodeInfo,
     UnifiedTreeCoreInterface,
 )
@@ -1335,6 +1336,14 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
         binding_result = self._binding.drop_subtree_no_host(node_id)
         result = DropSubtreeNoHostResult(is_dropped=binding_result.dropped)
         return self._fill_evict_result(binding_result, result)
+
+    def release_host_value(self, node_id: NodeId) -> ReleaseHostValueResult:
+        binding_result = self._binding.release_host_value(node_id)
+        result = ReleaseHostValueResult(is_released=binding_result.dropped)
+        return self._fill_evict_result(binding_result, result)
+
+    def is_external_cache_stored(self, node_id: NodeId) -> bool:
+        return self._binding.is_external_cache_stored(node_id)
 
     def mark_write_through_pending(
         self, node_ids: list[NodeId], ack_id: NodeId

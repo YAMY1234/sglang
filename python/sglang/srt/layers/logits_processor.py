@@ -573,6 +573,9 @@ class LogitsProcessor(nn.Module):
         # Set before graph capture by a speculative worker that finishes the TP
         # gather itself (see finish_deferred_gather / deferred_argmax).
         self.defer_verify_gather = False
+        # Set before graph capture by a speculative worker that widens a target
+        # verify's BF16/FP16 logits itself when a batch needs FP32.
+        self.verify_keeps_lm_head_dtype = False
         self._sharded_verify_eligible = (
             _runtime_optimized_vocab_shards_enabled()
             and self.do_tensor_parallel_all_gather
@@ -1222,6 +1225,12 @@ class LogitsProcessor(nn.Module):
             if use_logits_buffer and not self.do_tensor_parallel_all_gather
             else None
         )
+        keep_lm_head_dtype = self._verify_keeps_lm_head_dtype(logits_metadata)
+        if keep_lm_head_dtype:
+            # The FP32 buffer's storage holds the LM head's own output instead.
+            logits_buffer = self._borrow_shard_logits_buffer(
+                hidden_states, lm_head, logits_buffer
+            )
         with get_forward().scoped(lora_batch_layout=lora_batch_layout):
             logits = self._compute_lm_head(
                 hidden_states, lm_head, embedding_bias, out=logits_buffer
@@ -1234,6 +1243,9 @@ class LogitsProcessor(nn.Module):
 
         if self.logit_scale is not None:
             logits.mul_(self.logit_scale)
+
+        if keep_lm_head_dtype and logits.dtype in (torch.bfloat16, torch.float16):
+            return logits[:, : self.vocab_size]
 
         if self._can_gather_softcap_fused(
             logits, local_hidden_states, lm_head, logits_metadata
@@ -1297,6 +1309,16 @@ class LogitsProcessor(nn.Module):
                 )
 
         return logits
+
+    def _verify_keeps_lm_head_dtype(self, logits_metadata: LogitsMetadata) -> bool:
+        return (
+            self.verify_keeps_lm_head_dtype
+            and logits_metadata.forward_mode.is_target_verify()
+            and not self.do_tensor_parallel_all_gather
+            and not self.do_tensor_parallel_all_gather_dp_attn
+            and self.final_logit_softcapping is None
+            and not (self.use_fp32_lm_head or self.use_fp32_lm_head_output)
+        )
 
     def _can_gather_softcap_fused(
         self,
