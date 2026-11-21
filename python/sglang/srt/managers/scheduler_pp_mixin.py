@@ -36,7 +36,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     PPProxyTensors,
 )
 from sglang.srt.observability.req_time_stats import set_time_batch
-from sglang.srt.managers import pp_bubble_diag, pp_decouple
+from sglang.srt.managers import pp_bubble_diag, pp_ce_push, pp_decouple
 from sglang.srt.managers.pp_decouple import PPRecvInbox, PPSendWindow, PPSendWindows
 from sglang.srt.observability.scheduler_stage_metrics import (
     SCHEDULER_STAGE_BUILD_BATCH,
@@ -133,6 +133,10 @@ class SchedulerPPMixin:
     _pp_late_recv: bool = False
     # SGLANG_PP_CHECK_PROXY_BATCH: proxy messages carry their batch's identity.
     _pp_check_proxy_batch: bool = False
+    # SGLANG_PP_CE_PUSH: the ring endpoints, and the input slot the last forward read (released after the
+    # stage's own push of that batch, which may read the slot in place).
+    _pp_ce: Optional[pp_ce_push.PPCEPush] = None
+    _pp_ce_in_use: Optional[Tuple[int, int]] = None
 
     @DynamicGradMode()
     def event_loop_pp(self: Scheduler):
@@ -486,6 +490,8 @@ class SchedulerPPMixin:
                         )
                     if cur_batch:
                         self._pp_send_proxy_to_next_stage(result)
+                elif cur_batch:
+                    self._pp_ce_release_input()
 
                 self.pp_outputs = next_pp_outputs
                 release_rids = next_release_rids
@@ -783,9 +789,20 @@ class SchedulerPPMixin:
         ):
             return False
         bound = envs.SGLANG_PP_DECOUPLE_SEND_WINDOW.get() or self.pp_loop_size
-        self.pp_send_windows = PPSendWindows.create(
-            bound, envs.SGLANG_PP_DECOUPLE_TENSOR_WINDOW.get() or bound
-        )
+        tensor_bound = envs.SGLANG_PP_DECOUPLE_TENSOR_WINDOW.get() or bound
+        self.pp_send_windows = PPSendWindows.create(bound, tensor_bound)
+        if (
+            envs.SGLANG_PP_CE_PUSH.get()
+            and self.pp_comm_stream is not None
+            and self.attn_tp_group.world_size == 1
+        ):
+            # Collective over the PP group; must run before the relay receive threads start.
+            self._pp_ce = pp_ce_push.setup_ce_push(
+                pp_group=self.pp_group,
+                device_id=self.device_module.current_device(),
+                slots=max(2, tensor_bound),
+                slot_bytes=envs.SGLANG_PP_CE_PUSH_SLOT_MB.get() << 20,
+            )
         pp_rank = get_parallel().pp_rank
         # Proxy and output dicts from the previous stage (PP0: outputs from the last);
         # the thread takes their CPU-group part, the loop the device tensors.
@@ -1109,9 +1126,33 @@ class SchedulerPPMixin:
         if self.pp_send_done_event is not None:
             self.forward_stream.wait_event(self.pp_send_done_event)
             self.pp_send_done_event = None
-        if self.pp_proxy_recv_event is not None:
+        if isinstance(self.pp_proxy_recv_event, pp_ce_push.CEWait):
+            self._pp_ce.wait_full(self.forward_stream, self.pp_proxy_recv_event.slot_seq)
+            self._pp_ce_in_use = self.pp_proxy_recv_event.slot_seq
+            self.pp_proxy_recv_event = None
+        elif self.pp_proxy_recv_event is not None:
             self.forward_stream.wait_event(self.pp_proxy_recv_event)
             self.pp_proxy_recv_event = None
+
+    def _pp_ce_release_input(
+        self: Scheduler, nccl_send_work: Optional[List[P2PWork]] = None
+    ) -> None:
+        """Hand the ring slot the last forward read back to the previous stage. A non-last stage calls this
+        after enqueuing its own proxy send, which may read the slot in place (an in-place residual)."""
+        if self._pp_ce is None or self._pp_ce_in_use is None:
+            return
+        if self.pp_group.is_last_rank:
+            stream = self.forward_stream
+        else:
+            stream = self._pp_ce.stream
+            if nccl_send_work is not None:
+                # An NCCL fallback send reads on NCCL's stream: fence the release behind it.
+                with self.pp_comm_stream_ctx:
+                    for work in nccl_send_work:
+                        work.work.wait()
+                    stream.wait_event(self._pp_record_comm_event())
+        self._pp_ce.release(stream, self._pp_ce_in_use)
+        self._pp_ce_in_use = None
 
     @scheduler_stage_method(SCHEDULER_STAGE_PP_OUTPUT_WAIT)
     def _pp_commit_send_output_work_and_preprocess_output_tensors(
@@ -1282,14 +1323,26 @@ class SchedulerPPMixin:
     def _pp_send_proxy_to_next_stage(
         self: Scheduler, result: GenerationBatchResult
     ) -> None:
+        tensors = result.pp_hidden_states_proxy_tensors.tensors
+        ce_push = self._pp_ce is not None and self._pp_ce.fits(tensors)
         with torch.profiler.record_function("send_proxy_dict_to_next_stage"):
-            self.send_proxy_work = self._pp_send_dict_to_next_stage(
-                result.pp_hidden_states_proxy_tensors.tensors,
-                async_send=True,
-                msg_type="proxy",
-                ready_event=self.launch_event,
-            )
+            if ce_push:
+                meta, push = self._pp_ce.push(tensors, ready_event=self.launch_event)
+                meta.append(("__msg_type__", "proxy"))
+                self.send_proxy_work = self.pp_group.send_object(
+                    meta,
+                    dst=(self.pp_group.rank_in_group + 1) % self.pp_group.world_size,
+                    async_send=True,
+                ) + [push]
+            else:
+                self.send_proxy_work = self._pp_send_dict_to_next_stage(
+                    tensors,
+                    async_send=True,
+                    msg_type="proxy",
+                    ready_event=self.launch_event,
+                )
         self.send_proxy_requires_forward_fence = result.can_run_cuda_graph
+        self._pp_ce_release_input(nccl_send_work=None if ce_push else self.send_proxy_work)
 
     def _pp_recv_typed_dict(
         self: Scheduler,
@@ -1321,7 +1374,11 @@ class SchedulerPPMixin:
                         all_gather_group=all_gather_group,
                         host_part=host_part,
                     )
-                recv_event = self._pp_record_comm_event()
+                if pp_ce_push.CE_KEY in tensor_dict:
+                    tensor_dict, slot_seq = self._pp_ce.views(tensor_dict)
+                    recv_event = pp_ce_push.CEWait(slot_seq)
+                else:
+                    recv_event = self._pp_record_comm_event()
             received_kind = tensor_dict.get("__msg_type__", "default")
             if received_kind == expected_kind:
                 if received_kind == "default":
