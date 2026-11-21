@@ -298,6 +298,66 @@ class TestDPBudgetUpdateBudget(CustomTestCase):
         self.assertEqual(budget.total_tokens, [100, 50, 300])
 
 
+class TestDPBudgetRowsAwareDispatch(CustomTestCase):
+    @staticmethod
+    def _budget(rows_kv_eps, loads):
+        budget = DPBudget(num_dp_ranks=len(loads), rows_kv_eps=rows_kv_eps)
+        budget.update_budget(
+            [_load(dp_rank=i, timestamp=1.0, **kw) for i, kw in enumerate(loads)]
+        )
+        return budget
+
+    def test_off_keeps_total_tokens_picks(self):
+        loads = [
+            dict(num_running_reqs=9, num_total_tokens=1000),
+            dict(num_running_reqs=2, num_total_tokens=1100),
+            dict(num_running_reqs=5, num_total_tokens=1050),
+        ]
+        budget = self._budget(0.0, loads)
+        tokens, requests, picks, expected = [1000, 1100, 1050], [9, 2, 5], [], []
+        for est in (100, 300, 50, 200, 120, 80):
+            rank = min(range(3), key=lambda i: (tokens[i], requests[i]))
+            tokens[rank] += est
+            requests[rank] += 1
+            expected.append(rank)
+            picks.append(budget.dispatch(LoadBalanceMethod.TOTAL_TOKENS, est))
+        self.assertEqual(picks, expected)
+
+    def test_on_picks_fewest_rows_within_kv_guard(self):
+        budget = self._budget(
+            0.1,
+            [
+                dict(num_running_reqs=9, num_total_tokens=1000),
+                dict(num_running_reqs=2, num_total_tokens=1100),
+            ],
+        )
+        self.assertEqual(budget.dispatch(LoadBalanceMethod.TOTAL_TOKENS, 100), 1)
+        self.assertEqual(budget.total_requests, [9, 3])
+        self.assertEqual(budget.total_tokens, [1000, 1200])
+
+    def test_kv_guard_excludes_rank_with_fewest_rows(self):
+        budget = self._budget(
+            0.05,
+            [
+                dict(num_running_reqs=9, num_total_tokens=1000),
+                dict(num_running_reqs=1, num_total_tokens=2000),
+                dict(num_running_reqs=5, num_total_tokens=1010),
+            ],
+        )
+        self.assertEqual(budget.dispatch(LoadBalanceMethod.TOTAL_TOKENS, 100), 2)
+
+    def test_falls_back_to_total_tokens_when_no_rank_fits(self):
+        budget = self._budget(
+            0.05,
+            [
+                dict(num_running_reqs=9, num_total_tokens=3900),
+                dict(num_running_reqs=1, num_total_tokens=3950),
+                dict(num_running_reqs=5, num_total_tokens=3920),
+            ],
+        )
+        self.assertEqual(budget.dispatch(LoadBalanceMethod.TOTAL_TOKENS, 100), 0)
+
+
 class TestRoundRobinScheduler(CustomTestCase):
     def test_cycles_through_active_workers_in_order(self):
         ctl = _make_controller(num_dp_ranks=4)
