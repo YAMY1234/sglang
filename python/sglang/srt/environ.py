@@ -901,8 +901,8 @@ class Envs:
     SGLANG_PP_SCHED_WAR_FENCE = EnvBool(False)
     # Debug: log every PP tensor-dict send / receive (kind, batch tag, stash) and every launch.
     SGLANG_PP_DEBUG_TRACE = EnvBool(False)
-    # Debug: "FCT:SECONDS" makes every PP rank's scheduler sleep SECONDS once when its forward count
-    # reaches FCT, a stall cascade like a profiler export's without the profiler.
+    # Debug: "FCT:SECONDS[:STEP]" makes PP rank r's scheduler sleep SECONDS once when its forward count
+    # reaches FCT + r * STEP, a stall cascade like the profiler exports' without the profiler.
     SGLANG_PP_DEBUG_STALL = EnvStr("")
     # Debug: synchronize the device before the torch profiler stops, so no profiled kernel is still queued.
     SGLANG_PROFILER_SYNC_BEFORE_STOP = EnvBool(False)

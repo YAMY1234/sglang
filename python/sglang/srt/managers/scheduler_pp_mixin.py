@@ -361,8 +361,12 @@ class SchedulerPPMixin:
         epoch = 0
 
         diag = self.pp_bubble_diag
-        stall = envs.SGLANG_PP_DEBUG_STALL.get()
-        stall_fct, stall_s = (int(stall.split(":")[0]), float(stall.split(":")[1])) if stall else (-1, 0.0)
+        stall = envs.SGLANG_PP_DEBUG_STALL.get().split(":") if envs.SGLANG_PP_DEBUG_STALL.get() else []
+        # "FCT:SECONDS[:STEP]": rank r stalls at FCT + r * STEP, so the stalls run one after another
+        # down the pipeline like per-rank profiler exports do.
+        step = int(stall[2]) if len(stall) > 2 else 0
+        stall_fct = int(stall[0]) + get_parallel().pp_rank * step if stall else -1
+        stall_s = float(stall[1]) if stall else 0.0
         while True:
             server_is_idle = True
             for mb_id in range(self.pp_loop_size):
