@@ -1156,7 +1156,9 @@ class TestTriFactorySizing(unittest.TestCase):
                         initial_available = allocator.available_size()
                         req = SimpleNamespace(
                             kv=SimpleNamespace(
-                                req_pool_idx=0, mamba_pool_idx=allocator.alloc(1)[0]
+                                req_pool_idx=0,
+                                mamba_pool_idx=allocator.alloc(1)[0],
+                                mamba_fork_track_idx=None,
                             )
                         )
                         pool._alloc_ping_pong_buffer(req)
