@@ -2302,8 +2302,8 @@ class SchedulerDisaggregationPrefillMixin:
     def optimistic_release_and_requeue(self: Scheduler, req: Req) -> None:
         """Release KV cache and requeue an optimistic prefill request."""
         if (
-            self.enable_hicache_storage
-            and get_disagg().disaggregation_decode_allocation_policy == "prefill_complete"
+            get_disagg().disaggregation_decode_allocation_policy == "prefill_complete"
+            and self.enable_hicache_storage
         ):
             # Optimistic prefill with an L3 backend is allowed only because
             # prefill_complete never yields (serving_hook optimistic gate).
