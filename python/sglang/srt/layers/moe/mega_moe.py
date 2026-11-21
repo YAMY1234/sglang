@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import functools
+import importlib
 import logging
 import os
 from contextlib import contextmanager, nullcontext
@@ -125,7 +126,9 @@ def _mega_moe_dg(mma_type: str):
     if mma_type == "fp8xfp4" and envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_FP4_ACTS.get():
         # Read by the build at buffer creation and at every launch; DG_MEGA_MOE_ACT_DTYPE=fp8 keeps FP8 activations
         os.environ.setdefault("DG_MEGA_MOE_ACT_DTYPE", "mxfp4")
-        import deep_gemm_fp4acts
+        deep_gemm_fp4acts = importlib.import_module(
+            envs.SGLANG_DEEPGEMM_FP4_ACTS_MODULE.get()
+        )
 
         _log_fp4_acts_build_once(deep_gemm_fp4acts)
         _maybe_enable_fp4_acts_pdl(deep_gemm_fp4acts)

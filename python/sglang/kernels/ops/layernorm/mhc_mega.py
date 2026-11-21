@@ -5,6 +5,7 @@ https://github.com/deepseek-ai/DeepGEMM
 """
 
 import functools
+import importlib
 import logging
 from typing import Optional
 
@@ -31,7 +32,7 @@ def _task_ring_dg():
     """The DeepGEMM build whose Mega mHC host runs the task-ring kernel, or None (switch off)."""
     if not envs.SGLANG_OPT_DSV41_MEGA_MHC_TASK_RING.get():
         return None
-    import deep_gemm_fp4acts
+    deep_gemm_fp4acts = importlib.import_module(envs.SGLANG_DEEPGEMM_FP4_ACTS_MODULE.get())
 
     logger.info(
         "Mega mHC runs the task-ring kernel through %s (%s), locality %s",

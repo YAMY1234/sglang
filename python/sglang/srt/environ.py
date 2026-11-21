@@ -1470,6 +1470,9 @@ class Envs:
     # (requantized in the dispatch; DG_MEGA_MOE_ACT_DTYPE defaults to mxfp4 under this switch), the fused shared
     # expert stays FP8. Changes MoE numerics.
     SGLANG_OPT_DEEPGEMM_MEGA_MOE_FP4_ACTS = EnvBool(False)
+    # Module of the FP4-activation DeepGEMM build, also used by the Mega mHC task ring; deep_gemm.fp4acts when it
+    # ships inside the deep_gemm package.
+    SGLANG_DEEPGEMM_FP4_ACTS_MODULE = EnvStr("deep_gemm_fp4acts")
     SGLANG_FP8_IGNORED_LAYERS = EnvStr("")
     SGLANG_FP4_IGNORED_LAYERS = EnvStr("")
 
