@@ -74,8 +74,11 @@ from sglang.srt.layers.attention.dsa.dsa_dcp import (
     localize_dcp_page_table,
 )
 from sglang.srt.layers.attention.dsa.dsa_dcp_sharded import (
+    dcp_fused_gather_rows,
+    dcp_fused_gather_supported,
     dcp_gather_request_rows,
     dcp_localize_compact,
+    dcp_row_gather_plan,
     init_dcp_candidate_all_gather,
     init_dcp_topk_merge,
 )
@@ -1313,6 +1316,15 @@ class DeepseekSparseAttnBackend(
         # DCP prefill: the batch's KV rows from all ranks, request after request
         # in position order, padded to whole pages (the ragged top-k layout)
         rows = kv_cache.view(torch.uint8).view(-1, self.kv_cache_dim)
+        if dcp_fused_gather_supported(self.kv_cache_dim):
+            plan = dcp_row_gather_plan(forward_batch.seq_lens_cpu, rows.device)
+            gathered = rows.new_empty(
+                (plan.total + (-plan.total % self.physical_page_size), rows.shape[1])
+            )
+            dcp_fused_gather_rows(
+                [(rows, metadata.dcp_local_kv_rows)], plan, [gathered]
+            )
+            return gathered.view(kv_cache.dtype)
         gathered = dcp_gather_request_rows(
             rows[metadata.dcp_local_kv_rows], forward_batch.seq_lens_cpu
         )
