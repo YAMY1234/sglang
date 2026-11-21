@@ -233,17 +233,20 @@ class PPCEPush:
 
     # ---- producer ----
 
-    def fits(self, tensors: Dict[str, torch.Tensor]) -> bool:
+    def fits(self, tensors: Dict[str, object]) -> bool:
+        ts = {k: t for k, t in tensors.items() if isinstance(t, torch.Tensor)}
         _, used = pack_layout(
-            [(k, t.dtype, tuple(t.shape), t.numel() * t.element_size()) for k, t in tensors.items()]
+            [(k, t.dtype, tuple(t.shape), t.numel() * t.element_size()) for k, t in ts.items()]
         )
-        return used <= self.slot_bytes and all(t.is_contiguous() for t in tensors.values())
+        return used <= self.slot_bytes and all(t.is_contiguous() for t in ts.values())
 
     def push(
         self, tensors: Dict[str, torch.Tensor], ready_event: Optional[torch.cuda.Event]
     ) -> Tuple[List[Tuple[str, object]], _Push]:
         """Enqueue the copies of one message on the push stream; returns its metadata entries (CESlice per
         tensor, plus CE_KEY) and a window entry that keeps the sources alive until the push completed."""
+        others = [(k, v) for k, v in tensors.items() if not isinstance(v, torch.Tensor)]
+        tensors = {k: v for k, v in tensors.items() if isinstance(v, torch.Tensor)}
         seq = self.send_seq
         self.send_seq += 1
         slot = slot_of(seq, self.slots)
@@ -262,7 +265,7 @@ class PPCEPush:
             self.drv.signal(self.stream, self.peer_full_va + 4 * slot, self._scratch.data_ptr(), seq + 1)
             done = torch.cuda.Event()
             done.record(self.stream)
-        meta: List[Tuple[str, object]] = list(layout)
+        meta: List[Tuple[str, object]] = list(layout) + others
         meta.append((CE_KEY, (slot, seq)))
         return meta, _Push(_EventWork(done), list(tensors.values()))
 
