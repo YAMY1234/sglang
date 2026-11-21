@@ -1806,6 +1806,12 @@ class HybridCacheController(BaseHiCacheController):
         operation.storage_hit_count -= trim_tokens
         operation.storage_start += trim_tokens
 
+    def storage_oldest_object_age_s(self) -> Optional[float]:
+        """The storage backend's oldest object age (its eviction age now), or
+        None when the backend does not report one."""
+        fn = getattr(self.storage_backend, "oldest_object_age_s", None)
+        return fn() if fn is not None else None
+
     def _page_backup(self, operation):
         metadata = getattr(operation, "ledger_context", None)
         context = (

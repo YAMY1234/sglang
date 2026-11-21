@@ -460,6 +460,9 @@ class UnifiedRadixCache(BasePrefixCache):
         self._l3_stats_logged_at = 0.0
         # Belief TTL (0: off): PP0's clock picks the rotation step for every rank.
         self._l3_belief_ttl_s = 0.0
+        # SGLANG_HICACHE_L3_BELIEF_TTL_AGE_FRACTION: the TTL follows the store's eviction age.
+        self._l3_belief_ttl_max_s = 0.0
+        self._l3_belief_ttl_polled_at = 0.0
         self._l3_beliefs_rotated_at = time.monotonic()
         self._l3_tier_stats: dict[str, int] = {
             "wb_walks": 0,
@@ -779,6 +782,7 @@ class UnifiedRadixCache(BasePrefixCache):
                 envs.SGLANG_HICACHE_L3_EVICT_WRITE_RESERVE_FRACTION.get()
             )
             self._l3_belief_ttl_s = envs.SGLANG_HICACHE_L3_BELIEF_TTL_S.get()
+            self._l3_belief_ttl_max_s = self._l3_belief_ttl_s
             logger.info(
                 "HiCache L3 write-on-host-evict enabled: reserve fraction %.3f "
                 "of host pool (%d tokens)",
@@ -2867,6 +2871,17 @@ class UnifiedRadixCache(BasePrefixCache):
         """Rotate the storage beliefs every half TTL, by PP0's clock agreed on all ranks
         (one small collective every 256 steps)."""
         now = time.monotonic()
+        fraction = envs.SGLANG_HICACHE_L3_BELIEF_TTL_AGE_FRACTION.get()
+        # Only PP0's TTL decides (its clock picks the agreed rotation step).
+        if fraction > 0 and self.pp_rank == 0 and now - self._l3_belief_ttl_polled_at >= 30:
+            self._l3_belief_ttl_polled_at = now
+            age = self.cache_controller.storage_oldest_object_age_s()
+            if age is not None and age > 0:
+                self._l3_belief_ttl_s = min(
+                    self._l3_belief_ttl_max_s,
+                    max(envs.SGLANG_HICACHE_L3_BELIEF_TTL_MIN_S.get(), fraction * age),
+                )
+                self._l3_tier_stats["belief_ttl_s"] = int(self._l3_belief_ttl_s)
         due = now - self._l3_beliefs_rotated_at >= self._l3_belief_ttl_s / 2
         if self.agree_on_all_ranks([self.pp_rank == 0 and due])[0]:
             self.storage_existence_cache.rotate()

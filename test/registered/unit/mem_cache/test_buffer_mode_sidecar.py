@@ -140,6 +140,51 @@ class TestBufferModeSidecar(unittest.TestCase):
                     cache._l3_tier_stats["wb_clean_tokens"], 0 if written else 4
                 )
 
+    def test_belief_ttl_follows_a_shrinking_store_eviction_age(self):
+        # A write-ack belief must die before the store evicts the copy; with a
+        # fixed TTL a faster store turnover lets a host eviction skip the
+        # re-write of a copy that is already gone.
+        cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
+        cache.pp_rank = 0
+        cache._l3_belief_ttl_s = cache._l3_belief_ttl_max_s = 300.0
+        cache._l3_belief_ttl_polled_at = cache._l3_beliefs_rotated_at = 0.0
+        cache._l3_tier_stats = collections.Counter()
+        cache.storage_existence_cache = StorageExistenceCache()
+        cache.agree_on_all_ranks = lambda flags: flags
+        ages = [420.0, 200.0, 50.0]
+        polls = []
+        cache.cache_controller = SimpleNamespace(
+            storage_oldest_object_age_s=lambda: (
+                polls.append(1) or ages[min(len(polls), len(ages)) - 1]
+            )
+        )
+        clock = [1000.0]
+        beliefs = cache.storage_existence_cache.pool(PoolName.KV)
+        with (
+            envs.SGLANG_HICACHE_L3_BELIEF_TTL_AGE_FRACTION.override(0.5),
+            patch(
+                "sglang.srt.mem_cache.unified_radix_cache.time.monotonic",
+                lambda: clock[0],
+            ),
+        ):
+            ttls = []
+            for _ in ages:
+                clock[0] += 31
+                cache._maybe_rotate_beliefs()
+                ttls.append(cache._l3_belief_ttl_s)
+            # Half the eviction age, capped at the configured TTL, floored at 30 s.
+            self.assertEqual(ttls, [210.0, 100.0, 30.0])
+            # Under the 30 s TTL a fresh belief is gone within two 15 s rotations.
+            beliefs.add(["h"])
+            for _ in range(2):
+                clock[0] += 16
+                cache._maybe_rotate_beliefs()
+            self.assertFalse(beliefs.contains("h"))
+        # Off: the TTL stays where it is.
+        cache._l3_belief_ttl_s = 300.0
+        cache._maybe_rotate_beliefs()
+        self.assertEqual(cache._l3_belief_ttl_s, 300.0)
+
     @staticmethod
     def _swa_component():
         return SimpleNamespace(

@@ -157,6 +157,16 @@ class HiCacheNixlDram(MooncakeStore):
             page_size=page_size,
         )
 
+    def oldest_object_age_s(self) -> Optional[float]:
+        """The age of the oldest untouched object over all services: the store
+        evicts objects about this old now. None when no service reports it."""
+        ages = [
+            s["oldest_age_s"]
+            for s in self.store.service_stats().values()
+            if s.get("oldest_age_s") is not None
+        ]
+        return min(ages) if ages else None
+
     @contextmanager
     def write_ledger_context(self, context):
         previous = getattr(self._write_ledger, "context", None)

@@ -1077,6 +1077,12 @@ class Envs:
     # not touch the store's LRU), so it must not renew the belief that lets a host
     # eviction skip the re-write: queries only invalidate; acks and reads teach presence.
     SGLANG_HICACHE_L3_QUERY_HEAL_INVALIDATE_ONLY = EnvBool(False)
+    # > 0: the belief TTL follows this fraction of the oldest object age the L3
+    # services report (the age at which the store evicts now), floored at
+    # SGLANG_HICACHE_L3_BELIEF_TTL_MIN_S and capped at SGLANG_HICACHE_L3_BELIEF_TTL_S,
+    # so a belief never outlives the stored copy when the store's turnover speeds up.
+    SGLANG_HICACHE_L3_BELIEF_TTL_AGE_FRACTION = EnvFloat(0.0)
+    SGLANG_HICACHE_L3_BELIEF_TTL_MIN_S = EnvFloat(30.0)
     # Hybrid (Mamba) trees: when the tree holds KV past the deepest state (the tail state was
     # dropped, the KV kept), query L3 from the end of that KV instead of from the state, so a
     # tail L3 wrote on host eviction can resume the request through the tree's stateless KV.
