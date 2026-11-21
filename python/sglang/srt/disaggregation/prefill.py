@@ -1423,6 +1423,9 @@ class SchedulerDisaggregationPrefillMixin:
 
         # The polls are reduced across ranks in this order.
         transfer_queue = list(self.disagg_prefill_transfer_queue)
+        # Each stage's own transfer deadline, before any consensus on the polls.
+        for req in transfer_queue:
+            req.disagg_kv_sender.check_transfer_timeout()
         polls = poll_and_all_reduce_attn_cp_tp_group(
             [req.disagg_kv_sender for req in transfer_queue],
             self.attn_cp_cpu_group,

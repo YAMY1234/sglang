@@ -666,7 +666,8 @@ class TestPrefillResultPolling(CustomTestCase):
                     req.origin_input_ids = array("q", req.origin_input_ids)
                     req.pending_bootstrap = False
                     req.disagg_kv_sender = SimpleNamespace(
-                        poll=lambda: KVPoll.WaitingForInput
+                        poll=lambda: KVPoll.WaitingForInput,
+                        check_transfer_timeout=Mock(),
                     )
                 move([head, paced], scheduler.waiting_queue)
                 retries.poll_miss(paced.rid)
@@ -1062,13 +1063,15 @@ class TestPrefillResultPolling(CustomTestCase):
                         else KVPoll.Transferring
                     ),
                     clear=Mock(),
+                    check_transfer_timeout=Mock(),
                 )
                 scheduler.disagg_prefill_transfer_queue = _sending([prior])
                 first.reqs[0].metadata_buffer_index = allocator.alloc()
                 for req in (first.reqs[0], second.reqs[0]):
                     req.pending_bootstrap = False
                     req.disagg_kv_sender = SimpleNamespace(
-                        poll=lambda: KVPoll.Transferring
+                        poll=lambda: KVPoll.Transferring,
+                        check_transfer_timeout=Mock(),
                     )
                 released = []
                 scheduler.request_retirer = leaving_retirer()
@@ -1268,13 +1271,15 @@ class TestPrefillResultPolling(CustomTestCase):
                 req.kv.req_pool_idx = 1
                 req.kv.kv_allocated_len = 8
                 req.disagg_kv_sender = SimpleNamespace(
-                    poll=lambda: KVPoll.Bootstrapping
+                    poll=lambda: KVPoll.Bootstrapping,
+                    check_transfer_timeout=Mock(),
                 )
                 chunk_count = 1 if yield_before_pause else depth
                 chunks = [_batch(end, [req]) for end in (4, 8)[:chunk_count]]
                 other = _batch(100)
                 other.reqs[0].disagg_kv_sender = SimpleNamespace(
-                    poll=lambda: KVPoll.WaitingForInput
+                    poll=lambda: KVPoll.WaitingForInput,
+                    check_transfer_timeout=Mock(),
                 )
 
                 class OptimisticScheduler(_Scheduler):

@@ -243,6 +243,10 @@ class BaseKVSender(ABC):
         """
         ...
 
+    def check_transfer_timeout(self) -> None:
+        """Apply this sender's own transfer deadline, if the backend has one. Every
+        PP stage runs it before any release consensus."""
+
     @abstractmethod
     def failure_exception(self):
         """

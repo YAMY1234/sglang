@@ -208,6 +208,21 @@ class TestCommonSenderLifecycle(unittest.TestCase):
             consensus = SchedulerPPMixin._pp_pd_get_prefill_transferred_ids(stage)
         self.assertEqual(consensus, {"r": True})
 
+    def test_stage_deadline_reaches_a_release_that_pp0_alone_decides(self):
+        """When PP0 alone decides the release from every stage's status, a later
+        stage stuck past the deadline must fail on its own clock before PP0
+        decides, or the room is held forever."""
+        stage1, mgr1 = self._stuck_sender(KVPoll.Transferring)
+        pp0, mgr0 = self._stuck_sender(KVPoll.Success)
+        mgr0.request_status = FakePPStatus(mgr0.request_status, mgr1.request_status)
+        stage1._last_chunk_time -= 61
+        self.assertEqual(pp0.poll_pp_consensus(), KVPoll.Transferring)
+        stage1.check_transfer_timeout()
+        self.assertEqual(pp0.poll_pp_consensus(), KVPoll.Failed)
+        # Only PP0's decision concludes the sender; decode is told once.
+        self.assertIsNone(stage1.conclude_state)
+        mgr1.send_kv_status_message.assert_called_once()
+
     def test_pp_consensus_poll_does_not_time_out_a_later_stage(self):
         # PP0's last chunk is long queued, but stage 1 has not finished its
         # forward: the consensus poll must not count that against the timeout.

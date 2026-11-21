@@ -2600,16 +2600,7 @@ class CommonKVSender(BaseKVSender):
             status = check_status(self.bootstrap_room)
         else:
             status = KVPoll.Failed
-        # Hold Success until all staging chunks transferred. With deferred
-        # allocation also wait for worker cleanup (the zero entry is only
-        # removed after cleanup), before permitting the room to be reused.
-        if status == KVPoll.Success and (
-            self.kv_mgr._staging_outstanding.get(self.bootstrap_room, 0) > 0
-            or (
-                self.kv_mgr.defer_decode_allocation
-                and self.bootstrap_room in self.kv_mgr._staging_outstanding
-            )
-        ):
+        if status == KVPoll.Success and self._staging_holds_success():
             status = KVPoll.Transferring
         if status == KVPoll.Bootstrapping:
             timeout_status = self._check_bootstrap_timeout()
@@ -2658,6 +2649,30 @@ class CommonKVSender(BaseKVSender):
         )
         self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
         return KVPoll.Failed
+
+    def _staging_holds_success(self) -> bool:
+        # Hold Success until all staging chunks transferred. With deferred
+        # allocation also wait for worker cleanup (the zero entry is only
+        # removed after cleanup), before permitting the room to be reused.
+        return self.kv_mgr._staging_outstanding.get(self.bootstrap_room, 0) > 0 or (
+            self.kv_mgr.defer_decode_allocation
+            and self.bootstrap_room in self.kv_mgr._staging_outstanding
+        )
+
+    def check_transfer_timeout(self) -> None:
+        # Local status only, and never concludes: under PP the release decision
+        # then sees this stage's Failed, whichever stage makes it.
+        if (
+            self.conclude_state is not None
+            or self.kv_mgr.transfer_timeout <= 0
+            or self._last_chunk_time is None
+        ):
+            return
+        status = self.kv_mgr.request_status.get(self.bootstrap_room)
+        if status == KVPoll.Success and self._staging_holds_success():
+            status = KVPoll.Transferring
+        if status in (KVPoll.WaitingForInput, KVPoll.Transferring):
+            self._check_transfer_timeout(status)
 
     def _check_transfer_timeout(self, status: KVPoll) -> Optional[KVPoll]:
         # Only the transfer is left once the last chunk is queued.
