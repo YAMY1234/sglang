@@ -2248,6 +2248,81 @@ fn evict_excess_path_states_without_a_cap_is_a_no_op() {
     assert!(tc.arena.node(a).try_device_value(MAMBA).is_some());
 }
 
+// a: host-only state (in the host LRU), b: device + host copy, c: the device tail.
+fn capped_path_with_host_copies() -> (UnifiedTreeCore<Vec<i64>>, [NodeIdx_; 3]) {
+    let mut tc = mamba_core_with_cap(1);
+    tc.set_hicache_enabled();
+    let [a, b, c] = chain::<3>(&mut tc);
+    set_mamba_host(&mut tc, a, 70);
+    tc.host_lru_list_mut(MAMBA).insert_mru(a);
+    set_mamba_device(&mut tc, b, 8);
+    set_mamba_host(&mut tc, b, 80);
+    set_mamba_device(&mut tc, c, 9);
+    (tc, [a, b, c])
+}
+
+#[test]
+fn evict_excess_path_states_leaves_host_copies_by_default() {
+    let (mut tc, [a, b, c]) = capped_path_with_host_copies();
+    let result = tc
+        .evict_excess_path_states(tc.arena.node(c).id)
+        .expect("live test node");
+    assert_eq!(result.device_frees[&MAMBA].len(), 1);
+    assert!(result.host_frees.is_empty());
+    assert!(tc.arena.node(a).has_host_value(MAMBA));
+    assert!(!tc.arena.node(b).has_device_value(MAMBA));
+    assert!(tc.arena.node(b).has_host_value(MAMBA));
+    // The capped state's host copy becomes the host LRU's most recent entry.
+    assert_eq!(lru_order(tc.host_lru_list(MAMBA)), vec![b, a]);
+}
+
+#[test]
+fn evict_excess_path_states_counts_and_frees_host_copies_when_opted_in() {
+    let (mut tc, [a, b, c]) = capped_path_with_host_copies();
+    tc.set_mamba_path_cap_counts_host(true);
+    let mut result = tc
+        .evict_excess_path_states(tc.arena.node(c).id)
+        .expect("live test node");
+    let device = result.device_frees.remove(&MAMBA).unwrap();
+    assert_eq!(device.len(), 1);
+    assert!(device[0].equal(&Tensor::from_slice(&[8i64])));
+    let host = result.host_frees.remove(&MAMBA).unwrap();
+    assert_eq!(host.len(), 2);
+    assert!(host[0].equal(&Tensor::from_slice(&[70i64])));
+    assert!(host[1].equal(&Tensor::from_slice(&[80i64])));
+    for node in [a, b] {
+        assert!(!tc.arena.node(node).has_device_value(MAMBA));
+        assert!(!tc.arena.node(node).has_host_value(MAMBA));
+    }
+    assert!(tc.arena.node(c).has_device_value(MAMBA));
+    assert!(lru_order(tc.host_lru_list(MAMBA)).is_empty());
+}
+
+#[test]
+fn evict_excess_path_states_keeps_host_copies_that_are_locked_or_in_flight() {
+    for guard in ["host_lock", "backup", "load_back"] {
+        let (mut tc, [a, b, c]) = capped_path_with_host_copies();
+        tc.set_mamba_path_cap_counts_host(true);
+        match guard {
+            "host_lock" => tc
+                .arena
+                .node_mut(a)
+                .set_lock_ref_(ValueSlotIdx::host(MAMBA), 1),
+            "backup" => tc.arena.node_mut(a).write_through_pending_id = Some(1),
+            "load_back" => tc.arena.node_mut(a).load_back_pending_id = Some(1),
+            _ => unreachable!(),
+        }
+        let result = tc
+            .evict_excess_path_states(tc.arena.node(c).id)
+            .expect("live test node");
+        assert!(tc.arena.node(a).has_host_value(MAMBA), "{guard}");
+        // b still goes: the guarded copy does not count as a removal.
+        assert_eq!(result.host_frees[&MAMBA].len(), 1, "{guard}");
+        assert!(!tc.arena.node(b).has_host_value(MAMBA), "{guard}");
+        assert!(tc.arena.node(c).has_device_value(MAMBA), "{guard}");
+    }
+}
+
 #[test]
 fn insert_commit_emits_the_path_cap_action_only_when_capped() {
     let mut tc = mamba_core_with_cap(1);
@@ -2464,4 +2539,159 @@ fn release_after_a_restore_and_relock_keeps_the_other_lock() {
     assert_eq!(tc.arena.node(a).device_lock_ref(MAMBA), 0);
     assert_eq!(tc.evictable_size_(MAMBA), 1);
     assert_eq!(tc.protected_size_(MAMBA), 0);
+}
+
+/// Insert a one-page host-only node under `parent` (None: the root); returns its arena index.
+fn insert_host_page(
+    tc: &mut UnifiedTreeCore<Vec<i64>>,
+    parent: Option<NodeIdx_>,
+    token: i64,
+    slot: i64,
+) -> NodeIdx_ {
+    let parent_id = tc.arena.node(parent.unwrap_or_else(|| tc.arena.root())).id;
+    let id = tc
+        .insert_host(
+            parent_id,
+            /* extra_key = */ None,
+            vec![token],
+            Tensor::from_slice(&[slot]),
+            vec![format!("h{token}")],
+        )
+        .expect("live test node")
+        .inserted_host_node
+        .unwrap();
+    tc.arena.resolve(id).expect("live test node")
+}
+
+#[test]
+fn host_eviction_peeks_match_the_evictions() {
+    // Full: children first, then their newly eligible parent, in priority order.
+    for pages in [2usize, 3] {
+        let mut tc = mamba_core(/* page_size = */ 1);
+        tc.set_hicache_enabled();
+        let parent = insert_host_page(&mut tc, None, 1000, 100);
+        let child_a = insert_host_page(&mut tc, Some(parent), 2000, 101);
+        let child_b = insert_host_page(&mut tc, Some(parent), 3000, 102);
+        let other = insert_host_page(&mut tc, None, 4000, 103);
+        for (age, node) in [parent, child_a, child_b, other].into_iter().enumerate() {
+            tc.arena.node_mut(node).last_access_counter = age as i64;
+        }
+        let order: Vec<NodeId> =
+            [child_a, child_b, parent, other].iter().map(|&n| tc.arena.node(n).id).collect();
+        let peeked = tc.peek_host_eviction_candidates(FULL, pages);
+        assert_eq!(peeked.iter().map(|c| c.0).collect::<Vec<_>>(), order[..pages].to_vec());
+        assert!(peeked.iter().all(|c| c.1 == 1 && c.2.as_ref().is_some_and(|h| h.len() == 1)));
+        assert!(tc.peek_host_eviction_candidates(MAMBA, pages).is_empty());
+        let result = tc.drive_host_eviction(FULL, pages);
+        assert_eq!(result.tracker[&FULL], pages);
+        for id in &order[..pages] {
+            assert!(tc.arena.resolve(*id).is_err());
+        }
+        for id in &order[pages..] {
+            assert!(tc.arena.resolve(*id).is_ok());
+        }
+    }
+
+    // Mamba: only the host leaves among the coldest host-LRU members, coldest first.
+    let mut tc = mamba_core(/* page_size = */ 1);
+    tc.set_hicache_enabled();
+    let inner = insert_host_page(&mut tc, None, 1000, 100);
+    let _child = insert_host_page(&mut tc, Some(inner), 2000, 101);
+    let leaf_a = insert_host_page(&mut tc, None, 3000, 102);
+    let leaf_b = insert_host_page(&mut tc, None, 4000, 103);
+    for (node, slot) in [(inner, 8), (leaf_a, 9), (leaf_b, 10)] {
+        set_mamba_host(&mut tc, node, slot);
+        tc.host_lru_list_mut(MAMBA).insert_mru(node);
+    }
+    let ids = |nodes: &[NodeIdx_], tc: &UnifiedTreeCore<Vec<i64>>| -> Vec<NodeId> {
+        nodes.iter().map(|&n| tc.arena.node(n).id).collect()
+    };
+    let peek = |tc: &UnifiedTreeCore<Vec<i64>>, n| -> Vec<NodeId> {
+        tc.peek_mamba_host_eviction_leaves(n).iter().map(|c| c.0).collect()
+    };
+    assert_eq!(peek(&tc, 1), Vec::<NodeId>::new());
+    assert_eq!(peek(&tc, 2), ids(&[leaf_a], &tc));
+    assert_eq!(peek(&tc, 3), ids(&[leaf_a, leaf_b], &tc));
+    // The Mamba drive then takes leaf_a whole: the peek named a node whose Full pages leave too.
+    let leaf_a_id = tc.arena.node(leaf_a).id;
+    let mut tracker = HashMap::from([(MAMBA, 0)]);
+    mamba_component().drive_host_eviction(
+        &mut tc,
+        /* num_tokens = */ 2,
+        &mut tracker,
+        &mut HashMap::new(),
+        &mut HashMap::new(),
+        &mut Vec::new(),
+    );
+    assert!(tc.arena.resolve(leaf_a_id).is_err());
+    assert!(tc.arena.resolve(tc.arena.node(inner).id).is_ok());
+}
+
+#[test]
+fn l3_tombstone_begin_preserves_actual_victim_until_finish() {
+    let mut tc = mamba_core(1);
+    tc.set_hicache_enabled();
+    tc.set_l3_lifetime_ledger_enabled(true);
+    let root = tc.arena.node(tc.arena.root()).id;
+    let key: Vec<i64> = (0..8192).collect();
+    let hashes = (0..8192).map(|i| format!("{i:064x}")).collect();
+    let id = tc.insert_host(root, None, key, Tensor::arange(8192, (tch::Kind::Int64, tch::Device::Cpu)), hashes)
+        .unwrap().inserted_host_node.unwrap();
+    let idx = tc.arena.resolve(id).unwrap();
+    let child = insert_host_page(&mut tc, Some(idx), 9000, 9000);
+    set_mamba_host(&mut tc, idx, 7);
+    tc.host_lru_list_mut(MAMBA).insert_mru(idx);
+    let begin = tc.begin_mamba_host_eviction(1, 8192);
+    assert_eq!(begin.mamba_storage_backup_node_id, Some(id));
+    assert_eq!(begin.tracker[&MAMBA], 0);
+    assert!(begin.host_frees.is_empty());
+    assert!(tc.arena.has_host_value(idx, MAMBA));
+    let pin = tc.inc_host_lock_ref(id).unwrap();
+    assert_eq!(tc.finish_mamba_host_eviction(id).unwrap().tracker[&MAMBA], 0);
+    tc.dec_host_lock_ref(id, &pin.to_dec_params()).unwrap();
+    let finish = tc.finish_mamba_host_eviction(id).unwrap();
+    assert_eq!(finish.tracker[&MAMBA], 1);
+    assert!(!tc.arena.has_host_value(idx, MAMBA));
+    assert!(tc.arena.has_host_value(idx, FULL));
+    assert!(tc.arena.has_host_value(child, FULL));
+    let events = tc.take_l3_lifetime_events();
+    let evictions: Vec<_> = events.iter().filter(|e| e.1 == "evict" && e.3 == MAMBA.idx() as u8).collect();
+    assert_eq!(evictions.len(), 1);
+    assert_eq!(evictions[0].7, "state_tombstone_written");
+}
+
+#[test]
+fn l3_within_tree_restore_splits_without_replacing_full_or_suffix_state() {
+    let mut tc = mamba_core_with_chunk(1, 1);
+    tc.set_hicache_enabled();
+    tc.set_enable_storage(true);
+    tc.set_l3_lifetime_ledger_enabled(true);
+    let key = vec![1, 2, 3, 4];
+    tc.insert(&insert_params_mamba(&key, &[10, 11, 12, 13], Some(7)));
+    let created = tc.take_l3_lifetime_events();
+    assert_eq!(created.iter().filter(|e| e.1 == "create" && e.3 == MAMBA.idx() as u8).count(), 1);
+    let (endpoint, actions) = tc.prepare_mamba_host_restore(&key, Default::default(), 2);
+    assert!(actions.is_empty());
+    let id = endpoint.unwrap();
+    let idx = tc.arena.resolve(id).unwrap();
+    assert_eq!(tc.arena.node(idx).key, vec![1, 2]);
+    assert!(!tc.arena.has_device_value(idx, MAMBA));
+    assert_eq!(tc.arena.device_value(idx, FULL).int64_value(&[1]), 11);
+    let child = tc.arena.node(idx).children.values().copied().next().unwrap();
+    assert_eq!(tc.arena.device_value(child, MAMBA).int64_value(&[0]), 7);
+    assert_eq!(tc.arena.device_value(child, FULL).int64_value(&[0]), 12);
+    assert!(tc.take_l3_lifetime_events().is_empty()); // A split creates no checkpoint.
+    let pin = tc.inc_host_lock_ref(id).unwrap();
+    assert!(tc.commit_mamba_host_restore(id, Tensor::from_slice(&[55i64])).unwrap());
+    assert!(!tc.commit_mamba_host_restore(id, Tensor::from_slice(&[56i64])).unwrap());
+    assert_eq!(tc.arena.host_value(idx, MAMBA).int64_value(&[0]), 55);
+    assert!(!tc.host_lru_list(MAMBA).in_list(Some(idx)));
+    tc.dec_host_lock_ref(id, &pin.to_dec_params()).unwrap();
+    assert!(tc.host_lru_list(MAMBA).in_list(Some(idx)));
+    let restored = tc.take_l3_lifetime_events();
+    assert_eq!(restored.len(), 1);
+    assert_eq!(restored[0].7, "within_tree_restore");
+    assert_eq!(restored[0].6, 2);
+    let (missing, _) = tc.prepare_mamba_host_restore(&vec![1, 2, 9], Default::default(), 3);
+    assert!(missing.is_none());
 }

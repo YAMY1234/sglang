@@ -944,6 +944,7 @@ pub struct HostEvictionResultBinding {
     new_device_frees: Py<PyDict>,
     new_host_frees: Py<PyDict>,
     cache_actions: Py<PyList>,
+    mamba_storage_backup_node_id: Option<NodeId>,
 }
 
 impl HostEvictionResultBinding {
@@ -953,6 +954,7 @@ impl HostEvictionResultBinding {
             new_device_frees: frees_to_py(py, result.device_frees)?,
             new_host_frees: frees_to_py(py, result.host_frees)?,
             cache_actions: cache_actions_to_py(py, result.cache_actions)?,
+            mamba_storage_backup_node_id: result.mamba_storage_backup_node_id,
         })
     }
 }
@@ -2019,6 +2021,71 @@ macro_rules! tree_core_methods {
                 })
             }
 
+            /// Host leaves among the coldest Mamba host LRU members, read-only.
+            fn set_l3_lifetime_ledger_enabled(&self, py: Python<'_>, enabled: bool) {
+                py.detach(|| self.core().set_l3_lifetime_ledger_enabled(enabled));
+            }
+
+            fn take_l3_lifetime_events(&self, py: Python<'_>) -> Vec<crate::unified_tree_core::L3LifetimeEvent> {
+                py.detach(|| self.core().take_l3_lifetime_events())
+            }
+
+            fn begin_mamba_host_eviction(&self, py: Python<'_>, num_states: usize, min_depth: usize) -> PyResult<HostEvictionResultBinding> {
+                let result = py.detach(|| self.core().begin_mamba_host_eviction(num_states, min_depth));
+                HostEvictionResultBinding::from_eviction_step(py, result)
+            }
+
+            fn finish_mamba_host_eviction(&self, py: Python<'_>, node_id: NodeId) -> PyResult<HostEvictionResultBinding> {
+                let result = py.detach(|| self.core().finish_mamba_host_eviction(node_id)).map_err(node_access_error)?;
+                HostEvictionResultBinding::from_eviction_step(py, result)
+            }
+
+            fn prepare_mamba_host_restore(&self, py: Python<'_>, key: &Bound<'_, PyAny>, end_tokens: usize,
+                extra_key: Option<String>, cache_salt: Option<String>) -> PyResult<(Option<NodeId>, Py<PyList>)> {
+                let key = K::key_from(Cow::Owned(py_array_to_vec_i64(py, key)?)).into_owned();
+                let (node_id, actions) = py.detach(|| self.core().prepare_mamba_host_restore(
+                    &key, KeyNamespaceRef::new(extra_key.as_deref(), cache_salt.as_deref()), end_tokens));
+                Ok((node_id, cache_actions_to_py(py, actions)?))
+            }
+
+            fn commit_mamba_host_restore(&self, py: Python<'_>, node_id: NodeId, host_indices: PyTensor) -> PyResult<bool> {
+                py.detach(|| self.core().commit_mamba_host_restore(node_id, host_indices.0)).map_err(node_access_error)
+            }
+
+            fn peek_mamba_host_eviction_leaves(
+                &self,
+                py: Python<'_>,
+                max_states: usize,
+            ) -> Vec<(NodeId, usize, Option<Vec<String>>)> {
+                py.detach(move || self.core().peek_mamba_host_eviction_leaves(max_states))
+            }
+
+            /// Full device leaves in the device eviction walk's order, read-only.
+            fn peek_device_eviction_candidates(
+                &self,
+                py: Python<'_>,
+                component_type: u8,
+                num_tokens: usize,
+            ) -> PyResult<Vec<(NodeId, usize, bool, bool)>> {
+                let ct = parse_component_type(component_type)?;
+                Ok(py.detach(move || self.core().peek_device_eviction_candidates(ct, num_tokens)))
+            }
+
+            fn set_write_ahead_spare(&self, py: Python<'_>, node_ids: Vec<NodeId>) {
+                py.detach(move || self.core().set_write_ahead_spare(node_ids));
+            }
+
+            /// Full host leaves in drive_host_eviction's order, read-only.
+            fn peek_host_eviction_candidates(
+                &self,
+                py: Python<'_>,
+                component_type: u8,
+                num_tokens: usize,
+            ) -> PyResult<Vec<(NodeId, usize, Option<Vec<String>>)>> {
+                let ct = parse_component_type(component_type)?;
+                Ok(py.detach(move || self.core().peek_host_eviction_candidates(ct, num_tokens)))
+            }
+
             /// Evict up to num_tokens of one component's host resources.
             fn drive_host_eviction(
                 &self,
@@ -2040,6 +2107,7 @@ macro_rules! tree_core_methods {
                     new_device_frees: frees_to_py(py, result.device_frees)?,
                     new_host_frees: frees_to_py(py, result.host_frees)?,
                     cache_actions: cache_actions_to_py(py, result.cache_actions)?,
+                    mamba_storage_backup_node_id: result.mamba_storage_backup_node_id,
                 })
             }
 
@@ -2058,6 +2126,7 @@ macro_rules! tree_core_methods {
                     new_device_frees: frees_to_py(py, result.device_frees)?,
                     new_host_frees: frees_to_py(py, result.host_frees)?,
                     cache_actions: cache_actions_to_py(py, result.cache_actions)?,
+                    mamba_storage_backup_node_id: result.mamba_storage_backup_node_id,
                 })
             }
 
@@ -2093,6 +2162,10 @@ macro_rules! tree_core_methods {
             /// Set the write-back (vs write-through) policy; decided at HiCache init.
             fn set_is_write_back(&self, py: Python<'_>, is_write_back: bool) {
                 py.detach(|| self.core().set_is_write_back(is_write_back));
+            }
+
+            fn set_mamba_path_cap_counts_host(&self, py: Python<'_>, enabled: bool) {
+                py.detach(|| self.core().set_mamba_path_cap_counts_host(enabled));
             }
 
             /// The current write-back (vs write-through) policy.
@@ -3391,6 +3464,78 @@ macro_rules! tree_core_binding {
                 catch_native_panic(|| self.inner.demote(py, node_id))
             }
 
+            /// The host leaves among the max_states coldest Mamba host LRU members, in
+            fn set_l3_lifetime_ledger_enabled(&self, py: Python<'_>, enabled: bool) -> PyResult<()> {
+                catch_native_panic(|| { self.inner.set_l3_lifetime_ledger_enabled(py, enabled); Ok(()) })
+            }
+
+            fn take_l3_lifetime_events(&self, py: Python<'_>) -> PyResult<Vec<crate::unified_tree_core::L3LifetimeEvent>> {
+                catch_native_panic(|| Ok(self.inner.take_l3_lifetime_events(py)))
+            }
+
+            #[pyo3(signature = (num_states, min_depth = 8192))]
+            fn begin_mamba_host_eviction(&self, py: Python<'_>, num_states: usize, min_depth: usize) -> PyResult<HostEvictionResultBinding> {
+                catch_native_panic(|| self.inner.begin_mamba_host_eviction(py, num_states, min_depth))
+            }
+
+            fn finish_mamba_host_eviction(&self, py: Python<'_>, node_id: NodeId) -> PyResult<HostEvictionResultBinding> {
+                catch_native_panic(|| self.inner.finish_mamba_host_eviction(py, node_id))
+            }
+
+            #[pyo3(signature = (key, end_tokens, extra_key = None, cache_salt = None))]
+            fn prepare_mamba_host_restore(&self, py: Python<'_>, key: &Bound<'_, PyAny>, end_tokens: usize,
+                extra_key: Option<String>, cache_salt: Option<String>) -> PyResult<(Option<NodeId>, Py<PyList>)> {
+                catch_native_panic(|| self.inner.prepare_mamba_host_restore(py, key, end_tokens, extra_key, cache_salt))
+            }
+
+            fn commit_mamba_host_restore(&self, py: Python<'_>, node_id: NodeId, host_indices: PyTensor) -> PyResult<bool> {
+                catch_native_panic(|| self.inner.commit_mamba_host_restore(py, node_id, host_indices))
+            }
+
+            /// The host leaves among the max_states coldest Mamba host LRU members, in
+            /// Mamba host eviction order: [(node id, tokens, page hashes)]; read-only.
+            fn peek_mamba_host_eviction_leaves(
+                &self,
+                py: Python<'_>,
+                max_states: usize,
+            ) -> PyResult<Vec<(NodeId, usize, Option<Vec<String>>)>> {
+                catch_native_panic(|| Ok(self.inner.peek_mamba_host_eviction_leaves(py, max_states)))
+            }
+
+            /// Full device leaves in the order the device eviction walk takes them, until
+            /// their tokens reach num_tokens: [(node id, tokens, Full KV not on host,
+            /// write pending)]; read-only.
+            fn peek_device_eviction_candidates(
+                &self,
+                py: Python<'_>,
+                component_type: u8,
+                num_tokens: usize,
+            ) -> PyResult<Vec<(NodeId, usize, bool, bool)>> {
+                catch_native_panic(|| {
+                    self.inner
+                        .peek_device_eviction_candidates(py, component_type, num_tokens)
+                })
+            }
+
+            /// Replace the device-tail set that Full duplicate reclaim never takes.
+            fn set_write_ahead_spare(&self, py: Python<'_>, node_ids: Vec<NodeId>) -> PyResult<()> {
+                catch_native_panic(|| { self.inner.set_write_ahead_spare(py, node_ids); Ok(()) })
+            }
+
+            /// Full host leaves in the order drive_host_eviction takes them, until
+            /// their tokens reach num_tokens: [(node id, tokens, page hashes)]; read-only.
+            fn peek_host_eviction_candidates(
+                &self,
+                py: Python<'_>,
+                component_type: u8,
+                num_tokens: usize,
+            ) -> PyResult<Vec<(NodeId, usize, Option<Vec<String>>)>> {
+                catch_native_panic(|| {
+                    self.inner
+                        .peek_host_eviction_candidates(py, component_type, num_tokens)
+                })
+            }
+
             /// Evict up to num_tokens of one component's host resources.
             #[pyo3(signature = (component_type, num_tokens, skip_full_duplicate_reclaim = false))]
             fn drive_host_eviction(
@@ -3455,6 +3600,14 @@ macro_rules! tree_core_binding {
             /// The current write-back (vs write-through) policy.
             fn is_write_back(&self, py: Python<'_>) -> PyResult<bool> {
                 catch_native_panic(|| Ok(self.inner.is_write_back(py)))
+            }
+
+            /// Make the per-path Mamba cap count and free host copies; decided at HiCache init.
+            fn set_mamba_path_cap_counts_host(&self, py: Python<'_>, enabled: bool) -> PyResult<()> {
+                catch_native_panic(|| {
+                    self.inner.set_mamba_path_cap_counts_host(py, enabled);
+                    Ok(())
+                })
             }
 
             /// Set the write-through backup hit threshold; decided at HiCache init.

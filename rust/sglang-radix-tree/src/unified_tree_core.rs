@@ -6,6 +6,7 @@ use crate::cache_action::{FreeDeviceKV, FreeDeviceKVFullOnly, UpdatePendingBacku
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use sha2::{Digest, Sha256};
 use tch::{Device, Kind, Tensor};
@@ -597,7 +598,12 @@ pub struct EvictionStepResult {
     pub swa_backup_node_id: Option<NodeId>,
     /// Required SWA host capacity, including unbacked ancestors in the window.
     pub swa_backup_num_tokens: usize,
+    /// Actual host-state victim suspended before its storage backup.
+    pub mamba_storage_backup_node_id: Option<NodeId>,
 }
+
+/// wall_ns, event, node, component, tier, page/state keys, endpoint depth, cause.
+pub type L3LifetimeEvent = (u64, String, NodeId, u8, String, Vec<String>, usize, String);
 
 /// The radix tree mechanism: owns the tree structure, per-node values, the
 /// per-component LRUs, the size/leaf bookkeeping, and the component drivers,
@@ -616,6 +622,9 @@ pub struct UnifiedTreeCore<K: ChildKeyType> {
     pub(crate) evictable_host_leaves: NodeSet,
     /// Full has no device LRU; track host/device duplicates in insertion order.
     pub(crate) full_coexisting_host_nodes: NodeSet,
+    /// Device-tail nodes the write-ahead walk keeps backed (SGLANG_HICACHE_DEVICE_WRITE_AHEAD); the first
+    /// Full duplicate-reclaim pass spares them like the imminent demotes. Ids guard against slot reuse.
+    pub(crate) write_ahead_spare: HashMap<NodeIdx_, NodeId>,
     pub(crate) write_back_coexist_reclaim_digest: i64,
     /// Present only during a device-eviction step, including its cascades.
     tracked_unbacked_tokens: Option<usize>,
@@ -652,6 +661,9 @@ pub struct UnifiedTreeCore<K: ChildKeyType> {
     pub(crate) namespaced_event_hashes: HashMap<NodeId, Vec<HashDigest>>,
     /// Hit count at which a node earns a host write-through backup.
     pub(crate) write_through_threshold: i64,
+    /// The per-path Mamba cap also counts host copies and frees the host
+    /// copies of the states it caps (opt-in, decided at HiCache init).
+    pub(crate) mamba_path_cap_counts_host: bool,
 
     /// Per-component monotonic sources for lock-segment UUIDs.
     pub(crate) component_uuid_counters: [i64; NUM_COMPONENT_TYPES],
@@ -661,6 +673,7 @@ pub struct UnifiedTreeCore<K: ChildKeyType> {
     pub(crate) empty_device_indices: Tensor,
     /// The single in-flight resumable insert, if suspended at a barrier.
     ongoing_insert_walk_state: Option<InsertWalkState<K>>,
+    l3_lifetime_events: Option<Vec<L3LifetimeEvent>>,
 }
 
 impl<K: ChildKeyType> UnifiedTreeCore<K> {
@@ -962,6 +975,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             evictable_device_leaves: NodeSet::new(),
             evictable_host_leaves: NodeSet::new(),
             full_coexisting_host_nodes: NodeSet::new(),
+            write_ahead_spare: HashMap::new(),
             write_back_coexist_reclaim_digest: 0,
             tracked_unbacked_tokens: None,
             // Disabled components keep harmless empty lists, like component_states.
@@ -986,10 +1000,12 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             kv_event_queue: Vec::new(),
             namespaced_event_hashes: HashMap::new(),
             write_through_threshold: params.write_through_threshold,
+            mamba_path_cap_counts_host: false,
             component_uuid_counters: COMPONENT_UUID_INITIAL_VALUES,
             device: params.device,
             empty_device_indices: Tensor::empty([0], (Kind::Int64, params.device)),
             ongoing_insert_walk_state: None,
+            l3_lifetime_events: None,
         };
         for component in components {
             tree_core.register_component_(component);
@@ -1005,6 +1021,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         self.evictable_device_leaves = NodeSet::new();
         self.evictable_host_leaves = NodeSet::new();
         self.full_coexisting_host_nodes = NodeSet::new();
+        self.write_ahead_spare.clear();
         self.write_back_coexist_reclaim_digest = 0;
         self.tracked_unbacked_tokens = None;
         self.lru_lists = Self::new_lru_lists();
@@ -2517,6 +2534,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
 
         self.update_evictable_leaf_sets_(new_node_id);
         self.update_evictable_leaf_sets_(parent_id);
+        self.record_l3_lifetime_event_(new_node_id, FULL, "create", "device", "full_insert");
         self.record_store_event_(new_node_id, StorageMedium::Gpu, session_id);
         new_node_id
     }
@@ -2544,6 +2562,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         if let Some(parent_id) = self.arena.node(node_id).try_parent() {
             self.update_evictable_leaf_sets_(parent_id);
         }
+        self.record_l3_lifetime_event_(node_id, FULL, "create", "device", "full_rehydrate");
         self.record_store_event_(node_id, StorageMedium::Gpu, session_id);
     }
 
@@ -2992,6 +3011,293 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         self.drive_host_eviction_with_options(component_type, num_tokens, false)
     }
 
+    pub fn set_l3_lifetime_ledger_enabled(&mut self, enabled: bool) {
+        self.l3_lifetime_events = enabled.then(Vec::new);
+    }
+
+    pub fn take_l3_lifetime_events(&mut self) -> Vec<L3LifetimeEvent> {
+        self.l3_lifetime_events.as_mut().map(std::mem::take).unwrap_or_default()
+    }
+
+    pub(crate) fn node_depth_(&self, mut idx: NodeIdx_) -> usize {
+        let mut depth = 0;
+        loop {
+            let node = self.arena.node(idx);
+            depth += node.key.atom_len();
+            let Some(parent) = node.try_parent() else { break };
+            idx = parent;
+        }
+        depth
+    }
+
+    pub(crate) fn record_l3_lifetime_event_(
+        &mut self, idx: NodeIdx_, component: ComponentType,
+        event: &str, tier: &str, reason: &str,
+    ) {
+        if self.l3_lifetime_events.is_none() || self.arena.node(idx).is_root() {
+            return;
+        }
+        if self.arena.node(idx).hash_value.is_none() {
+            let hashes = self.arena.compute_node_hash_values(idx, self.page_size);
+            self.arena.node_mut(idx).hash_value = Some(hashes);
+        }
+        let node = self.arena.node(idx);
+        let mut keys = node.hash_value.clone().unwrap_or_default();
+        if component == MAMBA {
+            keys = keys.last().cloned().into_iter().collect();
+        }
+        let id = node.id;
+        let depth = self.node_depth_(idx);
+        let wall_ns = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos() as u64;
+        self.l3_lifetime_events.as_mut().unwrap().push((
+            wall_ns, event.into(), id, component.idx() as u8, tier.into(), keys, depth, reason.into(),
+        ));
+    }
+
+    /// Walk actual victims, stopping before the first eligible state tombstone.
+    /// The controller must pin it during storage I/O and finish that exact id.
+    pub fn begin_mamba_host_eviction(&mut self, num_states: usize, min_depth: usize) -> EvictionStepResult {
+        let mut result = EvictionStepResult::default();
+        result.tracker.insert(MAMBA, 0);
+        if self.try_component_by_type_(MAMBA).is_none() { return result; }
+        let mut current = self.host_lru_list(MAMBA).get_lru_no_lock(&self.arena);
+        while result.tracker[&MAMBA] < num_states {
+            let Some(idx) = current else { break };
+            if !self.host_lru_list(MAMBA).in_list(Some(idx)) { break; }
+            let next = self.host_lru_list(MAMBA).get_prev_no_lock(idx, &self.arena);
+            if self.evictable_host_leaves.contains(idx) {
+                self.evict_host_leaf_(idx, &mut result.tracker, &mut result.device_frees,
+                                     &mut result.host_frees, &mut result.cache_actions);
+            } else if self.arena.has_host_value(idx, FULL) && self.node_depth_(idx) >= min_depth {
+                result.mamba_storage_backup_node_id = Some(self.arena.node(idx).id);
+                self.record_l3_lifetime_event_(idx, MAMBA, "host_evict_deferred", "host", "state_tombstone_backup");
+                break;
+            } else {
+                self.evict_component_and_detach_lru_(idx, MAMBA, &mut result.device_frees,
+                    &mut result.host_frees, &mut result.cache_actions, EvictLayer::Host, Some(&mut result.tracker));
+                self.cascade_evict_(idx, MAMBA, &mut result.tracker, &mut result.device_frees,
+                                   &mut result.host_frees, &mut result.cache_actions, EvictLayer::Host);
+            }
+            current = next;
+        }
+        result
+    }
+
+    /// Resume only this victim after its storage acknowledgement and pin release.
+    pub fn finish_mamba_host_eviction(&mut self, node_id: NodeId) -> Result<EvictionStepResult, NodeAccessError> {
+        let idx = self.arena.resolve(node_id)?;
+        let mut result = EvictionStepResult::default();
+        result.tracker.insert(MAMBA, 0);
+        if !self.arena.has_host_value(idx, MAMBA)
+            || self.arena.host_lock_ref(idx, MAMBA) != 0
+            || self.arena.has_device_value(idx, MAMBA) {
+            return Ok(result);
+        }
+        self.evict_component_and_detach_lru_with_reason_(idx, MAMBA, &mut result.device_frees,
+            &mut result.host_frees, &mut result.cache_actions, EvictLayer::Host, Some(&mut result.tracker),
+            Some("state_tombstone_written"));
+        self.cascade_evict_(idx, MAMBA, &mut result.tracker, &mut result.device_frees,
+                           &mut result.host_frees, &mut result.cache_actions, EvictLayer::Host);
+        Ok(result)
+    }
+
+    /// Materialize only a structural endpoint; retain every existing Full slot.
+    pub fn prepare_mamba_host_restore(
+        &mut self, key: &K, namespace: KeyNamespaceRef<'_>, end_tokens: usize,
+    ) -> (Option<NodeId>, CacheActions) {
+        let mut actions = Vec::new();
+        if end_tokens == 0 || end_tokens > key.atom_len() || end_tokens % self.page_size != 0 {
+            return (None, actions);
+        }
+        let spans = self.collect_matched_spans_(key, namespace, end_tokens);
+        let mut covered = 0;
+        for &(idx, start, len) in &spans {
+            if start != covered || (!self.arena.has_device_value(idx, FULL) && !self.arena.has_host_value(idx, FULL)) {
+                return (None, actions);
+            }
+            covered += len;
+        }
+        if covered < end_tokens { return (None, actions); }
+        let Some(&(mut idx, start, _)) = spans.last() else { return (None, actions); };
+        let prefix = end_tokens - start;
+        if prefix < self.arena.node(idx).key.atom_len() {
+            let (new_idx, action) = self.split_node_(idx, prefix);
+            idx = new_idx;
+            if let Some(action) = action { actions.push(Box::new(action)); }
+        }
+        (Some(self.arena.node(idx).id), actions)
+    }
+
+    /// Attach an already fetched state only; the caller retains its pins until return.
+    pub fn commit_mamba_host_restore(
+        &mut self, node_id: NodeId, host_indices: Tensor,
+    ) -> Result<bool, NodeAccessError> {
+        let idx = self.arena.resolve(node_id)?;
+        if self.arena.has_host_value(idx, MAMBA) || host_indices.kind() != Kind::Int64 || host_indices.numel() != 1 {
+            return Ok(false);
+        }
+        let mut cursor = idx;
+        loop {
+            let node = self.arena.node(cursor);
+            if node.is_root() { break; }
+            if !node.has_device_value(FULL) && !node.has_host_value(FULL) { return Ok(false); }
+            cursor = node.parent();
+        }
+        self.arena.set_host_value(idx, MAMBA, host_indices);
+        if !self.arena.has_device_value(idx, MAMBA) && self.arena.host_lock_ref(idx, MAMBA) == 0
+            && !self.host_lru_list(MAMBA).in_list(Some(idx)) {
+            self.host_lru_list_mut(MAMBA).insert_mru(idx);
+        }
+        self.update_evictable_leaf_sets_(idx);
+        self.record_l3_lifetime_event_(idx, MAMBA, "create", "host", "within_tree_restore");
+        Ok(true)
+    }
+
+    /// Full host leaves in the order drive_host_eviction takes them, until their
+    /// tokens reach num_tokens, as (node id, tokens, page hashes); read-only. A
+    /// parent joins once all its children are taken, mirroring the leaf cascade.
+    /// Exclusive L2->L3 tiering writes these to storage ahead of host eviction.
+    pub fn peek_host_eviction_candidates(
+        &self,
+        component_type: ComponentType,
+        num_tokens: usize,
+    ) -> Vec<(NodeId, usize, Option<Vec<String>>)> {
+        if component_type != BASE_COMPONENT_TYPE
+            || self.try_component_by_type_(component_type).is_none()
+        {
+            return Vec::new();
+        }
+        let arena = &self.arena;
+        let strategy = &self.eviction_strategy;
+        let mut heap: BinaryHeap<Reverse<(PriorityKey, NodeIdx_)>> = self
+            .evictable_host_leaves
+            .iter()
+            .map(|id| Reverse((strategy.get_priority(arena.node(id)), id)))
+            .collect();
+        let mut children_left: HashMap<NodeIdx_, usize> = HashMap::new();
+        let mut out = Vec::new();
+        let mut covered = 0usize;
+        while covered < num_tokens {
+            let Some(Reverse((_, x))) = heap.pop() else {
+                break;
+            };
+            let node = arena.node(x);
+            let tokens = node.key.atom_len();
+            out.push((node.id, tokens, node.hash_value.clone()));
+            covered += tokens;
+            if let Some(p) = node.try_parent() {
+                let parent = arena.node(p);
+                let left = children_left.entry(p).or_insert(parent.children.len());
+                *left = left.saturating_sub(1);
+                if *left == 0 && self.is_host_leaf_once_childless_(parent) {
+                    heap.push(Reverse((strategy.get_priority(parent), p)));
+                }
+            }
+        }
+        out
+    }
+
+    /// Full device leaves in the order the device eviction walk takes them, until
+    /// their tokens reach num_tokens, as (node id, tokens, Full KV not on host,
+    /// write pending); read-only. A parent joins once its last device child is
+    /// taken. The write-ahead walk backs these up before eviction reaches them.
+    pub fn peek_device_eviction_candidates(
+        &self,
+        component_type: ComponentType,
+        num_tokens: usize,
+    ) -> Vec<(NodeId, usize, bool, bool)> {
+        if component_type != BASE_COMPONENT_TYPE
+            || self.try_component_by_type_(component_type).is_none()
+        {
+            return Vec::new();
+        }
+        let arena = &self.arena;
+        let strategy = &self.eviction_strategy;
+        let mut heap: BinaryHeap<Reverse<(PriorityKey, NodeIdx_)>> = self
+            .evictable_device_leaves
+            .iter()
+            .map(|id| Reverse((strategy.get_priority(arena.node(id)), id)))
+            .collect();
+        let mut children_left: HashMap<NodeIdx_, usize> = HashMap::new();
+        let mut out = Vec::new();
+        let mut covered = 0usize;
+        while covered < num_tokens {
+            let Some(Reverse((_, x))) = heap.pop() else {
+                break;
+            };
+            let node = arena.node(x);
+            let tokens = node.key.atom_len();
+            out.push((
+                node.id,
+                tokens,
+                !node.backuped(),
+                node.write_through_pending_id.is_some(),
+            ));
+            covered += tokens;
+            if let Some(p) = node.try_parent() {
+                let parent = arena.node(p);
+                let left = children_left.entry(p).or_insert_with(|| {
+                    parent
+                        .children
+                        .values()
+                        .filter(|&&c| arena.has_device_value(c, FULL))
+                        .count()
+                });
+                *left = left.saturating_sub(1);
+                if *left == 0 && self.is_device_leaf_once_childless_(parent) {
+                    heap.push(Reverse((strategy.get_priority(parent), p)));
+                }
+            }
+        }
+        out
+    }
+
+    /// Replace the device-tail set that duplicate reclaim never takes (host
+    /// eviction drops host-only leaves instead of these written-ahead copies).
+    pub fn set_write_ahead_spare(&mut self, node_ids: Vec<NodeId>) {
+        self.write_ahead_spare.clear();
+        for node_id in node_ids {
+            if let Ok(idx) = self.arena.resolve(node_id) {
+                self.write_ahead_spare.insert(idx, node_id);
+            }
+        }
+    }
+
+    pub(crate) fn is_write_ahead_spared_(&self, node_idx: NodeIdx_) -> bool {
+        self.write_ahead_spare
+            .get(&node_idx)
+            .is_some_and(|&id| self.arena.node(node_idx).id == id)
+    }
+
+    /// The host leaves among the max_states coldest members of the Mamba host
+    /// LRU, in the order a Mamba host eviction meets them, as (node id, tokens,
+    /// page hashes); read-only. Such an eviction drops the whole leaf (its Full
+    /// pages too), so exclusive L2->L3 tiering writes these ahead of it.
+    pub fn peek_mamba_host_eviction_leaves(
+        &self,
+        max_states: usize,
+    ) -> Vec<(NodeId, usize, Option<Vec<String>>)> {
+        let mut out = Vec::new();
+        if self.try_component_by_type_(MAMBA).is_none() {
+            return out;
+        }
+        let lru = self.host_lru_list(MAMBA);
+        let mut x = lru.get_lru_no_lock(&self.arena);
+        let mut seen = 0usize;
+        while let Some(cur) = x {
+            if seen >= max_states || !lru.in_list(Some(cur)) {
+                break;
+            }
+            seen += 1;
+            if self.evictable_host_leaves.contains(cur) {
+                let node = self.arena.node(cur);
+                out.push((node.id, node.key.atom_len(), node.hash_value.clone()));
+            }
+            x = lru.get_prev_no_lock(cur, &self.arena);
+        }
+        out
+    }
+
     /// Skip Full duplicate reclaim when requested by the controller, while
     /// preserving the normal host-leaf eviction walk.
     pub fn drive_host_eviction_with_options(
@@ -3060,7 +3366,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             // BlockRemoved tracks Full host residency, not auxiliary slices.
             self.record_remove_event_(node_id, StorageMedium::Cpu);
         }
-        self.evict_component_and_detach_lru_(
+        self.evict_component_and_detach_lru_with_reason_(
             node_id,
             component_type,
             device_frees,
@@ -3068,6 +3374,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             cache_actions,
             EvictLayer::Host,
             Some(tracker),
+            Some("duplicate_reclaim"),
         );
         let victim_id = self.arena.node(node_id).id;
         self.write_back_coexist_reclaim_digest = next_coexist_reclaim_digest(
@@ -3160,7 +3467,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             let node = self.arena.node(node_id);
             assert!(!node.evicted() && node.backuped());
         }
-        self.evict_component_and_detach_lru_(
+        self.evict_component_and_detach_lru_with_reason_(
             node_id,
             BASE_COMPONENT_TYPE,
             device_frees,
@@ -3168,6 +3475,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             cache_actions,
             EvictLayer::Device,
             Some(tracker),
+            Some("demote"),
         );
         self.cascade_evict_(
             node_id,
@@ -3230,7 +3538,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             if !should_evict {
                 continue;
             }
-            self.evict_component_and_detach_lru_(
+            self.evict_component_and_detach_lru_with_reason_(
                 node_id,
                 ct,
                 device_frees,
@@ -3238,6 +3546,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
                 cache_actions,
                 target,
                 Some(tracker),
+                Some("cascade"),
             );
         }
 
@@ -3335,6 +3644,24 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         target: EvictLayer,
         tracker: Option<&mut HashMap<ComponentType, usize>>,
     ) -> (usize, usize) {
+        self.evict_component_and_detach_lru_with_reason_(node_id, component_type, device_frees,
+            host_frees, cache_actions, target, tracker, None)
+    }
+
+    pub(crate) fn evict_component_and_detach_lru_with_reason_(
+        &mut self,
+        node_id: NodeIdx_,
+        component_type: ComponentType,
+        device_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
+        host_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
+        cache_actions: &mut CacheActions,
+        target: EvictLayer,
+        tracker: Option<&mut HashMap<ComponentType, usize>>,
+        reason: Option<&str>,
+    ) -> (usize, usize) {
+        let host_reason = reason.unwrap_or(if self.evictable_host_leaves.contains(node_id) { "host_leaf" }
+                          else if component_type == MAMBA { "state_tombstone" }
+                          else { "host_component" });
         let had_host_copy = self.arena.has_host_value(node_id, component_type);
         let component = self.component_by_type_(component_type);
         let (device_freed, host_freed) = component.evict_component(
@@ -3345,6 +3672,12 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             cache_actions,
             target,
         );
+        if device_freed > 0 {
+            self.record_l3_lifetime_event_(node_id, component_type, "evict", "device", reason.unwrap_or("component_eviction"));
+        }
+        if host_freed > 0 {
+            self.record_l3_lifetime_event_(node_id, component_type, "evict", "host", host_reason);
+        }
         if let Some(tracker) = tracker {
             let freed = if target.contains(EvictLayer::Device) {
                 device_freed
@@ -3474,8 +3807,22 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         true
     }
 
+    /// The D-leaf rule without the no-device-children clause.
+    fn is_device_leaf_once_childless_(&self, node: &Node<K>) -> bool {
+        !node.is_root()
+            && !node.evicted()
+            && !node.is_device_locked()
+            && !node.is_load_back_pending()
+    }
+
     /// Whether the node is an evictable Full host leaf.
     fn is_evictable_host_leaf_(&self, node: &Node<K>) -> bool {
+        self.is_host_leaf_once_childless_(node) && node.children.is_empty()
+    }
+
+    /// The H-leaf rule without the no-children clause: whether the node becomes
+    /// an evictable host leaf once its children are gone.
+    fn is_host_leaf_once_childless_(&self, node: &Node<K>) -> bool {
         if node.is_root() || !node.evicted() {
             return false;
         }
@@ -3491,9 +3838,6 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         // Segment locks count evicted nodes too: a device-locked candidate is
         // a live segment's anchor, and evict_host_leaf_ would delete it.
         if node.is_device_locked() {
-            return false;
-        }
-        if !node.children.is_empty() {
             return false;
         }
         true
@@ -3525,6 +3869,11 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
 
     pub fn set_write_through_threshold(&mut self, value: i64) {
         self.write_through_threshold = value;
+    }
+
+    /// Make the per-path Mamba cap count and free host copies; decided at HiCache init.
+    pub fn set_mamba_path_cap_counts_host(&mut self, enabled: bool) {
+        self.mamba_path_cap_counts_host = enabled;
     }
 
     pub fn enable_storage(&self) -> bool {
@@ -3933,6 +4282,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
                     self.update_evictable_leaf_sets_(parent_id);
                 }
                 self.update_full_coexisting_host_tracking_(node_id);
+                self.record_l3_lifetime_event_(node_id, FULL, "create", "host", "full_host_refill");
                 self.record_store_event_(node_id, StorageMedium::Cpu, /* session_id = */ None);
                 inserted_host_node = Some(self.arena.node(node_id).id);
             }
@@ -4010,6 +4360,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         self.update_evictable_leaf_sets_(new_node_id);
         self.update_evictable_leaf_sets_(node_id);
         result.inserted_host_node = Some(self.arena.node(new_node_id).id);
+        self.record_l3_lifetime_event_(new_node_id, FULL, "create", "host", "full_host_insert");
         self.record_store_event_(
             new_node_id,
             StorageMedium::Cpu,
@@ -4586,6 +4937,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
                 /* pool_storage_result = */ None,
             );
         for loaded_idx in loaded_node_indices {
+            self.record_l3_lifetime_event_(loaded_idx, FULL, "create", "device", "H2D_reserve");
             self.record_store_event_(loaded_idx, StorageMedium::Gpu, /* session_id = */ None);
         }
         for (component_type, transfers) in comp_xfers {
@@ -4785,6 +5137,11 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             if node.write_through_pending_id == Some(ack_id) {
                 node.write_through_pending_id = None;
                 self.update_full_coexisting_host_tracking_(node_idx);
+                for component in [FULL, MAMBA] {
+                    if self.arena.has_host_value(node_idx, component) {
+                        self.record_l3_lifetime_event_(node_idx, component, "d2h_ack", "host", "node_backup_ack");
+                    }
+                }
             }
             self.record_store_event_(node_idx, StorageMedium::Cpu, /* session_id = */ None);
         }
@@ -4990,6 +5347,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             "set_component_device_value: auxiliary components only"
         );
         self.arena.set_device_value(node_id, component_type, value);
+        self.record_l3_lifetime_event_(node_id, component_type, "create", "device", "component_materialize");
         let tokens = self.component_reclaimable_value_len_(node_id, component_type);
         let host_lru = self.host_lru_list_mut(component_type);
         if host_lru.in_list(Some(node_id)) {
