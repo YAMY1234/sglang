@@ -4517,6 +4517,8 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         // nodes consume fresh host indices and must not contribute to this count.
         let mut host_prefix_len = 0;
         let mut refilled_unbacked_node = false;
+        // S2b-alpha: where the first refilled kv_in_storage node starts; host_value from there on is kept.
+        let mut kv_fill_start: Option<usize> = None;
         let mut inserted_host_node = None;
         let mut cache_actions: CacheActions = Vec::new();
         while matched_length < total_len {
@@ -4562,7 +4564,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
                 self.record_l3_lifetime_event_(node_id, FULL, "create", "host", "kv_fill_insert_host");
                 self.record_store_event_(node_id, StorageMedium::Cpu, /* session_id = */ None);
                 inserted_host_node = Some(self.arena.node(node_id).id);
-                host_prefix_len = matched_length;
+                kv_fill_start.get_or_insert(matched_start);
                 continue;
             }
 
@@ -4602,11 +4604,13 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         }
 
         let mut result = InsertResult {
+            // The caller frees host_value[..prefix_len] as duplicates; refilled nodes keep theirs.
             prefix_len: if self.is_write_back {
                 matched_length
             } else {
                 host_prefix_len
-            },
+            }
+            .min(kv_fill_start.unwrap_or(usize::MAX)),
             total_len,
             last_device_node_id: None,
             inserted_host_node,

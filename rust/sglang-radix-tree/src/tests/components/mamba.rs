@@ -2846,12 +2846,37 @@ fn s2ba_insert_host_refills_a_kv_in_storage_node_on_its_path() {
     let (a, b) = s2ba_host_chain(&mut tc);
     tc.drive_host_eviction_with_options(FULL, /* num_tokens = */ 2, true);
     // An L3 prefetch completing from the root re-materializes the whole path.
-    tc.insert_host(root, None, vec![1, 2, 3], Tensor::from_slice(&[400i64, 401, 402]), vec!["h1".into(), "h2".into(), "h3".into()])
+    let result = tc
+        .insert_host(root, None, vec![1, 2, 3], Tensor::from_slice(&[400i64, 401, 402]), vec!["h1".into(), "h2".into(), "h3".into()])
         .expect("live test node");
+    // Nothing is a duplicate: the refilled nodes keep 400 and 401, the new leaf 402.
+    assert_eq!(result.prefix_len, 0);
+    assert!(tc.arena.node(a).host_value(FULL).equal(&Tensor::from_slice(&[400i64])));
     assert!(!tc.arena.node(a).kv_in_storage && tc.arena.node(a).has_host_value(FULL));
     assert!(!tc.arena.node(b).kv_in_storage && tc.arena.node(b).has_host_value(FULL));
     assert_eq!(tc.kv_in_storage_stats(), (2, 2, 0, 0, 0, 0));
     tc.sanity_check(&[], &[]);
+}
+
+#[test]
+fn s2ba_insert_host_frees_only_the_host_resident_prefix_before_a_refill() {
+    for write_back in [true, false] {
+        let mut tc = mamba_core(/* page_size = */ 1);
+        let root = tc.arena.node(tc.arena.root()).id;
+        let (a, b) = s2ba_host_chain(&mut tc);
+        tc.is_write_back = write_back;
+        tc.drive_host_eviction_with_options(FULL, /* num_tokens = */ 1, true);
+        assert!(tc.arena.node(b).kv_in_storage && !tc.arena.node(a).kv_in_storage);
+        let result = tc
+            .insert_host(root, None, vec![1, 2], Tensor::from_slice(&[500i64, 501]), vec!["h1".into(), "h2".into()])
+            .expect("live test node");
+        // [1] is host-resident (500 is a duplicate); [2] is refilled with 501.
+        assert_eq!(result.prefix_len, 1, "write_back={write_back}");
+        assert!(tc.arena.node(a).host_value(FULL).equal(&Tensor::from_slice(&[100i64])));
+        assert!(tc.arena.node(b).host_value(FULL).equal(&Tensor::from_slice(&[501i64])));
+        assert_eq!(tc.kv_in_storage_stats(), (1, 1, 0, 0, 0, 0));
+        tc.sanity_check(&[], &[]);
+    }
 }
 
 fn s2ba_xorshift(state: &mut u64) -> u64 {
