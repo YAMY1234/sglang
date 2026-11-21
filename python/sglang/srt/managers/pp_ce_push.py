@@ -18,6 +18,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import time
 from collections import deque, namedtuple
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -202,6 +203,7 @@ class PPCEPush:
     def __init__(
         self,
         *,
+        rank: int,
         device_id: int,
         slots: int,
         slot_bytes: int,
@@ -209,6 +211,7 @@ class PPCEPush:
         has_prev: bool,
         has_next: bool,
     ) -> None:
+        self.rank = rank
         self.device_id = device_id
         self.slots = slots
         # This stage's input ring slots, and the next stage's, which bound what a push carries.
@@ -230,6 +233,10 @@ class PPCEPush:
         self.max_bytes = 0
         # (copy start, done) timing events of recent pushes: how long the copy engine runs per message.
         self._timed: deque = deque(maxlen=64)
+        # Since boot, for the SGLANG_PP_CE_PUSH_LOG_INTERVAL line: messages, fallbacks, largest bytes.
+        self.log_interval = envs.SGLANG_PP_CE_PUSH_LOG_INTERVAL.get()
+        self.totals = [0, 0, 0]
+        self._next_log = time.monotonic() + self.log_interval
         self._ck_send: Optional[_CEChecksum] = None
         self._ck_recv: Optional[_CEChecksum] = None
         self._ck_views: Dict[int, List[Tuple[str, torch.Tensor]]] = {}
@@ -285,7 +292,24 @@ class PPCEPush:
         self.max_bytes = max(self.max_bytes, used)
         ok = used <= self.peer_slot_bytes and all(t.is_contiguous() for t in ts.values())
         self.fallbacks += not ok
+        if self.log_interval > 0:
+            self._log_totals(used, ok)
         return ok
+
+    def _log_totals(self, used: int, ok: bool) -> None:
+        t = self.totals
+        t[0], t[1], t[2] = t[0] + 1, t[1] + (not ok), max(t[2], used)
+        now = time.monotonic()
+        if now >= self._next_log:
+            self._next_log = now + self.log_interval
+            logger.info(
+                "PP CE push on PP%d: %d messages, fallbacks=%d since boot, largest %d MiB (next stage's slot %d MiB)",
+                self.rank,
+                t[0],
+                t[1],
+                -(-t[2] >> 20),
+                self.peer_slot_bytes >> 20,
+            )
 
     def take_stats(self) -> Dict[str, float]:
         ms = []
@@ -415,6 +439,7 @@ def setup_ce_push(*, pp_group, device_id: int, slots: int, slot_mb: Sequence[int
     slot_mb = list(slot_mb) * size if len(slot_mb) == 1 else list(slot_mb)
     assert len(slot_mb) == size, (slot_mb, size)
     ce = PPCEPush(
+        rank=rank,
         device_id=device_id,
         slots=slots,
         slot_bytes=slot_mb[rank] << 20,

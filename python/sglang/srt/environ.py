@@ -900,6 +900,8 @@ class Envs:
     # by the receiving stage; PP0's entry is unused), or "auto" (each stage's previous stage's
     # largest proxy at the prefill token budget). A larger message goes over NCCL.
     SGLANG_PP_CE_PUSH_SLOT_MB = EnvTuple(("1600",))
+    # Seconds between "PP CE push on PPn: ... fallbacks=F since boot" lines (0: no line).
+    SGLANG_PP_CE_PUSH_LOG_INTERVAL = EnvFloat(0.0)
     # PP layer split: comma list of layers per stage (read by distributed.utils.get_pp_indices).
     SGLANG_PP_LAYER_PARTITION = EnvStr(None)
     # PP: choose the layer split at boot from each GPU's measured speed (distributed.pp_partition_auto); the speed
