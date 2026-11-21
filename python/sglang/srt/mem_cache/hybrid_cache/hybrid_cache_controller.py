@@ -224,6 +224,38 @@ class MambaStateRestoreOperation(PrefetchOperation):
         self.cancelled = False
 
 
+class KvFillOperation(PrefetchOperation):
+    """A KV-only L3 read that refills kv_in_storage nodes between the tree's KV end
+    (start_len) and a state this rank still holds (S2b-alpha). Carries no Mamba
+    transfer: the state is local. ``state_pages`` are the pages, relative to
+    start_len and 1-based, at which this rank holds a usable state."""
+
+    def __init__(
+        self,
+        handle: CacheRequestHandle,
+        token_ids: List[int],
+        start_len: int,
+        end_len: int,
+        state_pages,
+        fill_node_ids,
+        last_hash: Optional[str] = None,
+        prefix_keys: Optional[List[str]] = None,
+        pool_transfers: Optional[list[PoolTransfer]] = None,
+    ):
+        assert all(t.name != PoolName.MAMBA for t in pool_transfers or ())
+        super().__init__(
+            handle,
+            token_ids,
+            last_hash,
+            prefix_keys=prefix_keys,
+            pool_transfers=pool_transfers,
+        )
+        self.start_len = start_len
+        self.end_len = end_len
+        self.state_pages = tuple(state_pages)
+        self.fill_node_ids = list(fill_node_ids)
+
+
 @dataclass(frozen=True)
 class PrefetchSubmission:
     operation: Optional[PrefetchOperation] = None
@@ -1543,7 +1575,21 @@ class HybridCacheController(BaseHiCacheController):
         by any rank heals from the folded cut without learning presence."""
         if isinstance(operation, MambaStateRestoreOperation):
             return self._sync_mamba_state_restore(operation)
-        if any(
+        if isinstance(operation, KvFillOperation):
+            # A page can end the fill only if every rank has the KV up to it in
+            # L3 and holds a state there. The shape comes from end_len -
+            # start_len, which rank_consensus keeps identical on every rank.
+            n_pages = (operation.end_len - operation.start_len) // self.page_size
+            if n_pages <= 0:
+                hits = [0]
+            else:
+                hits = [0] * (n_pages + 1)
+                hits[0] = 1
+                kv_pages = storage_hit_count // self.page_size
+                local = set(operation.state_pages)
+                for page in range(1, n_pages + 1):
+                    hits[page] = int(page <= kv_pages and page in local)
+        elif any(
             transfer.hit_policy == PoolHitPolicy.TRAILING_PAGES
             for transfer in operation.pool_transfers or []
         ):

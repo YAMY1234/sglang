@@ -3599,6 +3599,27 @@ class Scheduler(
             req.init_next_round_input(self.tree_cache, cow_mamba=False)
             tree_cache = self.tree_cache
             buffer_mode = get_memory().hicache_host_memory_mode == "buffer_only"
+            # S2b-alpha: the tree holds a state past its KV end and L3 holds the KV
+            # in between; fill only that KV. Ahead of the within-tree state
+            # restore, so a request with a fill never also queues a restore.
+            if (
+                envs.SGLANG_HICACHE_L3_KV_FILL.get()
+                and not buffer_mode
+                and req.kv_fill is not None
+                and req.kv_fill.end_len - req.kv_fill.start_len
+                >= envs.SGLANG_HICACHE_L3_KV_FILL_MIN_TOKENS.get()
+            ):
+                decision = tree_cache.prefetch_kv_fill_from_storage(
+                    req.cache_request_handle,
+                    req.kv_fill,
+                    req.full_untruncated_fill_ids[
+                        req.kv_fill.start_len : req.kv_fill.end_len
+                    ],
+                    extra_key=req.extra_key,
+                    cache_salt=req.cache_salt,
+                )
+                if decision is not None:
+                    return decision
             matched_len = req.prefix_len + req.host_hit_length
             within_tree = (
                 envs.SGLANG_HICACHE_L3_READ_WITHIN_TREE_KV.get()

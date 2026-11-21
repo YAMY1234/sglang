@@ -9,6 +9,7 @@ from contextlib import nullcontext
 from dataclasses import replace
 from pathlib import Path
 from queue import Empty, Queue
+from types import SimpleNamespace
 from unittest.mock import Mock, call, patch
 
 import torch
@@ -29,6 +30,7 @@ from sglang.srt.mem_cache.hicache_storage import (
 )
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
+    KvFillOperation,
     PPPrefetchDecision,
 )
 from sglang.srt.mem_cache.memory_pool_host import LogicalHostPool
@@ -503,6 +505,61 @@ class TestPPPrefetchTicket(unittest.TestCase):
         self.assertEqual(operation.storage_hit_count, free_pages * 4)
         self.assertEqual(len(operation.hash_value), free_pages)
         self.assertFalse(operation.is_terminated())
+
+    @staticmethod
+    def _kv_fill_vote(page_size, n_pages, kv_pages, state_pages, peer_hits):
+        """This rank's KV-fill vote, MIN-reduced with one peer's per-page vote."""
+        sent = []
+
+        def reduce(values, *_):
+            sent.append(values.tolist())
+            peer = values.clone()
+            peer[: len(peer_hits)] = torch.tensor(peer_hits, dtype=values.dtype)
+            values.copy_(torch.minimum(values, peer))
+
+        controller = SimpleNamespace(
+            page_size=page_size, prefetch_hits_sync_groups=[], _all_reduce=reduce
+        )
+        operation = KvFillOperation(
+            CacheRequestHandle("fill", 0),
+            list(range(n_pages * page_size)),
+            start_len=128,
+            end_len=128 + n_pages * page_size,
+            state_pages=state_pages,
+            fill_node_ids=[],
+        )
+        got = HybridCacheController._sync_prefetch_hit_query(
+            controller, operation, kv_pages * page_size
+        )
+        return got, sent[0]
+
+    def test_kv_fill_ends_at_deepest_page_every_rank_can_serve(self):
+        # This rank: L3 KV through page 6, states at 2, 4, 6. Peer: KV through
+        # 5, states at 4 and 6. Page 6 lacks the peer's KV, so the fill stops at 4.
+        got, sent = self._kv_fill_vote(4, 6, 6, (2, 4, 6), [1, 0, 0, 0, 1, 0, 0])
+        self.assertEqual(sent[:7], [1, 0, 1, 0, 1, 0, 1])
+        self.assertEqual(got, 4 * 4)
+
+    def test_kv_fill_without_a_common_state_page_fills_nothing(self):
+        got, _ = self._kv_fill_vote(4, 4, 4, (4,), [1, 0, 1, 0, 0])
+        self.assertEqual(got, 0)
+
+    def test_kv_fill_vote_shape_does_not_depend_on_local_state(self):
+        # No KV and no state on this rank still sends n_pages + 1 slots.
+        _, sent = self._kv_fill_vote(4, 5, 0, (), [1, 1, 1, 1, 1, 1])
+        self.assertEqual(sent[:6], [1, 0, 0, 0, 0, 0])
+
+    def test_kv_fill_operation_carries_no_state_transfer(self):
+        with self.assertRaises(AssertionError):
+            KvFillOperation(
+                CacheRequestHandle("fill", 0),
+                list(range(4)),
+                start_len=0,
+                end_len=4,
+                state_pages=(1,),
+                fill_node_ids=[],
+                pool_transfers=[PoolTransfer(PoolName.MAMBA, keys=["state"])],
+            )
 
     def test_local_miss_or_query_error_completes_before_next_ticket(self):
         """A stage miss/error must complete admission without breaking ACK order."""
