@@ -1953,6 +1953,10 @@ class Envs:
     # ===================================================================
     SGLANG_MAMBA_CONV_DTYPE = EnvStr("bfloat16")
     SGLANG_MAMBA_SSM_DTYPE = EnvStr(None)
+    # When the branching point (KV hit past the deepest state) falls in the forward
+    # that ends the input, track the input end instead, so the next turn can extend
+    # this request; an earlier forward still tracks the branching point.
+    SGLANG_MAMBA_BRANCH_TRACK_PREFER_END = EnvBool(False)
     # Kill-switch for the fused per-slot conv clear/copy kernel (MambaPool);
     # falls back to the per-conv-type Python loop.
     SGLANG_DISABLE_FUSED_MAMBA_SLOT_OPS = EnvBool(False)

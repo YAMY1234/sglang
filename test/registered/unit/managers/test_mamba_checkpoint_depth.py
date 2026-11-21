@@ -14,6 +14,7 @@ from array import array
 from types import SimpleNamespace
 from unittest.mock import MagicMock, create_autospec, patch
 
+from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import (
     Req,
     ScheduleBatch,
@@ -45,6 +46,8 @@ def _prepare_extend(
     extend_len: int,
     dcp_enabled: bool = False,
     next_idx: int = 0,
+    branching: int | None = None,
+    input_len: int | None = None,
 ) -> tuple[_MambaRadixCacheV2TrackEntry, Req]:
     """Run one extend through the tracker; return its track entry and the request."""
     server_args = ServerArgs(model_path="dummy", page_size=CHUNK)
@@ -57,14 +60,14 @@ def _prepare_extend(
     req = Req(
         rid="req",
         origin_input_text="",
-        origin_input_ids=array("q", [1] * (prefix_len + extend_len)),
+        origin_input_ids=array("q", [1] * (input_len or prefix_len + extend_len)),
         sampling_params=sampling_params,
         vocab_size=128,
     )
     req.prefix_len = prefix_len
     req.extend_end = prefix_len + extend_len
     req.kv.mamba_next_track_idx = next_idx
-    req.mamba_branching_seqlen = None
+    req.mamba_branching_seqlen = branching
 
     batch = ScheduleBatch(reqs=[req])
     batch.token_to_kv_pool_allocator = SimpleNamespace(storage=None)
@@ -90,6 +93,29 @@ def _track_seqlen(**kwargs) -> int | None:
         assert req.kv.mamba_last_track_seqlen is None
         return None
     return req.kv.mamba_last_track_seqlen
+
+
+class TestBranchingTrackInTheLastForward(unittest.TestCase):
+    """A KV hit past the deepest state (branching point 6144) inside the forward
+    that ends the input: by default the branching point is tracked and the
+    request's own end state never reaches the tree, so its next turn recomputes it."""
+
+    ARGS = dict(tree_page=CHUNK, prefix_len=4096, extend_len=4000)
+
+    def test_the_branching_point_takes_the_last_forward_by_default(self):
+        self.assertEqual(_track_seqlen(**self.ARGS, branching=6144), 6144)
+
+    def test_prefer_end_tracks_the_input_end_in_the_last_forward(self):
+        end = _track_seqlen(**self.ARGS)
+        self.assertGreater(end, 6144)
+        with envs.SGLANG_MAMBA_BRANCH_TRACK_PREFER_END.override(True):
+            self.assertEqual(_track_seqlen(**self.ARGS, branching=6144), end)
+
+    def test_prefer_end_keeps_the_branching_point_in_an_earlier_forward(self):
+        with envs.SGLANG_MAMBA_BRANCH_TRACK_PREFER_END.override(True):
+            self.assertEqual(
+                _track_seqlen(**self.ARGS, branching=6144, input_len=40000), 6144
+            )
 
 
 class TestMambaCheckpointDepth(unittest.TestCase):

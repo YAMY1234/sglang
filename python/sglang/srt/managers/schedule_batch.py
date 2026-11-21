@@ -2769,7 +2769,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 mamba_track_seqlen,
                 cache_chunk_size,
             )
-            if branch is not None:
+            prefer_end = envs.SGLANG_MAMBA_BRANCH_TRACK_PREFER_END.get() and (
+                seq_end >= len(req.origin_input_ids)
+            )
+            if branch is not None and not prefer_end:
                 # We want to track mamba_track_seqlen_aligned, and it's not the last position,
                 # so we need to add 1 to the seqlen to retrieve the correct mamba state from h.
                 # See _force_track_h() for more details.
