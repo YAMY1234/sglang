@@ -4503,6 +4503,12 @@ class Scheduler(
     def _pp_debug_trace_admission(self, chunked_prefill_size: int) -> None:
         """SGLANG_PP_DEBUG_TRACE: every input of this admission pass, to compare across PP ranks."""
         import hashlib
+        import json
+
+        from sglang.srt.mem_cache.unified_radix_cache import DBG_CTR as urc_dbg
+
+        def urc_dbg_ctr():
+            return urc_dbg
 
         wq = self.waiting_queue
         order = hashlib.blake2b("|".join(r.rid for r in wq).encode(), digest_size=6).hexdigest()
@@ -4515,12 +4521,13 @@ class Scheduler(
         pp_debug_verify_ids(wq[:6], "admission", self.forward_ct)
         logger.info(
             "PPT admit fct=%d wq=%d order=%s chunked=%s chunk=%d avail=%d evictable=%d protected=%d "
-            "reqpool=%d processed=%d top=%s",
+            "reqpool=%d processed=%d ctr=%s top=%s",
             self.forward_ct, len(wq), order,
             None if self.chunked_req is None else self.chunked_req.rid[:6],
             chunked_prefill_size, self.token_to_kv_pool_allocator.available_size(),
             self.tree_cache.evictable_size(), self.tree_cache.protected_size(),
-            self.req_to_token_pool.available_size(), self.processed_tokens_counter, top,
+            self.req_to_token_pool.available_size(), self.processed_tokens_counter,
+            json.dumps(dict(sorted(urc_dbg_ctr().items())), separators=(",", ":")), top,
         )
 
     def _get_new_batch_prefill_raw(

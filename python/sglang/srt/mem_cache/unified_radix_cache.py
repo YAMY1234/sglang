@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import atexit
+import collections
 import contextlib
 import logging
+import sys
 import threading
 import time
 from array import array
@@ -181,6 +183,16 @@ COMPONENT_REGISTRY: dict[ComponentType, type[TreeComponent]] = {
 
 
 logger = logging.getLogger(__name__)
+
+# SGLANG_PP_DEBUG_TRACE: cumulative tree-mutation counters, keyed by kind and call site, so PP ranks can
+# be compared pass by pass and the first divergent mutation names where it happened.
+DBG_CTR: collections.Counter = collections.Counter()
+_DBG = envs.SGLANG_PP_DEBUG_TRACE.get()
+
+
+def _dbg_site(depth: int = 2) -> str:
+    f = sys._getframe(depth)
+    return f"{f.f_code.co_name}<{f.f_back.f_code.co_name if f.f_back else ''}"
 device_module = get_device_module()
 
 
@@ -1059,6 +1071,8 @@ class UnifiedRadixCache(BasePrefixCache):
                 if step.result is not None:
                     # Walk actions flow through the steps; the result is action-free.
                     assert not step.result.cache_actions
+                    if _DBG:
+                        DBG_CTR["ins:" + _dbg_site()] += len(params.key) - step.result.prefix_len
                     if self.buffer_pipeline is not None:
                         self.buffer_pipeline.on_insert_complete(step.result)
                     self._wb_overlap_observe(step.result.last_device_node)
@@ -1190,6 +1204,13 @@ class UnifiedRadixCache(BasePrefixCache):
         raise ValueError(f"Unsupported cache component: {component_type}")
 
     def _evict(self, params: EvictParams, *args, **kwargs) -> EvictResult:
+        if _DBG:
+            result = self._evict_dbg(params, *args, **kwargs)
+            DBG_CTR["evict:" + _dbg_site(3)] += result.num_tokens_evicted
+            return result
+        return self._evict_dbg(params, *args, **kwargs)
+
+    def _evict_dbg(self, params: EvictParams, *args, **kwargs) -> EvictResult:
         # Eviction frees unlocked nodes only, never an in-flight transfer's pages: apply them
         # now even under defer_device_frees, or an allocation that evicts to make room fails.
         sink = getattr(self, "_deferred_free_sink", None)
@@ -1491,6 +1512,8 @@ class UnifiedRadixCache(BasePrefixCache):
     ) -> IncLockRefResult:
         if self.disable:
             return IncLockRefResult()
+        if _DBG:
+            DBG_CTR["lock+:" + _dbg_site()] += 1
         return self.tree_core.inc_lock_ref(node_id, skip_lock_components)
 
     def dec_lock_ref(
@@ -1501,6 +1524,8 @@ class UnifiedRadixCache(BasePrefixCache):
     ) -> DecLockRefResult:
         if self.disable:
             return DecLockRefResult()
+        if _DBG:
+            DBG_CTR["lock-:" + _dbg_site()] += 1
         return self.tree_core.dec_lock_ref(node_id, params, skip_swa)
 
     def lock(
@@ -1895,7 +1920,10 @@ class UnifiedRadixCache(BasePrefixCache):
     ) -> int:
         """Evict host resources for a specific component to free host pool space."""
         with pp_bubble_diag.sub("evict_host"):
-            return self._evict_host_timed(num_tokens, component_type)
+            n = self._evict_host_timed(num_tokens, component_type)
+        if _DBG:
+            DBG_CTR["evict_host:" + _dbg_site()] += n
+        return n
 
     def _evict_host_timed(self, num_tokens: int, component_type: ComponentType) -> int:
         if not pmicro_hoststats.ON:
@@ -5387,6 +5415,8 @@ class UnifiedRadixCache(BasePrefixCache):
                 if pmicro_hoststats.ON and self.ongoing_write_through
                 else None
             )
+            if _DBG and self.ongoing_write_through:
+                DBG_CTR["wb_block:" + _dbg_site()] += len(cc.ack_write_queue)
             while self.ongoing_write_through:
                 for ack in cc.ack_write_queue:
                     with pp_bubble_diag.wait("ack_sync.write_flush"):
@@ -5414,6 +5444,8 @@ class UnifiedRadixCache(BasePrefixCache):
             finish_count = finish_count_tensor.item()
 
         # Process completed acks
+        if _DBG and finish_count:
+            DBG_CTR["w_acks"] += finish_count
         while finish_count > 0:
             ack = cc.ack_write_queue.pop(0)
             with pp_bubble_diag.wait("ack_sync.write"):
@@ -5461,6 +5493,8 @@ class UnifiedRadixCache(BasePrefixCache):
                 "write_back duplicate-reclaim victims diverged across TP ranks"
             )
 
+        if _DBG and finish_count:
+            DBG_CTR["l_acks"] += finish_count
         while finish_count > 0:
             ack = cc.ack_load_queue.pop(0)
             with pp_bubble_diag.wait("ack_sync.load"):
