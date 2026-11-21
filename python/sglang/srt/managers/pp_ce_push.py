@@ -304,6 +304,24 @@ class PPCEPush:
         self.drv.signal(stream, self.peer_free_va + 4 * slot, self._scratch.data_ptr() + 128, seq + 1)
 
 
+def _warm_ring_p2p(pp_group, device_id: int) -> None:
+    """Create the NCCL point-to-point communicator of every ring pair (rank, rank + 1 mod size) now.
+    NCCL builds a pair's communicator on its first send and both ranks must join it; with activations
+    on the copy-engine ring, that first send is an output message mid-run, whose receiver can be blocked
+    behind the sender's own pushes (a hang). Even ranks send first, odd ranks receive first, so no
+    rank waits on a pair its peer has not reached."""
+    import torch.distributed as dist
+
+    rank, size = pp_group.rank_in_group, pp_group.world_size
+    buf = torch.zeros(1, device=f"cuda:{device_id}")
+    nxt, prv = pp_group.ranks[(rank + 1) % size], pp_group.ranks[(rank - 1) % size]
+    send = lambda: dist.send(buf, nxt, group=pp_group.device_group)  # noqa: E731
+    recv = lambda: dist.recv(buf, prv, group=pp_group.device_group)  # noqa: E731
+    for op in (send, recv) if rank % 2 == 0 else (recv, send):
+        op()
+    torch.cuda.synchronize(device_id)
+
+
 def setup_ce_push(*, pp_group, device_id: int, slots: int, slot_bytes: int) -> Optional[PPCEPush]:
     """Collective over the PP group (every stage calls it once, before any relay receive thread starts):
     allocate, exchange FABRIC handles with both neighbours, map. Returns None on every stage if any stage fails,
@@ -352,6 +370,7 @@ def setup_ce_push(*, pp_group, device_id: int, slots: int, slot_bytes: int) -> O
         ok = False
     if not all_ranks_ok(pp_group.cpu_group, ok):
         return None
+    _warm_ring_p2p(pp_group, device_id)
     logger.info(
         "PP CE push on PP%d: %d slots x %.0f MiB input ring, copy-engine pushes to PP%s",
         rank,
