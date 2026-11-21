@@ -785,6 +785,12 @@ class Envs:
     SGLANG_DISAGGREGATION_TRANSFER_TIMEOUT = EnvFloat(0.0)
     # Scheduler processes dump all thread stacks to stderr on SIGUSR2 (hang diagnosis).
     SGLANG_FAULTHANDLER_SIGUSR2 = EnvBool(False)
+    # With SGLANG_DISAGGREGATION_TRANSFER_TIMEOUT under the PP release relay: the deadline also
+    # covers a Success held back by staging, and (from the room's first inflight poll on PP0)
+    # a room whose last chunk was never enqueued there.
+    SGLANG_DISAGGREGATION_TRANSFER_TIMEOUT_ANY_STATE = EnvBool(False)
+    # PD prefill: on SIGUSR2 each scheduler logs every inflight room's transfer state.
+    SGLANG_PD_INFLIGHT_DIAG = EnvBool(False)
     # Decode: dispatch to the DP rank --load-balance-method picks, ignoring the router's routed_dp_rank.
     SGLANG_DISAGG_DECODE_IGNORE_ROUTED_DP_RANK = EnvBool(False)
     # A wedged RDMA stack fails startup here instead of at the scheduler watchdog.

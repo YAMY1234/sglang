@@ -288,6 +288,7 @@ _KV_POLL_NAMES = {v: k for k, v in vars(KVPoll).items() if isinstance(v, int)}
 
 class CommonKVManager(BaseKVManager):
     defer_decode_allocation: bool = False
+    transfer_timeout_any_state: bool = False
     deferred_bootstrap: Optional[DeferredBootstrap] = None
     _staging_ctx = None
 
@@ -415,6 +416,9 @@ class CommonKVManager(BaseKVManager):
         self.failure_lock = threading.Lock()
         # SGLANG_DISAGGREGATION_TRANSFER_TIMEOUT (0 = off); rid per room for its log.
         self.transfer_timeout = envs.SGLANG_DISAGGREGATION_TRANSFER_TIMEOUT.get()
+        self.transfer_timeout_any_state = (
+            envs.SGLANG_DISAGGREGATION_TRANSFER_TIMEOUT_ANY_STATE.get()
+        )
         self.room_rids: Dict[int, str] = {}
         self._timed_out_rooms: Set[int] = set()
         self._staging_outstanding: Dict[int, int] = defaultdict(int)
@@ -1096,6 +1100,24 @@ class CommonKVManager(BaseKVManager):
         targets = dict(self._deferred_ack_targets.get(room, ()))
         targets[(target.ip, target.port)] = target
         self._deferred_ack_targets[room] = targets
+
+    def describe_room(self, room: int) -> str:
+        """SGLANG_PD_INFLIGHT_DIAG: this stage's view of one room (PP0 adds every stage's)."""
+        status = self.request_status.get(room)
+        text = f"local {_KV_POLL_NAMES.get(status, status)}"
+        if isinstance(self.request_status, PPConsensusStore) and self.pp_rank == 0:
+            stages = self.request_status.collect(room)
+            text += " stages " + ",".join(
+                "-" if s is None else _KV_POLL_NAMES.get(s, str(s)) for s in stages
+            )
+        infos = self.transfer_infos.get(room) or {}
+        required = next(
+            (getattr(info, "required_dst_info_num", None) for info in infos.values()), None
+        )
+        return (
+            f"{text} staging_outstanding {self._staging_outstanding.get(room, 0)}"
+            f" dst_infos {len(infos)}/{required}"
+        )
 
     def fail_room_on_timeout(
         self, bootstrap_room: int, stuck_in: str, seconds: float
@@ -2157,6 +2179,8 @@ class CommonKVManager(BaseKVManager):
 class CommonKVSender(BaseKVSender):
     # Last chunk's enqueue time; SGLANG_DISAGGREGATION_TRANSFER_TIMEOUT counts from it.
     _last_chunk_time: Optional[float] = None
+    # First release-relay poll on PP0 (SGLANG_DISAGGREGATION_TRANSFER_TIMEOUT_ANY_STATE).
+    _inflight_since: Optional[float] = None
 
     def __init__(
         self,
@@ -2407,6 +2431,10 @@ class CommonKVSender(BaseKVSender):
         return self._poll_with_status(self.kv_mgr.check_status)
 
     def poll_pp_consensus(self) -> KVPoll:
+        # Only the release relay polls this, so the first call is the room's first
+        # inflight pass on PP0: the ANY_STATE deadline counts from it without a last chunk.
+        if self._inflight_since is None:
+            self._inflight_since = time.perf_counter()
         return self._poll_with_status(self.kv_mgr.check_status_pp_consensus)
 
     def _poll_with_status(self, check_status) -> KVPoll:
@@ -2420,6 +2448,7 @@ class CommonKVSender(BaseKVSender):
         # Hold Success until all staging chunks transferred. With deferred
         # allocation also wait for worker cleanup (the zero entry is only
         # removed after cleanup), before permitting the room to be reused.
+        any_state = getattr(self.kv_mgr, "transfer_timeout_any_state", False)
         if status == KVPoll.Success and (
             self.kv_mgr._staging_outstanding.get(self.bootstrap_room, 0) > 0
             or (
@@ -2427,7 +2456,9 @@ class CommonKVSender(BaseKVSender):
                 and self.bootstrap_room in self.kv_mgr._staging_outstanding
             )
         ):
-            return KVPoll.Transferring
+            if not any_state:
+                return KVPoll.Transferring
+            status = KVPoll.Transferring
         if status == KVPoll.Bootstrapping:
             timeout_status = self._check_bootstrap_timeout()
             if timeout_status is not None:
@@ -2453,12 +2484,20 @@ class CommonKVSender(BaseKVSender):
         """SGLANG_DISAGGREGATION_TRANSFER_TIMEOUT, from the last chunk's enqueue. Under
         with the release relay this runs on PP0's consensus poll and is relayed."""
         timeout = getattr(self.kv_mgr, "transfer_timeout", 0)
-        if timeout <= 0 or self._last_chunk_time is None:
+        start = self._last_chunk_time
+        no_last_chunk = start is None and getattr(
+            self.kv_mgr, "transfer_timeout_any_state", False
+        )
+        if no_last_chunk:
+            start = self._inflight_since
+        if timeout <= 0 or start is None:
             return None
-        elapsed = time.perf_counter() - self._last_chunk_time
+        elapsed = time.perf_counter() - start
         if elapsed < timeout:
             return None
         stuck_in = _KV_POLL_NAMES.get(status, str(status))
+        if no_last_chunk:
+            stuck_in += " with no last chunk enqueued here"
         collect = getattr(self.kv_mgr.request_status, "collect", None)
         if (
             check_status == self.kv_mgr.check_status_pp_consensus

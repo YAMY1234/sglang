@@ -92,6 +92,7 @@ from sglang.srt.disaggregation.prefill import (
     PrefillBootstrapQueue,
     SchedulerDisaggregationPrefillMixin,
     maybe_release_metadata_buffer,
+    request_inflight_diag,
 )
 from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
@@ -6802,9 +6803,15 @@ def configure_scheduler_process(
     # Configure the logger
     configure_logger(server_args, prefix=prefix)
     suppress_other_loggers()
+    if envs.SGLANG_PD_INFLIGHT_DIAG.get():
+        # The event loop logs every inflight room's state at its next pass.
+        signal.signal(signal.SIGUSR2, request_inflight_diag)
+        logger.info("PD inflight diag: SIGUSR2 logs every inflight room's transfer state")
     if envs.SGLANG_FAULTHANDLER_SIGUSR2.get():
         # For a hang watcher: every thread's stack (KV transfer workers too) to stderr.
-        faulthandler.register(signal.SIGUSR2, all_threads=True)
+        faulthandler.register(
+            signal.SIGUSR2, all_threads=True, chain=envs.SGLANG_PD_INFLIGHT_DIAG.get()
+        )
         logger.info("faulthandler: SIGUSR2 dumps all thread stacks to stderr")
 
     # Set cpu affinity to this gpu process

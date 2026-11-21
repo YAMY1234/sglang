@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import threading
 import time
 from array import array
 from collections import deque
@@ -156,6 +157,14 @@ def max_bootstrap_input_len(*, capacity: int, page_size: int, shard_size: int) -
     # Strictest path, add_one_req_ignore_eos: page-rounded prompt, one page per
     # shard, 1 new token and 1 spare token must stay below capacity.
     return (capacity - shard_size * page_size - 3) // page_size * page_size
+
+
+_INFLIGHT_DIAG_REQUESTED = threading.Event()
+
+
+def request_inflight_diag(signum=None, frame=None) -> None:
+    """SGLANG_PD_INFLIGHT_DIAG's SIGUSR2 handler: log at the next inflight pass."""
+    _INFLIGHT_DIAG_REQUESTED.set()
 
 
 def maybe_release_metadata_buffer(
@@ -1194,6 +1203,9 @@ class SchedulerDisaggregationPrefillMixin:
                 self.attn_cp_cpu_group,
                 self.attn_tp_cpu_group,
             )
+        if _INFLIGHT_DIAG_REQUESTED.is_set():
+            _INFLIGHT_DIAG_REQUESTED.clear()
+            self._log_inflight_diag(polls)
 
         undone_reqs: List[Req] = []
         # Check .poll() for the reqs in disagg_prefill_inflight_queue. If Success, respond to the client and remove it from the queue
@@ -1688,6 +1700,33 @@ class SchedulerDisaggregationPrefillMixin:
             len(self.disagg_prefill_inflight_queue), held,
             self.disagg_prefill_early_send_stats.get("deferred", 0),
         )
+
+    def _log_inflight_diag(self: Scheduler, polls: List[int]) -> None:
+        """SGLANG_PD_INFLIGHT_DIAG: one line per inflight room, this stage's view."""
+        queue = self.disagg_prefill_inflight_queue
+        now = time.perf_counter()
+        logger.warning(
+            "PD inflight diag: PP%d, %d inflight rooms",
+            get_parallel().pp_rank,
+            len(queue),
+        )
+        for req, poll in zip(queue, polls):
+            sender = req.disagg_kv_sender
+            kv_mgr = getattr(sender, "kv_mgr", None)
+            last = getattr(sender, "_last_chunk_time", None)
+            logger.warning(
+                "PD inflight diag: room %s rid %s poll %s conclude %s pending_bootstrap %s "
+                "last_chunk_age %s %s",
+                req.bootstrap_room,
+                req.rid,
+                poll,
+                getattr(sender, "conclude_state", None),
+                req.pending_bootstrap,
+                "-" if last is None else f"{now - last:.1f}s",
+                kv_mgr.describe_room(req.bootstrap_room)
+                if hasattr(kv_mgr, "describe_room")
+                else "",
+            )
 
     def _apply_deferred_frees(self: Scheduler, req: Req) -> None:
         frees = getattr(req, "disagg_deferred_frees", None)
