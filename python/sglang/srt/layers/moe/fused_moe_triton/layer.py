@@ -477,6 +477,8 @@ class FusedMoE(torch.nn.Module):
         self._mega_moe_weights_built = False
         self._mega_moe_nvfp4 = False
         self._mega_moe_trtllm_layout = False
+        # (lock, {param name: localized weight}) when experts load straight into localized memory.
+        self._mega_moe_load_localized = None
         # Read at construction: draft_model_build_scope applies the draft's own value.
         self._mega_moe_w4a4 = get_exec().moe.enable_w4a4_mxfp4_megamoe
         self._pending_fp8_shared_weights: dict[tuple[int, str], torch.Tensor] = {}
@@ -1261,6 +1263,15 @@ class FusedMoE(torch.nn.Module):
             return
 
         for local_expert_id in self._weight_loader_expert_ids(param, expert_id):
+            if self._mega_moe_load_localized is not None and (
+                param is self.w13_weight or param is self.w2_weight
+            ):
+                from sglang.srt.layers.moe.mega_moe import load_localized_expert_shard
+
+                load_localized_expert_shard(
+                    self, param, loaded_weight, weight_name, shard_id, local_expert_id
+                )
+                continue
             self._weight_loader_impl(
                 param=param,
                 loaded_weight=loaded_weight,

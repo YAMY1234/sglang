@@ -18,6 +18,7 @@ from __future__ import annotations
 import functools
 import logging
 import os
+import threading
 from contextlib import contextmanager, nullcontext
 from typing import TYPE_CHECKING, NamedTuple, Optional
 
@@ -822,11 +823,18 @@ def build_mega_moe_experts_weights(experts) -> None:
     w2 = experts.w2_weight.data
     w2_sf_fp32 = _mega_moe_sf_as_fp32(experts.w2_weight_scale_inv.data)
 
-    num_groups, n1, packed_k1 = w13.shape
+    loaded_localized = experts._mega_moe_load_localized is not None
+    if loaded_localized:
+        # (E, domains, N / domains, K): already gate/up interleaved and localized
+        num_groups, d, n_d, packed_k1 = w13.shape
+        n1 = d * n_d
+    else:
+        num_groups, n1, packed_k1 = w13.shape
     # Packed E2M1 weights hold two K elements per byte; E4M3 holds one.
     k1 = packed_k1 * (1 if mma_type == "fp8xfp8" else 2)
     check_mega_moe_shapes(hidden=k1, intermediate=n1 // 2, mma_type=mma_type)
-    _, n2, packed_k2 = w2.shape
+    packed_k2 = w2.shape[-1]
+    n2 = w2.shape[-3] * w2.shape[-2] if loaded_localized else w2.shape[1]
     k2 = packed_k2 * (1 if mma_type == "fp8xfp8" else 2)
 
     w13_sf = transform_sf_into_required_layout(
@@ -856,11 +864,18 @@ def build_mega_moe_experts_weights(experts) -> None:
     w13_sf_interleaved = _interleave_mega_moe_gate_up(w13_sf, gran=gran)
     w13_sf_utccp = _transpose_mega_moe_sf_for_utccp(w13_sf_interleaved)
     w2_sf_utccp = _transpose_mega_moe_sf_for_utccp(w2_sf)
-    w13_interleaved = _interleave_mega_moe_gate_up(w13, gran=gran)
-
     localize = _is_mega_moe_localization_enabled()
-    mega_l1, mega_l2 = w13_interleaved, w2
-    if localize:
+    if loaded_localized:
+        assert gran == 8 and localize
+        _, dsts = experts._mega_moe_load_localized
+        mega_l1, mega_l2 = dsts["w13"].view(w13.dtype), dsts["w2"].view(w2.dtype)
+        w13_interleaved = w13
+        experts._mega_moe_weights_localized = True
+        experts._mega_moe_load_localized = None
+    else:
+        w13_interleaved = _interleave_mega_moe_gate_up(w13, gran=gran)
+        mega_l1, mega_l2 = w13_interleaved, w2
+    if localize and not loaded_localized:
         # The build that runs the kernel localizes: it recognizes only its own localized memory
         deep_gemm = _mega_moe_dg(mma_type)
 
@@ -953,6 +968,40 @@ def _localize_mega_moe_weight(
     return deep_gemm.localize(t)
 
 
+def _deinterleave_mega_moe_gate_up(t: torch.Tensor, gran: int = 8) -> torch.Tensor:
+    """Inverse of `_interleave_mega_moe_gate_up` for gran 8 on one expert's (N, K)."""
+    n, *rest = t.shape
+    pairs = t.reshape(n // (2 * gran), 2, gran, *rest)
+    return torch.cat([pairs[:, 0], pairs[:, 1]]).reshape(n, *rest)
+
+
+def load_localized_expert_shard(
+    experts, param, loaded_weight, weight_name: str, shard_id: str, expert_id: int
+) -> None:
+    """Load one checkpoint shard into the localized (domains, E, N / domains, K) weight,
+    gate/up interleaved, through the logical (N, K) view as vLLM's `_load_localized` does."""
+    lock, dsts = experts._mega_moe_load_localized
+    is_w13 = param is experts.w13_weight
+    dst = dsts["w13" if is_w13 else "w2"][:, expert_id]
+    with lock:  # w1 and w3 of one expert read-modify-write the same rows
+        logical = dst.flatten(0, 1)
+        if is_w13:
+            logical = _deinterleave_mega_moe_gate_up(logical)
+        tmp = torch.nn.Parameter(logical.unsqueeze(0), requires_grad=False)
+        experts._weight_loader_impl(
+            param=tmp,
+            loaded_weight=loaded_weight,
+            weight_name=weight_name,
+            shard_id=shard_id,
+            expert_id=0,
+        )
+        out = tmp.data[0]
+        if is_w13:
+            out = _interleave_mega_moe_gate_up(out.unsqueeze(0))[0]
+        dst.copy_(out.view_as(dst))
+    _log_prealloc_localized_once("loaded straight from the checkpoint shards")
+
+
 def preallocate_mega_moe_localized_weights(moe: DeepseekV2MoE) -> None:
     """Allocate the per-domain MegaMoE weights before any checkpoint loads, as vLLM's
     construction-time localization does; the post-load build copies into them."""
@@ -979,6 +1028,14 @@ def preallocate_mega_moe_localized_weights(moe: DeepseekV2MoE) -> None:
         "l2": (deep_gemm, alloc(w2.shape, w2.dtype)),
     }
     nbytes = w13.nbytes + w2.nbytes
+    if envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_LOAD_LOCALIZED.get():
+        # Checkpoint shards load into these directly (load_localized_expert_shard); the
+        # parameters hold the expert-major view, as after a post-load localize.
+        l1 = experts._mega_moe_localized_dst.pop("l1")[1]
+        l2 = experts._mega_moe_localized_dst.pop("l2")[1]
+        experts._mega_moe_load_localized = (threading.Lock(), {"w13": l1, "w2": l2})
+        experts.w13_weight.data = l1.transpose(0, 1)
+        experts.w2_weight.data = l2.transpose(0, 1)
     shared = moe.shared_experts
     if (
         shared is not None
