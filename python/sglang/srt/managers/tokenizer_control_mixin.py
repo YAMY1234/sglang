@@ -402,6 +402,8 @@ class TokenizerControlMixin:
         self: TokenizerManager,
         req: Optional[ProfileReq] = None,
     ):
+        if get_bool_env_var("ARIA_NO_PROFILE"):  # ARIA --score: no profiler on a counted run's serving path
+            raise RuntimeError("start_profile refused: profiling is off in this run (ARIA_NO_PROFILE)")
         self.auto_create_handle_loop()
         req = req or ProfileReq()
         req.req_type = ProfileReqType.START_PROFILE
