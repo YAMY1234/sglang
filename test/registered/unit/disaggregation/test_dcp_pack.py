@@ -10,6 +10,7 @@ from sglang.srt.disaggregation.base.conn import StateType
 from sglang.srt.disaggregation.common.dcp_pack import (
     dcp_pack_buffer_bytes,
     init_dcp_pack_buffers,
+    pack_dcp_row_segments,
 )
 from sglang.srt.disaggregation.common.utils import build_dcp_token_transfer_plan
 from sglang.srt.disaggregation.nixl.conn import NixlKVManager, NixlKVSender
@@ -274,6 +275,42 @@ class TestTryDcpPack(CustomTestCase):
         pack_view = copy_mock.call_args.args[2]
         self.assertEqual(pack_view.storage_offset(), pack_offset)
         self.assertEqual(pack_view.numel(), src.size * item_len)
+
+
+class TestPackDcpRowSegmentsGrid(CustomTestCase):
+    def test_one_pack_past_65535_blocks_per_layer(self):
+        """Row blocks run on grid x: a 120,000-row chunk of 576-B rows (67,500 blocks of
+        1 KiB per layer, past the old grid-y limit of 65,535) still packs in one gather."""
+        n, width = 120_000, 576
+        pack = torch.zeros(n * width, dtype=torch.uint8)
+        gather_stream = Mock()
+        buf = type(
+            "Buf",
+            (),
+            {
+                "buffer": pack,
+                "fits": lambda self, nbytes: nbytes <= pack.numel(),
+                "get_ptr": lambda self: 0x1000,
+                "get_gather_stream": lambda self: gather_stream,
+                "producer_stream": lambda self: Mock(),
+            },
+        )()
+        rows = np.arange(n, dtype=np.int64)
+        with (
+            patch("sglang.srt.disaggregation.common.dcp_pack.torch.cuda.set_device"),
+            patch(
+                "sglang.srt.disaggregation.common.dcp_pack.device_stream_context",
+                return_value=nullcontext(),
+            ),
+            patch(
+                "sglang.srt.disaggregation.common.dcp_pack.copy_mla_rows_into_pack"
+            ) as copy_mock,
+        ):
+            bases = pack_dcp_row_segments(buf, [([0x10_0000_0000], rows, [width])])
+
+        self.assertEqual(bases, [[0x1000]])
+        copy_mock.assert_called_once()
+        self.assertEqual(copy_mock.call_args.args[1].numel(), n)
 
 
 if __name__ == "__main__":

@@ -13,15 +13,17 @@ def _copy_mla_rows_into_pack_kernel(
     num_rows,
     BLOCK_SIZE: tl.constexpr,
 ):
-    layer_id = tl.program_id(0)
-    block_id = tl.program_id(1)
+    # Row blocks on grid x (limit 2**31 - 1), layers on grid y: a chunk past
+    # 65535 KiB per layer used to exceed the grid-y limit.
+    block_id = tl.program_id(0)
+    layer_id = tl.program_id(1)
     metadata_offset = layer_id * 4
     src = tl.load(src_metadata + metadata_offset).to(pack.dtype)
     row_nbytes = tl.load(src_metadata + metadata_offset + 1)
     pack_offset = tl.load(src_metadata + metadata_offset + 2)
     src_row_stride = tl.load(src_metadata + metadata_offset + 3)
 
-    offsets = block_id * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    offsets = block_id.to(tl.int64) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     layer_nbytes = num_rows * row_nbytes
     mask = offsets < layer_nbytes
     row = offsets // row_nbytes
@@ -62,7 +64,7 @@ def copy_mla_rows_into_pack(
 
     src_metadata = torch.tensor(metadata, dtype=torch.int64, device=pack.device)
     max_item_len = max(int(item_len) for item_len in token_item_lens)
-    grid = (len(kv_data_ptrs), triton.cdiv(n * max_item_len, 1024))
+    grid = (triton.cdiv(n * max_item_len, 1024), len(kv_data_ptrs))
     _copy_mla_rows_into_pack_kernel[grid](
         src_metadata,
         row_indices,

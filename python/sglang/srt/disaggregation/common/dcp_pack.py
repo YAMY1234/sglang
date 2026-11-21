@@ -95,8 +95,8 @@ def try_pack_dcp_src(
     return packed_ptrs, np.arange(n, dtype=np.int64)
 
 
-# copy_mla_rows_into_pack puts the row-dependent block count on grid.y.
-_MAX_GATHER_GRID_Y = 65535
+# copy_mla_rows_into_pack puts the row-dependent block count on grid.x.
+_MAX_GATHER_GRID_X = 2**31 - 1
 _GATHER_BLOCK_BYTES = 1024
 
 
@@ -125,7 +125,7 @@ def pack_dcp_row_segments(
         if n == 0 or not ptrs:
             plan.append((ptrs, rows, widths, offset, n))
             continue
-        if -(-n * max(widths) // _GATHER_BLOCK_BYTES) > _MAX_GATHER_GRID_Y:
+        if -(-n * max(widths) // _GATHER_BLOCK_BYTES) > _MAX_GATHER_GRID_X:
             return None
         plan.append((ptrs, rows, widths, offset, n))
         offset += n * sum(widths)
