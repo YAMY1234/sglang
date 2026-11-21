@@ -1,5 +1,6 @@
 """Unit coverage for sidecar pools in HiCache buffer-only mode."""
 
+import collections
 import unittest
 from array import array
 from pathlib import Path
@@ -10,6 +11,7 @@ from unittest.mock import MagicMock, patch
 import msgspec
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
 from sglang.srt.mem_cache.buffer_mode.pipeline import (
     BufferModePipeline,
@@ -89,6 +91,52 @@ class TestBufferModeSidecar(unittest.TestCase):
                 self.assertEqual(
                     [beliefs.contains(h) for h in chain],
                     [peer_kv_pages == -1] * len(chain),
+                )
+
+    def test_unread_query_hit_lets_host_eviction_skip_the_rewrite_unless_heal_only_invalidates(
+        self,
+    ):
+        # An L3 exists-hit nobody reads (a full miss on another pool, a cut, a
+        # decline) leaves the stored copy aging: exists() does not touch the
+        # store's LRU. If the hit renews the belief, the recomputed node's host
+        # eviction counts as clean and skips the write that would have refreshed
+        # the copy; the copy then expires and the next return misses it.
+        operation = PrefetchOperation(CacheRequestHandle("unread", 0), list(range(4)))
+        operation.storage_hit_count = 4
+        operation.query_pool_hit_pages = {PoolName.KV: 2}
+        chain = operation.all_hash_values
+        for invalidate_only, written in ((False, False), (True, True)):
+            with self.subTest(invalidate_only=invalidate_only):
+                cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
+                cache.page_size, cache.components = 2, {}
+                cache.storage_existence_cache = StorageExistenceCache()
+                with envs.SGLANG_HICACHE_L3_QUERY_HEAL_INVALIDATE_ONLY.override(
+                    invalidate_only
+                ):
+                    cache._invalidate_absent_from_hit_query(operation)
+                # The write-behind walk over the host LRU tail holding that node.
+                cache._write_behind_step, cache._l3_belief_ttl_s = 0, 0.0
+                cache._l3_wb_walk_every, cache._l3_mamba_leaf_reserve = 1, 0
+                cache._l3_evict_write_reserve_fraction = 0.5
+                cache._write_behind_inflight, cache._write_behind_clean_tokens = {}, 0
+                cache._l3_tier_stats = collections.Counter()
+                cache._l3_last_write_has_state = False
+                cache.cache_controller = SimpleNamespace(
+                    mem_pool_host=SimpleNamespace(size=16, available_size=lambda: 0)
+                )
+                cache.tree_core = SimpleNamespace(
+                    peek_host_eviction_candidates=lambda *_: [(7, 4, chain)],
+                    build_storage_backup_spec=lambda *_: SimpleNamespace(
+                        hash_value=chain, host_value=None, comp_xfers={}
+                    ),
+                )
+                cache.hicache_storage_pass_prefix_keys = False
+                cache._build_sidecar_transfers = lambda *_: []
+                cache.write_backup_storage = MagicMock(return_value=11)
+                cache._write_behind_host_tail()
+                self.assertEqual(cache.write_backup_storage.called, written)
+                self.assertEqual(
+                    cache._l3_tier_stats["wb_clean_tokens"], 0 if written else 4
                 )
 
     @staticmethod

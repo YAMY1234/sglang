@@ -4184,10 +4184,12 @@ class UnifiedRadixCache(BasePrefixCache):
         if PoolName.KV not in verdicts:
             return
         folded_pages = operation.storage_hit_count // self.page_size
+        # A hit verdict teaches presence unless only acks and reads may.
+        teach = not envs.SGLANG_HICACHE_L3_QUERY_HEAL_INVALIDATE_ONLY.get()
 
         def verdict(pool: PoolName) -> tuple[int, bool]:
             pages = verdicts.get(pool)
-            return (folded_pages, False) if pages is None else (pages, True)
+            return (folded_pages, False) if pages is None else (pages, teach)
 
         kv_pages, kv_evidence = verdict(PoolName.KV)
         self._belief_policy(PoolName.KV, PoolHitPolicy.ALL_PAGES).heal_from_query(
