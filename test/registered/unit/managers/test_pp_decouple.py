@@ -48,7 +48,7 @@ register_cpu_ci(est_time=8, suite="base-a-test-cpu")
 
 
 class _Payload:
-    pass
+    is_cpu = False
 
 
 class _FakeWork:
@@ -288,6 +288,23 @@ class TestPPCEPush(CustomTestCase):
         s._pp_wait_forward_dependencies()
         s._pp_ce_release_input()
         self.assertEqual(log[1:], [("release", "forward", (1, 7))])
+
+    def test_a_fallback_send_after_a_pushed_input_waits_each_gloo_send_once(self):
+        """A stage whose input came by push and whose output does not fit a slot sends it over
+        NCCL, with the metadata over gloo. The release fences only the NCCL send; the gloo sends
+        stay in the send window, which waits them once (a second wait never returns)."""
+        log = []
+        s = self._scheduler(False, log)
+        s._pp_wait_forward_dependencies()
+        host = [_CountedWork() for _ in range(2)]
+        sent = [parallel_state.P2PWork(w, torch.zeros(1)) for w in host] + _round("nccl", log, n=1)
+        s._pp_ce_release_input(nccl_send_work=sent)
+        self.assertEqual(
+            log[1:], ["nccl.0", ("push_wait", "comm-tail"), ("release", "push", (1, 7))]
+        )
+        window = PPSendWindow(0)
+        window.push(sent)
+        self.assertEqual([w.waits for w in host], [1, 1])
 
 
 class _StageModel:

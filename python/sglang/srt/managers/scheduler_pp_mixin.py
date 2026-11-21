@@ -1151,10 +1151,13 @@ class SchedulerPPMixin:
         else:
             stream = self._pp_ce.stream
             if nccl_send_work is not None:
-                # An NCCL fallback send reads on NCCL's stream: fence the release behind it.
+                # An NCCL fallback send reads on NCCL's stream: fence the release behind it. Its gloo
+                # sends read no device memory and are left to the send window, which waits each once:
+                # a second wait of a gloo send never returns.
                 with self.pp_comm_stream_ctx:
                     for work in nccl_send_work:
-                        work.work.wait()
+                        if not work.payload.is_cpu:
+                            work.work.wait()
                     stream.wait_event(self._pp_record_comm_event())
         self._pp_ce.release(stream, self._pp_ce_in_use)
         self._pp_ce_in_use = None
