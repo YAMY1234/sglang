@@ -904,6 +904,8 @@ class Envs:
     SGLANG_PP_PARTITION_AUTO = EnvBool(False)
     SGLANG_PP_PARTITION_AUTO_SPEED = EnvTuple(tuple())
     SGLANG_PP_PARTITION_AUTO_BURN_S = EnvFloat(20.0)
+    # Stretch of the burn's speed spread around 1 to match serving (fitted on rig node pairs).
+    SGLANG_PP_PARTITION_AUTO_BURN_SCALE = EnvFloat(1.0)
     # Fraction of the reference split's KV token capacity the chosen split must keep (capacity is the stage minimum).
     SGLANG_PP_PARTITION_AUTO_KV_FLOOR = EnvFloat(1.0)
     # JSON StageCostModel (per-layer costs and memory); empty = the built-in Kimi-K3.1 prefill model.
