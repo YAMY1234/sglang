@@ -1763,6 +1763,8 @@ class PrefillAdder:
                         max_new_tokens,
                         is_chunked,
                         self._replay_len(req, prefix_len),
+                        # A split leaves chunk budget; commit must still close the batch.
+                        admission.branch_split and is_chunked,
                     )
                 elif req.host_loaded_length < promised_host_hit:
                     # No FULL was loaded; recomputation may no longer fit.
@@ -1859,6 +1861,9 @@ class PrefillAdder:
                 and get_schedule().schedule_policy == "shortest-prefill-first"
             ):
                 # Only one unfinished chunked request can be tracked.
+                return AddReqResult.OTHER
+            if self.new_chunked_req is not None:
+                # A second one would replace it, and the first would run as finished.
                 return AddReqResult.OTHER
             if self.exact_chunk_fill:
                 # Take the remainder verbatim so the batch hits exactly

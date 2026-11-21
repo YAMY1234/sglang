@@ -275,6 +275,47 @@ class TestPrefillAdder(CustomTestCase):
                 self.assertEqual(waiting.extend_end, end)
                 self.assertIs(adder.new_chunked_req, waiting if chunked else None)
 
+    def test_branch_split_over_delivered_load_back_closes_the_batch(self):
+        """A branch-split request whose HiCache load-back delivers more than promised
+        stays the batch's only chunked request. Otherwise a later long request became
+        the chunked one, and the split request ran as finished with a partial input:
+        its PD last-chunk send stopped short of num_kv_indices and never concluded."""
+        PAGE, HOST_HIT, LOADED = 64, 4096, 4160
+        adder = self._create_delayer_adder(
+            available_tokens=100_000,
+            delayer=None,
+            page_size=PAGE,
+            rem_chunk_tokens=16384,
+        )
+        split = self._create_host_hit_req(host_hit=HOST_HIT, tail=6144)
+        split.mamba_branching_seqlen = 8192
+        self.mock_tree_cache.init_load_back.side_effect = lambda params: (
+            LOADED,
+            split.last_node,
+        )
+        long = self._create_delayer_req(32768, rid="long")
+        admitted = []
+        with (
+            envs.SGLANG_MAMBA_BRANCH_TRACK_SPLIT.override(True),
+            get_context().override_server_args(_mamba_cache_chunk_size=PAGE),
+        ):
+            for req in (split, long):
+                if adder.budget_state() == AddReqResult.OTHER:
+                    break
+                res = adder.add_one_req(req, False, None)
+                admitted = list(adder.can_run_list)
+                if res != AddReqResult.CONTINUE:
+                    break
+        self.assertEqual((split.prefix_len, split.extend_end), (LOADED, LOADED + 4096))
+        self.assertEqual(admitted, [split])
+        self.assertIs(adder.new_chunked_req, split)
+        self.assertEqual(adder.rem_chunk_tokens, 0)
+        # Whatever chunk budget is left, a batch never takes a second chunked request.
+        adder.rem_chunk_tokens = 12288
+        self.assertIs(adder.add_one_req(long, False, None), AddReqResult.OTHER)
+        self.assertEqual(adder.can_run_list, [split])
+        self.assertIs(adder.new_chunked_req, split)
+
     def test_shortest_prefill_rejects_second_unfinished_chunk(self):
         adder = self.create_shortest_prefill_adder(chunk_tokens=512)
         req = self.create_shared_req("second-chunk")
