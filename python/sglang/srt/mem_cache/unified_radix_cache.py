@@ -731,6 +731,9 @@ class UnifiedRadixCache(BasePrefixCache):
         self._l3_saved_token_threshold = (
             envs.SGLANG_HICACHE_L3_SAVED_TOKEN_THRESHOLD.get()
         )
+        self._inflight_admission_waits = max(
+            0, envs.SGLANG_HICACHE_L3_INFLIGHT_ADMISSION_WAITS.get()
+        )
         self._l3_wb_ack_credit = envs.SGLANG_HICACHE_L3_WB_ACK_CREDIT.get()
         self._l3_wb_walk_every = max(1, envs.SGLANG_HICACHE_L3_WB_WALK_EVERY.get())
         self._init_ack_lag()
@@ -3481,6 +3484,34 @@ class UnifiedRadixCache(BasePrefixCache):
             or (wait.timer.running and wait.timer.elapsed() > wait.timeout_s)
         )
 
+    def _hold_inflight_hybrid_prefetch(self, operation: PrefetchOperation) -> bool:
+        """SGLANG_HICACHE_L3_INFLIGHT_ADMISSION_WAITS: under best_effort, a read that is
+        all-or-nothing (it carries a Mamba / SWA transfer) and already has its host
+        staging (IO in flight) gets that many admission polls to finish; cutting it at
+        the first poll discards the whole read. Rank-replicated: the staging is allocated
+        and the completion committed in the synced drains, and admission polls run in
+        lockstep. The cut after the last poll is a policy deadline, not absent data."""
+        waits = getattr(self, "_inflight_admission_waits", 0)
+        if (
+            not waits
+            or self.prefetch_stop_policy != "best_effort"
+            or operation.host_indices is None
+            or not any(
+                t.indices_from_pool != PoolName.KV for t in operation.pool_transfers or ()
+            )
+        ):
+            return False
+        held = getattr(operation, "admission_waits", 0)
+        if held >= waits:
+            self._mark_prefetch_deadline_expired(operation)
+            return False
+        operation.admission_waits = held + 1
+        stats = self._prefetch_outcome_stats
+        stats["inflight_admission_waits"] = stats.get("inflight_admission_waits", 0) + 1
+        if held == 0:
+            stats["inflight_admission_held"] = stats.get("inflight_admission_held", 0) + 1
+        return True
+
     def _mark_prefetch_deadline_expired(self, operation: PrefetchOperation) -> None:
         operation.deadline_expired = True
         self.storage_prefetch_retries.cancel(operation.handle.rid)
@@ -3616,6 +3647,8 @@ class UnifiedRadixCache(BasePrefixCache):
 
         operation = self.ongoing_prefetch[request].operation
 
+        if self._hold_inflight_hybrid_prefetch(operation):
+            return False
         if not operation.is_terminated():
             if not self._can_terminate_prefetch(operation):
                 self._start_storage_prefetch_wait(operation)

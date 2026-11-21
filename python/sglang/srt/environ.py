@@ -1084,6 +1084,9 @@ class Envs:
     SGLANG_HICACHE_L3_SAVED_TOKEN_THRESHOLD = EnvBool(False)
     # Recover checkpoints inside the resident KV span, beyond the deepest live state.
     SGLANG_HICACHE_L3_READ_WITHIN_TREE_KV = EnvBool(False)
+    # best_effort: admission polls an all-or-nothing (Mamba-carrying) storage read already
+    # staged in host memory may wait for it to finish before cutting (and discarding) it; 0 = off.
+    SGLANG_HICACHE_L3_INFLIGHT_ADMISSION_WAITS = EnvInt(0)
     # Keyed PP0 lifetime evidence; the output directory must be explicitly provided.
     SGLANG_HICACHE_L3_LIFETIME_LEDGER = EnvBool(False)
     SGLANG_HICACHE_L3_LIFETIME_LEDGER_DIR = EnvStr(None)
