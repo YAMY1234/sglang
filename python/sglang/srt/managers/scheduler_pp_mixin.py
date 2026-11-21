@@ -801,7 +801,7 @@ class SchedulerPPMixin:
                 pp_group=self.pp_group,
                 device_id=self.device_module.current_device(),
                 slots=max(2, tensor_bound),
-                slot_bytes=envs.SGLANG_PP_CE_PUSH_SLOT_MB.get() << 20,
+                slot_mb=[int(mb) for mb in envs.SGLANG_PP_CE_PUSH_SLOT_MB.get()],
             )
         pp_rank = get_parallel().pp_rank
         # Proxy and output dicts from the previous stage (PP0: outputs from the last);
@@ -859,16 +859,17 @@ class SchedulerPPMixin:
         """Per-interval proof the decoupled path runs: peak un-waited send rounds per
         channel, and inbox pops that found their message already received."""
         inboxes = {"dict": self._pp_dict_inbox, "relay": pp_decouple.relay_inbox()}
-        return {
-            "decouple": {
-                "win_peak": self.pp_send_windows.take_peaks(),
-                "inbox_pops_ready": {
-                    name: inbox.take_counts()
-                    for name, inbox in inboxes.items()
-                    if inbox is not None
-                },
-            }
+        stats = {
+            "win_peak": self.pp_send_windows.take_peaks(),
+            "inbox_pops_ready": {
+                name: inbox.take_counts()
+                for name, inbox in inboxes.items()
+                if inbox is not None
+            },
         }
+        if self._pp_ce is not None:
+            stats["ce_push"] = self._pp_ce.take_stats()
+        return {"decouple": stats}
 
     def _pp_overlap_input_wait(self: Scheduler, inbox: Optional[PPRecvInbox]) -> None:
         """While the next input is still upstream, send the early KV chunks whose
