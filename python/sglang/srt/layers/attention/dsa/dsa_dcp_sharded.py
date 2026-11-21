@@ -27,7 +27,9 @@ resolve by global position at both steps. With 8 or 16 ranks and multicast,
 decode rows instead merge in one kernel (``DcpTopKMerge``).
 """
 
+from collections import OrderedDict
 from functools import partial
+from itertools import accumulate
 from typing import Callable, Optional
 
 import torch
@@ -35,12 +37,16 @@ import triton
 import triton.language as tl
 
 from sglang.kernels.ops.attention.dcp_kernels import _gather_candidate_prefix_kernel
+from sglang.kernels.ops.attention.dsa import k31ht_select as _k31ht_select
 from sglang.kernels.ops.attention.dsa.dcp_topk_merge import (
+    DCP_TOPK_MERGE_NUM_STATS,
     dcp_topk_merge,
     dcp_topk_merge_buffer_numel,
+    dcp_topk_merge_pushed,
 )
 from sglang.kernels.ops.attention.dsv4.topk import (
     candidates_cluster_size,
+    topk_transform_candidates_dcp_push,
     topk_transform_candidates_v2,
     topk_transform_packed_v2,
     topk_transform_paged_v2,
@@ -49,6 +55,7 @@ from sglang.srt.distributed.device_communicators.custom_all_reduce_utils import 
     is_one_nvlink_clique,
 )
 from sglang.srt.distributed.parallel_state import in_the_same_node_as
+from sglang.srt.environ import envs
 from sglang.srt.kernel_plugins.nvidia.binding import megakernel_enabled
 from sglang.srt.layers.dcp.comm import all_gather_kv_cache_for_dcp
 from sglang.srt.runtime_context import get_parallel, get_platform
@@ -179,31 +186,56 @@ _CANDIDATE_CLUSTER_FLOOR = 16384
 # workloads (32K and 100K contexts, all 24 DSA layers), a rank held at most 339
 # of a row's global top-2048 keys under DCP8, so 384 needs no fallback there.
 _DCP_MERGE_CAND_K = 384
+# DCP4 (push mode only): 768 keeps the union at 3072 >= 2048 keys, as 8 x 384,
+# so no rank can certify fewer than the global top-2048 it holds.
+_DCP_MERGE_CAND_K_BY_WORLD = {4: 768}
 
 
 class DcpTopKMerge:
     """Exact global top-k merge of decode rows in one kernel; see
     jit/csrc/dsa/dcp_topk_merge.cuh. Needs 8 or 16 ranks (one warp each), top-k
     2048 and multicast; ``usable`` is False otherwise. ``split``: candidates come
-    from the context-split verify indexer."""
+    from the context-split verify indexer. ``push`` (token interleave only): the
+    local top-k selects only the candidates and pushes them (``merge_pushed``)."""
 
-    def __init__(self, group, max_rows: int, topk: int, split: bool = False):
+    cand_k = _DCP_MERGE_CAND_K
+
+    def __init__(
+        self,
+        group,
+        max_rows: int,
+        topk: int,
+        split: bool = False,
+        push: bool = False,
+    ):
         import torch.distributed._symmetric_memory as symm_mem
 
         self.rank = group.rank_in_group
+        self.world = group.world_size
         self.max_rows = max_rows
         self.split = split
+        self.push = push and not split
         self.buffer: Optional[torch.Tensor] = None
         self.multicast_ptr = 0
         self.peer_ptrs: Optional[torch.Tensor] = None
         self.counters: Optional[torch.Tensor] = None
         # 1 where a row's candidates could not certify the result (for tests)
         self.fallback: Optional[torch.Tensor] = None
+        # running totals of the kernels (DCP_TOPK_MERGE_NUM_STATS), reported by
+        # log_line from a copy one report old, so reading them never syncs
+        self.stats: Optional[torch.Tensor] = None
+        self._stats_host: Optional[torch.Tensor] = None
+        self._stats_copied: Optional[torch.cuda.Event] = None
+        self._stats_reported = [0] * DCP_TOPK_MERGE_NUM_STATS
+        self._report_index = 0
         self.union_scratch: Optional[torch.Tensor] = None
 
         world = group.world_size
         # 16 ranks only on megakernel paths; stock DCP16 keeps the all-gather.
         worlds = (8, 16) if split or megakernel_enabled() else (8,)
+        if self.push:
+            worlds += (4,)
+        self.cand_k = _DCP_MERGE_CAND_K_BY_WORLD.get(world, _DCP_MERGE_CAND_K)
         if world not in worlds or topk != 2048:
             print_info_once(
                 "DSA DCP top-k merge off: it needs 8 or 16 ranks and top-k 2048"
@@ -216,7 +248,7 @@ class DcpTopKMerge:
         ):
             return
         buffer = symm_mem.empty(
-            dcp_topk_merge_buffer_numel(world, max_rows, topk, _DCP_MERGE_CAND_K),
+            dcp_topk_merge_buffer_numel(world, max_rows, topk, self.cand_k),
             dtype=torch.int64,
             device=group.device,
         )
@@ -235,6 +267,18 @@ class DcpTopKMerge:
         )
         self.counters = torch.zeros(max_rows, dtype=torch.int64, device=group.device)
         self.fallback = torch.zeros(max_rows, dtype=torch.int32, device=group.device)
+        self.stats = torch.zeros(
+            DCP_TOPK_MERGE_NUM_STATS, dtype=torch.int64, device=group.device
+        )
+        self._stats_host = torch.zeros_like(self.stats, device="cpu").pin_memory()
+        if self.push:
+            # the pushed merge's fallback reads the failed ranks' slots directly
+            print_info_once(
+                f"DSA DCP top-k merge: the local top-k pushes its best "
+                f"{self.cand_k} keys per row to the merge, no local "
+                f"top-{topk} (SGLANG_DSA_DCP_TOPK_PUSH)"
+            )
+            return
         self.union_scratch = torch.empty(
             (max_rows, world * topk), dtype=torch.int64, device=group.device
         )
@@ -263,12 +307,92 @@ class DcpTopKMerge:
             out_fallback=self.fallback[: out.shape[0]],
             rank=self.rank,
             span=span,
-            cand_k=_DCP_MERGE_CAND_K,
+            cand_k=self.cand_k,
             split=self.split,
+            stats=self.stats,
         )
+
+    def merge_pushed(
+        self,
+        logits: torch.Tensor,
+        local_lens: torch.Tensor,
+        global_lens: torch.Tensor,
+        page_table: torch.Tensor,
+        out: torch.Tensor,
+        span: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Push mode: this rank's top-``cand_k`` candidates straight
+        into every rank's buffer, then the merge. Fills ``out`` (as ``__call__``)
+        and returns the same keys localized, as ``dcp_localize_compact(out)``."""
+        rows = out.shape[0]
+        topk_transform_candidates_dcp_push(
+            logits,
+            local_lens,
+            push_mc=self.multicast_ptr,
+            counters=self.counters,
+            world=self.world,
+            rank=self.rank,
+            cand_k=self.cand_k,
+            slot=self.world * self.cand_k + out.shape[1],
+            cluster_size=candidates_cluster_size(rows),
+            cluster_floor=_CANDIDATE_CLUSTER_FLOOR,
+        )
+        local = torch.empty_like(out)
+        lengths = torch.empty(rows, dtype=torch.int32, device=out.device)
+        dcp_topk_merge_pushed(
+            logits,
+            local_lens,
+            global_lens,
+            page_table,
+            buffer=self.buffer,
+            peer_ptrs=self.peer_ptrs,
+            counters=self.counters,
+            out_slots=out,
+            out_local=local,
+            out_lengths=lengths,
+            out_fallback=self.fallback[:rows],
+            rank=self.rank,
+            span=span,
+            cand_k=self.cand_k,
+            stats=self.stats,
+        )
+        return local, lengths
+
+    def log_line(self, decode_step: int) -> Optional[str]:
+        """Fallback counts since the previous line, every
+        SGLANG_DSA_DCP_TOPK_MERGE_LOG_INTERVAL decode steps (0: never)."""
+        interval = envs.SGLANG_DSA_DCP_TOPK_MERGE_LOG_INTERVAL.get()
+        if self.stats is None or interval <= 0 or decode_step // interval == self._report_index:
+            return None
+        self._report_index = decode_step // interval
+        line = None
+        if self._stats_copied is not None and self._stats_copied.query():
+            now = self._stats_host.tolist()
+            fallback, published, selected, rows = (
+                a - b for a, b in zip(now, self._stats_reported)
+            )
+            self._stats_reported = now
+            line = (
+                f"DSA DCP top-k merge (DCP{self.world}, {self.cand_k} candidates): "
+                f"certificate failed on {fallback} of {rows} merged rows "
+                f"({100 * fallback / max(rows, 1):.4f}%); this rank published "
+                f"{published} of them, {selected} needing a top-k select"
+            )
+        self._stats_host.copy_(self.stats, non_blocking=True)
+        self._stats_copied = torch.cuda.Event()
+        self._stats_copied.record()
+        return line
 
 
 _TOPK_MERGE: Optional[DcpTopKMerge] = None
+
+
+def topk_merge_log_line(decode_step: int) -> Optional[str]:
+    return None if _TOPK_MERGE is None else _TOPK_MERGE.log_line(decode_step)
+
+# (slots, localized rows, counts) of the last pushed merge: dcp_localize_compact
+# returns the last two for that very slots tensor instead of recomputing them
+_PUSHED_LOCALIZED: Optional[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None
 
 
 def init_dcp_topk_merge(max_rows: int, topk: int) -> None:
@@ -284,7 +408,9 @@ def init_dcp_topk_merge(max_rows: int, topk: int) -> None:
         parallel.attn_dcp_size,
         parallel.attn_dcp_rank,
     )
-    _TOPK_MERGE = DcpTopKMerge(group, max_rows, topk)
+    _TOPK_MERGE = DcpTopKMerge(
+        group, max_rows, topk, push=envs.SGLANG_DSA_DCP_TOPK_PUSH.get()
+    )
 
 
 def _zeros_i32(n: int, device: torch.device) -> torch.Tensor:
@@ -379,6 +505,8 @@ def _localize_compact_kernel(
 def dcp_localize_compact(slots: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """Global top-k slots [rows, topk] -> (this rank's rows compacted to the
     front, -1 after; [rows] counts) for FlashMLA's ``topk_length``."""
+    if _PUSHED_LOCALIZED is not None and _PUSHED_LOCALIZED[0] is slots:
+        return _PUSHED_LOCALIZED[1], _PUSHED_LOCALIZED[2]
     parallel = get_parallel()
     rows, topk = slots.shape
     out = torch.empty_like(slots)
@@ -410,6 +538,10 @@ def _local_candidates(
     if logits.shape[1] == 0:
         out[..., 1] = -1
         return out
+    if _k31ht_select.ENABLED:  # K31HT_DSA_SELECT=gvrm (default off): same value-exact set, not tie-stable
+        return _k31ht_select.local_candidates(
+            logits, local_lens, out, parallel.attn_dcp_size, parallel.attn_dcp_rank, topk
+        )
     # v2 ragged top-k with the candidate epilogue: local positions ascend
     # with global ones, so its tie order matches the merge's
     topk_transform_candidates_v2(
@@ -461,6 +593,13 @@ def dcp_global_topk(
     if rows == 0:
         return out
     if all_gather is None and _TOPK_MERGE is not None and _TOPK_MERGE.usable(rows):
+        if _TOPK_MERGE.push:
+            global _PUSHED_LOCALIZED
+            local, lengths = _TOPK_MERGE.merge_pushed(
+                logits, local_lens, global_lens, page_table, out, span
+            )
+            _PUSHED_LOCALIZED = (out, local, lengths)
+            return out
         candidates = _local_candidates(logits, local_lens, topk)
         _TOPK_MERGE(candidates, global_lens, page_table, out, span)
         return out
@@ -551,3 +690,199 @@ def dcp_gather_request_rows(
     top-k indices).
     """
     return all_gather_kv_cache_for_dcp(local_rows, local_rows[:, :0], seq_lens_cpu)
+
+
+# Fused prefill gather (SGLANG_DSA_DCP_PREFILL_FUSED_GATHER): one gather kernel
+# packs this rank's rows straight from their source into the all-gather send
+# buffer, and one writes the request-ordered result from the rank-major receive
+# buffer. It replaces dcp_gather_request_rows' cat / per-request pad copies,
+# the transpose reorder, the per-request cat, and the caller's pad or split.
+@triton.jit
+def _gather_rows_kernel(
+    src,
+    src_pitch,
+    idx,
+    idx2,
+    dst,
+    dst_pitch,
+    n_rows,
+    n_idx,
+    WIDTH: tl.constexpr,
+    HAS_IDX2: tl.constexpr,
+    BLOCK_R: tl.constexpr,
+    BLOCK_W: tl.constexpr,
+):
+    # dst[row, :WIDTH] = src[idx2[idx[row]] if HAS_IDX2 else idx[row], :WIDTH];
+    # rows past n_idx or with a negative index become zeros. Pointers and
+    # pitches are in 32-bit words.
+    rows = tl.program_id(0) * BLOCK_R + tl.arange(0, BLOCK_R)
+    in_range = rows < n_rows
+    src_rows = tl.load(idx + rows, mask=rows < n_idx, other=-1).to(tl.int64)
+    if HAS_IDX2:
+        src_rows = tl.load(idx2 + src_rows, mask=src_rows >= 0, other=-1).to(tl.int64)
+    valid = src_rows >= 0
+    src_base = src + src_rows * src_pitch
+    dst_base = dst + rows.to(tl.int64) * dst_pitch
+    for col in tl.static_range(0, WIDTH, BLOCK_W):
+        cols = col + tl.arange(0, BLOCK_W)
+        col_ok = cols < WIDTH
+        value = tl.load(
+            src_base[:, None] + cols[None, :],
+            mask=valid[:, None] & col_ok[None, :],
+            other=0,
+        )
+        tl.store(
+            dst_base[:, None] + cols[None, :],
+            value,
+            mask=in_range[:, None] & col_ok[None, :],
+        )
+
+
+def _gather_rows(
+    src: torch.Tensor,
+    idx: torch.Tensor,
+    dst: torch.Tensor,
+    idx2: Optional[torch.Tensor] = None,
+) -> None:
+    """``dst[i] = src[idx2[idx[i]]]`` (or ``src[idx[i]]``) for 2D int32 views
+    whose rows may be strided; rows past ``idx`` or with a negative index
+    become zeros."""
+    rows, width = dst.shape
+    if rows == 0:
+        return
+    assert src.dtype == dst.dtype == torch.int32 and src.shape[1] == width
+    assert src.stride(1) == 1 and dst.stride(1) == 1 and idx.numel() <= rows
+    block_w = min(triton.next_power_of_2(width), 64)
+    block_r = max(1, 2048 // block_w)
+    _gather_rows_kernel[(triton.cdiv(rows, block_r),)](
+        src,
+        src.stride(0),
+        idx,
+        idx if idx2 is None else idx2,
+        dst,
+        dst.stride(0),
+        rows,
+        idx.numel(),
+        WIDTH=width,
+        HAS_IDX2=idx2 is not None,
+        BLOCK_R=block_r,
+        BLOCK_W=block_w,
+        num_warps=4,
+    )
+
+
+class DcpRowGatherPlan:
+    """Row maps of a fused DCP prefill gather; they depend only on the request
+    lengths and the group, so a forward's layers (KV and index-K) share one.
+
+    Global position p of a request lives on rank p % N at local position
+    p // N. Rank r sends ceil(len / N) rows per request (its rows, then zero
+    padding), so the all-gather output is [N, rows_per_rank] rank-major.
+    """
+
+    def __init__(
+        self,
+        seq_lens: list[int],
+        world: int,
+        rank: int,
+        device: torch.device,
+    ):
+        padded = [(n + world - 1) // world for n in seq_lens]
+        local = [max(0, (n - rank + world - 1) // world) for n in seq_lens]
+        p_starts = [0, *accumulate(padded)]
+        l_starts = [0, *accumulate(local)]
+        s_starts = [0, *accumulate(seq_lens)]
+        self.rows_per_rank = p_starts[-1]
+        self.num_local = l_starts[-1]
+        self.total = s_starts[-1]
+        table = torch.tensor(
+            [padded, local, p_starts[:-1], l_starts[:-1], s_starts[:-1], seq_lens],
+            dtype=torch.int64,
+            pin_memory=device.type == "cuda",
+        ).to(device, non_blocking=True)
+        padded_t, local_t, p_t, l_t, s_t, lens_t = table.unbind(0)
+        reqs = torch.arange(len(seq_lens), device=device)
+
+        # send row -> this rank's local row (or -1 for padding)
+        req = torch.repeat_interleave(reqs, padded_t, output_size=self.rows_per_rank)
+        j = torch.arange(self.rows_per_rank, device=device) - p_t[req]
+        self.send_local = torch.where(j < local_t[req], l_t[req] + j, -1).to(
+            torch.int32
+        )
+        # output row -> all-gather row
+        req = torch.repeat_interleave(reqs, lens_t, output_size=self.total)
+        p = torch.arange(self.total, device=device) - s_t[req]
+        self.out_src = (
+            (p % world) * self.rows_per_rank + p_t[req] + p // world
+        ).to(torch.int32)
+
+
+_ROW_GATHER_PLANS: "OrderedDict[tuple, DcpRowGatherPlan]" = OrderedDict()
+
+
+def dcp_row_gather_plan(
+    seq_lens_cpu: torch.Tensor, device: torch.device
+) -> DcpRowGatherPlan:
+    parallel = get_parallel()
+    key = (
+        tuple(seq_lens_cpu.tolist()),
+        parallel.dcp_size,
+        parallel.dcp_rank,
+        device,
+    )
+    plan = _ROW_GATHER_PLANS.get(key)
+    if plan is None:
+        plan = DcpRowGatherPlan(list(key[0]), *key[1:])
+        _ROW_GATHER_PLANS[key] = plan
+        while len(_ROW_GATHER_PLANS) > 4:
+            _ROW_GATHER_PLANS.popitem(last=False)
+    return plan
+
+
+def dcp_fused_gather_supported(*widths_bytes: int) -> bool:
+    return (
+        envs.SGLANG_DSA_DCP_PREFILL_FUSED_GATHER.get()
+        and all(w % 4 == 0 for w in widths_bytes)
+        and not torch.cuda.is_current_stream_capturing()
+    )
+
+
+def dcp_fused_gather_rows(
+    sources: list[tuple[torch.Tensor, Optional[torch.Tensor]]],
+    plan: DcpRowGatherPlan,
+    outputs: list[torch.Tensor],
+) -> None:
+    """Prefill: ``dcp_gather_request_rows`` without its pack / reorder copies.
+
+    ``sources``: (rows, index) pairs, each [*, W_i] byte rows of this rank; the
+    send row of local row l is ``rows[index[l]]`` (``rows[l]`` without an
+    index). ``outputs``: [>= plan.total, W_i] byte tensors that receive the
+    request-ordered rows (zeros past plan.total).
+    """
+    print_info_once(
+        "DSA DCP prefill: fused KV / index-K gather "
+        "(SGLANG_DSA_DCP_PREFILL_FUSED_GATHER)"
+    )
+    parallel = get_parallel()
+    device = outputs[0].device
+    widths = [out.shape[1] // 4 for out in outputs]
+    width = sum(widths)
+    send = torch.empty((plan.rows_per_rank, width), dtype=torch.int32, device=device)
+    col = 0
+    for (rows, index), w in zip(sources, widths):
+        _gather_rows(
+            rows.view(torch.int32), plan.send_local, send[:, col : col + w], index
+        )
+        col += w
+    recv = torch.empty(
+        (parallel.dcp_size * plan.rows_per_rank, width),
+        dtype=torch.int32,
+        device=device,
+    )
+    parallel.dcp_group.all_gather_into_tensor(
+        recv.view(torch.uint8), send.view(torch.uint8)
+    )
+    col = 0
+    for out, w in zip(outputs, widths):
+        _gather_rows(recv[:, col : col + w], plan.out_src, out.view(torch.int32))
+        col += w
