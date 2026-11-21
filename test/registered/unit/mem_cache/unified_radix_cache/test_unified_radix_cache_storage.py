@@ -2487,6 +2487,7 @@ class TestPrefetchCommitOrdering(CustomTestCase):
         cache.cache_controller.prefetch_tokens_occupied = 100
         cache.prefetch_loaded_tokens_by_reqid = {}
         cache._can_terminate_prefetch.return_value = True
+        cache._hold_inflight_hybrid_prefetch.return_value = False
         cache.pp_rank = 0
 
         order = mock.MagicMock()
@@ -2517,6 +2518,57 @@ class TestPrefetchCommitOrdering(CustomTestCase):
             order.commit.call_args.kwargs["cache_actions"], insert_result.cache_actions
         )
         self.assertEqual(cache.ongoing_prefetch, {})
+
+
+class TestInflightAdmissionWait(CustomTestCase):
+    """SGLANG_HICACHE_L3_INFLIGHT_ADMISSION_WAITS under best_effort (mock-based)."""
+
+    def _cache(self, waits, policy="best_effort"):
+        cache = mock.MagicMock()
+        cache._inflight_admission_waits = waits
+        cache.prefetch_stop_policy = policy
+        cache._prefetch_outcome_stats = {}
+        cache._storage_prefetch_wait = {}
+        cache._mark_prefetch_deadline_expired = (
+            lambda op: UnifiedRadixCache._mark_prefetch_deadline_expired(cache, op)
+        )
+        return cache
+
+    @staticmethod
+    def _operation(transfers, staged=True):
+        from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
+            PrefetchOperation,
+        )
+
+        operation = PrefetchOperation(
+            CacheRequestHandle("req", 0), list(range(128)), pool_transfers=transfers
+        )
+        operation.host_indices = torch.arange(128) if staged else None
+        return operation
+
+    def test_staged_hybrid_read_waits_then_cuts_as_a_deadline(self):
+        cache = self._cache(waits=2)
+        operation = self._operation([PoolTransfer(name=PoolName.MAMBA, keys=["s"])])
+        hold = UnifiedRadixCache._hold_inflight_hybrid_prefetch
+        self.assertEqual([hold(cache, operation) for _ in range(3)], [True, True, False])
+        self.assertTrue(operation.deadline_expired)
+        self.assertEqual(cache._prefetch_outcome_stats["inflight_admission_waits"], 2)
+        self.assertEqual(cache._prefetch_outcome_stats["inflight_admission_held"], 1)
+
+    def test_no_wait_before_staging_for_kv_only_reads_or_off(self):
+        hold = UnifiedRadixCache._hold_inflight_hybrid_prefetch
+        mamba = [PoolTransfer(name=PoolName.MAMBA, keys=["s"])]
+        sidecar = [
+            PoolTransfer(
+                name=PoolName.INDEXER, keys=["k"], indices_from_pool=PoolName.KV
+            )
+        ]
+        # Query not done yet (no host staging): today's cut.
+        self.assertFalse(hold(self._cache(4), self._operation(mamba, staged=False)))
+        # KV and KV-derived sidecars are clamped, not discarded whole.
+        self.assertFalse(hold(self._cache(4), self._operation(sidecar)))
+        self.assertFalse(hold(self._cache(0), self._operation(mamba)))
+        self.assertFalse(hold(self._cache(4, policy="timeout"), self._operation(mamba)))
 
 
 class TestUnifiedRadixPrefetchCorruption(
