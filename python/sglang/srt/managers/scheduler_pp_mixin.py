@@ -803,6 +803,8 @@ class SchedulerPPMixin:
                 slots=max(2, tensor_bound),
                 slot_mb=self._pp_ce_slot_mb(),
             )
+            if self._pp_ce is not None:
+                self._pp_ce.log_extra = self._pp_mem_stats
         pp_rank = get_parallel().pp_rank
         # Proxy and output dicts from the previous stage (PP0: outputs from the last);
         # the thread takes their CPU-group part, the loop the device tensors.

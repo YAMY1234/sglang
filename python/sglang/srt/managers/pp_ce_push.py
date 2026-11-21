@@ -20,7 +20,7 @@ import logging
 import os
 import time
 from collections import deque, namedtuple
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 import torch
 
@@ -237,6 +237,8 @@ class PPCEPush:
         self.log_interval = envs.SGLANG_PP_CE_PUSH_LOG_INTERVAL.get()
         self.totals = [0, 0, 0]
         self._next_log = time.monotonic() + self.log_interval
+        # Extra fields for that line (the scheduler sets its free-memory stats).
+        self.log_extra: Optional[Callable[[], dict]] = None
         self._ck_send: Optional[_CEChecksum] = None
         self._ck_recv: Optional[_CEChecksum] = None
         self._ck_views: Dict[int, List[Tuple[str, torch.Tensor]]] = {}
@@ -303,12 +305,13 @@ class PPCEPush:
         if now >= self._next_log:
             self._next_log = now + self.log_interval
             logger.info(
-                "PP CE push on PP%d: %d messages, fallbacks=%d since boot, largest %d MiB (next stage's slot %d MiB)",
+                "PP CE push on PP%d: %d messages, fallbacks=%d since boot, largest %d MiB (next stage's slot %d MiB) %s",
                 self.rank,
                 t[0],
                 t[1],
                 -(-t[2] >> 20),
                 self.peer_slot_bytes >> 20,
+                json.dumps(self.log_extra() if self.log_extra is not None else {}),
             )
 
     def take_stats(self) -> Dict[str, float]:
