@@ -109,13 +109,16 @@ class _Drv:
 
 
 class _EventWork:
-    """P2PWork-shaped handle for a push: wait() returns once the push's flag write ran, so the sources can go."""
+    """P2PWork-shaped handle for a push. wait() orders the caller's current stream after the push, like an NCCL
+    Work, and never blocks the host: a host wait here can close a cycle with the next stage, whose slot release
+    this push waits on and which only runs after this stage's next relay. The sources' memory stays safe through
+    record_stream on the push stream."""
 
     def __init__(self, event: torch.cuda.Event) -> None:
         self.event = event
 
     def wait(self) -> None:
-        self.event.synchronize()
+        torch.cuda.current_stream().wait_event(self.event)
 
 
 class _Push:
@@ -265,6 +268,8 @@ class PPCEPush:
             self.drv.signal(self.stream, self.peer_full_va + 4 * slot, self._scratch.data_ptr(), seq + 1)
             done = torch.cuda.Event()
             done.record(self.stream)
+            for t in tensors.values():
+                t.record_stream(self.stream)
         meta: List[Tuple[str, object]] = list(layout) + others
         meta.append((CE_KEY, (slot, seq)))
         return meta, _Push(_EventWork(done), list(tensors.values()))
