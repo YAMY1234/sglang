@@ -3188,7 +3188,10 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             let Some(idx) = current else { break };
             if !self.host_lru_list(MAMBA).in_list(Some(idx)) { break; }
             let next = self.host_lru_list(MAMBA).get_prev_no_lock(idx, &self.arena);
-            if self.evictable_host_leaves.contains(idx) && self.arena.node(idx).children.is_empty() {
+            let host_leaf = self.evictable_host_leaves.contains(idx) && self.arena.node(idx).children.is_empty();
+            // S2b-alpha: host KV leaves only through L3; an unwritten leaf is written (with its state) first.
+            let unwritten = self.kv_evict_keep_state && !self.arena.node(idx).kv_l3;
+            if host_leaf && !unwritten {
                 self.evict_host_leaf_(idx, &mut result.tracker, &mut result.device_frees,
                                      &mut result.host_frees, &mut result.cache_actions);
             } else if self.arena.has_host_value(idx, FULL) && self.node_depth_(idx) >= min_depth {
@@ -3198,8 +3201,11 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             } else {
                 self.evict_component_and_detach_lru_(idx, MAMBA, &mut result.device_frees,
                     &mut result.host_frees, &mut result.cache_actions, EvictLayer::Host, Some(&mut result.tracker));
-                self.cascade_evict_(idx, MAMBA, &mut result.tracker, &mut result.device_frees,
-                                   &mut result.host_frees, &mut result.cache_actions, EvictLayer::Host);
+                // An unwritten host leaf keeps its KV for the Full write-behind (a leaf cascade would take it).
+                if !host_leaf {
+                    self.cascade_evict_(idx, MAMBA, &mut result.tracker, &mut result.device_frees,
+                                       &mut result.host_frees, &mut result.cache_actions, EvictLayer::Host);
+                }
                 self.prune_kv_in_storage_(idx, &mut result.tracker, &mut result.device_frees,
                                           &mut result.host_frees, &mut result.cache_actions);
             }

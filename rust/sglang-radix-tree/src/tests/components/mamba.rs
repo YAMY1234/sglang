@@ -2963,6 +2963,28 @@ fn s2ba_mark_kv_in_l3_survives_a_split() {
     tc.sanity_check(&[], &[]);
 }
 
+#[test]
+fn s2ba_mamba_eviction_writes_an_unwritten_host_leaf_first() {
+    let mut tc = mamba_core(/* page_size = */ 1);
+    let (a, b) = s2ba_host_chain(&mut tc);
+    tc.arena.node_mut(b).kv_l3 = false;
+    // The storage-backed walk defers the leaf for a tombstone write (KV and state) instead of dropping it.
+    let step = tc.begin_mamba_host_eviction(/* num_states = */ 1, /* min_depth = */ 0);
+    assert_eq!(step.mamba_storage_backup_node_id, Some(tc.arena.node(b).id));
+    assert_eq!(step.tracker[&MAMBA], 0);
+    // The plain walk tombstones only the state: the KV stays for the Full write-behind.
+    let mut tracker = HashMap::from([(MAMBA, 0)]);
+    let (mut device_frees, mut host_frees) = (HashMap::new(), HashMap::new());
+    mamba_component().drive_host_eviction(
+        &mut tc, /* num_tokens = */ 1, &mut tracker, &mut device_frees, &mut host_frees, &mut Vec::new(),
+    );
+    assert!(host_frees[&MAMBA][0].equal(&Tensor::from_slice(&[8i64])));
+    assert!(!host_frees.contains_key(&FULL));
+    assert!(tc.arena.node(b).has_host_value(FULL) && !tc.arena.node(b).has_host_value(MAMBA));
+    assert!(tc.arena.node(a).has_host_value(FULL));
+    tc.sanity_check(&[], &[]);
+}
+
 fn s2ba_xorshift(state: &mut u64) -> u64 {
     *state ^= *state << 13;
     *state ^= *state >> 7;
