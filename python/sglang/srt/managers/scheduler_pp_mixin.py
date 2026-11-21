@@ -131,6 +131,8 @@ class SchedulerPPMixin:
     pp_send_windows: PPSendWindows = PPSendWindows()
     _pp_dict_inbox: Optional[PPRecvInbox] = None
     _pp_late_recv: bool = False
+    # SGLANG_PP_CHECK_PROXY_BATCH: proxy messages carry their batch's identity.
+    _pp_check_proxy_batch: bool = False
 
     @DynamicGradMode()
     def event_loop_pp(self: Scheduler):
@@ -307,6 +309,7 @@ class SchedulerPPMixin:
                 "metadata (SGLANG_PP_PD_PREFILL_EARLY_SEND)."
             )
         decoupled = self._pp_maybe_init_decouple()
+        self._pp_check_proxy_batch = envs.SGLANG_PP_CHECK_PROXY_BATCH.get()
         overlap_input_wait = (
             decoupled and early_send and not self.pp_group.is_first_rank
         )
@@ -385,6 +388,8 @@ class SchedulerPPMixin:
                     if overlap_input_wait:
                         self._pp_overlap_input_wait(self._pp_dict_inbox)
                     pp_proxy_tensors = self._pp_recv_proxy_tensors()
+                    if self._pp_check_proxy_batch:
+                        self._pp_assert_proxy_batch(pp_proxy_tensors, cur_batch)
 
                 if get_parallel().pp_async_batch_depth > 0:
                     next_pp_outputs, next_batch_result, d2h_event = (
@@ -1344,6 +1349,20 @@ class SchedulerPPMixin:
             pp_proxy_tensors = PPProxyTensors(tensor_dict)
         return pp_proxy_tensors
 
+    def _pp_assert_proxy_batch(
+        self: Scheduler, pp_proxy_tensors: Optional[PPProxyTensors], batch: ScheduleBatch
+    ) -> None:
+        """A proxy that belongs to another micro-batch must stop the server, not feed a forward."""
+        if pp_proxy_tensors is None:
+            return
+        got = pp_proxy_tensors.tensors.pop(pp_decouple.PROXY_BATCH_KEY)
+        want = pp_decouple.proxy_batch_tag(batch)
+        if tuple(got) != want:
+            raise RuntimeError(
+                f"PP rank {get_parallel().pp_rank}: proxy for batch {tuple(got)} arrived for batch "
+                f"{want} (forward {self.forward_ct})"
+            )
+
     def _pp_recv_dict_from_prev_stage(
         self: Scheduler,
     ) -> Tuple[Dict[str, torch.Tensor], Optional[torch.Event]]:
@@ -2112,6 +2131,10 @@ class SchedulerPPMixin:
                     trace_only=True,
                     attrs={"pp_mb_id": mb_id},
                 )
+                if self._pp_check_proxy_batch and not self.pp_group.is_last_rank:
+                    result.pp_hidden_states_proxy_tensors.tensors[
+                        pp_decouple.PROXY_BATCH_KEY
+                    ] = pp_decouple.proxy_batch_tag(cur_batch)
                 pd_local_result = self._pp_pd_local_result(cur_batch)
                 mb_metadata[mb_id] = PPBatchMetadata(
                     can_run_cuda_graph=result.can_run_cuda_graph,

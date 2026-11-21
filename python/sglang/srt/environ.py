@@ -889,6 +889,9 @@ class Envs:
     # forward ends. A receive kernel waits on the GPU for its sender, and resident there it
     # blocks the forward's cooperative kernels (MoE routing).
     SGLANG_PP_DECOUPLE_LATE_RECV = EnvBool(False)
+    # PP PD prefill: every proxy message carries its micro-batch's identity (request count, new
+    # tokens, a hash of the rids) and the next stage asserts it is the batch it is about to run.
+    SGLANG_PP_CHECK_PROXY_BATCH = EnvBool(False)
     # PP PD prefill: log a digest of allocator and radix tree state every N loop
     # epochs (0 = off); every stage must log the same digest at the same epoch.
     SGLANG_DEBUG_PP_STATE_DIGEST_EVERY = EnvInt(0)
