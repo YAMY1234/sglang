@@ -234,6 +234,22 @@ class DevicePoolGroup:
         return resolved
 
 
+def attach_cpu_indices(transfers: list[PoolTransfer]) -> list[PoolTransfer]:
+    """SGLANG_EXTERNAL_LINKER_CPU_INDICES: on the scheduler thread, give each
+    resolved transfer with device slot indices a pinned CPU copy (non-blocking D2H
+    on the current stream). The caller records its ready event after this, so the
+    copy has landed once a linker thread waits on that event."""
+    out = []
+    for transfer in transfers:
+        indices = transfer.host_indices
+        if indices is not None and indices.is_cuda:
+            cpu = torch.empty(indices.shape, dtype=indices.dtype, pin_memory=True)
+            cpu.copy_(indices, non_blocking=True)
+            transfer = replace(transfer, host_indices=cpu)
+        out.append(transfer)
+    return out
+
+
 def _with_packed_draft_mapping(
     layer_mapping: dict[int, int],
     *,
