@@ -1207,7 +1207,11 @@ class MambaPool:
         for sibling in self._slot_siblings:
             sibling.reset_slots(indices)
         if self.kda_fold_pending is not None:
-            self.reset_kda_pending(indices)
+            from sglang.kernels.ops.attention.linear.kda_replayssm_spec_decode import (
+                reset_kda_pending,
+            )
+
+            reset_kda_pending(pending=self.kda_fold_pending, slots=indices)
         idx64 = indices.to(torch.int64)
         if self._should_fuse_slot_ops():
             from sglang.srt.mem_cache.mamba_slot_fused import fused_clear_conv_slots
