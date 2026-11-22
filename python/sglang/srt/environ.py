@@ -1720,6 +1720,10 @@ class Envs:
     # Resolved lazily so it tracks SGLANG_CACHE_DIR, which is defined below.
     SGLANG_DG_CACHE_DIR = EnvStr(lambda: _default_cache_subdir("deep_gemm"))
     SGLANG_DG_USE_NVRTC = EnvBool(False)
+    # Serve MegaMoE from a header patch set bundled in sglang/srt/dg_mega_patch_data/<set> ("" = stock);
+    # the node-local deep_gemm mirror lives under SGLANG_DG_MEGA_PATCH_ROOT.
+    SGLANG_K31_DG_MEGA_PATCH = EnvStr("")
+    SGLANG_DG_MEGA_PATCH_ROOT = EnvStr("/tmp/sglang-dg-mega-patch")
     SGLANG_USE_DEEPGEMM_BMM = EnvBool(False)
     SGLANG_DEEPGEMM_SANITY_CHECK = EnvBool(False)
     SGLANG_DEEPGEMM_PDL = EnvBool(True)

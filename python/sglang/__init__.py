@@ -15,6 +15,11 @@ from sglang.srt.environ import (
 
 _redirect_third_party_caches()
 
+# Before anything imports deep_gemm: serve MegaMoE from a bundled header patch set if one is selected.
+from sglang.srt.dg_mega_patch import apply as _apply_dg_mega_patch
+
+_apply_dg_mega_patch()
+
 if _is_hip():
     from sglang.srt.debug_utils.rocprofiler_register import (
         clear_inherited_rocprofiler_registration as _clear_inherited_rocprofiler_registration,
