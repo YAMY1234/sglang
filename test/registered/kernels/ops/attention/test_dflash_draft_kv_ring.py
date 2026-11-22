@@ -106,25 +106,27 @@ def test_extend_keeps_only_the_readable_tail():
 
 
 @pytest.mark.parametrize("seq_len", [5000, 300])
-def test_pd_window_rows_pair_prefill_with_each_decode_rank(seq_len):
-    """PD: a DCP-1 prefill's window rows, paired positionally with each DCP-8
-    decode rank's (sink pairs dropped as the transfer does), cover every window
-    position exactly once, each landing on the row that rank's window reads."""
+@pytest.mark.parametrize("decode_dcp", [8, 1])
+def test_pd_window_rows_pair_prefill_with_each_decode_rank(seq_len, decode_dcp):
+    """PD: a DCP-1 prefill's window rows, paired positionally with each decode
+    rank's (sink pairs dropped as the transfer does), cover every window position
+    exactly once per DCP group, each landing on the row that rank's window reads.
+    A DCP-1 decode ring (SGLANG_K31_DRAFT_NO_DCP) takes the whole window."""
     prefill = _ring(1, 4, "cpu")
     src = prefill.transfer_rows(2, seq_len)
     window = list(range(max(0, seq_len - WINDOW_LEFT - 1), seq_len))
     assert len(src) == len(window) and (src != 0).all()
     covered = []
-    for rank in range(8):
-        decode = _ring(8, 6, "cpu", dcp_rank=rank)
+    for rank in range(decode_dcp):
+        decode = _ring(decode_dcp, 6, "cpu", dcp_rank=rank)
         dst = decode.transfer_rows(5, seq_len)
         assert len(dst) == len(src)
         for p, a, b in zip(window, src, dst):
             if a and b:
                 covered.append(p)
-                assert p % 8 == rank
+                assert p % decode_dcp == rank
                 assert a == int(prefill.locs(torch.tensor([2]), torch.tensor([p])))
-                assert b * 8 + rank == int(
+                assert b * decode_dcp + rank == int(
                     decode.locs(torch.tensor([5]), torch.tensor([p]))
                 )
     assert sorted(covered) == window

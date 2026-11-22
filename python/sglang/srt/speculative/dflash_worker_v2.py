@@ -4,6 +4,7 @@ import math
 import os
 from typing import TYPE_CHECKING, List, Optional, Tuple
 
+import msgspec
 import torch
 
 from sglang.kernels.ops.memory.small_copy import try_small_copy
@@ -502,6 +503,19 @@ class _DominoDraftSampler:
         self.out[: bs * (self.block_size - 1)].copy_(proposals.reshape(-1))
 
 
+def _draft_no_dcp_requested() -> bool:
+    """SGLANG_K31_DRAFT_NO_DCP under DCP: the draft scope sees DCP off."""
+    if not envs.SGLANG_K31_DRAFT_NO_DCP.get() or get_parallel().attn_dcp_size == 1:
+        return False
+    # Without the ring the draft pool spans every target slot; replicating it is out of scope.
+    if not draft_kv_ring_enabled():
+        raise ValueError(
+            "SGLANG_K31_DRAFT_NO_DCP needs the DFLASH draft KV ring "
+            "(SGLANG_DFLASH_DRAFT_KV_RING resolved off)."
+        )
+    return True
+
+
 class DFlashWorkerV2(BaseSpecWorker):
     """DFLASH speculative decoding worker (spec-v2).
 
@@ -560,6 +574,10 @@ class DFlashWorkerV2(BaseSpecWorker):
             ),
             collapse_cp=True,
         )
+        if _draft_no_dcp_requested():
+            self.draft_parallel_layout = msgspec.structs.replace(
+                self.draft_parallel_layout, disable_dcp=True
+            )
         # Inside the draft scope the context answers the draft's narrowed rank.
         self._target_tp_rank = get_parallel().tp_rank
         # On a pipelined PD prefill only the last stage holds the draft: the
@@ -973,8 +991,16 @@ class DFlashWorkerV2(BaseSpecWorker):
                 "drop --speculative-draft-window-size."
             )
         parallel = get_parallel()
-        dcp_size = parallel.attn_dcp_size
+        no_dcp = self.draft_parallel_layout.disable_dcp
+        dcp_size = 1 if no_dcp else parallel.attn_dcp_size
         pool = self.draft_model_runner.token_to_kv_pool
+        if no_dcp:
+            if not isinstance(pool, MLATokenToKVPool):
+                raise ValueError(
+                    f"SGLANG_K31_DRAFT_NO_DCP needs an MLA draft pool, got {type(pool).__name__}."
+                )
+            # Every rank writes every position at its ring row, outside the draft scope too.
+            pool.dcp_replicated = True
         if dcp_size > 1 and not pool.rows_are_dcp_collapsed:
             raise ValueError(
                 "SGLANG_DFLASH_DRAFT_KV_RING under DCP needs DCP-collapsed draft rows."
@@ -993,7 +1019,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             req_pool_rows=req_pool_rows,
             device=self.device,
             window_left=window_left,
-            dcp_rank=parallel.dcp_rank if parallel.dcp_enabled else 0,
+            dcp_rank=parallel.dcp_rank if dcp_size > 1 else 0,
             pool=pool,
             mem_pool=pool.maybe_get_custom_mem_pool(),
         )
@@ -1008,6 +1034,12 @@ class DFlashWorkerV2(BaseSpecWorker):
                 req_pool_rows,
                 pool.size,
             )
+            if no_dcp:
+                logger.info(
+                    "SGLANG_K31_DRAFT_NO_DCP: the draft runs without DCP (attn_dcp_size %d): "
+                    "every rank holds the whole window and attends its own TP heads.",
+                    parallel.attn_dcp_size,
+                )
 
     def _build_hicache_draft_plan(self) -> HiCacheDraftPlan:
         # A ring holds no prefix: a cached prefix brings no draft KV back.

@@ -873,12 +873,34 @@ def draft_pp_context():
 
 def draft_tp_context(layout: DraftParallelLayout):
     """Enter an already-resolved draft placement from outside any draft scope."""
+    if layout.disable_dcp:
+        return _draft_without_dcp(_draft_tp_context(layout))
+    return _draft_tp_context(layout)
+
+
+def _draft_tp_context(layout: DraftParallelLayout):
     if layout.tp_group is None:
         return contextlib.nullcontext()
     tp_context = patch_tensor_parallel_group(layout.tp_group, owns_attention=True)
     if layout.disable_cp:
         return _draft_without_cp(tp_context)
     return tp_context
+
+
+@contextmanager
+def _draft_without_dcp(tp_context):
+    # Every draft rank holds the whole window and attends its own TP heads.
+    with (
+        tp_context,
+        get_parallel().override(
+            dcp_size=1,
+            dcp_enabled=False,
+            attn_dcp_size=1,
+            dcp_rank=0,
+            attn_dcp_rank=0,
+        ),
+    ):
+        yield
 
 
 @contextmanager
