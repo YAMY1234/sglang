@@ -341,6 +341,11 @@ class SchedulerPPMixin:
                 if diag is not None:
                     diag.maybe_log()
                     diag.phase("ingest")
+                if self._pp_host_lead_max:
+                    # First, so the requests and bootstraps that land meanwhile join this batch.
+                    self._pp_bound_host_lead()
+                    if early_send:
+                        self._pp_pd_flush_early_sends()
                 if overlap_input_wait:
                     self._pp_overlap_input_wait(pp_decouple.relay_inbox())
                 recv_reqs = self.ingest_requests()
@@ -359,8 +364,6 @@ class SchedulerPPMixin:
                     )
                     tmbs[mb_id] = transferred_rids
 
-                if self._pp_host_lead_max:
-                    self._pp_bound_host_lead()
                 # The pipeline loop builds its own batch instead of calling
                 # get_next_batch_to_run, so label the same work here.
                 if diag is not None:
