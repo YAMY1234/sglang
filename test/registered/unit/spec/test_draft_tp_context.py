@@ -2,6 +2,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import msgspec
 import torch
 
 from sglang.srt.configs.draft_parallel import DraftParallelSpec, DraftTPExecution
@@ -173,6 +174,38 @@ class TestDraftTpContext(CustomTestCase):
             self.assertTrue(get_parallel().enable_cp_tp_group_sharing)
             self.assertIs(cp._STRATEGY, strategy)
             self.assertIsNone(get_flags().dp.scoped_gather_slot)
+
+    def test_disable_dcp_hides_dcp_in_the_draft_scope_only(self):
+        """SGLANG_K31_DRAFT_NO_DCP: the draft scope reads DCP as off, with or
+        without its own TP group, and the target's DCP comes back on exit."""
+        dcp = dict(
+            dcp_size=4, dcp_enabled=True, attn_dcp_size=4, dcp_rank=3, attn_dcp_rank=3
+        )
+        off = dict(
+            dcp_size=1, dcp_enabled=False, attn_dcp_size=1, dcp_rank=0, attn_dcp_rank=0
+        )
+        with get_parallel().override(
+            tp_group=self.whole_tp, attn_tp_group=self.attn_tp, **dcp
+        ):
+            for single_group in (True, False):
+                with self.subTest(single_group=single_group):
+                    layout = self._resolve(single_group=single_group)
+                    self.assertFalse(layout.disable_dcp)
+                    with draft_tp_context(layout):
+                        self.assertEqual(get_parallel().attn_dcp_size, 4)
+                    no_dcp = msgspec.structs.replace(layout, disable_dcp=True)
+                    with self.assertRaisesRegex(RuntimeError, "draft failed"):
+                        with draft_tp_context(no_dcp):
+                            for name, value in off.items():
+                                self.assertEqual(getattr(get_parallel(), name), value)
+                            self.assertEqual(
+                                get_parallel().tp_group,
+                                self.attn_tp if single_group else self.whole_tp,
+                            )
+                            raise RuntimeError("draft failed")
+                    for name, value in dcp.items():
+                        self.assertEqual(getattr(get_parallel(), name), value)
+                    self.assertFalse(parallel_state._TP_STATE_PATCHED)
 
     def test_cp_only_is_a_worker_policy(self):
         with get_parallel().override(

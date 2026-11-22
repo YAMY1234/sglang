@@ -26,6 +26,8 @@ class DraftParallelLayout(msgspec.Struct, frozen=True, kw_only=True):
     tp_group: GroupCoordinator | None
     attn_tp_size: int
     disable_cp: bool = False
+    # The draft sees DCP as off (SGLANG_K31_DRAFT_NO_DCP).
+    disable_dcp: bool = False
 
     @property
     def local_dp(self) -> bool:
