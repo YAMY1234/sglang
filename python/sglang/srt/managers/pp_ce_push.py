@@ -294,9 +294,16 @@ class PPCEPush:
         # SGLANG_PP_CE_PUSH_GATED: the gate thread enqueues a push's copies only once its forward ended and the next
         # stage freed its slot, both seen from the host. Copies queued behind any unmet wait hold the GPU's peer copy
         # path, so every other peer copy from this GPU (PD KV transfers) would wait with them.
+        # 0 off, 1 the first stage, 2 every stage (releases then become in-order flag stores, see release()).
         self.gated = envs.SGLANG_PP_CE_PUSH_GATED.get()
         self._poll_stream: Optional[int] = None
         self._poll_host: Optional[torch.Tensor] = None
+        self._wake_stream: Optional[torch.cuda.ExternalStream] = None
+        # Gate-every-stage: the input-slot tensors this stage's last push copied out must be copied before the
+        # release (an in-place residual); and the stream the last release went on, to keep releases in order.
+        self._release_after: Optional[torch.cuda.Event] = None
+        self._release_stream: Optional[torch.cuda.Stream] = None
+        self._peer_free_view: Optional[torch.Tensor] = None
         self._gate_q: "queue.SimpleQueue" = queue.SimpleQueue()
         self._gate_lock = threading.Lock()
         self._gate_pending = 0
@@ -341,6 +348,11 @@ class PPCEPush:
         if self.has_prev:
             fab, size = prev_exports["free"]
             self.peer_free_va = _import(self.device_id, fab, size, prev_rank)
+            from sglang.srt.utils.cuda_vmm_utils import tensor_from_pointer
+
+            self._peer_free_view = tensor_from_pointer(
+                self.peer_free_va, 4 * self.slots, shape=(self.slots,), dtype=torch.int32, device_id=self.device_id
+            )
 
     # ---- producer ----
 
@@ -399,14 +411,16 @@ class PPCEPush:
         )
         meta: List[Tuple[str, object]] = list(layout) + others
         meta.append((CE_KEY, (slot, seq)))
-        sources = list(tensors.values())
         if self._gating():
+            if self.gated >= 2 and self.has_prev:
+                tensors, ready_event = self._copy_out_of_input_slot(tensors, ready_event)
             landing = _GatedLanding()
             self._gate_submit(
                 lambda: landing.set(self._enqueue_push(seq, slot, layout, tensors, ready_event)),
-                (slot, free_target(seq, self.slots), ready_event),
+                (slot, free_target(seq, self.slots), self._wake_event(ready_event)),
             )
-            return meta, PushWork(_GatedWork(landing), sources)
+            return meta, PushWork(_GatedWork(landing), list(tensors.values()))
+        sources = list(tensors.values())
         done = self._enqueue_push(seq, slot, layout, tensors, ready_event)
         return meta, PushWork(_EventWork(done), sources)
 
@@ -441,14 +455,43 @@ class PPCEPush:
         # at the gate, later push-stream work goes through it too, in order.
         return (self.gated and not self.has_prev) or self._gate_pending > 0
 
-    _GATE_POLL_S = 2e-4
+    _GATE_POLL_S = 5e-4
+
+    def _copy_out_of_input_slot(self, tensors, ready_event):
+        """Gate-every-stage: the release goes right after the forward, so a pushed tensor still in this stage's
+        input slot (an in-place residual) is first copied out, after the forward, on the current stream."""
+        lo, hi = self.ring_va, self.ring_va + self.ring_bytes
+        inside = [k for k, t in tensors.items() if lo <= t.data_ptr() < hi]
+        if not inside:
+            self._release_after = None
+            return tensors, ready_event
+        stream = torch.cuda.current_stream()
+        if ready_event is not None:
+            stream.wait_event(ready_event)
+        tensors = {k: (t.clone() if k in inside else t) for k, t in tensors.items()}
+        done = torch.cuda.Event()
+        done.record(stream)
+        self._release_after = done
+        return tensors, done
+
+    def _wake_event(self, ready: Optional[torch.cuda.Event]) -> Optional[torch.cuda.Event]:
+        """A blocking-sync event that completes with `ready`, so the gate thread sleeps instead of polling it. The
+        helper stream only waits (no copies), which holds nothing."""
+        if ready is None:
+            return None
+        if self._wake_stream is None:
+            self._wake_stream = torch.cuda.ExternalStream(self.drv.stream_create(), device=f"cuda:{self.device_id}")
+        self._wake_stream.wait_event(ready)
+        wake = torch.cuda.Event(blocking=True)
+        wake.record(self._wake_stream)
+        return wake
 
     def _gate_wait(self, slot: int, target: int, ready: Optional[torch.cuda.Event]) -> None:
         """Wait on the host, never with a stream wait: a GPU wait for the next stage's release depends on that
         stage's later host work, and a device-wide sync on either side (a lazy module load, cudaFree) waits for
         every queued wait, which turns that into a deadlock."""
-        while ready is not None and not ready.query():
-            time.sleep(self._GATE_POLL_S)
+        if ready is not None:
+            ready.synchronize()
         if target <= 0:
             return
         if self._poll_stream is None:
@@ -533,8 +576,22 @@ class PPCEPush:
         logger.warning("PP CE checksum (debug) on PP%d: first %d messages per side -> %s", rank, n, d)
 
     def release(self, stream: torch.cuda.Stream, slot_seq: Tuple[int, int]) -> None:
-        # Its own staging word: the release can run on a different stream from the pushes.
         slot, seq = slot_seq
+        if self._release_stream is not None and stream is not self._release_stream:
+            # Releases of one slot must land in order: the flag only ever grows.
+            stream.wait_stream(self._release_stream)
+        self._release_stream = stream
+        if self.gated >= 2:
+            # In program order after the forward (and the copy out of the slot), as a one-thread store: a copy-engine
+            # signal queued behind the forward would hold this GPU's peer copy path until the forward ends, and a
+            # release left to the gate thread would make the previous stage's GPU wait on this stage's host.
+            if self._release_after is not None:
+                stream.wait_event(self._release_after)
+                self._release_after = None
+            with torch.cuda.stream(stream):
+                self._peer_free_view[slot].fill_(seq + 1)
+            return
+        # Its own staging word: the release can run on a different stream from the pushes.
         self.drv.signal(stream, self.peer_free_va + 4 * slot, self._scratch.data_ptr() + 128, seq + 1)
 
 

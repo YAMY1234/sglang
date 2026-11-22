@@ -321,6 +321,7 @@ class TestPPCEPush(CustomTestCase):
 
         ce = PPCEPush.__new__(PPCEPush)
         ce.rank, ce.device_id, ce.slots, ce.send_seq, ce.gated, ce.has_prev = 0, 0, 2, 0, gated, has_prev
+        ce.ring_va = ce.ring_bytes = 0
         ce.stream = "push"
         ce._gate_q, ce._gate_lock, ce._gate_pending, ce._gate_thread = _queue.SimpleQueue(), threading.Lock(), 0, None
         slot_free = defaultdict(threading.Event)
@@ -363,6 +364,50 @@ class TestPPCEPush(CustomTestCase):
         ce.push(t, None)
         self.assertEqual(log[-1], ("push", 4))  # nothing at the gate any more: enqueued at once
 
+    def test_gate_every_stage_gates_a_middle_stage_and_releases_in_order(self):
+        """SGLANG_PP_CE_PUSH_GATED=2: a stage with an input ring gates its push too; its release is a flag store
+        on the given stream after the copy out of the slot, and a release on another stream than the last one
+        first waits for that stream, so a slot's flag only grows."""
+        from unittest.mock import patch
+
+        log = []
+        ce, slot_free = self._gated_ce(log, gated=2, has_prev=True)
+        ce.release = type(ce).release.__get__(ce)
+        ce._release_after = ce._release_stream = None
+        stores = []
+        ce._peer_free_view = [SimpleNamespace(fill_=lambda v, i=i: stores.append((i, v))) for i in range(2)]
+
+        class _Stream:
+            def __init__(self, name):
+                self.name = name
+
+            def wait_stream(self, other):
+                log.append(("wait_stream", self.name, other.name))
+
+            def wait_event(self, e):
+                log.append(("wait_event", self.name, e))
+
+        fwd, other = _Stream("forward"), _Stream("other")
+        t = {"hidden_states": torch.zeros(4)}
+        with patch("torch.cuda.set_device"), patch("torch.cuda.stream", lambda s: nullcontext()):
+            _, w0 = ce.push(t, None)
+            _, w1 = ce.push(t, None)
+            _, w2 = ce.push(t, None)  # gated: waits for slot 0
+            self.assertTrue(w1.work.event.enqueued.wait(5))
+            time.sleep(0.2)
+            self.assertEqual(log, [("push", 0), ("push", 1)])
+            ce._release_after = "copied-out"
+            ce.release(fwd, (1, 4))
+            ce.release(fwd, (0, 5))
+            ce.release(other, (1, 6))
+            slot_free[2].set()
+            self.assertTrue(w2.work.event.enqueued.wait(5))
+        self.assertEqual(stores, [(1, 5), (0, 6), (1, 7)])
+        self.assertEqual(
+            log,
+            [("push", 0), ("push", 1), ("wait_event", "forward", "copied-out"), ("wait_stream", "other", "forward"), ("push", 2)],
+        )
+
     def test_an_ungated_push_enqueues_at_once(self):
         for gated, has_prev in ((False, False), (True, True)):
             # A stage with an input ring never gates: its forward's work parked on the next input would hold back
@@ -376,7 +421,7 @@ class TestPPCEPush(CustomTestCase):
             self.assertEqual(w.work.event, "done2")
             self.assertIsNone(ce._gate_thread)
 
-    def _scheduler(self, last, log):
+    def _scheduler(self, last, log, gated=0):
         from sglang.srt.managers.pp_ce_push import CEWait
 
         scheduler = SchedulerPPMixin()
@@ -395,6 +440,7 @@ class TestPPCEPush(CustomTestCase):
             stream=SimpleNamespace(name="push", wait_event=lambda e: log.append(("push_wait", e))),
             wait_full=lambda stream, ss: log.append(("wait_full", stream.name, ss)),
             release=lambda stream, ss: log.append(("release", stream.name, ss)),
+            gated=gated,
         )
         scheduler._pp_ce = ce
         scheduler.pp_proxy_recv_event = CEWait((1, 7))
@@ -427,6 +473,24 @@ class TestPPCEPush(CustomTestCase):
         s._pp_wait_forward_dependencies()
         s._pp_ce_release_input()
         self.assertEqual(log[1:], [("release", "forward", (1, 7))])
+
+    def test_gate_every_stage_releases_on_the_forward_stream(self):
+        """SGLANG_PP_CE_PUSH_GATED=2: the push is enqueued later by the gate thread, so a non-last stage releases
+        its input slot in program order on the forward stream (the push copied in-slot tensors out first); an
+        NCCL fallback send still fences it."""
+        log = []
+        s = self._scheduler(False, log, gated=2)
+        s._pp_wait_forward_dependencies()
+        s._pp_ce_release_input()
+        self.assertEqual(log[1:], [("release", "forward", (1, 7))])
+
+        log.clear()
+        s = self._scheduler(False, log, gated=2)
+        s._pp_wait_forward_dependencies()
+        s._pp_ce_release_input(nccl_send_work=_round("nccl", log))
+        self.assertEqual(
+            log[1:], ["nccl.0", "nccl.1", ("fwd_wait_event", "comm-tail"), ("release", "forward", (1, 7))]
+        )
 
     def test_a_fallback_send_after_a_pushed_input_waits_each_gloo_send_once(self):
         """A stage whose input came by push and whose output does not fit a slot sends it over
