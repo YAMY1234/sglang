@@ -323,15 +323,13 @@ class TestPPCEPush(CustomTestCase):
         ce.rank, ce.device_id, ce.slots, ce.send_seq, ce.gated, ce.has_prev = 0, 0, 2, 0, gated, has_prev
         ce.stream = "push"
         ce._gate_q, ce._gate_lock, ce._gate_pending, ce._gate_thread = _queue.SimpleQueue(), threading.Lock(), 0, None
-        slot_free = {}
+        slot_free = defaultdict(threading.Event)
 
-        def slot_free_event(seq, slot):
-            if seq < ce.slots:
-                return None
-            slot_free[seq] = threading.Event()
-            return SimpleNamespace(synchronize=slot_free[seq].wait)
+        def gate_wait(slot, target, ready):
+            if target > 0:
+                slot_free[target + ce.slots - 1].wait()
 
-        ce._slot_free_event = slot_free_event
+        ce._gate_wait = gate_wait
         ce._enqueue_push = lambda seq, slot, layout, tensors, ready: log.append(("push", seq)) or f"done{seq}"
         ce.release = lambda stream, slot_seq: log.append(("release", slot_seq))
         return ce, slot_free

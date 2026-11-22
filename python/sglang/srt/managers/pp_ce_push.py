@@ -73,6 +73,19 @@ class _Drv:
         if err != self.drv.CUresult.CUDA_SUCCESS:
             raise RuntimeError(f"{label}: {err}")
 
+    def stream_create(self) -> int:
+        """A non-blocking stream outside torch's pool, so it never aliases a stream that carries other work."""
+        drv = self.drv
+        res = drv.cuStreamCreate(drv.CUstream_flags.CU_STREAM_NON_BLOCKING)
+        self._ok(res, "cuStreamCreate")
+        return int(res[1])
+
+    def read(self, stream: int, host: int, addr: int) -> None:
+        """Copy one 32-bit word of device memory to pinned host memory and wait for it."""
+        drv = self.drv
+        self._ok(drv.cuMemcpyDtoHAsync(host, drv.CUdeviceptr(addr), 4, drv.CUstream(stream)), "cuMemcpyDtoHAsync")
+        self._ok(drv.cuStreamSynchronize(drv.CUstream(stream)), "cuStreamSynchronize")
+
     def wait_geq(self, stream: torch.cuda.Stream, addr: int, value: int) -> None:
         drv = self.drv
         self._ok(
@@ -278,11 +291,12 @@ class PPCEPush:
         self._ck_recv: Optional[_CEChecksum] = None
         self._ck_views: Dict[int, List[Tuple[str, torch.Tensor]]] = {}
         self.ring_bytes = slots * slot_bytes
-        # SGLANG_PP_CE_PUSH_GATED: a push whose slot may still be in use parks only a bare wait on the gate stream;
-        # the gate thread enqueues its copies once the slot is free. Copies parked behind a stream wait hold the
-        # GPU's peer copy path, so every other peer copy from this GPU (PD KV transfers) would wait with them.
+        # SGLANG_PP_CE_PUSH_GATED: the gate thread enqueues a push's copies only once its forward ended and the next
+        # stage freed its slot, both seen from the host. Copies queued behind any unmet wait hold the GPU's peer copy
+        # path, so every other peer copy from this GPU (PD KV transfers) would wait with them.
         self.gated = envs.SGLANG_PP_CE_PUSH_GATED.get()
-        self._gate_stream = torch.cuda.Stream(device=device_id) if has_next else None
+        self._poll_stream: Optional[int] = None
+        self._poll_host: Optional[torch.Tensor] = None
         self._gate_q: "queue.SimpleQueue" = queue.SimpleQueue()
         self._gate_lock = threading.Lock()
         self._gate_pending = 0
@@ -388,10 +402,9 @@ class PPCEPush:
         sources = list(tensors.values())
         if self._gating():
             landing = _GatedLanding()
-            slot_free = self._slot_free_event(seq, slot)
             self._gate_submit(
                 lambda: landing.set(self._enqueue_push(seq, slot, layout, tensors, ready_event)),
-                slot_free,
+                (slot, free_target(seq, self.slots), ready_event),
             )
             return meta, PushWork(_GatedWork(landing), sources)
         done = self._enqueue_push(seq, slot, layout, tensors, ready_event)
@@ -428,17 +441,27 @@ class PPCEPush:
         # at the gate, later push-stream work goes through it too, in order.
         return (self.gated and not self.has_prev) or self._gate_pending > 0
 
-    def _slot_free_event(self, seq: int, slot: int) -> Optional[torch.cuda.Event]:
-        target = free_target(seq, self.slots)
-        if target <= 0:
-            return None
-        event = torch.cuda.Event(blocking=True)
-        with torch.cuda.stream(self._gate_stream):
-            self.drv.wait_geq(self._gate_stream, self.free_va + 4 * slot, target)
-            event.record(self._gate_stream)
-        return event
+    _GATE_POLL_S = 2e-4
 
-    def _gate_submit(self, fn: Callable[[], None], ready: Optional[torch.cuda.Event] = None) -> None:
+    def _gate_wait(self, slot: int, target: int, ready: Optional[torch.cuda.Event]) -> None:
+        """Wait on the host, never with a stream wait: a GPU wait for the next stage's release depends on that
+        stage's later host work, and a device-wide sync on either side (a lazy module load, cudaFree) waits for
+        every queued wait, which turns that into a deadlock."""
+        while ready is not None and not ready.query():
+            time.sleep(self._GATE_POLL_S)
+        if target <= 0:
+            return
+        if self._poll_stream is None:
+            self._poll_stream = self.drv.stream_create()
+            self._poll_host = torch.zeros(1, dtype=torch.int32, pin_memory=True)
+        host, addr = self._poll_host.data_ptr(), self.free_va + 4 * slot
+        while True:
+            self.drv.read(self._poll_stream, host, addr)
+            if int(self._poll_host[0]) >= target:
+                return
+            time.sleep(self._GATE_POLL_S)
+
+    def _gate_submit(self, fn: Callable[[], None], wait: Optional[Tuple[int, int, Optional[torch.cuda.Event]]] = None) -> None:
         with self._gate_lock:
             self._gate_pending += 1
             if self._gate_thread is None:
@@ -446,15 +469,15 @@ class PPCEPush:
                     target=self._gate_loop, name=f"pp{self.rank}-ce-gate", daemon=True
                 )
                 self._gate_thread.start()
-        self._gate_q.put((fn, ready))
+        self._gate_q.put((fn, wait))
 
     def _gate_loop(self) -> None:
         torch.cuda.set_device(self.device_id)
         while True:
-            fn, ready = self._gate_q.get()
+            fn, wait = self._gate_q.get()
             try:
-                if ready is not None:
-                    ready.synchronize()
+                if wait is not None:
+                    self._gate_wait(*wait)
                 fn()
             except Exception:
                 # Everything behind this item would wait forever: fail the process instead of hanging it.
