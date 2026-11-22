@@ -2265,6 +2265,13 @@ class Envs:
     # the verify steps decode runs anyway, six prompt tokens per step, instead of a
     # separate extend step. Ranks without running requests keep the extend.
     SGLANG_DSV41_FUSED_TAIL = EnvBool(False)
+    # PD decode with DP attention: a DP rank joins transferred requests to its running
+    # batch only up to the mean batch over DP ranks at the last step plus the slack.
+    # Every rank replays the CUDA graph of the largest rank's batch, so one rank ahead
+    # of the others slows all of them. A request held longer than the max hold joins.
+    SGLANG_DECODE_DP_ADMIT_BALANCE = EnvBool(False)
+    SGLANG_DECODE_DP_ADMIT_SLACK = EnvInt(2)
+    SGLANG_DECODE_DP_ADMIT_MAX_HOLD_MS = EnvInt(500)
     # PD with --dsv41-encoder-only-prefill, set alike on prefill, decode and the tail
     # server: a shared tail server runs every late-fed request's last window through
     # the late layers and sends their SWA and DSpark captures to decode as PP rank 1;
