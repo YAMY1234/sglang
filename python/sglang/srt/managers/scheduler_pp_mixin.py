@@ -933,13 +933,18 @@ class SchedulerPPMixin:
         self._pp_host_lead_read_at = now
         try:
             with open(self._pp_host_lead_file) as f:
-                bound = int(f.read().strip() or 0)
+                fields = [int(v) for v in f.read().split()]
         except (OSError, ValueError):
             return
+        bound = fields[0] if fields else 0
         if bound != self._pp_host_lead_max:
             logger.info("PP host lead bound %d -> %d (%s)", self._pp_host_lead_max, bound, self._pp_host_lead_file)
             self._pp_host_lead_max = bound
             self._pp_launch_events.clear()
+        # An optional second field switches the CE push gate (SGLANG_PP_CE_PUSH_GATED).
+        if len(fields) > 1 and self._pp_ce is not None and bool(fields[1]) != self._pp_ce.gated:
+            logger.info("PP CE push gate -> %s (%s)", bool(fields[1]), self._pp_host_lead_file)
+            self._pp_ce.gated = bool(fields[1])
 
     def _pp_bound_host_lead(self: Scheduler) -> None:
         """SGLANG_PP_HOST_LEAD_MAX: wait until fewer than that many of this stage's forwards are not yet

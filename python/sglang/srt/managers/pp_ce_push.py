@@ -18,6 +18,8 @@ from __future__ import annotations
 import json
 import logging
 import os
+import queue
+import threading
 import time
 from collections import deque, namedtuple
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
@@ -126,8 +128,41 @@ class _EventWork:
         torch.cuda.current_stream().wait_event(self.event)
 
 
+class _GatedLanding:
+    """Event-like end of a gated push: query() / synchronize() cover the copies the gate thread enqueues once the
+    slot is free, including the time before they exist."""
+
+    def __init__(self) -> None:
+        self.enqueued = threading.Event()
+        self.done: Optional[torch.cuda.Event] = None
+
+    def set(self, done: torch.cuda.Event) -> None:
+        self.done = done
+        self.enqueued.set()
+
+    def query(self) -> bool:
+        return self.enqueued.is_set() and self.done.query()
+
+    def synchronize(self) -> None:
+        self.enqueued.wait()
+        self.done.synchronize()
+
+
+class _GatedWork:
+    """Window entry of a gated push. wait() first waits on the host until the gate thread enqueued the copies (the
+    consumer has freed the slot of seq - slots by then), then orders the caller's stream after them. The window
+    waits a push only rounds after it was made, so the consumer needs no later relay of this stage: no cycle."""
+
+    def __init__(self, landing: _GatedLanding) -> None:
+        self.event = landing
+
+    def wait(self) -> None:
+        self.event.enqueued.wait()
+        torch.cuda.current_stream().wait_event(self.event.done)
+
+
 class PushWork:
-    def __init__(self, work: _EventWork, sources: List[torch.Tensor]) -> None:
+    def __init__(self, work, sources: List[torch.Tensor]) -> None:
         self.work = work
         self.payload = sources
 
@@ -243,6 +278,15 @@ class PPCEPush:
         self._ck_recv: Optional[_CEChecksum] = None
         self._ck_views: Dict[int, List[Tuple[str, torch.Tensor]]] = {}
         self.ring_bytes = slots * slot_bytes
+        # SGLANG_PP_CE_PUSH_GATED: a push whose slot may still be in use parks only a bare wait on the gate stream;
+        # the gate thread enqueues its copies once the slot is free. Copies parked behind a stream wait hold the
+        # GPU's peer copy path, so every other peer copy from this GPU (PD KV transfers) would wait with them.
+        self.gated = envs.SGLANG_PP_CE_PUSH_GATED.get()
+        self._gate_stream = torch.cuda.Stream(device=device_id) if has_next else None
+        self._gate_q: "queue.SimpleQueue" = queue.SimpleQueue()
+        self._gate_lock = threading.Lock()
+        self._gate_pending = 0
+        self._gate_thread: Optional[threading.Thread] = None
         # Local staging words for signal(): [0] the push stream's full flags, [1] the release's free flags.
         self._scratch = torch.zeros(64, dtype=torch.int32, device=f"cuda:{device_id}")
 
@@ -328,8 +372,9 @@ class PPCEPush:
     def push(
         self, tensors: Dict[str, torch.Tensor], ready_event: Optional[torch.cuda.Event]
     ) -> Tuple[List[Tuple[str, object]], PushWork]:
-        """Enqueue the copies of one message on the push stream; returns its metadata entries (CESlice per
-        tensor, plus CE_KEY) and a window entry that keeps the sources alive until the push completed."""
+        """Enqueue the copies of one message on the push stream (gated: once its slot is free); returns its metadata
+        entries (CESlice per tensor, plus CE_KEY) and a window entry that keeps the sources alive until the push
+        completed."""
         others = [(k, v) for k, v in tensors.items() if not isinstance(v, torch.Tensor)]
         tensors = {k: v for k, v in tensors.items() if isinstance(v, torch.Tensor)}
         seq = self.send_seq
@@ -338,6 +383,21 @@ class PPCEPush:
         layout, _ = pack_layout(
             [(k, t.dtype, tuple(t.shape), t.numel() * t.element_size()) for k, t in tensors.items()]
         )
+        meta: List[Tuple[str, object]] = list(layout) + others
+        meta.append((CE_KEY, (slot, seq)))
+        sources = list(tensors.values())
+        if self._gating():
+            landing = _GatedLanding()
+            slot_free = self._slot_free_event(seq, slot)
+            self._gate_submit(
+                lambda: landing.set(self._enqueue_push(seq, slot, layout, tensors, ready_event)),
+                slot_free,
+            )
+            return meta, PushWork(_GatedWork(landing), sources)
+        done = self._enqueue_push(seq, slot, layout, tensors, ready_event)
+        return meta, PushWork(_EventWork(done), sources)
+
+    def _enqueue_push(self, seq, slot, layout, tensors, ready_event) -> torch.cuda.Event:
         with torch.cuda.stream(self.stream):
             if ready_event is not None:
                 self.stream.wait_event(ready_event)
@@ -357,9 +417,48 @@ class PPCEPush:
             self._timed.append((start, done))
             for t in tensors.values():
                 t.record_stream(self.stream)
-        meta: List[Tuple[str, object]] = list(layout) + others
-        meta.append((CE_KEY, (slot, seq)))
-        return meta, PushWork(_EventWork(done), list(tensors.values()))
+        return done
+
+    # ---- gate (SGLANG_PP_CE_PUSH_GATED) ----
+
+    def _gating(self) -> bool:
+        # Once anything waits at the gate, later push-stream work goes through it too, in order.
+        return self.gated or self._gate_pending > 0
+
+    def _slot_free_event(self, seq: int, slot: int) -> Optional[torch.cuda.Event]:
+        target = free_target(seq, self.slots)
+        if target <= 0:
+            return None
+        event = torch.cuda.Event(blocking=True)
+        with torch.cuda.stream(self._gate_stream):
+            self.drv.wait_geq(self._gate_stream, self.free_va + 4 * slot, target)
+            event.record(self._gate_stream)
+        return event
+
+    def _gate_submit(self, fn: Callable[[], None], ready: Optional[torch.cuda.Event] = None) -> None:
+        with self._gate_lock:
+            self._gate_pending += 1
+            if self._gate_thread is None:
+                self._gate_thread = threading.Thread(
+                    target=self._gate_loop, name=f"pp{self.rank}-ce-gate", daemon=True
+                )
+                self._gate_thread.start()
+        self._gate_q.put((fn, ready))
+
+    def _gate_loop(self) -> None:
+        torch.cuda.set_device(self.device_id)
+        while True:
+            fn, ready = self._gate_q.get()
+            try:
+                if ready is not None:
+                    ready.synchronize()
+                fn()
+            except Exception:
+                # Everything behind this item would wait forever: fail the process instead of hanging it.
+                logger.critical("PP CE push gate thread on PP%d failed", self.rank, exc_info=True)
+                os._exit(1)
+            with self._gate_lock:
+                self._gate_pending -= 1
 
     # ---- consumer ----
 
@@ -408,6 +507,14 @@ class PPCEPush:
         logger.warning("PP CE checksum (debug) on PP%d: first %d messages per side -> %s", rank, n, d)
 
     def release(self, stream: torch.cuda.Stream, slot_seq: Tuple[int, int]) -> None:
+        # A release on the push stream follows this stage's push, which may read the slot in place: behind the gate
+        # it must follow that push's copies, which the gate thread enqueues later.
+        if stream is self.stream and self._gating():
+            self._gate_submit(lambda: self._signal_release(stream, slot_seq))
+            return
+        self._signal_release(stream, slot_seq)
+
+    def _signal_release(self, stream: torch.cuda.Stream, slot_seq: Tuple[int, int]) -> None:
         # Its own staging word: the release can run on a different stream from the pushes.
         slot, seq = slot_seq
         self.drv.signal(stream, self.peer_free_va + 4 * slot, self._scratch.data_ptr() + 128, seq + 1)
