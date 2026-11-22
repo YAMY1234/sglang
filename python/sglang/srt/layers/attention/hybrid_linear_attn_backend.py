@@ -1571,6 +1571,7 @@ class HybridLinearAttnBackend(AttentionBackend):
                 mamba_steps_to_track=mamba_steps_to_track,
                 src_indices_raw=src_indices_raw,
                 null_block_id=-1,
+                pending=mamba_pool.kda_fold_pending,
             )
             return
 

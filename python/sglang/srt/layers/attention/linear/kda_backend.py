@@ -47,6 +47,7 @@ from sglang.srt.runtime_context import (
     get_disagg,
     get_exec,
     get_memory,
+    get_parallel,
     get_platform,
     get_spec,
     mamba_cache_chunk_size,
@@ -568,6 +569,34 @@ class KDAAttnBackend(MambaAttnBackendBase):
                 dtype=torch.int32,
                 device=model_runner.device,
             )
+        if self.req_to_token_pool.mamba_pool.kda_fold_pending is not None:
+            self._check_pending_fold_contract(verify_backend)
+
+    @staticmethod
+    def _check_pending_fold_contract(verify_backend) -> None:
+        """SGLANG_OPT_KDA_PENDING_FOLD leaves `temporal` behind by the pending rows
+        between a commit and the next verify; refuse any setup with a reader of
+        `temporal` that MambaPool's flushes (host copy, copy_from) do not cover."""
+        from sglang.srt.kernel_plugins.nvidia.binding import megakernel_enabled
+
+        problems = []
+        if not (
+            verify_backend.is_nv_cutedsl()
+            and envs.SGLANG_OPT_KDA_MTP_VERIFY_P1_HOIST.get()
+        ):
+            problems.append("the CuTe verify with SGLANG_OPT_KDA_MTP_VERIFY_P1_HOIST")
+        if not get_memory().disable_radix_cache:
+            problems.append("no radix cache (mamba tree snapshots read `temporal`)")
+        if get_memory().enable_hierarchical_cache:
+            problems.append("no HiCache (host offload reads `temporal`)")
+        if megakernel_enabled():
+            problems.append("no NVIDIA megakernel (its KDA commit folds eagerly)")
+        if get_parallel().pp_size != 1:
+            problems.append("pp_size 1 (PP commits on forward_stream without overlap)")
+        if problems:
+            raise ValueError(
+                "SGLANG_OPT_KDA_PENDING_FOLD needs " + "; ".join(problems) + "."
+            )
 
     @staticmethod
     def _can_fuse_accept_state(verify_backend) -> bool:
@@ -804,6 +833,11 @@ class KDAAttnBackend(MambaAttnBackendBase):
         b: torch.Tensor,
         **kwargs,
     ):
+        if self.req_to_token_pool.mamba_pool.kda_fold_pending is not None:
+            raise RuntimeError(
+                "SGLANG_OPT_KDA_PENDING_FOLD: a plain KDA decode would read states "
+                "without their pending rows"
+            )
         layer_cache = self.req_to_token_pool.mamba2_layer_cache(layer.layer_id)
         conv_states = layer_cache.conv[0]
         ssm_states = layer_cache.temporal
@@ -1379,6 +1413,14 @@ class KDAAttnBackend(MambaAttnBackendBase):
                 replayssm_rawk=mamba_cache_params.replayssm_rawk,
                 replayssm_g=mamba_cache_params.replayssm_g,
                 replayssm_beta=mamba_cache_params.replayssm_beta,
+                replayssm_pending=self.req_to_token_pool.mamba_pool.kda_fold_pending,
+            )
+        if self.req_to_token_pool.mamba_pool.kda_fold_pending is not None:
+            # Only the CuTe verify folds pending rows; another verify would read a
+            # stale state.
+            raise RuntimeError(
+                "SGLANG_OPT_KDA_PENDING_FOLD needs the CuTe MTP verify; this batch "
+                "does not meet its contract"
             )
         if ragged_layout is None:
             batch_size = seq_len // draft_token_num
@@ -1884,7 +1926,13 @@ class KDAAttnBackend(MambaAttnBackendBase):
         replayssm_rawk: Optional[torch.Tensor] = None,
         replayssm_g: Optional[torch.Tensor] = None,
         replayssm_beta: Optional[torch.Tensor] = None,
+        replayssm_pending: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        pending_kwargs = {}
+        if replayssm_pending is not None:
+            # Only the phase-1-hoisted (v2) kernel folds pending rows.
+            assert envs.SGLANG_OPT_KDA_MTP_VERIFY_P1_HOIST.get()
+            pending_kwargs = dict(replayssm_pending=replayssm_pending)
         if envs.SGLANG_OPT_KDA_MTP_VERIFY_P1_HOIST.get():
             from sglang.kernels.ops.attention.kda_decode_mtp_v2 import (
                 fused_kda_decode_mtp_dspark,
@@ -1973,6 +2021,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
             onorm_gate=onorm_gate,
             onorm_weight=onorm_weight,
             onorm_eps=onorm_eps,
+            **pending_kwargs,
         )
         if apply_onorm:
             layer._k3_onorm_consumed = True
