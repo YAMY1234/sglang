@@ -1,6 +1,7 @@
 import json
 import sys
 import threading
+import time
 import unittest
 from functools import partial
 from types import SimpleNamespace
@@ -1116,6 +1117,66 @@ class TestDecodePrebuilt(unittest.TestCase):
             scheduler.forward_stream
         )
         self.assertEqual(call_order, ["prepare", "wait", "process"])
+
+    def _admit_with_dp_balance(self, scheduler, rids, curr_bs, mean_bs):
+        move(
+            [MagicMock(rid=rid, owner_list=None) for rid in rids],
+            scheduler.waiting_queue,
+        )
+        scheduler.running_batch.batch_size.return_value = curr_bs
+        scheduler.req_to_token_pool = MagicMock(size=256)
+        scheduler.max_running_requests = 256
+        scheduler.dp_admit_mean_bs = mean_bs
+        new_batch = MagicMock()
+        with (
+            patch(
+                "sglang.srt.disaggregation.decode.ScheduleBatch.init_new",
+                return_value=new_batch,
+            ) as init_new,
+            get_context().override_server_args(
+                disaggregation_decode_enable_radix_cache=False
+            ),
+            envs.SGLANG_DECODE_DP_ADMIT_BALANCE.override(True),
+            envs.SGLANG_DECODE_DP_ADMIT_SLACK.override(1),
+        ):
+            SchedulerDisaggregationDecodeMixin._get_new_prebuilt_batch(
+                scheduler, scheduler.running_batch
+            )
+        return (
+            [req.rid for req in init_new.call_args.args[0]] if init_new.called else []
+        )
+
+    def test_dp_admit_balance_holds_requests_above_the_mean(self):
+        scheduler = self._new_scheduler(enable_overlap=False)
+        # ceil(9.2) + slack 1 - 9 running: two of four join, two wait.
+        admitted = self._admit_with_dp_balance(scheduler, ["a", "b", "c", "d"], 9, 9.2)
+        self.assertEqual(admitted, ["a", "b"])
+        self.assertEqual([req.rid for req in scheduler.waiting_queue], ["c", "d"])
+        self.assertEqual(set(scheduler.dp_admit_held_since), {"a", "b", "c", "d"})
+
+    def test_dp_admit_balance_rank_at_the_mean_plus_slack_admits_none(self):
+        scheduler = self._new_scheduler(enable_overlap=False)
+        self.assertEqual(self._admit_with_dp_balance(scheduler, ["a"], 12, 10.0), [])
+        self.assertEqual([req.rid for req in scheduler.waiting_queue], ["a"])
+
+    def test_dp_admit_balance_admits_requests_held_past_the_max_hold(self):
+        scheduler = self._new_scheduler(enable_overlap=False)
+        scheduler.dp_admit_held_since = {"old": time.monotonic() - 10.0}
+        admitted = self._admit_with_dp_balance(scheduler, ["old", "new"], 12, 10.0)
+        self.assertEqual(admitted, ["old"])
+        self.assertEqual([req.rid for req in scheduler.waiting_queue], ["new"])
+
+    def test_dp_admit_mean_converts_gathered_rows_to_requests(self):
+        scheduler = Scheduler.__new__(Scheduler)
+        batch = MagicMock(global_num_tokens=[40, 48, 56, 64])
+        batch.forward_mode.is_decode.return_value = True
+        batch.batch_size.return_value = 12  # 4 rows per request on this rank
+        with patch(
+            "sglang.srt.disaggregation.decode.get_parallel",
+            return_value=SimpleNamespace(attn_dp_rank=1),
+        ):
+            SchedulerDisaggregationDecodeMixin._note_dp_admit_mean(scheduler, batch)
+        self.assertAlmostEqual(scheduler.dp_admit_mean_bs, 13.0)
 
     def test_prebuilt_requests_run_from_their_admission(self):
         """Admission moves the requests from waiting into running."""

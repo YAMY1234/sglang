@@ -23,6 +23,7 @@ from __future__ import annotations
 import contextlib
 import hashlib
 import logging
+import math
 import random
 import time
 from collections import deque
@@ -4225,7 +4226,18 @@ def defer_decode_prealloc() -> bool:
     )
 
 
+def dp_admit_limit(mean_bs: float, curr_bs: int, slack: int) -> int:
+    """SGLANG_DECODE_DP_ADMIT_BALANCE: how many waiting requests this DP rank may
+    join to its running batch of curr_bs, given the mean batch over DP ranks."""
+    return max(0, math.ceil(mean_bs) + slack - curr_bs)
+
+
 class SchedulerDisaggregationDecodeMixin:
+    # SGLANG_DECODE_DP_ADMIT_BALANCE: mean batch over DP ranks at the last decode step,
+    # and when each held waiting request was first held (by rid).
+    dp_admit_mean_bs: Optional[float] = None
+    dp_admit_held_since: Optional[Dict[str, float]] = None
+
     @torch.no_grad()
     def event_loop_normal_disagg_decode(self: Scheduler):
         """A normal scheduler loop for decode worker in disaggregation mode."""
@@ -4561,11 +4573,23 @@ class SchedulerDisaggregationDecodeMixin:
             ret = running_batch if not running_batch.is_empty() else None
 
         ret = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(ret)
+        if ret and envs.SGLANG_DECODE_DP_ADMIT_BALANCE.get():
+            self._note_dp_admit_mean(ret)
         if ret:
             if dsv41_encoder_only_prefill_enabled():
                 self._set_dsv41_feed_inputs(ret)
             set_schedule_time_batch(ret)
         return NextBatchPlan(batch_to_run=ret, running_batch=running_batch)
+
+    def _note_dp_admit_mean(self: Scheduler, batch: ScheduleBatch) -> None:
+        # Decode rows per request are the same on every rank, so own rows / own batch
+        # converts the gathered rows to requests.
+        rows = batch.global_num_tokens
+        if not batch.forward_mode.is_decode() or not rows or len(rows) < 2:
+            return
+        own = rows[get_parallel().attn_dp_rank]
+        if own > 0:
+            self.dp_admit_mean_bs = sum(rows) / len(rows) * batch.batch_size() / own
 
     def _admit_dsv41_fed_tails(
         self: Scheduler, running_batch: ScheduleBatch
@@ -4948,6 +4972,31 @@ class SchedulerDisaggregationDecodeMixin:
         batch_size = min(self.req_to_token_pool.size, self.max_running_requests)
 
         num_not_used_batch = batch_size - curr_batch_size
+        num_balanced = num_not_used_batch
+        if (
+            envs.SGLANG_DECODE_DP_ADMIT_BALANCE.get()
+            and self.dp_admit_mean_bs is not None
+        ):
+            num_balanced = min(
+                num_not_used_batch,
+                dp_admit_limit(
+                    self.dp_admit_mean_bs,
+                    curr_batch_size,
+                    envs.SGLANG_DECODE_DP_ADMIT_SLACK.get(),
+                ),
+            )
+            now = time.monotonic()
+            held = self.dp_admit_held_since or {}
+            if held is not self.dp_admit_held_since:
+                logger.info(
+                    "Decode DP admit balance on: slack %d, max hold %d ms",
+                    envs.SGLANG_DECODE_DP_ADMIT_SLACK.get(),
+                    envs.SGLANG_DECODE_DP_ADMIT_MAX_HOLD_MS.get(),
+                )
+            self.dp_admit_held_since = {
+                req.rid: held.get(req.rid, now) for req in self.waiting_queue
+            }
+            max_hold_s = envs.SGLANG_DECODE_DP_ADMIT_MAX_HOLD_MS.get() / 1000
 
         # pop req from waiting queue
         can_run_list: List[Req] = []
@@ -4955,7 +5004,13 @@ class SchedulerDisaggregationDecodeMixin:
         for req in self.waiting_queue:
             # we can only add at least `num_not_used_batch` new batch to the running queue;
             # a request restored from host memory waits until its copy has finished
-            if len(can_run_list) < num_not_used_batch and (
+            limit = num_balanced
+            if (
+                num_balanced < num_not_used_batch
+                and now - self.dp_admit_held_since[req.rid] >= max_hold_s
+            ):
+                limit = num_not_used_batch
+            if len(can_run_list) < limit and (
                 not host_restore
                 or req.kv.restore_done_event is None
                 or id(req) in restores_ready
