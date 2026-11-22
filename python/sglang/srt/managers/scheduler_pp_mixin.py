@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from collections import defaultdict, deque
 from contextlib import nullcontext
 from dataclasses import dataclass
@@ -341,6 +342,8 @@ class SchedulerPPMixin:
                 if diag is not None:
                     diag.maybe_log()
                     diag.phase("ingest")
+                if self._pp_host_lead_file is not None:
+                    self._pp_reread_host_lead_max()
                 if self._pp_host_lead_max:
                     # First, so the requests and bootstraps that land meanwhile join this batch.
                     self._pp_bound_host_lead()
@@ -781,6 +784,8 @@ class SchedulerPPMixin:
 
         self._pp_host_lead_max = envs.SGLANG_PP_HOST_LEAD_MAX.get()
         self._pp_launch_events: deque[torch.Event] = deque()
+        self._pp_host_lead_file = envs.SGLANG_DEBUG_PP_HOST_LEAD_MAX_FILE.get()
+        self._pp_host_lead_read_at = 0.0
         self._pp_tensor_dict_inbox: Dict[
             str, deque[Tuple[Dict[str, torch.Tensor], Optional[torch.Event]]]
         ] = defaultdict(deque)
@@ -920,6 +925,21 @@ class SchedulerPPMixin:
             if isinstance(work, pp_ce_push.PushWork):
                 return work.work.event
         return self.launch_event
+
+    def _pp_reread_host_lead_max(self: Scheduler) -> None:
+        now = time.monotonic()
+        if now - self._pp_host_lead_read_at < 5.0:
+            return
+        self._pp_host_lead_read_at = now
+        try:
+            with open(self._pp_host_lead_file) as f:
+                bound = int(f.read().strip() or 0)
+        except (OSError, ValueError):
+            return
+        if bound != self._pp_host_lead_max:
+            logger.info("PP host lead bound %d -> %d (%s)", self._pp_host_lead_max, bound, self._pp_host_lead_file)
+            self._pp_host_lead_max = bound
+            self._pp_launch_events.clear()
 
     def _pp_bound_host_lead(self: Scheduler) -> None:
         """SGLANG_PP_HOST_LEAD_MAX: wait until fewer than that many of this stage's forwards are not yet

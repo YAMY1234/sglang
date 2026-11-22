@@ -892,6 +892,8 @@ class Envs:
     # PP PD prefill: a stage builds its next batch only once fewer than this many of its forwards
     # are queued or running on its GPU (0 = no bound). Admission then stays near its forward.
     SGLANG_PP_HOST_LEAD_MAX = EnvInt(0)
+    # Debug (A/B in one run): a file whose integer replaces SGLANG_PP_HOST_LEAD_MAX, re-read every 5 s.
+    SGLANG_DEBUG_PP_HOST_LEAD_MAX_FILE = EnvStr(None)
     # PP PD prefill: every proxy message carries its micro-batch's identity (request count, new
     # tokens, a hash of the rids) and the next stage asserts it is the batch it is about to run.
     SGLANG_PP_CHECK_PROXY_BATCH = EnvBool(False)
