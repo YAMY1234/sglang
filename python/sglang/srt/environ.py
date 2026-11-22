@@ -2011,6 +2011,9 @@ class Envs:
     # KDA CuTe DSpARK/DFLASH verify: the phase-1-hoisted kernel (backport of
     # #49135, bit-identical outputs); off by default.
     SGLANG_OPT_KDA_MTP_VERIFY_P1_HOIST = EnvBool(False)
+    # KDA ReplaySSM spec commit: record the accepted ring rows per slot and fold
+    # them inside the next P1_HOIST verify (bit-identical); off by default.
+    SGLANG_OPT_KDA_PENDING_FOLD = EnvBool(False)
     SGLANG_ENABLE_LILICORR_SAMPLING = EnvBool(False)
     SGLANG_LILICORR_REQUIRE_SAMPLING = EnvBool(False)
     SGLANG_RAGGED_VERIFY_MODE = EnvStr("static")
