@@ -1673,15 +1673,24 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
 
     @staticmethod
     def _new_transfer_time_stats() -> dict:
-        return dict(span=[], wait=[], send=[], workers=defaultdict(int), since=time.perf_counter())
+        return dict(
+            span=[], wait=[], send=[], event=[], workers=defaultdict(int),
+            busy=defaultdict(float), ready_at_enqueue=0, since=time.perf_counter(),
+        )
 
-    def _record_transfer_time(self, kv_chunk: TransferKVChunk, deq_t: float, worker_index: int) -> None:
+    def _record_transfer_time(
+        self, kv_chunk: TransferKVChunk, deq_t: float, worker_index: int, event_t: float
+    ) -> None:
         now = time.perf_counter()
         with self._xt_lock:
             st = self._xt_stats
             st["wait"].append(deq_t - kv_chunk.enqueued_at)
             st["send"].append(now - deq_t)
+            # Part of dequeue -> sent spent waiting for the chunk's forward / index events.
+            st["event"].append(event_t - deq_t)
             st["workers"][worker_index] += 1
+            st["busy"][worker_index] += now - deq_t
+            st["ready_at_enqueue"] += kv_chunk.ready_at_enqueue
             if kv_chunk.is_last_chunk:
                 first = self._xt_first.pop(kv_chunk.room, None)
                 if first is not None:
@@ -1699,7 +1708,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         logger.info(
             "PD transfer time over %.0f s: %d requests, first chunk enqueued -> last chunk sent ms "
             "p50 %.1f p90 %.1f max %.1f; %d chunks, queue wait ms p50 %.1f p90 %.1f, dequeue -> sent ms "
-            "p50 %.1f p90 %.1f; chunks per worker %s",
+            "p50 %.1f p90 %.1f; chunks per worker %s; event wait ms p50 %.1f p90 %.1f, %d chunks "
+            "ready at enqueue, worker busy %% %s",
             elapsed,
             len(st["span"]),
             q(st["span"], 0.5),
@@ -1711,6 +1721,10 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             q(st["send"], 0.5),
             q(st["send"], 0.9),
             dict(sorted(st["workers"].items())),
+            q(st["event"], 0.5),
+            q(st["event"], 0.9),
+            st["ready_at_enqueue"],
+            {w: round(100 * b / elapsed) for w, b in sorted(st["busy"].items())},
         )
 
     def _send_kvcache_dcp_chunk_packed(
@@ -3162,6 +3176,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                         self, kv_chunk.indices_event, kv_chunk.room, "indices_event"
                     )
                     kv_chunk.indices_event = None
+                event_t = time.perf_counter() if kv_chunk.enqueued_at else 0.0
                 if isinstance(kv_chunk.prefill_kv_indices, torch.Tensor):
                     kv_chunk.prefill_kv_indices = kv_chunk.prefill_kv_indices.numpy()
 
@@ -3485,7 +3500,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 if staging_deferred:
                     continue
                 if kv_chunk.enqueued_at:
-                    self._record_transfer_time(kv_chunk, deq_t, worker_index)
+                    self._record_transfer_time(kv_chunk, deq_t, worker_index, event_t)
 
                 self._staging_outstanding[kv_chunk.room] -= 1
                 if self.enable_deferred_decode_kv_release:
@@ -3791,8 +3806,10 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 puts = self._queue_puts = [0] * len(self.transfer_queues)
             puts[shard_idx] += 1
         enqueued_at = 0.0
+        ready_at_enqueue = False
         if self._xt_interval > 0:
             enqueued_at = time.perf_counter()
+            ready_at_enqueue = all(e is None or e.query() for e in (wait_event, indices_event))
             with self._xt_lock:
                 self._xt_first.setdefault(bootstrap_room, enqueued_at)
         self.transfer_queues[shard_idx].put(
@@ -3808,6 +3825,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 wait_event=wait_event,
                 indices_event=indices_event,
                 enqueued_at=enqueued_at,
+                ready_at_enqueue=ready_at_enqueue,
             )
         )
 

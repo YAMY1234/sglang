@@ -241,6 +241,11 @@ class PPBubbleDiag:
         self.qgap_n = 0
         self.qgap_cpu_ms = 0.0
         self.qgap_dep_ms = 0.0
+        # Forwards launched but not complete on this stage's GPU, sampled at each launch
+        # (the launched one included): how far the host runs ahead of its GPU.
+        self.lead_n = 0
+        self.lead_sum = 0
+        self.lead_max = 0
         # Full forwards split by whether a host load-back overlapped them.
         self.full_load_n = 0
         self.full_load_ms = 0.0
@@ -379,6 +384,10 @@ class PPBubbleDiag:
         )
         self._prev_end = end
         self._drain_events()
+        lead = len(self._pending)
+        self.lead_n += 1
+        self.lead_sum += lead
+        self.lead_max = max(self.lead_max, lead)
 
     def _drain_events(self) -> None:
         while self._pending and self._pending[0][3].query():
@@ -433,6 +442,8 @@ class PPBubbleDiag:
             "qgap_n": self.qgap_n,
             "qgap_cpu_ms": r(self.qgap_cpu_ms),
             "qgap_dep_ms": r(self.qgap_dep_ms),
+            "lead_mean": r(self.lead_sum / max(1, self.lead_n)),
+            "lead_max": self.lead_max,
             "full_load_n": self.full_load_n,
             "full_load_ms": r(self.full_load_ms),
             "full_load_cached": self.full_load_cached,

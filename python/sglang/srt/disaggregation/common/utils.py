@@ -38,6 +38,8 @@ class TransferKVChunk:
     indices_event: Optional[object] = None
     # perf_counter() at enqueue when SGLANG_DISAGG_TRANSFER_TIME_STATS_INTERVAL > 0, else 0.
     enqueued_at: float = 0.0
+    # With those stats: whether both events had already completed at enqueue.
+    ready_at_enqueue: bool = False
 
 
 def bind_thread_to_device(gpu_id: int) -> None:

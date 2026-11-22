@@ -359,6 +359,8 @@ class SchedulerPPMixin:
                     )
                     tmbs[mb_id] = transferred_rids
 
+                if self._pp_host_lead_max:
+                    self._pp_bound_host_lead()
                 # The pipeline loop builds its own batch instead of calling
                 # get_next_batch_to_run, so label the same work here.
                 if diag is not None:
@@ -413,6 +415,8 @@ class SchedulerPPMixin:
                         self.mb_metadata,
                         self.last_rank_comm_queue,
                     )
+                    if self._pp_host_lead_max:
+                        self._pp_launch_events.append(self.launch_event)
                     if early_send:
                         self._pp_pd_early_send_last_chunks(
                             cur_batch, result, self.launch_event
@@ -772,6 +776,8 @@ class SchedulerPPMixin:
                 "PP tensor communication overlap enabled on a dedicated CUDA stream"
             )
 
+        self._pp_host_lead_max = envs.SGLANG_PP_HOST_LEAD_MAX.get()
+        self._pp_launch_events: deque[torch.Event] = deque()
         self._pp_tensor_dict_inbox: Dict[
             str, deque[Tuple[Dict[str, torch.Tensor], Optional[torch.Event]]]
         ] = defaultdict(deque)
@@ -903,6 +909,19 @@ class SchedulerPPMixin:
             "min_free_mib": (free - peak_extra) >> 20,
             "logits_budget_mib": mqa_logits_static_budget_bytes(device_index=device) >> 20,
         }
+
+    def _pp_bound_host_lead(self: Scheduler) -> None:
+        """SGLANG_PP_HOST_LEAD_MAX: wait until fewer than that many of this stage's launched forwards are
+        unfinished on its GPU. Requests admitted earlier than their forward can start only hold their
+        request row and KV longer; under a free-running host that lead reaches pp_loop_size forwards."""
+        events = self._pp_launch_events
+        while events and events[0].query():
+            events.popleft()
+        if len(events) < self._pp_host_lead_max:
+            return
+        with pp_bubble_diag.wait("host_lead"):
+            while len(events) >= self._pp_host_lead_max:
+                events.popleft().synchronize()
 
     def _pp_overlap_input_wait(self: Scheduler, inbox: Optional[PPRecvInbox]) -> None:
         """While the next input is still upstream, send the early KV chunks whose
