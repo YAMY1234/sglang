@@ -490,8 +490,13 @@ def commit_kda_replayssm_after_verify(
     mamba_steps_to_track: torch.Tensor | None = None,
     src_indices_raw: torch.Tensor | None = None,
     null_block_id: int = -1,
+    pending: torch.Tensor | None = None,
 ) -> None:
     """Fold each layer's accepted window into `temporal` and roll back conv.
+
+    With ``pending`` (SGLANG_OPT_KDA_PENDING_FOLD) the accepted counts are recorded
+    per slot instead and the next verify folds them; a batch with track indices
+    still folds at once (the track snapshot needs the folded state).
 
     Single commit entry point shared by the generic spec_utils commit and the
     dspark/dflash direct `update_mamba_state_after_mtp_verify` path. The SSM state
@@ -505,20 +510,27 @@ def commit_kda_replayssm_after_verify(
 
     L = spec_state.replayssm_rawv.shape[-2]
     num_k_heads = spec_state.replayssm_rawk.shape[2]
-    commit_kda_replayssm_spec_all_layers(
-        checkpoint_state=spec_state.temporal,
-        rawv_cache=spec_state.replayssm_rawv,
-        rawk_cache=spec_state.replayssm_rawk,
-        gk_cache=spec_state.replayssm_g,
-        beta_cache=spec_state.replayssm_beta,
-        ssm_state_indices=state_batch_indices,
-        accept_lens=accept_lens,
-        max_cache_len=L,
-        num_k_heads=num_k_heads,
-        mamba_track_indices=mamba_track_indices,
-        mamba_steps_to_track=mamba_steps_to_track,
-        null_block_id=null_block_id,
-    )
+    if pending is not None and mamba_track_indices is None:
+        record_kda_pending(
+            pending=pending, slots=state_batch_indices, accept_lens=accept_lens
+        )
+    else:
+        commit_kda_replayssm_spec_all_layers(
+            checkpoint_state=spec_state.temporal,
+            rawv_cache=spec_state.replayssm_rawv,
+            rawk_cache=spec_state.replayssm_rawk,
+            gk_cache=spec_state.replayssm_g,
+            beta_cache=spec_state.replayssm_beta,
+            ssm_state_indices=state_batch_indices,
+            accept_lens=accept_lens,
+            max_cache_len=L,
+            num_k_heads=num_k_heads,
+            mamba_track_indices=mamba_track_indices,
+            mamba_steps_to_track=mamba_steps_to_track,
+            null_block_id=null_block_id,
+        )
+        if pending is not None:
+            reset_kda_pending(pending=pending, slots=state_batch_indices)
     # Conv rollback + track-slot conv snapshot, per conv group (fold already did
     # the ssm side via HAS_TRACK). Loop mirrors the recurrent commit's zip; track
     # scatter is mask-gated (step -1 => skip).
@@ -540,3 +552,39 @@ def commit_kda_replayssm_after_verify(
                 mamba_steps_to_track,
                 src_indices_raw,
             )
+
+
+def record_kda_pending(
+    *, pending: torch.Tensor, slots: torch.Tensor, accept_lens: torch.Tensor
+) -> None:
+    """pending[slot] = accepted rows the next verify folds; null slots (< 0) land in
+    the scratch entry pending[-1], which no verify reads."""
+    rows = torch.where(slots >= 0, slots, pending.numel() - 1).to(torch.int64)
+    pending.index_copy_(0, rows, accept_lens.to(torch.int32))
+
+
+def reset_kda_pending(*, pending: torch.Tensor, slots: torch.Tensor) -> None:
+    """Forget the pending rows of ``slots`` (e.g. a slot that changes owner)."""
+    rows = torch.where(slots >= 0, slots, pending.numel() - 1).to(torch.int64)
+    pending.index_fill_(0, rows.reshape(-1), 0)
+
+
+def fold_kda_pending(*, spec_state, pending: torch.Tensor, slots: torch.Tensor) -> None:
+    """Fold the pending rows of ``slots`` into ``temporal`` (the eager commit fold) and
+    clear them, so a reader of those slots sees the committed state."""
+    slots = slots.reshape(-1).to(torch.int64)
+    commit_kda_replayssm_spec_all_layers(
+        checkpoint_state=spec_state.temporal,
+        rawv_cache=spec_state.replayssm_rawv,
+        rawk_cache=spec_state.replayssm_rawk,
+        gk_cache=spec_state.replayssm_g,
+        beta_cache=spec_state.replayssm_beta,
+        ssm_state_indices=slots,
+        accept_lens=pending[torch.where(slots >= 0, slots, pending.numel() - 1)].to(
+            torch.int64
+        ),
+        max_cache_len=spec_state.replayssm_rawv.shape[-2],
+        num_k_heads=spec_state.replayssm_rawk.shape[2],
+        null_block_id=-1,
+    )
+    reset_kda_pending(pending=pending, slots=slots)

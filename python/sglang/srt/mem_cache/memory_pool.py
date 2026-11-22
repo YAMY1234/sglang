@@ -514,6 +514,56 @@ class MambaPool:
     # class-level default because UnifiedMambaPool skips MambaPool.__init__.
     _slot_siblings: Tuple = ()
 
+    # SGLANG_OPT_KDA_PENDING_FOLD: [slots + 1] int32 accepted ring rows per slot that
+    # the next verify folds (the last entry absorbs null rows); None when off.
+    kda_fold_pending: Optional[torch.Tensor] = None
+    # Stream of the commits that write kda_fold_pending (the scheduler's forward
+    # stream under overlap); None = the caller's stream.
+    kda_flush_stream = None
+
+    def _on_kda_flush_stream(self, fn, slots: torch.Tensor, *, wait_back: bool):
+        cur = torch.cuda.current_stream()
+        stream = self.kda_flush_stream
+        if stream is None or stream == cur:
+            fn(slots)
+            return
+        # Behind every commit already enqueued there, and behind the caller's
+        # writes of `slots`.
+        stream.wait_stream(cur)
+        slots.record_stream(stream)
+        with torch.cuda.stream(stream):
+            fn(slots)
+        if wait_back:
+            cur.wait_stream(stream)
+
+    def reset_kda_pending(self, slots: torch.Tensor) -> None:
+        """A slot changes owner: drop the pending rows a finished owner's last
+        commit may still record."""
+        from sglang.kernels.ops.attention.linear.kda_replayssm_spec_decode import (
+            reset_kda_pending,
+        )
+
+        self._on_kda_flush_stream(
+            lambda idx: reset_kda_pending(pending=self.kda_fold_pending, slots=idx),
+            slots.reshape(-1),
+            wait_back=False,
+        )
+
+    def flush_kda_pending(self, slots: torch.Tensor) -> None:
+        """Fold the pending rows of `slots` into `temporal` before a reader outside
+        the verify; the caller's stream waits for the fold."""
+        from sglang.kernels.ops.attention.linear.kda_replayssm_spec_decode import (
+            fold_kda_pending,
+        )
+
+        self._on_kda_flush_stream(
+            lambda idx: fold_kda_pending(
+                spec_state=self.mamba_cache, pending=self.kda_fold_pending, slots=idx
+            ),
+            slots.reshape(-1),
+            wait_back=True,
+        )
+
     def register_slot_state(self, state) -> None:
         """Attach a state that rides along on clear / copy / host round-trip,
         so a slot never changes owner with a stale sibling row attached."""
@@ -1053,6 +1103,12 @@ class MambaPool:
                 if enable_linear_replayssm_spec and not self.replayssm_spec_fold
                 else None
             )
+            if self.replayssm_spec_fold and envs.SGLANG_OPT_KDA_PENDING_FOLD.get():
+                self.kda_fold_pending = torch.zeros(
+                    (self.mamba_cache.temporal.shape[1] + 1,),
+                    dtype=torch.int32,
+                    device=device,
+                )
             mem_usage_bytes = self.mamba_cache.mem_usage_bytes()
             if isinstance(self.mamba_cache, self.SpeculativeState):
                 # `intermediate_conv_window` is an as_strided view whose logical
@@ -1150,6 +1206,12 @@ class MambaPool:
         """Zero out mamba state at the given pool indices. Must run on forward stream."""
         for sibling in self._slot_siblings:
             sibling.reset_slots(indices)
+        if self.kda_fold_pending is not None:
+            from sglang.kernels.ops.attention.linear.kda_replayssm_spec_decode import (
+                reset_kda_pending,
+            )
+
+            reset_kda_pending(pending=self.kda_fold_pending, slots=indices)
         idx64 = indices.to(torch.int64)
         if self._should_fuse_slot_ops():
             from sglang.srt.mem_cache.mamba_slot_fused import fused_clear_conv_slots
@@ -1173,6 +1235,9 @@ class MambaPool:
         caps the donate to the last flush boundary. The dst cursor is reset to 0
         (the copied checkpoint has no pending ring entries).
         """
+        if self.kda_fold_pending is not None:
+            self.flush_kda_pending(src_indices)
+            self.reset_kda_pending(dst_indices)
         if self.replayssm_write_pos is not None and self.debug_memory_pool:
             # Debug-only (syncs): catch any copy of an active, un-flushed slot.
             src_wp = self.replayssm_write_pos[src_indices]
@@ -1208,6 +1273,8 @@ class MambaPool:
             sibling.copy_slots(src_indices, dst_indices)
 
     def get_cpu_copy(self, indices):
+        if self.kda_fold_pending is not None:
+            self.flush_kda_pending(indices)
         current_platform.synchronize()
         conv_cpu = [
             conv[:, indices].to("cpu", non_blocking=True)
@@ -1591,6 +1658,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
                 self.mamba_pool.replayssm_is_flush.index_fill_(0, fresh_rows, 0)
 
         mamba_indices: list[torch.Tensor] = []
+        fresh_mamba_indices: list[torch.Tensor] = []
         mamba_ping_pong_track_buffers: list[torch.Tensor] = []
         for req in reqs:
             if req.kv.holds_mamba:  # for radix cache / continuing chunked
@@ -1602,6 +1670,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
                 )
                 req.kv.mamba_pool_idx = mid[0]
                 req.kv.mamba_needs_clear = True
+                fresh_mamba_indices.append(mid[0])
                 # GDN ReplaySSM: a freshly (re)assigned slot starts an empty
                 # ring. write_pos=0 means "ring empty", so the decode kernel
                 # ignores ring contents and reads only the checkpoint state
@@ -1622,6 +1691,8 @@ class HybridReqToTokenPool(ReqToTokenPool):
             assert len(select_index) == len(mamba_ping_pong_track_buffers), (
                 "Not enough space for mamba ping pong idx, try to increase --mamba-full-memory-ratio."
             )
+        if fresh_mamba_indices and self.mamba_pool.kda_fold_pending is not None:
+            self.mamba_pool.reset_kda_pending(torch.stack(fresh_mamba_indices))
         # Device rows: indexing a device tensor with a Python list syncs the host.
         rows = async_h2d(select_index, dtype=torch.int64, device=self.device)
         mamba_index_tensor = torch.stack(mamba_indices).to(dtype=torch.int32)

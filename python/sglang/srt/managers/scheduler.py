@@ -310,6 +310,7 @@ from sglang.srt.mem_cache.common import (
     release_kv_cache,
 )
 from sglang.srt.mem_cache.events import KvEventLoraNames
+from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
 from sglang.srt.mem_cache.prefill_budget import park_chunked_prefill_enabled
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.model_executor.runner_utils.pool import prewarm_graph_pool_borrow
@@ -1906,6 +1907,11 @@ class Scheduler(
 
         if not self.enable_overlap:
             return
+
+        # KDA pending fold: commits run on forward_stream, so slot resets and
+        # flushes from the scheduler are ordered there.
+        if isinstance(self.req_to_token_pool, HybridReqToTokenPool):
+            self.req_to_token_pool.mamba_pool.kda_flush_stream = self.forward_stream
 
         # Under NVIDIA Confidential Computing (CC) the per-step D2H result readback is
         # forced synchronous and blocks the scheduler thread at issue, serializing the
