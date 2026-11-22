@@ -10,7 +10,6 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-import os
 import threading
 from dataclasses import replace
 from pathlib import Path
@@ -141,10 +140,6 @@ class NVFP4MooncakeIO:
         )
         self.lock = threading.Lock()
         self.stream = None
-        # Diagnostic: re-read every Nth multi-chunk load (fraction), fenced, and compare with what the load decoded.
-        self.get_recheck = float(os.environ.get("SGLANG_MOONCAKE_NVFP4_GET_RECHECK", "0") or 0)
-        self.recheck_stats = dict(seen=0, loads=0, pages=0, bad_pages=0, bad_loads=0, read_fail=0)
-        self._recheck_scratch = None
         storage.registered_pools = {**pool_group.entry_map, PoolName.KV: self.stage_pool}
         suffix = "_hostnvfp4_" + self.digest
         storage.mla_suffix += suffix
@@ -265,72 +260,7 @@ class NVFP4MooncakeIO:
         return self._run(self._set, transfers, extra_info)
 
     def load_all_layers(self, transfers):
-        return self._run(self._get_checked, transfers)
-
-    def _get_checked(self, transfers):
-        ok = self._get(transfers)
-        if ok and self.get_recheck and any(
-            t.name == PoolName.KV and len(t.keys) > self.chunk_pages for t in transfers
-        ):
-            st = self.recheck_stats
-            st["seen"] += 1
-            if int(st["seen"] * self.get_recheck) != int((st["seen"] - 1) * self.get_recheck):
-                self._recheck(transfers)
-        return ok
-
-    def _recheck(self, transfers):
-        """Read each KV chunk of the finished load again, fenced, decode it into a scratch copy of the rows the load
-        wrote and compare. Stored objects are immutable and still under the load's read lease, so a correct load matches
-        byte for byte; a differing page was decoded from staging bytes the next chunk's read had overwritten."""
-        st = self.recheck_stats
-        rows_max = self.chunk_pages * self.page_size
-        if self._recheck_scratch is None:
-            self._recheck_scratch = (
-                torch.empty((rows_max, *self.layers[0].shape[1:]), dtype=self.layers[0].dtype, device=self.device),
-                torch.arange(rows_max, device=self.device),
-            )
-        scratch, local = self._recheck_scratch
-        pages = bad = 0
-        detail = []
-        for transfer in transfers:
-            if transfer.name != PoolName.KV:
-                continue
-            for index, (chunk, rows) in enumerate(self._chunks(transfer)):
-                keys, multiplier = self.storage._get_hybrid_page_component_keys(list(chunk.keys), chunk)
-                keys = self.storage._tag_keys(keys)
-                ptrs, sizes = self.storage._build_pool_buffer_meta(
-                    self.storage.registered_pools[chunk.name], chunk.host_indices, keys, multiplier, None,
-                )
-                self.stream.synchronize()  # the load's (or the last check's) decode is done before staging is reused
-                received = self.storage._get_batch_zero_copy_impl(keys, ptrs, sizes)
-                expected = [sum(size) if isinstance(size, list) else size for size in sizes]
-                if received is None or isinstance(received, int) or list(received) != expected:
-                    st["read_fail"] += 1  # gone between the passes: no verdict on this load
-                    return
-                n, m = len(chunk.keys), rows.numel()
-                differ = torch.zeros(n, dtype=torch.bool, device=self.device)
-                for layer, target in enumerate(self.layers):
-                    loaded = target.index_select(0, rows)
-                    scratch[:m].copy_(loaded)  # bytes the decode does not write compare equal
-                    self.codec.decode_rows(
-                        self.workspace[layer, :n].view(-1, self.codec.row_bytes), local[:m], scratch,
-                    )
-                    self.stream.synchronize()
-                    differ |= (scratch[:m] != loaded).view(n, -1).any(1)
-                nbad = int(differ.sum())
-                pages += n
-                bad += nbad
-                if nbad:
-                    detail.append(f"chunk {index}: {nbad} of {n} pages")
-        st["loads"] += 1
-        st["pages"] += pages
-        st["bad_pages"] += bad
-        st["bad_loads"] += bad > 0
-        if bad or st["loads"] % 20 == 1:
-            (logger.warning if bad else logger.info)(
-                "Mooncake host NVFP4 get recheck: this load %d of %d pages differ (%s); totals %s",
-                bad, pages, "; ".join(detail) or "none", st,
-            )
+        return self._run(self._get, transfers)
 
 
 class MooncakeNVFP4Linker(MooncakeDirectLinker):
