@@ -449,11 +449,10 @@ class PPCEPush:
     # ---- gate (SGLANG_PP_CE_PUSH_GATED) ----
 
     def _gating(self) -> bool:
-        # Only a stage without an input ring gates: on one with a ring, the forward stream parks on the next input's
-        # full flag with copy-engine work behind it, which holds back copies the gate thread enqueues later (this
-        # stage's push and input-slot release), while that input's push waits for the release. Once anything waits
-        # at the gate, later push-stream work goes through it too, in order.
-        return (self.gated and not self.has_prev) or self._gate_pending > 0
+        # 1: only the first stage. A stage with an input ring gates only under 2, which releases that ring in program
+        # order (release()): a release left behind the gated push would make the previous stage wait on this gate.
+        # Once anything waits at the gate, later push-stream work goes through it too, in order.
+        return self.gated >= 2 or (self.gated == 1 and not self.has_prev) or self._gate_pending > 0
 
     _GATE_POLL_S = 5e-4
 
