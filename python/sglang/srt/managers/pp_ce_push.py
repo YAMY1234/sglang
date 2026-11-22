@@ -422,8 +422,11 @@ class PPCEPush:
     # ---- gate (SGLANG_PP_CE_PUSH_GATED) ----
 
     def _gating(self) -> bool:
-        # Once anything waits at the gate, later push-stream work goes through it too, in order.
-        return self.gated or self._gate_pending > 0
+        # Only a stage without an input ring gates: on one with a ring, the forward stream parks on the next input's
+        # full flag with copy-engine work behind it, which holds back copies the gate thread enqueues later (this
+        # stage's push and input-slot release), while that input's push waits for the release. Once anything waits
+        # at the gate, later push-stream work goes through it too, in order.
+        return (self.gated and not self.has_prev) or self._gate_pending > 0
 
     def _slot_free_event(self, seq: int, slot: int) -> Optional[torch.cuda.Event]:
         target = free_target(seq, self.slots)
@@ -507,14 +510,6 @@ class PPCEPush:
         logger.warning("PP CE checksum (debug) on PP%d: first %d messages per side -> %s", rank, n, d)
 
     def release(self, stream: torch.cuda.Stream, slot_seq: Tuple[int, int]) -> None:
-        # A release on the push stream follows this stage's push, which may read the slot in place: behind the gate
-        # it must follow that push's copies, which the gate thread enqueues later.
-        if stream is self.stream and self._gating():
-            self._gate_submit(lambda: self._signal_release(stream, slot_seq))
-            return
-        self._signal_release(stream, slot_seq)
-
-    def _signal_release(self, stream: torch.cuda.Stream, slot_seq: Tuple[int, int]) -> None:
         # Its own staging word: the release can run on a different stream from the pushes.
         slot, seq = slot_seq
         self.drv.signal(stream, self.peer_free_va + 4 * slot, self._scratch.data_ptr() + 128, seq + 1)

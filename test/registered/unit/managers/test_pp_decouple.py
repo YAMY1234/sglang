@@ -314,13 +314,13 @@ class TestPPCEPush(CustomTestCase):
         self.assertEqual(got["sums"][0][:2], [int(h.view(torch.int32).sum()), 3])
         self.assertEqual(got["sums"][1][0], int((h + 1).view(torch.int32).sum()))
 
-    def _gated_ce(self, log, gated):
+    def _gated_ce(self, log, gated, has_prev=False):
         import queue as _queue
 
         from sglang.srt.managers.pp_ce_push import PPCEPush
 
         ce = PPCEPush.__new__(PPCEPush)
-        ce.rank, ce.device_id, ce.slots, ce.send_seq, ce.gated = 1, 0, 2, 0, gated
+        ce.rank, ce.device_id, ce.slots, ce.send_seq, ce.gated, ce.has_prev = 0, 0, 2, 0, gated, has_prev
         ce.stream = "push"
         ce._gate_q, ce._gate_lock, ce._gate_pending, ce._gate_thread = _queue.SimpleQueue(), threading.Lock(), 0, None
         slot_free = {}
@@ -333,13 +333,12 @@ class TestPPCEPush(CustomTestCase):
 
         ce._slot_free_event = slot_free_event
         ce._enqueue_push = lambda seq, slot, layout, tensors, ready: log.append(("push", seq)) or f"done{seq}"
-        ce._signal_release = lambda stream, slot_seq: log.append(("release", slot_seq))
+        ce.release = lambda stream, slot_seq: log.append(("release", slot_seq))
         return ce, slot_free
 
     def test_a_gated_push_enqueues_its_copies_only_once_its_slot_is_free(self):
         """SGLANG_PP_CE_PUSH_GATED: copies parked behind a stream wait would stall every other peer copy from the
-        GPU, so a push whose slot is still in use is held back; the release of the stage's own input slot, which
-        the push may read in place, stays behind it; later pushes keep their order through the gate."""
+        GPU, so a push whose slot is still in use is held back; later pushes keep their order through the gate."""
         from unittest.mock import patch
 
         log = []
@@ -349,7 +348,6 @@ class TestPPCEPush(CustomTestCase):
             _, w0 = ce.push(t, None)
             _, w1 = ce.push(t, None)
             _, w2 = ce.push(t, None)  # reuses slot 0: waits until seq 0 was released
-            ce.release("push", (0, 5))
             ce.gated = False
             _, w3 = ce.push(t, None)  # gate turned off, but work is still queued at it
             self.assertTrue(w1.work.event.enqueued.wait(5))
@@ -359,7 +357,7 @@ class TestPPCEPush(CustomTestCase):
             slot_free[2].set()
             slot_free[3].set()
             self.assertTrue(w3.work.event.enqueued.wait(5))
-        self.assertEqual(log, [("push", 0), ("push", 1), ("push", 2), ("release", (0, 5)), ("push", 3)])
+        self.assertEqual(log, [("push", 0), ("push", 1), ("push", 2), ("push", 3)])
         self.assertEqual(w2.work.event.done, "done2")
         deadline = time.time() + 5
         while ce._gate_pending and time.time() < deadline:
@@ -368,12 +366,17 @@ class TestPPCEPush(CustomTestCase):
         self.assertEqual(log[-1], ("push", 4))  # nothing at the gate any more: enqueued at once
 
     def test_an_ungated_push_enqueues_at_once(self):
-        log = []
-        ce, _ = self._gated_ce(log, gated=False)
-        _, w = ce.push({"hidden_states": torch.zeros(4)}, None)
-        ce.release("push", (0, 1))
-        self.assertEqual(log, [("push", 0), ("release", (0, 1))])
-        self.assertEqual(w.work.event, "done0")
+        for gated, has_prev in ((False, False), (True, True)):
+            # A stage with an input ring never gates: its forward's work parked on the next input would hold back
+            # the copies and the input-slot release the gate thread enqueues later, while that input waits for them.
+            log = []
+            ce, _ = self._gated_ce(log, gated=gated, has_prev=has_prev)
+            for seq in range(3):
+                _, w = ce.push({"hidden_states": torch.zeros(4)}, None)
+                ce.release("push", (seq % 2, seq))
+            self.assertEqual(log, [x for seq in range(3) for x in (("push", seq), ("release", (seq % 2, seq)))])
+            self.assertEqual(w.work.event, "done2")
+            self.assertIsNone(ce._gate_thread)
 
     def _scheduler(self, last, log):
         from sglang.srt.managers.pp_ce_push import CEWait
