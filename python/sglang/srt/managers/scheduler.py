@@ -3871,8 +3871,12 @@ class Scheduler(
     def _linker_requery_after_device_loss(self, req: Req) -> bool:
         """Re-query an external-linker range lost to device eviction while queued."""
         max_attempts = get_memory().hicache_storage_prefetch_retry_max_attempts
-        if req.storage_prefetch_retry_attempts >= max_attempts:
+        over = req.storage_prefetch_retry_attempts >= max_attempts
+        linker = self.tree_cache.linker
+        if over and not linker.wait_fit_s:
             return False
+        # F6c7e: past the cap the linker re-queries only a room-refused load (PP0 decides).
+        linker.requery_over_attempts = over
         requeried = self.tree_cache.requery_prefetch_after_device_loss(req)
         if not requeried:
             return False
