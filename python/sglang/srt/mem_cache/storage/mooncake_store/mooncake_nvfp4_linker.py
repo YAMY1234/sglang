@@ -239,6 +239,7 @@ class NVFP4MooncakeIO:
                     self.storage.registered_pools[chunk.name],
                     chunk.host_indices, keys, multiplier, None,
                 )
+                self.stream.synchronize()  # Previous chunk's decode may still read staging.
                 received = self.storage._get_batch_zero_copy_impl(keys, ptrs, sizes)
                 expected = [sum(size) if isinstance(size, list) else size for size in sizes]
                 if received is None or isinstance(received, int) or list(received) != expected:
