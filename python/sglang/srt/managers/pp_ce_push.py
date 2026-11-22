@@ -126,7 +126,7 @@ class _EventWork:
         torch.cuda.current_stream().wait_event(self.event)
 
 
-class _Push:
+class PushWork:
     def __init__(self, work: _EventWork, sources: List[torch.Tensor]) -> None:
         self.work = work
         self.payload = sources
@@ -327,7 +327,7 @@ class PPCEPush:
 
     def push(
         self, tensors: Dict[str, torch.Tensor], ready_event: Optional[torch.cuda.Event]
-    ) -> Tuple[List[Tuple[str, object]], _Push]:
+    ) -> Tuple[List[Tuple[str, object]], PushWork]:
         """Enqueue the copies of one message on the push stream; returns its metadata entries (CESlice per
         tensor, plus CE_KEY) and a window entry that keeps the sources alive until the push completed."""
         others = [(k, v) for k, v in tensors.items() if not isinstance(v, torch.Tensor)]
@@ -359,7 +359,7 @@ class PPCEPush:
                 t.record_stream(self.stream)
         meta: List[Tuple[str, object]] = list(layout) + others
         meta.append((CE_KEY, (slot, seq)))
-        return meta, _Push(_EventWork(done), list(tensors.values()))
+        return meta, PushWork(_EventWork(done), list(tensors.values()))
 
     # ---- consumer ----
 

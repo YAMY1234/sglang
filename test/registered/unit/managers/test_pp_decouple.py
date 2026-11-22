@@ -194,6 +194,54 @@ class TestPPLateRecv(CustomTestCase):
         self.assertEqual(log, [("recv",)])
 
 
+class _DoneEvent:
+    """A CUDA event: query() turns true once synchronize() ran or it was made done."""
+
+    def __init__(self, name, log, done=False):
+        self.name, self.log, self.done = name, log, done
+
+    def query(self):
+        return self.done
+
+    def synchronize(self):
+        self.log.append(self.name)
+        self.done = True
+
+
+class TestPPHostLead(CustomTestCase):
+    def _scheduler(self, bound, events):
+        scheduler = SchedulerPPMixin()
+        scheduler._pp_host_lead_max = bound
+        scheduler._pp_launch_events = deque(events)
+        return scheduler
+
+    def test_next_batch_waits_until_fewer_than_the_bound_are_not_handed_on(self):
+        """A stage builds its next batch only once fewer than SGLANG_PP_HOST_LEAD_MAX of its forwards
+        are not handed on, waiting oldest first and never on one already handed on."""
+        log = []
+        names = [("done", True), ("a", False), ("b", False), ("c", False)]
+        events = [_DoneEvent(name, log, done) for name, done in names]
+        scheduler = self._scheduler(2, events)
+        scheduler._pp_bound_host_lead()
+        self.assertEqual(log, ["a", "b"])
+        self.assertEqual([e.name for e in scheduler._pp_launch_events], ["c"])
+        scheduler._pp_bound_host_lead()
+        self.assertEqual(log, ["a", "b"])
+
+    def test_handoff_is_the_push_into_the_next_ring_else_the_forward_end(self):
+        """Through the copy-engine ring a forward is handed on when its push lands, which waits for
+        the next stage to free the slot; any other way, when the forward ends."""
+        from sglang.srt.managers import pp_ce_push
+
+        scheduler = SchedulerPPMixin()
+        scheduler.launch_event = "fwd-end"
+        push = pp_ce_push.PushWork(SimpleNamespace(event="push-done"), [])
+        scheduler.send_proxy_work = [_FakeP2PWork("meta", []), push]
+        self.assertEqual(scheduler._pp_handoff_event(), "push-done")
+        scheduler.send_proxy_work = [_FakeP2PWork("nccl", [])]
+        self.assertEqual(scheduler._pp_handoff_event(), "fwd-end")
+
+
 class TestPPCEPush(CustomTestCase):
     def test_layout_is_aligned_and_the_slot_reuse_waits_for_the_previous_user(self):
         from sglang.srt.managers.pp_ce_push import CESlice, free_target, pack_layout, slot_of

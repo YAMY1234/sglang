@@ -415,8 +415,6 @@ class SchedulerPPMixin:
                         self.mb_metadata,
                         self.last_rank_comm_queue,
                     )
-                    if self._pp_host_lead_max:
-                        self._pp_launch_events.append(self.launch_event)
                     if early_send:
                         self._pp_pd_early_send_last_chunks(
                             cur_batch, result, self.launch_event
@@ -496,6 +494,8 @@ class SchedulerPPMixin:
                         self._pp_send_proxy_to_next_stage(result)
                 elif cur_batch:
                     self._pp_ce_release_input()
+                if cur_batch and self._pp_host_lead_max:
+                    self._pp_launch_events.append(self._pp_handoff_event())
 
                 self.pp_outputs = next_pp_outputs
                 release_rids = next_release_rids
@@ -910,10 +910,18 @@ class SchedulerPPMixin:
             "logits_budget_mib": mqa_logits_static_budget_bytes(device_index=device) >> 20,
         }
 
+    def _pp_handoff_event(self: Scheduler) -> torch.Event:
+        """When this iteration's forward is handed on: its copy-engine push into the next stage's ring
+        (which waits for a free slot) if it went that way, else the forward's end."""
+        for work in self.send_proxy_work:
+            if isinstance(work, pp_ce_push.PushWork):
+                return work.work.event
+        return self.launch_event
+
     def _pp_bound_host_lead(self: Scheduler) -> None:
-        """SGLANG_PP_HOST_LEAD_MAX: wait until fewer than that many of this stage's launched forwards are
-        unfinished on its GPU. Requests admitted earlier than their forward can start only hold their
-        request row and KV longer; under a free-running host that lead reaches pp_loop_size forwards."""
+        """SGLANG_PP_HOST_LEAD_MAX: wait until fewer than that many of this stage's forwards are not yet
+        handed on (_pp_handoff_event). Requests admitted before their forward can run only hold their
+        request row and KV longer; a host nothing holds back gets pp_loop_size forwards ahead."""
         events = self._pp_launch_events
         while events and events[0].query():
             events.popleft()

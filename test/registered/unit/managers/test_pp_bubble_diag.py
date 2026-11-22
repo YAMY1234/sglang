@@ -141,6 +141,19 @@ class TestSlowEvents(unittest.TestCase):
         self.assertEqual(len(d._it_walls), 0)
 
 
+class TestHostLead(unittest.TestCase):
+    def test_lead_counts_the_forwards_still_unfinished_at_each_launch(self):
+        d, clock = _diag()
+        clock["done_upto"] = -1.0
+        for i in range(3):
+            _forward(d, clock, pre=200 * i, start=200 * i, end=200 * i + 200)
+        clock["done_upto"] = 1e18
+        _forward(d, clock, pre=600, start=600, end=800)
+        s = d.snapshot(1.0)
+        self.assertEqual(s["lead_max"], 3)
+        self.assertAlmostEqual(s["lead_mean"], (1 + 2 + 3 + 0) / 4)
+
+
 class TestPasses(unittest.TestCase):
     def test_vote_relay_is_binned_by_queue_length(self):
         d, _ = _diag()
