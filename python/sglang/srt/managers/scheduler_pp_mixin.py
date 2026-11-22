@@ -308,6 +308,7 @@ class SchedulerPPMixin:
             self.disagg_prefill_early_sent_rids = set()
             self.disagg_prefill_early_send_pending = deque()
             self.disagg_prefill_early_send_stats = {"early": 0, "waited": 0}
+            self._pp_early_send_when_ready = envs.SGLANG_PP_PD_EARLY_SEND_WHEN_READY.get()
             logger.info(
                 "PP PD prefill: each stage sends a request's last KV chunk when its "
                 "own forward of it completes; the last stage sends the first-token "
@@ -941,10 +942,14 @@ class SchedulerPPMixin:
             logger.info("PP host lead bound %d -> %d (%s)", self._pp_host_lead_max, bound, self._pp_host_lead_file)
             self._pp_host_lead_max = bound
             self._pp_launch_events.clear()
-        # An optional second field switches the CE push gate (SGLANG_PP_CE_PUSH_GATED).
+        # An optional second field switches the CE push gate (SGLANG_PP_CE_PUSH_GATED), a third
+        # SGLANG_PP_PD_EARLY_SEND_WHEN_READY.
         if len(fields) > 1 and self._pp_ce is not None and bool(fields[1]) != self._pp_ce.gated:
             logger.info("PP CE push gate -> %s (%s)", bool(fields[1]), self._pp_host_lead_file)
             self._pp_ce.gated = bool(fields[1])
+        if len(fields) > 2 and bool(fields[2]) != self._pp_early_send_when_ready:
+            logger.info("PP early send when ready -> %s (%s)", bool(fields[2]), self._pp_host_lead_file)
+            self._pp_early_send_when_ready = bool(fields[2])
 
     def _pp_bound_host_lead(self: Scheduler) -> None:
         """SGLANG_PP_HOST_LEAD_MAX: wait until fewer than that many of this stage's forwards are not yet

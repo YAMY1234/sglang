@@ -595,6 +595,8 @@ class SchedulerDisaggregationPrefillMixin:
     # (SGLANG_PP_PD_PREFILL_EARLY_SEND). Class-level default for every other loop;
     # event_loop_pp_disagg_prefill replaces it with a set when the flag is on.
     disagg_prefill_early_sent_rids: frozenset = frozenset()
+    # SGLANG_PP_PD_EARLY_SEND_WHEN_READY (set by event_loop_pp_disagg_prefill).
+    _pp_early_send_when_ready: bool = False
 
     def maybe_prefetch_staging_for_batch(self: Scheduler, batch: ScheduleBatch) -> None:
         """Pre-send STAGING_REQ so decode allocates staging during GPU forward."""
@@ -1599,9 +1601,10 @@ class SchedulerDisaggregationPrefillMixin:
         the pipeline (pp_size - 1 micro-batches later), so its KV is released sooner.
 
         A stage before the last one hands the chunk to the transfer worker now,
-        fenced on the forward's event, and leaves the aux (first-token metadata) to
-        the last stage. The last stage, which sampled the first token, sends after
-        the token's D2H lands (_pp_pd_flush_early_sends)."""
+        fenced on the forward's event (with SGLANG_PP_PD_EARLY_SEND_WHEN_READY: once
+        that event completed, from _pp_pd_flush_early_sends), and leaves the aux
+        (first-token metadata) to the last stage. The last stage, which sampled the
+        first token, sends after the token's D2H lands (_pp_pd_flush_early_sends)."""
         reqs = [
             (i, req)
             for i, req in enumerate(batch.reqs)
@@ -1610,6 +1613,13 @@ class SchedulerDisaggregationPrefillMixin:
         if not reqs:
             return
         if not self.pp_group.is_last_rank:
+            if self._pp_early_send_when_ready and launch_event is not None:
+                # A transfer worker is one FIFO thread: a chunk whose forward is still
+                # queued would block it, and every ready chunk behind it, until then.
+                self.disagg_prefill_early_send_pending.append(
+                    (batch.forward_iter, launch_event, None, reqs)
+                )
+                return
             for _, req in reqs:
                 self._pp_pd_send_last_chunk_early(req, launch_event, None)
             return
@@ -1624,8 +1634,8 @@ class SchedulerDisaggregationPrefillMixin:
     def _pp_pd_flush_early_sends(
         self: Scheduler, block_upto_forward_iter: Optional[int] = None
     ) -> None:
-        """Last stage: send the queued last chunks whose forward and first-token D2H
-        completed; wait for those launched at or before block_upto_forward_iter."""
+        """Send the queued last chunks whose forward (and on the last stage, first-token
+        D2H) completed; wait for those launched at or before block_upto_forward_iter."""
         pending = self.disagg_prefill_early_send_pending
         while pending:
             forward_iter, ready, first_tokens, reqs = pending[0]
@@ -1638,8 +1648,12 @@ class SchedulerDisaggregationPrefillMixin:
                 return
             pending.popleft()
             for i, req in reqs:
+                if first_tokens is None:
+                    # A stage before the last sends as it would have at launch, aborted
+                    # since or not: every stage keeps the same early-sent set.
+                    self._pp_pd_send_last_chunk_early(req, None, None)
                 # An abort since launch retires it at its result instead.
-                if not is_aborted(req):
+                elif not is_aborted(req):
                     self._pp_pd_send_last_chunk_early(req, None, int(first_tokens[i]))
 
     def _pp_pd_send_last_chunk_early(

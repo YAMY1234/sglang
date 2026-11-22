@@ -1626,6 +1626,45 @@ class TestPPPrefillEarlySend(CustomTestCase):
         self.assertEqual([s[0] for s in last.sent], ["done"])
         self.assertEqual(last.sent[0][2], dict(first_output_id=3, send_aux=True))
 
+    def test_stage_hands_the_last_chunk_to_the_worker_once_its_forward_ended(self):
+        """SGLANG_PP_PD_EARLY_SEND_WHEN_READY: a FIFO transfer worker must not block on
+        a chunk whose forward is still queued; an abort since launch still sends, so
+        every stage keeps the same early-sent set."""
+        done = _early_req("done", 1)
+        late = _early_req("late", 2)
+        stage = _PPEarlySendScheduler(is_last_rank=False)
+        stage._pp_early_send_when_ready = True
+        first, second = _ForwardEvent(), _ForwardEvent()
+        stage._pp_pd_early_send_last_chunks(
+            SimpleNamespace(reqs=[done], forward_iter=5), None, first
+        )
+        stage._pp_pd_early_send_last_chunks(
+            SimpleNamespace(reqs=[late], forward_iter=6), None, second
+        )
+        stage._pp_pd_flush_early_sends()
+        self.assertEqual(stage.sent, [])
+        self.assertEqual(stage.disagg_prefill_early_sent_rids, set())
+        second.ready = True  # in order: the older forward still holds it back
+        stage._pp_pd_flush_early_sends()
+        self.assertEqual(stage.sent, [])
+        first.ready = True
+        late.to_finish = FINISH_ABORT("abort")
+        stage._pp_pd_flush_early_sends()
+        no_aux = dict(first_output_id=None, send_aux=False)
+        self.assertEqual(
+            stage.sent, [("done", True, no_aux, None), ("late", True, no_aux, None)]
+        )
+        self.assertEqual(stage.disagg_prefill_early_sent_rids, {"done", "late"})
+
+        # Before a micro-batch's result is processed its sends are forced out.
+        pending = _ForwardEvent()
+        stage._pp_pd_early_send_last_chunks(
+            SimpleNamespace(reqs=[_early_req("forced", 3)], forward_iter=7), None, pending
+        )
+        stage._pp_pd_flush_early_sends(block_upto_forward_iter=7)
+        self.assertEqual(stage.sent[-1][0], "forced")
+        self.assertEqual(pending.synchronizations, 1)
+
     def test_result_skips_the_early_sent_chunk_after_its_transfer_ends(self):
         stage = _PPEarlySendScheduler(is_last_rank=False)
         req = _early_req("r", 1, status=KVPoll.Transferring)

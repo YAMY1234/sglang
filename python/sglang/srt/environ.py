@@ -958,6 +958,10 @@ class Envs:
     # micro-batches later; only the last stage, which samples the first token, sends
     # the first-token metadata (aux).
     SGLANG_PP_PD_PREFILL_EARLY_SEND = EnvBool(False)
+    # Under SGLANG_PP_PD_PREFILL_EARLY_SEND: a stage before the last hands an early last chunk to the transfer
+    # worker only once its forward completed, as the last stage does, instead of at launch with the forward's
+    # event; a transfer worker blocked on that event holds up every ready chunk queued behind it.
+    SGLANG_PP_PD_EARLY_SEND_WHEN_READY = EnvBool(False)
 
     # ===================================================================
     # Distributed and model-parallel runtime
