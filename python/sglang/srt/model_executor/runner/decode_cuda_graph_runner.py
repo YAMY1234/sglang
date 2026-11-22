@@ -945,6 +945,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             raise RuntimeError(
                 "DP CUDA graph replay requires raw per-rank request counts"
             )
+        from sglang.srt.model_executor.runner import base_cuda_graph_runner as _h274b
+        _h274b._h274_set_mode(request_counts)
         return max(request_counts)
 
     def maybe_init_uocr_graph_io(self, model_runner: ModelRunner) -> None:

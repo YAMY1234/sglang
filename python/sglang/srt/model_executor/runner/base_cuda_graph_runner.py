@@ -128,6 +128,17 @@ def get_batch_sizes_to_capture(
     return capture_bs, compile_bs
 
 
+_H274 = [False, sorted(int(x) for x in __import__('os').environ.get('H274_COARSE_BUCKETS', '').split(':') if x), set(), None]
+
+
+def _h274_set_mode(request_counts):
+    c = len(request_counts) > 1 and request_counts[-1] < request_counts[-2]
+    if c != _H274[3]:
+        _H274[3] = c
+        print(f'H274 mode {"coarse" if c else "fine"} counts={list(request_counts)}', flush=True)
+    _H274[0] = c
+
+
 class BaseCudaGraphRunner(BaseRunner):
     """Abstract base for phase-specific cuda-graph runners.
 
@@ -194,6 +205,13 @@ class BaseCudaGraphRunner(BaseRunner):
             f"size {raw_size} exceeds max captured bucket {buckets[-1]}; "
             f"can_run_graph should have rejected this batch"
         )
+        if _H274[0] and _H274[1] and buckets[-1] == _H274[1][-1]:
+            _i = bisect.bisect_left(_H274[1], raw_size)
+            if _i < len(_H274[1]):
+                if (raw_size, _H274[1][_i]) not in _H274[2]:
+                    _H274[2].add((raw_size, _H274[1][_i]))
+                    print(f'H274 coarse raw={raw_size} bucket={_H274[1][_i]}', flush=True)
+                return _H274[1][_i]
         index = bisect.bisect_left(buckets, raw_size)
         return buckets[index]
 

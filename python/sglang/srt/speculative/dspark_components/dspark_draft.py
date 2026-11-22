@@ -700,9 +700,7 @@ class DraftBlockProposer:
         if deferred_draft_kv is not None:
             deferred_draft_kv.before_draft_forward(
                 graph_bs=(
-                    graph_runner.capture_bs[
-                        bisect.bisect_left(graph_runner.capture_bs, bs)
-                    ]
+                    graph_runner._pad_to_bucket(bs, graph_runner.capture_bs)
                     if runs_graph
                     else None
                 ),
