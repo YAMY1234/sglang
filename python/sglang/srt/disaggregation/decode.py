@@ -4237,6 +4237,9 @@ class SchedulerDisaggregationDecodeMixin:
     # and when each held waiting request was first held (by rid).
     dp_admit_mean_bs: Optional[float] = None
     dp_admit_held_since: Optional[Dict[str, float]] = None
+    # Hold times (s) of requests admitted since the last summary line, and its time.
+    dp_admit_holds: Optional[List[float]] = None
+    dp_admit_log_t: float = 0.0
 
     @torch.no_grad()
     def event_loop_normal_disagg_decode(self: Scheduler):
@@ -4590,6 +4593,27 @@ class SchedulerDisaggregationDecodeMixin:
         own = rows[get_parallel().attn_dp_rank]
         if own > 0:
             self.dp_admit_mean_bs = sum(rows) / len(rows) * batch.batch_size() / own
+
+    def _log_dp_admit(self, admitted, now, max_hold_s, curr_bs) -> None:
+        holds = self.dp_admit_holds = self.dp_admit_holds or []
+        holds += [now - self.dp_admit_held_since[req.rid] for req in admitted]
+        if now - self.dp_admit_log_t < 30 or not holds:
+            return
+        holds.sort()
+        logger.info(
+            "Decode DP admit balance: admitted %d, held >0 %d, hold ms p50 %.0f "
+            "p90 %.0f max %.0f, past max hold %d, waiting %d, running %d, mean %.1f",
+            len(holds),
+            sum(h > 0 for h in holds),
+            1000 * holds[len(holds) // 2],
+            1000 * holds[int(len(holds) * 0.9)],
+            1000 * holds[-1],
+            sum(h >= max_hold_s for h in holds),
+            len(self.waiting_queue),
+            curr_bs,
+            self.dp_admit_mean_bs,
+        )
+        self.dp_admit_holds, self.dp_admit_log_t = [], now
 
     def _admit_dsv41_fed_tails(
         self: Scheduler, running_batch: ScheduleBatch
@@ -5032,6 +5056,12 @@ class SchedulerDisaggregationDecodeMixin:
                 # token because init_next_round_input rebuilt it as full).
                 if req.kv.kv_committed_len is not None:
                     req.extend_end = req.kv.kv_committed_len
+
+        if (
+            envs.SGLANG_DECODE_DP_ADMIT_BALANCE.get()
+            and self.dp_admit_mean_bs is not None
+        ):
+            self._log_dp_admit(can_run_list, now, max_hold_s, curr_batch_size)
 
         if len(can_run_list) == 0:
             return None
