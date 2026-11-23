@@ -465,6 +465,7 @@ struct TopKCandidatesParams {
   const int64_t* push_counters = nullptr;      // [push_max_rows] merge calls per row slot
   int64_t push_slot = 0;                       // entries per row slot
   int32_t push_max_rows = 0;
+  uint32_t sampled_min_len = 0;  // sampled variant only: rows up to this length stay on the exact path
 
   SGL_DEVICE int32_t global_position(int32_t local) const {
     const auto b = cand_page_bits;
@@ -563,9 +564,9 @@ union SampledCandidatesSmem {
 };
 static_assert(sizeof(SampledCandidatesSmem) <= 48 * 1024, "static shared memory limit");
 
-/// `candidates_one_block`, except that rows past the register paths take the sampled
-/// single pass (impl::TopKSampled) and fall back to the exact path when it misses,
-/// counted in `overflow_rows`. Same selected set; slot order differs.
+/// `candidates_one_block`, except that rows longer than `sampled_min_len` and past the
+/// register paths take the sampled single pass (impl::TopKSampled), falling back to the
+/// exact path when it misses, counted in `overflow_rows`. Same selected set; slot order differs.
 template <bool kPDL, bool kPush>
 SGL_DEVICE void
 candidates_sampled_one_block(const TopKCandidatesParams& params, const uint32_t bx, SampledCandidatesSmem* smem) {
@@ -573,7 +574,8 @@ candidates_sampled_one_block(const TopKCandidatesParams& params, const uint32_t 
   const auto seq_len = static_cast<uint32_t>(params.seq_lens[bx]);
   const auto row_start = params.row_starts == nullptr ? 0u : static_cast<uint32_t>(params.row_starts[bx]);
   const auto rem = row_start % kVecSize;
-  if (seq_len <= params.topk || seq_len + rem <= Register4::kMaxSeqLen) {
+  const auto topk = params.topk;
+  if (seq_len <= topk || seq_len + rem <= Register4::kMaxSeqLen || seq_len <= params.sampled_min_len) {
     return candidates_one_block<kPDL, kPush>(params, bx, &smem->exact.ragged, smem->exact.staged);
   }
 
@@ -585,14 +587,23 @@ candidates_sampled_one_block(const TopKCandidatesParams& params, const uint32_t 
   const auto problem = TopKProblem{
       .in = score + (row_start - rem),
       .out = nullptr,
-      .topk = params.topk,
+      .topk = topk,
       .seq_len = seq_len + rem,
+      .bias = -static_cast<int32_t>(rem),
       .input_start = rem,
   };
-  const bool done = Sampled::forward<kPDL>(problem, &smem->sampled, [&](uint32_t slot, float val, uint32_t idx) {
+  uint32_t first_staged = 0;
+  const auto emit_above = [&](uint32_t slot, float val, uint32_t idx) {
     sink.put(slot, __float_as_int(val), params.global_position(static_cast<int32_t>(idx - rem)));
-  });
-  if (done) return;
+  };
+  if (Sampled::forward<kPDL>(problem, &smem->sampled, emit_above, first_staged)) {
+    __syncthreads();
+    for (uint32_t slot = first_staged + threadIdx.x; slot < topk; slot += kBlockSize) {
+      const auto idx = smem->sampled.staged[slot];
+      sink.put(slot, __float_as_int(score[row_start + idx]), params.global_position(idx));
+    }
+    return;
+  }
   if (threadIdx.x == 0 && params.overflow_rows != nullptr) atomicAdd(params.overflow_rows, 1);
   __syncthreads();  // every thread has read n_ge before the exact path reuses the storage
   candidates_one_block<kPDL, kPush>(params, bx, &smem->exact.ragged, smem->exact.staged);
@@ -2133,8 +2144,9 @@ struct TopKKernel {
   /**
    * \brief DCP decode variant of `transform_candidates` (token interleave): `cluster_size` 2 / 4
    * runs rows longer than `cluster_floor` on that many blocks, 0 one block. With `cluster_size` 0,
-   * `sampled` takes rows past the register paths through the sampled single pass, counting
-   * the rows it redoes on the exact path in `fallback_rows` (int32 [1], optional).
+   * `sampled` takes rows longer than `sampled_min_len` and past the register paths through the
+   * sampled single pass, counting the rows it redoes on the exact path in `fallback_rows`
+   * (int32 [1], optional).
    */
   static void transform_candidates_dcp(
       const tvm::ffi::TensorView scores,
@@ -2146,6 +2158,7 @@ struct TopKKernel {
       const int64_t cluster_size,
       const int64_t cluster_floor,
       const bool sampled,
+      const int64_t sampled_min_len,
       const tvm::ffi::Optional<tvm::ffi::TensorView> fallback_rows) {
     using namespace host;
     auto B = SymbolicSize{"batch_size"};
@@ -2181,6 +2194,7 @@ struct TopKKernel {
     const auto topk = static_cast<uint32_t>(K.unwrap());
     RuntimeCheck(topk > 0 && topk <= kMaxTopK, "topk must be in (0, 2048]");
     RuntimeCheck(world >= 1 && rank >= 0 && rank < world, "invalid world/rank");
+    RuntimeCheck(sampled_min_len >= 0 && sampled_min_len <= UINT32_MAX, "invalid sampled_min_len");
     int32_t* fallback_ptr = nullptr;
     if (fallback_rows.has_value()) {
       TensorMatcher({1}).with_dtype<int32_t>().with_device(device_).verify(fallback_rows.value());
@@ -2197,6 +2211,7 @@ struct TopKKernel {
         .cand_world = static_cast<int32_t>(world),
         .cand_rank = static_cast<int32_t>(rank),
         .overflow_rows = fallback_ptr,
+        .sampled_min_len = static_cast<uint32_t>(sampled_min_len),
     };
     const auto rows = static_cast<uint32_t>(B.unwrap());
 #if SUPPORT_CLUSTER
@@ -2242,7 +2257,8 @@ struct TopKKernel {
    * every rank's DCP merge buffer (multicast address `push_mc`; the int64 layout
    * of dsa/dcp_topk_merge.cuh, `slot` entries per row slot, `max_rows` slots per
    * parity), tagged with the call of `counters[i]`. The merge kernel that reads
-   * them advances the counters. `sampled` / `fallback_rows`: as in `transform_candidates_dcp`.
+   * them advances the counters. `sampled` / `sampled_min_len` / `fallback_rows`: as in
+   * `transform_candidates_dcp`.
    */
   static void transform_candidates_dcp_push(
       const tvm::ffi::TensorView scores,
@@ -2256,6 +2272,7 @@ struct TopKKernel {
       const int64_t cluster_size,
       const int64_t cluster_floor,
       const bool sampled,
+      const int64_t sampled_min_len,
       const tvm::ffi::Optional<tvm::ffi::TensorView> fallback_rows) {
     using namespace host;
     auto B = SymbolicSize{"batch_size"};
@@ -2284,6 +2301,7 @@ struct TopKKernel {
     RuntimeCheck(world >= 1 && rank >= 0 && rank < world, "invalid world/rank");
     RuntimeCheck(push_mc != 0 && slot >= world * cand_k, "invalid push buffer");
     RuntimeCheck(B.unwrap() <= M.unwrap(), "more rows than merge row slots");
+    RuntimeCheck(sampled_min_len >= 0 && sampled_min_len <= UINT32_MAX, "invalid sampled_min_len");
     int32_t* fallback_ptr = nullptr;
     if (fallback_rows.has_value()) {
       TensorMatcher({1}).with_dtype<int32_t>().with_device(device_).verify(fallback_rows.value());
@@ -2304,6 +2322,7 @@ struct TopKKernel {
         .push_counters = static_cast<const int64_t*>(counters.data_ptr()),
         .push_slot = slot,
         .push_max_rows = static_cast<int32_t>(M.unwrap()),
+        .sampled_min_len = static_cast<uint32_t>(sampled_min_len),
     };
     const auto rows = static_cast<uint32_t>(B.unwrap());
     if (rows == 0) return;
