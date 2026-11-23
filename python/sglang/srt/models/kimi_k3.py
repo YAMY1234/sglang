@@ -3682,6 +3682,10 @@ class KimiK3LinearModel(nn.Module):
                 else pp_proxy_tensors["attn_res_bank"]
             )
             self.attn_bank.open(hidden_states, attn_res_block_num, inherited)
+            if inherited is not None:
+                nan_watch.check_entry(
+                    self.start_layer, hidden_states, self.attn_bank.require()
+                )
 
         packs_aux = self.packs_aux_hidden_states
         aux_hidden_states: AuxHiddenStateAccumulator = (

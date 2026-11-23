@@ -188,6 +188,30 @@ class TestNanWatch(unittest.TestCase):
         self.assertTrue(torch.isnan(tensors["attn"][1, 0]))
         self.assertEqual(tuple(tensors["ssm"].shape), (1, 2, 2))
 
+    def test_received_bytes_changing_under_the_stage_are_flagged(self):
+        # Row 1's received hidden changes before the first layer reads it; row 0's received bank changes by the end.
+        hidden = torch.zeros(5, 3)
+        bank = torch.zeros(5, 2, 3)
+        proxy = PPProxyTensors({"hidden_states": hidden, "attn_res_bank": bank})
+        pool = _Pool([5, 6], [7, 8], self.rtt)
+        with patch("sglang.srt.mem_cache.memory_pool.HybridReqToTokenPool", _Pool):
+            nan_watch.begin(
+                self.batch,
+                proxy,
+                model_runner=_runner(pool, [20]),
+                rids=["a", "b"],
+                stage=3,
+            )
+        hidden[3, 0] = 1.0
+        copied = SimpleNamespace(block_residual=bank.clone(), num_valid_blocks=2)
+        nan_watch.check_entry(36, hidden, copied)
+        bank[0, 1, 2] = 1.0
+        nan_watch.end(logits=torch.zeros(2, 8), forward_batch=self.batch)
+        with self.assertLogs(nan_watch.logger, level="INFO") as logs:
+            nan_watch.poll()
+        line = next(m for m in logs.output if "recv changed PP3" in m)
+        self.assertIn("rows=[(0, 0, 1), (1, 1, 0)]", line)
+
     def test_shared_slots_are_counted(self):
         # Both rows on Mamba slot 5, which is also free; new KV token 41 sits on free page 10.
         lines = self._run(slots=(5, 5), free_slots=(5, 9, 9), free_pages=(10,))

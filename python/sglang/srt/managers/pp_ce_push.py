@@ -271,6 +271,7 @@ class PPCEPush:
         self.stream = torch.cuda.Stream(device=device_id) if has_next else None
         # Input ring + full flags (stage > 0); free flags for the ring I push into (stage < last).
         self.ring_va = self.full_va = self.free_va = None
+        self.full_flags: Optional[torch.Tensor] = None  # int32 [slots] view of this stage's full flags, for debug reads
         self.peer_ring_va = self.peer_full_va = self.peer_free_va = None
         self._exports: Dict[str, Tuple[bytes, int]] = {}
         self.send_seq = 0
@@ -352,6 +353,9 @@ class PPCEPush:
 
             self._peer_free_view = tensor_from_pointer(
                 self.peer_free_va, 4 * self.slots, shape=(self.slots,), dtype=torch.int32, device_id=self.device_id
+            )
+            self.full_flags = tensor_from_pointer(
+                self.full_va, 4 * self.slots, shape=(self.slots,), dtype=torch.int32, device_id=self.device_id
             )
 
     # ---- producer ----

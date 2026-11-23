@@ -30,6 +30,12 @@ _IN, _STATE, _OUT, _SLOT, _KV_MIN, _KV_MAX, _IN_BANK, _OUT_BANK = range(8)
 # Row checksums of the proxy received (after the forward stream's wait on it) and the proxy sent; the readout
 # matches a stage's sent rows to the next stage's received rows of the same micro-batch.
 _XFER_IN, _XFER_OUT = 8, 9
+# The received proxy re-read at the stage's first layer entry, and its bank region at the forward's end (the model
+# copies the bank out at entry and never writes it): 1 when the bytes differ from what arrived.
+_RECV_CHANGED_ENTRY, _RECV_BANK_CHANGED_END = 10, 11
+# Counter row: the CE-push receive slot's full flag (the last message seq + 1 written into it) read right after this
+# forward's wait and again at the first layer's entry; a later message landing in the slot shows as a larger value.
+_FULL_AT_WAIT, _FULL_AT_ENTRY = 12, 13
 _XFER_KEYS = ("hidden_states", "attn_res_bank", "dspark_hidden_states")
 # Counter row, past the counters: up to 4 values the Mamba free list holds twice, up to 2 batch slots on it.
 _FREE_DUP_VALS, _SLOTS_ON_FREE = slice(6, 10), slice(10, 12)
@@ -49,6 +55,8 @@ _POINT_NAMES = (
     "kda_q",
     "kda_k",
     "kda_v",
+    "entry_head",
+    "entry_bank",
 )
 _COUNTERS = (
     "dup_mamba_slot",
@@ -71,11 +79,16 @@ class _Forward:
         self.token_row, self.token_offset = token_row, token_offset
         self.points = {}  # (layer, point) -> column, in first-seen order
         self.received = self.sent = False
+        self.proxy = None  # the received proxy, re-read at entry and at the end
+        self.recv_slot = None  # ((slot, seq), full flags view)
+        self.recv_bank_sum = None
         self.capture: Optional[nan_capture.Capture] = None
         self.t = time.time()
 
 
 _active: Optional[_Forward] = None
+_recv_slot = None  # ((slot, seq), full flags, flag after the wait) noted by the scheduler for the next begin()
+_on = None
 _pending: deque = deque()
 _totals = {
     "forwards": 0,
@@ -86,6 +99,8 @@ _totals = {
     "out": 0,
     "in_bank": 0,
     "out_bank": 0,
+    "recv_changed_entry": 0,
+    "recv_bank_changed_end": 0,
 }
 _totals.update({k: 0 for k in _COUNTERS})
 _last_summary = [time.monotonic()]
@@ -93,6 +108,17 @@ _last_summary = [time.monotonic()]
 
 def enabled() -> bool:
     return envs.SGLANG_ENABLE_NAN_WATCH.get()
+
+
+def note_recv_slot(slot_seq, full_flags) -> None:
+    """The CE-push receive slot the next forward reads, after the forward stream's wait on it."""
+    global _recv_slot, _on
+    if _on is None:
+        _on = enabled()
+    if not _on or full_flags is None:
+        return
+    slot = slot_seq[0]
+    _recv_slot = (slot_seq, full_flags, full_flags[slot : slot + 1].long())
 
 
 def _bad_tokens(t: torch.Tensor, num_tokens: int) -> torch.Tensor:
@@ -106,9 +132,11 @@ def _add_proxy_flags(dev, cols, proxy, token_row, num_tokens):
             dev[:-1, col].index_add_(0, token_row, _bad_tokens(t, num_tokens))
 
 
-def _row_checksum(dev_col, proxy, token_row, token_offset, num_tokens) -> None:
+def _row_checksum(
+    dev_col, proxy, token_row, token_offset, num_tokens, keys=_XFER_KEYS
+) -> None:
     """Per row: sum over its tokens of (offset + 1) * (sum of the token's 16-bit words); exact, in int64."""
-    for key in _XFER_KEYS:
+    for key in keys:
         t = proxy.tensors.get(key)
         if t is None or t.shape[0] < num_tokens or t.element_size() not in (2, 4):
             continue
@@ -238,6 +266,23 @@ def begin(
         token_offset=token_offset,
     )
     _active.received = received
+    global _recv_slot
+    if received and _recv_slot is not None:
+        slot_seq, flags, at_wait = _recv_slot
+        _active.recv_slot = (slot_seq, flags)
+        dev[bs, _FULL_AT_WAIT] = at_wait[0]
+    _recv_slot = None
+    if received:
+        _active.proxy = pp_proxy_tensors
+        _active.recv_bank_sum = torch.zeros(bs, dtype=torch.int64, device=device)
+        _row_checksum(
+            _active.recv_bank_sum,
+            pp_proxy_tensors,
+            token_row,
+            token_offset,
+            num_tokens,
+            keys=("attn_res_bank",),
+        )
     if nan_capture.enabled():
         _active.capture = nan_capture.select(prefix_lens, extend_lens)
     if _active.capture is not None and pp_proxy_tensors is not None:
@@ -290,6 +335,27 @@ def check_point(layer_idx: int, point: int, hidden) -> None:
         )
 
 
+def check_entry(layer_idx: int, head: torch.Tensor, bank) -> None:
+    """At a later stage's entry, before its first layer: the stream head and the bank rows copied out of the received
+    proxy (non-finite tokens), and whether the received proxy still holds the bytes that arrived."""
+    watch = _active
+    if watch is None or watch.proxy is None:
+        return
+    check_point(layer_idx, 11, head)
+    if bank is not None and bank.num_valid_blocks > 0:
+        check_point(layer_idx, 12, bank.block_residual[:, : bank.num_valid_blocks])
+    dev = watch.dev
+    bs = dev.shape[0] - 1
+    now = torch.zeros(bs, dtype=torch.int64, device=dev.device)
+    _row_checksum(
+        now, watch.proxy, watch.token_row, watch.token_offset, watch.token_row.numel()
+    )
+    dev[:bs, _RECV_CHANGED_ENTRY] = (now != dev[:bs, _XFER_IN]).long()
+    if watch.recv_slot is not None:
+        (slot, _), flags = watch.recv_slot
+        dev[bs, _FULL_AT_ENTRY] = flags[slot].long()
+
+
 def capture_params(layer_idx: int, **tensors) -> None:
     """A layer's static parameters, for a replay bundle (no-op unless the capture has rows)."""
     if _active is not None and _active.capture is not None:
@@ -329,6 +395,17 @@ def end(
             num_tokens,
         )
         watch.sent = True
+    if watch.recv_bank_sum is not None:
+        now = torch.zeros_like(watch.recv_bank_sum)
+        _row_checksum(
+            now,
+            watch.proxy,
+            watch.token_row,
+            watch.token_offset,
+            watch.token_row.numel(),
+            keys=("attn_res_bank",),
+        )
+        dev[:bs, _RECV_BANK_CHANGED_END] = (now != watch.recv_bank_sum).long()
     if watch.capture is not None:
         nan_capture.finish(watch.capture)
     # Power-of-two pinned buffers, so the caching host allocator reuses blocks instead of a new cudaHostAlloc.
@@ -357,7 +434,8 @@ def poll() -> None:
 
 
 def _report(watch: _Forward, rows) -> None:
-    counters = dict(zip(_COUNTERS, rows[-1][: len(_COUNTERS)]))
+    counter_row = rows[-1]
+    counters = dict(zip(_COUNTERS, counter_row[: len(_COUNTERS)]))
     free_dup_vals = [v for v in rows[-1][_FREE_DUP_VALS] if v != _NONE]
     slots_on_free = [v for v in rows[-1][_SLOTS_ON_FREE] if v != _NONE]
     rows = rows[:-1]
@@ -390,12 +468,25 @@ def _report(watch: _Forward, rows) -> None:
         (_OUT, "out"),
         (_IN_BANK, "in_bank"),
         (_OUT_BANK, "out_bank"),
+        (_RECV_CHANGED_ENTRY, "recv_changed_entry"),
+        (_RECV_BANK_CHANGED_END, "recv_bank_changed_end"),
     ):
         _totals[key] += sum(1 for r in rows if r[col])
     _totals["hit_rows"] += len(hits)
     anomaly = {k: v for k, v in counters.items() if v > 0}
-    if not hits and not anomaly:
+    changed = [
+        (i, r[_RECV_CHANGED_ENTRY], r[_RECV_BANK_CHANGED_END])
+        for i, r in enumerate(rows)
+        if r[_RECV_CHANGED_ENTRY] or r[_RECV_BANK_CHANGED_END]
+    ]
+    if not hits and not anomaly and not changed:
         return
+    # (slot, seq, full flag after the wait, at the first layer's entry); the flag holds the last seq written + 1.
+    ring = (
+        (*watch.recv_slot[0], counter_row[_FULL_AT_WAIT], counter_row[_FULL_AT_ENTRY])
+        if watch.recv_slot is not None
+        else None
+    )
     batch = [
         (
             watch.rids[i] if i < len(watch.rids) else None,
@@ -415,7 +506,8 @@ def _report(watch: _Forward, rows) -> None:
         ]
         logger.warning(
             "NaN watch hit PP%d rid=%s in_bad_tokens=%d state_bad_layers=%d out_bad=%d in_bank_bad=%d out_bank_bad=%d "
-            "prefix=%d extend=%d mamba_slot=%d kv_slots=[%d,%d] counters=%s batch=%s t=%.3f points=%s",
+            "prefix=%d extend=%d mamba_slot=%d kv_slots=[%d,%d] counters=%s batch=%s t=%.3f points=%s "
+            "recv_changed=%d/%d ring=%s",
             watch.stage,
             batch[i][0],
             r[_IN],
@@ -432,6 +524,9 @@ def _report(watch: _Forward, rows) -> None:
             batch,
             watch.t,
             points,
+            r[_RECV_CHANGED_ENTRY],
+            r[_RECV_BANK_CHANGED_END],
+            ring,
         )
         if watch.capture is not None and not r[_IN] and not r[_STATE]:
             meta = {
@@ -450,6 +545,16 @@ def _report(watch: _Forward, rows) -> None:
             path = nan_capture.dump(watch.capture, i, meta)
             if path is not None:
                 logger.warning("NaN watch capture saved %s", path)
+    if changed:
+        # (row, changed by first-layer entry, bank changed by the forward's end): the received bytes moved under it.
+        logger.warning(
+            "NaN watch recv changed PP%d rows=%s ring=%s batch=%s t=%.3f",
+            watch.stage,
+            changed,
+            ring,
+            batch,
+            watch.t,
+        )
     if anomaly and not hits:
         logger.warning(
             "NaN watch slot anomaly PP%d counters=%s free_dup_vals=%s slots_on_free=%s batch=%s t=%.3f",

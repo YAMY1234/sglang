@@ -37,6 +37,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     PPProxyTensors,
 )
 from sglang.srt.observability.req_time_stats import set_time_batch
+from sglang.srt.debug_utils import nan_watch
 from sglang.srt.managers import pp_bubble_diag, pp_ce_push, pp_decouple
 from sglang.srt.managers.pp_decouple import PPRecvInbox, PPSendWindow, PPSendWindows
 from sglang.srt.observability.scheduler_stage_metrics import (
@@ -1228,6 +1229,7 @@ class SchedulerPPMixin:
         if isinstance(self.pp_proxy_recv_event, pp_ce_push.CEWait):
             self._pp_ce.wait_full(self.forward_stream, self.pp_proxy_recv_event.slot_seq)
             self._pp_ce_in_use = self.pp_proxy_recv_event.slot_seq
+            nan_watch.note_recv_slot(self._pp_ce_in_use, self._pp_ce.full_flags)
             self.pp_proxy_recv_event = None
         elif self.pp_proxy_recv_event is not None:
             self.forward_stream.wait_event(self.pp_proxy_recv_event)
