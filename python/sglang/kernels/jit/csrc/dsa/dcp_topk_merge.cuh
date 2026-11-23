@@ -945,7 +945,8 @@ SGL_DEVICE uint64_t unpack_tstar(uint64_t v) {
 }
 
 /// SGL_DCP_MERGE_WATCHDOG: trap once a spin has lasted ~1 s, naming what it waited for, from which rank, and the tag it
-/// expected against the one it saw (one call less: that rank is behind or skipped a call; 0: never written).
+/// expected against the one it saw (each parity buffer holds every other call, so a rank one or two calls behind shows
+/// the tag of two calls back; 0: never written).
 SGL_DEVICE void spin_watchdog(
     uint64_t& t0, uint32_t& n, int rank, int row, int64_t c, const char* what, int from, uint64_t tag, uint64_t seen) {
   if constexpr (SGL_DCP_MERGE_WATCHDOG) {
