@@ -2423,6 +2423,8 @@ class Envs:
     # More candidates make the certificate fail on fewer rows; a failed row runs the
     # slow fallback (the failing rank's full local top-k) and holds the whole merge.
     SGLANG_DCP4_PUSH_CAND_K = EnvInt(768)
+    # DCP4 push with SGLANG_DCP4_PUSH_CAND_K == top-k: warps per rank of the merge (0: one).
+    SGLANG_DCP4_PUSH_MERGE_WARPS = EnvInt(0)
     # merge_kernel (push off): stage the candidate push in smem, register fallback
     # for <= 2 failed ranks (sgl-project/sglang#49922); same output. MIN_BLOCKS: its
     # launch bounds' minimum blocks per SM.
