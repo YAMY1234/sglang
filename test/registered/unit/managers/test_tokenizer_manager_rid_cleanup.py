@@ -16,6 +16,7 @@ Covers:
 
 import asyncio
 import gc
+import json
 import pickle
 import time
 import unittest
@@ -1458,7 +1459,8 @@ class TestUntrackPromptIdsAfterDispatch(CustomTestCase):
     """SGLANG_K31_TM_UNTRACK_PROMPT: after dispatch the prompt ids leave every GC container.
 
     The caller (the dynamo handler) passes its own list as input_ids and keeps it for the whole stream, so the
-    switch stores the ids as an array and empties that shared list; the scheduler's copy is unaffected.
+    switch stores the ids as a tuple (untracked by the first collection that sees it) and empties that shared
+    list; the scheduler's copy is unaffected.
     """
 
     def _drive(self, ids, enabled):
@@ -1502,20 +1504,22 @@ class TestUntrackPromptIdsAfterDispatch(CustomTestCase):
         obj, caller_ids, tokenized = self._drive(ids, enabled=True)
         # the scheduler got the full prompt before anything changed
         self.assertEqual(list(tokenized.input_ids), ids)
-        # the tokenizer manager keeps every id, in a container full GCs never walk
-        self.assertIsInstance(obj.input_ids, array)
+        # the tokenizer manager keeps every id, in a container full GCs stop walking after one collection
+        self.assertIsInstance(obj.input_ids, tuple)
+        gc.collect()
         self.assertFalse(gc.is_tracked(obj.input_ids))
         self.assertEqual(list(obj.input_ids), ids)
         self.assertEqual(len(obj.input_ids), len(ids))
         self.assertEqual(list(obj.input_ids[:3]), ids[:3])
-        self.assertEqual(pickle.loads(pickle.dumps(obj.input_ids)), array("q", ids))
+        self.assertEqual(json.loads(json.dumps(obj.input_ids)), ids)
+        self.assertEqual(pickle.loads(pickle.dumps(obj.input_ids)), tuple(ids))
         # the caller's list (shared with the dynamo handler) no longer holds the prompt
         self.assertEqual(caller_ids, [])
 
     def test_only_flat_int_lists_are_converted(self):
         tm = _make_tokenizer_manager(self)
         nested = [[1, 2], [3]]
-        cases = [None, [], nested, "text", array("q", [1, 2])]
+        cases = [None, [], nested, "text", (1, 2), array("q", [1, 2])]
         with envs.SGLANG_K31_TM_UNTRACK_PROMPT.override(True):
             for value in cases:
                 obj = SimpleNamespace(input_ids=value)
