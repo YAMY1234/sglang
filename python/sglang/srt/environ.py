@@ -1040,6 +1040,10 @@ class Envs:
     # Grid cap for HiCache host-to-device load kernels (MLA/DSA KV, DSA indexer,
     # Mamba state); 0 keeps each kernel's default (2-4 blocks).
     SGLANG_HICACHE_LOAD_BLOCK_QUOTA = EnvInt(0)
+    # Radix COW of Mamba state in a forward with a load-back: copy each layer when the
+    # forward first reads it (after that layer's load event) instead of waiting for the
+    # whole load-back before the first layer.
+    SGLANG_HICACHE_COW_PER_LAYER = EnvBool(False)
     # Override for the slots in the layer-wise load-back event ring (0: derived, see
     # layer_load_ring_size); a start_loading reuses the slot of the load this many back.
     SGLANG_HICACHE_LAYER_LOAD_RING = EnvInt(0)

@@ -8,6 +8,7 @@ import torch
 from sglang.kernels.ops.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
 from sglang.srt.configs.mamba_utils import Mamba2CacheParams, Mamba2StateShape
 from sglang.srt.environ import envs
+from sglang.srt.managers.cache_controller import LayerDoneCounter
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.memory_pool import (
@@ -389,6 +390,127 @@ class TestMamba(unittest.TestCase):
             torch.equal(ngram.context[dst.long()], window),
             f"copy_from lost the N-gram window: got {ngram.context[dst.long()]}",
         )
+
+    # Mamba layers of a PP stage that starts at layer 10 (12 is attention).
+    COW_MAMBA_LAYERS = [10, 11, 13]
+    COW_START_LAYER = 10
+
+    def _setup_cow_pool(self):
+        server_args = ServerArgs(model_path="dummy", page_size=1)
+        server_args._mamba_cache_chunk_size = FLA_CHUNK_SIZE
+        set_global_server_args_for_scheduler(server_args)
+        with envs.SGLANG_MAMBA_SSM_DTYPE.override("bfloat16"):
+            shape = Mamba2StateShape.create(
+                tp_world_size=1,
+                intermediate_size=4096,
+                n_groups=16,
+                num_heads=32,
+                head_dim=128,
+                state_size=128,
+                conv_kernel=4,
+            )
+            cache_params = Mamba2CacheParams(shape=shape, layers=self.COW_MAMBA_LAYERS)
+        pool = HybridReqToTokenPool(
+            size=10,
+            mamba_size=20,
+            mamba_spec_state_size=10,
+            max_context_len=128,
+            device=get_device(),
+            enable_memory_saver=False,
+            cache_params=cache_params,
+            mamba_layer_ids=self.COW_MAMBA_LAYERS,
+            enable_mamba_extra_buffer=False,
+            speculative_num_draft_tokens=3,
+            start_layer=self.COW_START_LAYER,
+            ngram_context_len=self.NGRAM_CONTEXT_LEN,
+            ngram_eos_token_id=self.NGRAM_EOS,
+        )
+        counter = LayerDoneCounter(num_layers=4)
+        pool.register_layer_transfer_counter(counter)
+        waits = []
+        wait_until = counter.wait_until
+        counter.wait_until = lambda t: (waits.append(t), wait_until(t))[1]
+        src = pool.mamba_allocator.alloc(1)
+        dst = pool.mamba_allocator.alloc(1)
+        cache = pool.mamba_pool.mamba_cache
+        for conv in cache.conv:
+            conv[:, src.long()] = torch.randn_like(conv[:, src.long()])
+            conv[:, dst.long()] = 0
+        cache.temporal[:, src.long()] = torch.randn_like(cache.temporal[:, src.long()])
+        cache.temporal[:, dst.long()] = 0
+        pool.ngram_pool.context[src.long()] = torch.tensor(
+            [[55, 66]],
+            dtype=pool.ngram_pool.context.dtype,
+            device=pool.ngram_pool.context.device,
+        )
+        return pool, counter, waits, src, dst
+
+    def _cow_layer_copied(self, pool, src, dst, layer_id):
+        cache = pool.mamba_pool.mamba_cache
+        p = pool.mamba_map[layer_id]
+        tensors = [*cache.conv, cache.temporal]
+        return all(torch.equal(t[p, dst.long()], t[p, src.long()]) for t in tensors)
+
+    def test_cow_per_layer_with_hicache_consumer(self):
+        """With a load-back in flight, SGLANG_HICACHE_COW_PER_LAYER copies each layer's
+        conv / temporal only after that layer's load event, and the side state after
+        the first Mamba layer's; the result equals the whole-load copy."""
+        pool, counter, waits, src, dst = self._setup_cow_pool()
+        counter.set_consumer(0)
+        with envs.SGLANG_HICACHE_COW_PER_LAYER.override(True):
+            pool.copy_mamba_state(src, dst)
+        self.assertEqual(waits, [0])  # the first Mamba layer only
+        self.assertTrue(
+            torch.equal(
+                pool.ngram_pool.context[dst.long()], pool.ngram_pool.context[src.long()]
+            )
+        )
+        for layer_id in self.COW_MAMBA_LAYERS:
+            self.assertFalse(self._cow_layer_copied(pool, src, dst, layer_id))
+        for i, layer_id in enumerate(self.COW_MAMBA_LAYERS):
+            pool.mamba2_layer_cache(layer_id)
+            for j, other in enumerate(self.COW_MAMBA_LAYERS):
+                self.assertEqual(self._cow_layer_copied(pool, src, dst, other), j <= i)
+        self.assertEqual(waits, [0, 0, 1, 3])
+        self.assertIsNone(pool._pending_cow)
+        pool.mamba2_layer_cache(self.COW_MAMBA_LAYERS[0])  # a later read copies nothing
+        self.assertEqual(waits, [0, 0, 1, 3, 0])
+
+        # Same bytes as the whole-load path (flag off), which waits for the last layer.
+        ref, ref_counter, ref_waits, ref_src, ref_dst = self._setup_cow_pool()
+        cache, ref_cache = pool.mamba_pool.mamba_cache, ref.mamba_pool.mamba_cache
+        for t, r in zip(
+            [*cache.conv, cache.temporal], [*ref_cache.conv, ref_cache.temporal]
+        ):
+            r[:, ref_src.long()] = t[:, src.long()]
+        ref_counter.set_consumer(0)
+        ref.copy_mamba_state(ref_src, ref_dst)
+        self.assertEqual(ref_waits, [3])
+        for t, r in zip(
+            [*cache.conv, cache.temporal], [*ref_cache.conv, ref_cache.temporal]
+        ):
+            self.assertTrue(torch.equal(t[:, dst.long()], r[:, ref_dst.long()]))
+
+    def test_cow_per_layer_flush_and_no_load_back(self):
+        """Layers the forward did not read are copied by flush_pending_cow; without a
+        load-back consumer the flag keeps the one-shot copy."""
+        pool, counter, waits, src, dst = self._setup_cow_pool()
+        counter.set_consumer(0)
+        with envs.SGLANG_HICACHE_COW_PER_LAYER.override(True):
+            pool.copy_mamba_state(src, dst)
+            pool.mamba2_layer_cache(self.COW_MAMBA_LAYERS[0])
+            pool.flush_pending_cow()
+        self.assertIsNone(pool._pending_cow)
+        for layer_id in self.COW_MAMBA_LAYERS:
+            self.assertTrue(self._cow_layer_copied(pool, src, dst, layer_id))
+
+        pool, counter, waits, src, dst = self._setup_cow_pool()
+        with envs.SGLANG_HICACHE_COW_PER_LAYER.override(True):
+            pool.copy_mamba_state(src, dst)
+        self.assertEqual(waits, [])
+        self.assertIsNone(pool._pending_cow)
+        for layer_id in self.COW_MAMBA_LAYERS:
+            self.assertTrue(self._cow_layer_copied(pool, src, dst, layer_id))
 
     def test_ngram_cpu_offload_roundtrip(self):
         """The window survives a host offload round-trip along with mamba state."""
