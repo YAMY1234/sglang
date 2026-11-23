@@ -960,6 +960,13 @@ class SchedulerPPMixin:
             if bool(fields[5]) != kda_flashinfer_prefill.plan_seed_on:
                 logger.info("KDA plan seed -> %s (%s)", bool(fields[5]), self._pp_host_lead_file)
                 kda_flashinfer_prefill.set_plan_seed(bool(fields[5]))
+        # A seventh switches SGLANG_LAUNCH_FASTPATH.
+        if len(fields) > 6:
+            from sglang.kernels import launch_fastpath
+
+            if bool(fields[6]) != launch_fastpath.enabled:
+                logger.info("Launch fast path -> %s (%s)", bool(fields[6]), self._pp_host_lead_file)
+                launch_fastpath.set_enabled(bool(fields[6]))
 
     def _pp_bound_host_lead(self: Scheduler) -> None:
         """SGLANG_PP_HOST_LEAD_MAX: wait until fewer than that many of this stage's forwards are not yet

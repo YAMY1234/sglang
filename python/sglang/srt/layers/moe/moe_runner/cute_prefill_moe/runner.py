@@ -23,6 +23,8 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.kernels import launch_fastpath
+
 _ROWS = 128  # routing padding per expert segment = scale-atom height
 _CFG = ((512, 192, 128), (256, 192, 64), (2, 1))  # mma tiler, mma instruction, cluster
 # Test hook: when a list, run() appends (expanded->permuted map, FC1 rows, FC1 scale atoms, FC2 rows) of each call.
@@ -230,23 +232,29 @@ class _Engine:
 
     def launch(self, which: int, stream) -> None:
         import cuda.bindings.driver as cuda
-        import cutlass.cute as cute
 
         a0, b0, c0, sfa0, sfb0 = self.init
         _, (shapes, strides, ptrs, sfptrs, tmap) = self.t[which]
-        cu_stream = cuda.CUstream(stream.cuda_stream)
+        handle = stream.cuda_stream
         if self.comp[which] is None:
+            import cutlass.cute as cute
+
             with self.lock:
                 if self.comp[which] is None:
                     t0 = time.perf_counter()
                     self.comp[which] = cute.compile(
                         self.kern[which], a0, b0, c0, sfa0, sfb0, self.G, shapes, strides, ptrs, sfptrs,
-                        self.mac, tmap, self.mac, cu_stream,
+                        self.mac, tmap, self.mac, cuda.CUstream(handle),
                     )
                     logger.info(
                         "CuTe prefill MoE: compiled %s in %.1f s", ("FC1", "FC2")[which], time.perf_counter() - t0
                     )
-        self.comp[which](a0, b0, c0, sfa0, sfb0, shapes, strides, ptrs, sfptrs, tmap, cu_stream)
+        # Every argument is a per-engine buffer: the per-call shapes and pointers are written into them on the GPU.
+        launch_fastpath.cute_static_call(
+            self.comp[which],
+            lambda: (a0, b0, c0, sfa0, sfb0, shapes, strides, ptrs, sfptrs, tmap, cuda.CUstream(handle)),
+            cache_key=(id(self), which, handle),
+        )
 
 
 _engines: dict = {}
@@ -315,7 +323,8 @@ def run(
 
     counts = torch.zeros((E,), dtype=torch.int32, device=device)
     n_ids = num_tokens * top_k
-    _count_kernel[(triton.cdiv(n_ids, 1024),)](
+    launch_fastpath.triton_launch(
+        _count_kernel, (triton.cdiv(n_ids, 1024),),
         ids, n_ids, counts, E, SHIFT=16 if packed else 0, BLOCK=1024, num_warps=4,
     )
     n_map = p2t.numel() - 1  # FlashInfer keeps one guard element past the map
@@ -325,7 +334,8 @@ def run(
     sfb = torch.empty((rows // 128 * (H // 128) * 512,), dtype=u8, device=device)
     (s1, _, p1, f1, _), _ = eng.t[0]
     (s2t, _, p2, f2, _), _ = eng.t[1]
-    _plan_kernel[(1,)](
+    launch_fastpath.triton_launch(
+        _plan_kernel, (1,),
         counts, E,
         s1, p1, f1, s2t, p2, f2,
         w.w13.data_ptr(), w.w13[0].numel(), w.s13.data_ptr(), w.s13[0].numel(),
@@ -333,7 +343,8 @@ def run(
         xp.data_ptr(), sfb.data_ptr(), o1.data_ptr(), o1sf.data_ptr(), o2.data_ptr(),
         H=H, I=I, BLOCK=triton.next_power_of_2(E),
     )
-    _permute_kernel[(triton.cdiv(n_map, 64),)](
+    launch_fastpath.triton_launch(
+        _permute_kernel, (triton.cdiv(n_map, 64),),
         p2t, total, x_scale.view(u8), sfb, x_quant.view(torch.int64), xp.view(torch.int64),
         n_map, num_tokens, KB=H // 32, HW=H // 8, BLOCK_P=64, BLOCK_H=64, num_warps=4,
     )
