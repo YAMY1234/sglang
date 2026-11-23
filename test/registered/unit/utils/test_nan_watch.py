@@ -118,6 +118,7 @@ class TestNanWatch(unittest.TestCase):
         self.assertIn(
             "'dup_mamba_slot': 1, 'mamba_slot_free': 2, 'mamba_free_dup': 1", lines[0]
         )
+        self.assertIn("free_dup_vals=[9] slots_on_free=[5, 5]", lines[0])
         self.assertIn("'new_kv_page_free': 2", lines[0])
 
     def test_new_kv_on_a_prefix_slot_is_counted(self):

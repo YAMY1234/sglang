@@ -25,6 +25,10 @@ logger = logging.getLogger(__name__)
 # Row columns; the last row of a record holds the per-forward counters. IN / OUT read the "hidden_states" proxy
 # (last stage OUT: logits rows); the K3 attention-residual bank rides beside it as "attn_res_bank".
 _IN, _STATE, _OUT, _SLOT, _KV_MIN, _KV_MAX, _IN_BANK, _OUT_BANK = range(8)
+# Counter row, past the counters: up to 4 values the Mamba free list holds twice, up to 2 batch slots on it.
+_FREE_DUP_VALS, _SLOTS_ON_FREE = slice(6, 10), slice(10, 12)
+_NUM_COLS = 12
+_NONE = torch.iinfo(torch.int64).max
 _COUNTERS = (
     "dup_mamba_slot",
     "mamba_slot_free",
@@ -79,13 +83,31 @@ def _dups(sorted_ids: torch.Tensor) -> torch.Tensor:
     return (sorted_ids[1:] == sorted_ids[:-1]).sum()
 
 
-def _count_in(elements: torch.Tensor, test: torch.Tensor) -> torch.Tensor:
+def _member(elements: torch.Tensor, test: torch.Tensor) -> torch.Tensor:
     # Not torch.isin: for large test sets it takes a unique-based path whose output size syncs the host.
     if test.numel() == 0:
-        return torch.zeros((), dtype=torch.int64, device=elements.device)
+        return torch.zeros_like(elements, dtype=torch.bool)
     sorted_test = torch.sort(test).values
     idx = torch.searchsorted(sorted_test, elements).clamp_max(test.numel() - 1)
-    return (sorted_test[idx] == elements).sum()
+    return sorted_test[idx] == elements
+
+
+def _count_in(elements: torch.Tensor, test: torch.Tensor) -> torch.Tensor:
+    return _member(elements, test).sum()
+
+
+def _first_values(mask: torch.Tensor, values: torch.Tensor, k: int) -> torch.Tensor:
+    """The k smallest values where mask holds, padded with _NONE; fixed size, so no sync."""
+    picked = torch.where(mask, values, _NONE)
+    if picked.numel() < k:
+        picked = torch.cat([picked, picked.new_full((k - picked.numel(),), _NONE)])
+    return torch.sort(picked).values[:k]
+
+
+def _keep_for_this_stream(t: torch.Tensor) -> None:
+    # A scheduler-owned tensor read on the forward stream: its block must not be reused before the read runs.
+    if t.is_cuda:
+        t.record_stream(torch.cuda.current_stream(t.device))
 
 
 def begin(
@@ -105,7 +127,7 @@ def begin(
     prefix_lens = list(forward_batch.extend_prefix_lens_cpu or [0] * len(extend_lens))
     bs, num_tokens = len(extend_lens), sum(extend_lens)
     device = forward_batch.out_cache_loc.device
-    dev = torch.zeros((bs + 1, 8), dtype=torch.int64, device=device)
+    dev = torch.zeros((bs + 1, _NUM_COLS), dtype=torch.int64, device=device)
     token_row = torch.repeat_interleave(
         torch.arange(bs, device=device),
         forward_batch.extend_seq_lens[:bs].long(),
@@ -122,9 +144,15 @@ def begin(
         slots = pool.get_mamba_indices(req_idx).long()
         dev[:bs, _SLOT] = slots
         dev[bs, 0] = _dups(torch.sort(slots).values)
+        _keep_for_this_stream(pool.mamba_allocator.free_slots)
         free = pool.mamba_allocator.free_slots.long()
-        dev[bs, 1] = _count_in(slots, free)
-        dev[bs, 2] = _dups(torch.sort(free).values)
+        on_free = _member(slots, free)
+        dev[bs, 1] = on_free.sum()
+        dev[bs, _SLOTS_ON_FREE] = _first_values(on_free, slots, 2)
+        free_sorted = torch.sort(free).values
+        twice = free_sorted[1:] == free_sorted[:-1]
+        dev[bs, 2] = twice.sum()
+        dev[bs, _FREE_DUP_VALS] = _first_values(twice, free_sorted[1:], 4)
 
     loc = forward_batch.out_cache_loc[:num_tokens].long()
     big = torch.iinfo(torch.int64).max
@@ -138,6 +166,7 @@ def begin(
     allocator = model_runner.token_to_kv_pool_allocator
     free_pages = allocator.get_all_free_pages()
     if free_pages is not None:
+        _keep_for_this_stream(free_pages)
         dev[bs, 4] = _count_in(loc // allocator.page_size, free_pages.long())
     rows_cpu = forward_batch.req_pool_indices_cpu
     if rows_cpu is not None and not model_runner.kv_index_translator.is_translating:
@@ -227,6 +256,8 @@ def poll() -> None:
 
 def _report(watch: _Forward, rows) -> None:
     counters = dict(zip(_COUNTERS, rows[-1][: len(_COUNTERS)]))
+    free_dup_vals = [v for v in rows[-1][_FREE_DUP_VALS] if v != _NONE]
+    slots_on_free = [v for v in rows[-1][_SLOTS_ON_FREE] if v != _NONE]
     rows = rows[:-1]
     _totals["forwards"] += 1
     _totals["rows"] += len(rows)
@@ -278,9 +309,11 @@ def _report(watch: _Forward, rows) -> None:
         )
     if anomaly and not hits:
         logger.warning(
-            "NaN watch slot anomaly PP%d counters=%s batch=%s t=%.3f",
+            "NaN watch slot anomaly PP%d counters=%s free_dup_vals=%s slots_on_free=%s batch=%s t=%.3f",
             watch.stage,
             anomaly,
+            free_dup_vals,
+            slots_on_free,
             batch,
             watch.t,
         )
