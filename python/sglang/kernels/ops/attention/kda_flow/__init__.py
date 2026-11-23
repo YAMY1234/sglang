@@ -89,7 +89,7 @@ def _check_spills(compiled, device_index: int, key) -> None:
             logger.info("KdaFlow %s: %d registers, no local memory", key[:6], regs)
 
 
-def _compile(args, *, heads, tokens, requests, fused_fb, device_index):
+def _compile(args, *, heads, tokens, requests, fused_fb, prefetch, device_index):
     import cutlass.cute as cute
     from cutlass.cute.runtime import make_fake_stream, make_fake_tensor
 
@@ -118,7 +118,7 @@ def _compile(args, *, heads, tokens, requests, fused_fb, device_index):
             import cutlass
 
             fakes.append(cutlass.Float32(a))
-    kernel = KdaFlow(heads, tokens, requests, ctas, fused_fb)
+    kernel = KdaFlow(heads, tokens, requests, ctas, fused_fb, prefetch)
     with torch.cuda.device(device_index):
         return cute.compile(kernel, *fakes, make_fake_stream())
 
@@ -167,14 +167,18 @@ def kda_flow_verify(
         float(lower_bound), HEAD_DIM**-0.5, float(eps),
     )  # fmt: skip
     device_index = x.device.index
+    from sglang.srt.environ import envs
+
+    prefetch = envs.SGLANG_OPT_KDA_FLOW_PREFETCH.get()
     key = (
-        device_index, heads, tokens, n, fused_fb,
+        device_index, heads, tokens, n, fused_fb, prefetch,
         *(_layout(a) if isinstance(a, torch.Tensor) else ("s",) for a in args),
     )  # fmt: skip
     compiled = _COMPILED.get(key)
     if compiled is None:
         compiled = _compile(args, heads=heads, tokens=tokens, requests=n,
-                            fused_fb=fused_fb, device_index=device_index)  # fmt: skip
+                            fused_fb=fused_fb, prefetch=prefetch,
+                            device_index=device_index)  # fmt: skip
         _check_spills(compiled, device_index, key)
         _COMPILED[key] = compiled
     import cutlass

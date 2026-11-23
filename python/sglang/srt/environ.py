@@ -1977,6 +1977,9 @@ class Envs:
     # KdaFlow applies f_b itself (F_A in, F_B MMA in the prologue) instead of
     # reading the side stream's f_b GEMM output.
     SGLANG_OPT_KDA_FLOW_FB = EnvBool(False)
+    # KdaFlow issues its first state pages before the PDL wait (the state is not
+    # an output of the kernels just before the verify).
+    SGLANG_OPT_KDA_FLOW_PREFETCH = EnvBool(False)
     SGLANG_ENABLE_LILICORR_SAMPLING = EnvBool(False)
     SGLANG_LILICORR_REQUIRE_SAMPLING = EnvBool(False)
     SGLANG_RAGGED_VERIFY_MODE = EnvStr("static")
