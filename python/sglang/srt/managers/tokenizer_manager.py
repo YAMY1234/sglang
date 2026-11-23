@@ -2439,13 +2439,14 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
     def _maybe_untrack_prompt_ids(self, obj: GenerateReqInput):
         # A dispatched prompt's ids stay referenced for the whole stream, here and by the caller (the dynamo handler
-        # passes its own list), and every full GC walks each element. The scheduler already has its own copy.
+        # passes its own list), and every full GC walks each element. The scheduler already has its own copy. A tuple of
+        # ints is untracked by the first collection that sees it (as record_request_for_crash_dump relies on).
         if not envs.SGLANG_K31_TM_UNTRACK_PROMPT.get():
             return
         ids = obj.input_ids
         if not isinstance(ids, list) or not ids or not isinstance(ids[0], int):
             return
-        obj.input_ids = array("q", ids)
+        obj.input_ids = tuple(ids)
         ids.clear()
         if not getattr(self, "_untrack_prompt_logged", False):
             self._untrack_prompt_logged = True
