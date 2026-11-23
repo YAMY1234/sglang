@@ -2385,8 +2385,8 @@ struct TopKKernel {
    * every rank's DCP merge buffer (multicast address `push_mc`; the int64 layout
    * of dsa/dcp_topk_merge.cuh, `slot` entries per row slot, `max_rows` slots per
    * parity), tagged with the call of `counters[i]`. The merge kernel that reads
-   * them advances the counters. `sampled` / `sampled_min_len` / `fallback_rows`: as in
-   * `transform_candidates_dcp`.
+   * them advances the counters. `sampled` / `sampled_min_len` / `fallback_rows` / `row_map` / `lpt_trace`
+   * (bench only): as in `transform_candidates_dcp`.
    */
   static void transform_candidates_dcp_push(
       const tvm::ffi::TensorView scores,
@@ -2402,7 +2402,8 @@ struct TopKKernel {
       const bool sampled,
       const int64_t sampled_min_len,
       const tvm::ffi::Optional<tvm::ffi::TensorView> fallback_rows,
-      const tvm::ffi::Optional<tvm::ffi::TensorView> row_map) {
+      const tvm::ffi::Optional<tvm::ffi::TensorView> row_map,
+      const tvm::ffi::Optional<tvm::ffi::TensorView> lpt_trace) {
     using namespace host;
     auto B = SymbolicSize{"batch_size"};
     auto L = SymbolicSize{"max_seq_len"};
@@ -2480,11 +2481,21 @@ struct TopKKernel {
     if (sampled) {
 #ifdef USE_ROCM
       static_cast<void>(row_map);
+      static_cast<void>(lpt_trace);
       RuntimeCheck(false, "the sampled candidate top-k needs CUDA");
 #else
       if (row_map.has_value() && rows <= kBlockSize) {  // longest rows first (topk_candidates_sampled_kernel)
         auto lpt = params;
         lpt.row_map = verify_row_map(row_map.value(), rows, device_);
+        if (lpt_trace.has_value()) {  // bench only: int64 [>= rows, 16], the timestamped instantiation
+          auto G = SymbolicSize{"lpt_trace_blocks"};
+          TensorMatcher({G, 16}).with_dtype<int64_t>().with_device(device_).verify(lpt_trace.value());
+          RuntimeCheck(G.unwrap() >= rows, "lpt_trace has fewer rows than the grid");
+          lpt.lpt_trace = static_cast<int64_t*>(lpt_trace.value().data_ptr());
+          return LaunchKernel(rows, kBlockSize, device_.unwrap())
+              .config({.use_pdl = kUsePDL})
+              .launch(topk_candidates_sampled_kernel<kUsePDL, true, true, true>, lpt);
+        }
         return LaunchKernel(rows, kBlockSize, device_.unwrap())
             .config({.use_pdl = kUsePDL})
             .launch(topk_candidates_sampled_kernel<kUsePDL, true, true>, lpt);
