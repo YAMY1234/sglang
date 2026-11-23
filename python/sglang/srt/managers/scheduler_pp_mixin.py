@@ -953,6 +953,13 @@ class SchedulerPPMixin:
         if len(fields) > 2 and bool(fields[2]) != self._pp_early_send_when_ready:
             logger.info("PP early send when ready -> %s (%s)", bool(fields[2]), self._pp_host_lead_file)
             self._pp_early_send_when_ready = bool(fields[2])
+        # Fields 4-5 belong to other A/B switches; a sixth switches SGLANG_K31_KDA_PLAN_ASYNC_H2D.
+        if len(fields) > 5:
+            from sglang.srt.layers.attention.linear.kernels import kda_flashinfer_prefill
+
+            if bool(fields[5]) != kda_flashinfer_prefill.plan_seed_on:
+                logger.info("KDA plan seed -> %s (%s)", bool(fields[5]), self._pp_host_lead_file)
+                kda_flashinfer_prefill.set_plan_seed(bool(fields[5]))
 
     def _pp_bound_host_lead(self: Scheduler) -> None:
         """SGLANG_PP_HOST_LEAD_MAX: wait until fewer than that many of this stage's forwards are not yet

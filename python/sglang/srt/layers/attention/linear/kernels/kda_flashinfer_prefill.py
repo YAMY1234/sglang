@@ -23,6 +23,15 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# SGLANG_K31_KDA_PLAN_ASYNC_H2D, also switchable at run time (set_plan_seed) for in-window A/B.
+plan_seed_on = False
+
+
+def set_plan_seed(on: bool) -> None:
+    global plan_seed_on
+    plan_seed_on = on
+
+
 # SGLANG_K31_KDA_PREFILL_FI_SM107 runs FlashInfer v0.7.4's CuTe DSL KDA kernel module:
 # 0.7.2's decomp-chain kernel can deadlock (flashinfer#8684) and pass non-finite V
 # padding (#8599). On this path only that module differs, and it is imported lazily.
@@ -149,7 +158,7 @@ class FlashInferKDAPrefillKernel(LinearAttnKernelBase):
     wants_int64_query_start_loc = True
     supports_track_state_snapshot = True
     supports_safe_gate = True
-    # Set by __init__ under SGLANG_K31_KDA_PLAN_ASYNC_H2D; extend() records the head count.
+    # The vendored module when its plan cache can be seeded; extend() records the head count.
     _plan_module = None
     _kda_heads = None
 
@@ -182,8 +191,9 @@ class FlashInferKDAPrefillKernel(LinearAttnKernelBase):
         if self._seed_mode:
             module = importlib.import_module(_BT16)
             self._cu_contents_memo = getattr(module, "_CU_CONTENTS_MEMO", None)
-            if envs.SGLANG_K31_KDA_PLAN_ASYNC_H2D.get() and hasattr(module, "_PLAN_CACHE"):
+            if hasattr(module, "_PLAN_CACHE"):
                 self._plan_module = module
+                set_plan_seed(plan_seed_on or envs.SGLANG_K31_KDA_PLAN_ASYNC_H2D.get())
             logger.info(
                 "KDA prefill cu_seqlens seeded from host (SGLANG_K31_KDA_SEED_CU_SEQLENS=%d): %s",
                 self._seed_mode,
@@ -219,7 +229,7 @@ class FlashInferKDAPrefillKernel(LinearAttnKernelBase):
             version,
             contents,
         )
-        if self._plan_module is not None and self._kda_heads is not None:
+        if plan_seed_on and self._plan_module is not None and self._kda_heads is not None:
             seed_decomp_plan(
                 self._plan_module, contents, self._kda_heads, query_start_loc_i64.device
             )

@@ -28,7 +28,9 @@ DIGEST_LOG_PREFIX = "PP state digest: "
 _LAUNCH_QUEUE_ENV = "CUDA_SCALE_LAUNCH_QUEUES"
 
 
-def launch_queue_scale(pp_rank: int, scale: str, min_rank: int, current: Optional[str]) -> Optional[str]:
+def launch_queue_scale(
+    pp_rank: int, scale: str, min_rank: int, current: Optional[str]
+) -> Optional[str]:
     """CUDA_SCALE_LAUNCH_QUEUES for one PP rank's scheduler process, or None to leave the environment as is.
     The device launch queue holds ~1k commands at 1x (VR200), about 1.7 forwards of a 12-layer K3.1 stage, so it
     caps how far that stage's host runs ahead of its GPU. An explicit CUDA_SCALE_LAUNCH_QUEUES wins."""

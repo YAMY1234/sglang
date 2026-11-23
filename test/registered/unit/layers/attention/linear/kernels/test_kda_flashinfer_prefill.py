@@ -214,7 +214,9 @@ class TestFlashInferKDADecompPlanSeed(CustomTestCase):
         torch.cuda.synchronize()
         self.assertEqual(plan["cu_chunks"].tolist(), [0, 376, 378])
         self.assertEqual(plan["cu_chunks"].dtype, torch.int32)
-        self.assertEqual((plan["total_chunks"], plan["cu_list"]), (378, [0, 6001, 6033]))
+        self.assertEqual(
+            (plan["total_chunks"], plan["cu_list"]), (378, [0, 6001, 6033])
+        )
 
 
 if __name__ == "__main__":

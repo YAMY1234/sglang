@@ -29,7 +29,16 @@ from sglang.srt.environ import envs
 logger = logging.getLogger(__name__)
 
 _SYNC_WARNING = "synchronizing CUDA operation"
-_TENSOR_METHODS = ("item", "tolist", "cpu", "numpy", "__bool__", "__int__", "__float__", "__index__")
+_TENSOR_METHODS = (
+    "item",
+    "tolist",
+    "cpu",
+    "numpy",
+    "__bool__",
+    "__int__",
+    "__float__",
+    "__index__",
+)
 _SKIP_FILES = ("pp_sync_audit.py", "/warnings.py", "/torch/", "/contextlib.py")
 
 
@@ -39,7 +48,11 @@ def call_site(frame, depth: int = 3) -> str:
     while frame is not None and len(out) < depth:
         path = frame.f_code.co_filename
         if not any(s in path for s in _SKIP_FILES):
-            name = path.split("/sglang/", 1)[-1] if "/sglang/" in path else os.path.basename(path)
+            name = (
+                path.split("/sglang/", 1)[-1]
+                if "/sglang/" in path
+                else os.path.basename(path)
+            )
             out.append(f"{name}:{frame.f_lineno} {frame.f_code.co_name}")
         frame = frame.f_back
     return " <- ".join(out)
@@ -72,7 +85,9 @@ class SyncAudit:
         audit = self
 
         def wrapper(*args, **kwargs):
-            if only_cuda and not (args and isinstance(args[0], torch.Tensor) and args[0].is_cuda):
+            if only_cuda and not (
+                args and isinstance(args[0], torch.Tensor) and args[0].is_cuda
+            ):
                 return fn(*args, **kwargs)
             if getattr(audit._local, "inside", False):
                 return fn(*args, **kwargs)
@@ -95,10 +110,20 @@ class SyncAudit:
 
     def install(self) -> None:
         for name in _TENSOR_METHODS:
-            setattr(torch.Tensor, name, self.timed("tensor." + name, getattr(torch.Tensor, name), True))
-        torch.cuda.Event.synchronize = self.timed("event.synchronize", torch.cuda.Event.synchronize, False)
-        torch.cuda.Stream.synchronize = self.timed("stream.synchronize", torch.cuda.Stream.synchronize, False)
-        torch.cuda.synchronize = self.timed("cuda.synchronize", torch.cuda.synchronize, False)
+            setattr(
+                torch.Tensor,
+                name,
+                self.timed("tensor." + name, getattr(torch.Tensor, name), True),
+            )
+        torch.cuda.Event.synchronize = self.timed(
+            "event.synchronize", torch.cuda.Event.synchronize, False
+        )
+        torch.cuda.Stream.synchronize = self.timed(
+            "stream.synchronize", torch.cuda.Stream.synchronize, False
+        )
+        torch.cuda.synchronize = self.timed(
+            "cuda.synchronize", torch.cuda.synchronize, False
+        )
         self._showwarning = warnings.showwarning
         warnings.showwarning = self.on_warning
         warnings.filterwarnings("always", message=".*" + _SYNC_WARNING)
@@ -121,7 +146,11 @@ _audit: Optional[SyncAudit] = None
 def init(diag) -> Optional[SyncAudit]:
     """Install the audit in this scheduler process when SGLANG_PP_SYNC_AUDIT and the bubble diag are on."""
     global _audit
-    if not envs.SGLANG_PP_SYNC_AUDIT.get() or diag is None or not torch.cuda.is_available():
+    if (
+        not envs.SGLANG_PP_SYNC_AUDIT.get()
+        or diag is None
+        or not torch.cuda.is_available()
+    ):
         return None
     _audit = SyncAudit(lambda: diag._label)
     _audit.install()
