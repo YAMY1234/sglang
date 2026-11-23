@@ -381,7 +381,10 @@ class TestKdaFlowVerify(CustomTestCase):
     rows from its RecoverSSM records and verifies q = 5 rows; over steps with partial
     acceptance, a padding row and a slot changing owner it must match an FP64
     sequential reference (outputs within BF16, states and corrections within FP32
-    reduction order) and the reader flush must commit the same state."""
+    reduction order) and the reader flush must commit the same state. A_log, dt_bias,
+    f_b and the norm weight are nn.Parameters that require grad, as in the model:
+    exporting such a tensor through DLPack raises, which crashed every decode
+    scheduler at the first target verify."""
 
     @classmethod
     def setUpClass(cls):
@@ -414,10 +417,12 @@ class TestKdaFlowVerify(CustomTestCase):
             return (torch.randn(*shape, device=dev, generator=gen) * scale).to(dtype)
 
         conv_w = [prepare_conv_weight(randn(3 * d, 4, scale=0.5)) for _ in range(layers)]
-        a_log = [randn(heads, scale=0.5) for _ in range(layers)]
-        dt = [randn(d, scale=0.5) for _ in range(layers)]
-        f_b = [randn(d, 128, scale=128**-0.5, dtype=bf16) for _ in range(layers)]
-        norm_w = randn(128, scale=0.1) + 1
+        # the model's layer parameters, which require grad: the kernel must not export them as they are
+        param = torch.nn.Parameter
+        a_log = [param(randn(heads, scale=0.5)) for _ in range(layers)]
+        dt = [param(randn(d, scale=0.5)) for _ in range(layers)]
+        f_b = [param(randn(d, 128, scale=128**-0.5, dtype=bf16)) for _ in range(layers)]
+        norm_w = param(randn(128, scale=0.1) + 1)
         spec = SimpleNamespace(
             temporal=randn(layers, num_slots, heads, 128, 128, scale=0.1),
             replayssm_rawv=torch.zeros(layers, num_slots, heads, ring, 128, device=dev, dtype=bf16),
