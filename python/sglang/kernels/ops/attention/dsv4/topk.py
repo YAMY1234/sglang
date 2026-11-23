@@ -251,6 +251,7 @@ def topk_transform_candidates_v2(
     sampled: bool = False,
     sampled_min_len: int = 0,
     lpt: bool = False,
+    lpt_trace: Optional[torch.Tensor] = None,
 ) -> None:
     """Ragged top-k emitting candidates for a distributed top-k merge.
 
@@ -272,6 +273,8 @@ def topk_transform_candidates_v2(
     same set (slot order aside) and redoes on the exact path the rows it cannot certify;
     ``overflow_rows`` counts those. ``lpt`` (with ``sampled``, rows <= 1024) launches the blocks
     longest row first, so a launch of more rows than resident blocks queues the shortest.
+    ``lpt_trace`` (bench only): int64 [rows, 4], each block's {start, row chosen, end} in
+    globaltimer ns and its row.
 
     NOTE: ``scores`` is written in place as for the ragged entry point.
     """
@@ -290,6 +293,7 @@ def topk_transform_candidates_v2(
             int(sampled_min_len),
             overflow_rows,
             bool(lpt),
+            lpt_trace,
         )
         return
     module.topk_transform_candidates(
