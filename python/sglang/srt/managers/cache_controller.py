@@ -85,8 +85,9 @@ class LayerLoadingEvent:
 class LayerDoneCounter:
     def __init__(self, num_layers: int):
         self.num_layers = num_layers
-        # extra producer and consumer counters for overlap mode
-        self.num_counters = 3
+        # extra producer and consumer counters for overlap mode; a PP stage whose host runs
+        # further ahead of its GPU has as many loads in flight and needs as many slots
+        self.num_counters = envs.SGLANG_HICACHE_LAYER_LOAD_RING.get()
         self.events = [LayerLoadingEvent(num_layers) for _ in range(self.num_counters)]
         self.producer_index = -1
         self.consumer_index = -1

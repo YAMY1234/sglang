@@ -1040,6 +1040,9 @@ class Envs:
     # Grid cap for HiCache host-to-device load kernels (MLA/DSA KV, DSA indexer,
     # Mamba state); 0 keeps each kernel's default (2-4 blocks).
     SGLANG_HICACHE_LOAD_BLOCK_QUOTA = EnvInt(0)
+    # Slots in the layer-wise load-back event ring. A start_loading reuses the slot of
+    # the load this many back, so it bounds the loads in flight (PP: about the host lead).
+    SGLANG_HICACHE_LAYER_LOAD_RING = EnvInt(3)
     # Grid cap for the Mamba state device-to-host backup kernel; 0 keeps 2 blocks.
     SGLANG_HICACHE_MAMBA_BACKUP_BLOCK_QUOTA = EnvInt(0)
     # Build the host Mamba transfer JIT kernel when the host pool is created.
