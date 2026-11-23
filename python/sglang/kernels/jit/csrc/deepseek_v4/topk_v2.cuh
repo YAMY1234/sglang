@@ -2296,15 +2296,16 @@ struct TopKKernel {
       RuntimeCheck(false, "the sampled candidate top-k needs CUDA");
 #else
       if (lpt && rows <= kBlockSize) {  // longest rows first (topk_candidates_sampled_kernel)
+        auto lpt_params = params;
         if (lpt_trace.has_value()) {  // bench only: int64 [>= rows, 4]
           auto G = SymbolicSize{"lpt_trace_blocks"};
           TensorMatcher({G, 4}).with_dtype<int64_t>().with_device(device_).verify(lpt_trace.value());
           RuntimeCheck(G.unwrap() >= rows, "lpt_trace has fewer rows than the grid");
-          params.lpt_trace = static_cast<int64_t*>(lpt_trace.value().data_ptr());
+          lpt_params.lpt_trace = static_cast<int64_t*>(lpt_trace.value().data_ptr());
         }
         return LaunchKernel(rows, kBlockSize, device_.unwrap())
             .config({.use_pdl = kUsePDL})
-            .launch(topk_candidates_sampled_kernel<kUsePDL, false, true>, params);
+            .launch(topk_candidates_sampled_kernel<kUsePDL, false, true>, lpt_params);
       }
       return LaunchKernel(rows, kBlockSize, device_.unwrap())
           .config({.use_pdl = kUsePDL})
