@@ -469,7 +469,8 @@ def test_dcp4_topk_merge_pushed_sampled(kind: str, cand_k: int, min_len: int, lp
 @torch.inference_mode()
 def test_dcp4_topk_merge_pushed_lpt_forwards() -> None:
     """LPT across forwards as the indexer drives it (prepare_step in every DSA layer, the map built
-    at the lowest layer id): forwards of 2, 11, 3 and 1 rows, each over three layers, with
+    at the lowest layer id, 0 as in the other tests that share this merge): forwards of 2, 11, 3 and
+    1 rows, each over three layers, with
     an idle forward between; with SGLANG_DSA_DCP_TOPK_LPT_CHECK every launch's map must be its own
     lengths' order, and every merge is exact. A forward that skips the map's layer launches on a
     map built for other rows: plain order, still exact."""
@@ -485,15 +486,15 @@ def test_dcp4_topk_merge_pushed_lpt_forwards() -> None:
     with envs.SGLANG_DSA_DCP_TOPK_LPT_CHECK.override(True):
         for kind, seed in (("random2", 1234), ("short", 1235), ("long", 1236), ("random", 1237)):
             case = _Case(kind, seed, rank, world, span)
-            for layer in (3, 7, 11):  # one forward: the map is built at layer 3 only
+            for layer in (0, 4, 8):  # one forward: the map is built at layer 0 only
                 merge.prepare_step(case.local_lens, layer)
                 case.run_pushed_only(merge, span)
                 torch.cuda.synchronize()
                 bad += [f"{kind} layer {layer}: {b}" for b in case.pushed_failures(rank, world)]
-            merge.prepare_step(case.local_lens[:0], 3)  # an idle forward: nothing to map
-    # a forward that skips layer 3 after a 1-row forward: its map is for 1 row, so plain order
+            merge.prepare_step(case.local_lens[:0], 0)  # an idle forward: nothing to map
+    # a forward that skips layer 0 after a 1-row forward: its map is for 1 row, so plain order
     case = _Case("random2", 1238, rank, world, span)
-    merge.prepare_step(case.local_lens, 7)
+    merge.prepare_step(case.local_lens, 4)
     case.run_pushed_only(merge, span)
     torch.cuda.synchronize()
     bad += [f"skipped map: {b}" for b in case.pushed_failures(rank, world)]
