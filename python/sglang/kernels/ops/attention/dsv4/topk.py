@@ -269,6 +269,7 @@ def topk_transform_candidates_v2(
     split_chunk: int = 0,
     split_scratch: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
     split_extra: int = -1,
+    split_trace: Optional[torch.Tensor] = None,
 ) -> None:
     """Ragged top-k emitting candidates for a distributed top-k merge.
 
@@ -293,6 +294,8 @@ def topk_transform_candidates_v2(
     CTAs each, past the rows' own (``split_extra`` of them, -1: the slots of a two-CTA-per-SM
     wave the rows leave, up to 256; the chunk doubles while they are too few), through
     ``split_scratch`` (:func:`topk_candidates_split_scratch`). Same set again.
+    ``split_trace`` (bench only): int64 [grid, 4], each split-launch CTA's {start, end, row, chunk}
+    in globaltimer ns.
 
     NOTE: ``scores`` is written in place as for the ragged entry point.
     """
@@ -311,6 +314,7 @@ def topk_transform_candidates_v2(
             int(sampled_min_len),
             overflow_rows,
             *_split_args(split_chunk, split_scratch, split_extra),
+            split_trace,
         )
         return
     module.topk_transform_candidates(

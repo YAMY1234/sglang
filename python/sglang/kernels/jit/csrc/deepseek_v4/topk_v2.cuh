@@ -472,6 +472,7 @@ struct TopKCandidatesParams {
   uint32_t* split_counters = nullptr;    // [rows, 2]
   uint32_t split_chunk = 0;
   uint32_t split_extra = 0;
+  int64_t* split_trace = nullptr;  // bench only: per CTA {start, end, row, chunk} (globaltimer ns)
 
   SGL_DEVICE int32_t global_position(int32_t local) const {
     const auto b = cand_page_bits;
@@ -677,6 +678,20 @@ SGL_DEVICE uint32_t chunk_plan(
   return chunk_len;
 }
 
+/// Bench only (params.split_trace): thread 0 stamps this CTA's {start, end, row, chunk} once the block is done.
+SGL_DEVICE void split_trace_put(const TopKCandidatesParams& p, const uint64_t t0, const uint32_t row, const uint32_t chunk) {
+  if (p.split_trace == nullptr) return;
+  __syncthreads();
+  if (threadIdx.x != 0) return;
+  uint64_t t1;
+  asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t1));
+  auto* r = p.split_trace + 4 * static_cast<int64_t>(blockIdx.x);
+  r[0] = static_cast<int64_t>(t0);
+  r[1] = static_cast<int64_t>(t1);
+  r[2] = row;
+  r[3] = chunk;
+}
+
 /**
  * \brief `topk_candidates_sampled_kernel` on rows + split_extra CTAs: rows longer than
  * max(split_chunk, sampled_min_len) local keys are cut into chunks of whole vectors, one CTA each
@@ -693,12 +708,14 @@ TOPK_KERNEL void topk_candidates_split_kernel(const __grid_constant__ TopKCandid
     ChunkPlanSmem plan;
   } smem;
   constexpr uint32_t kVecSize = impl::TopKStreaming::kVecSize;
+  uint64_t t0 = 0;
+  if (params.split_trace != nullptr) asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t0));
   const auto rows = gridDim.x - params.split_extra;
   auto row = blockIdx.x;
   uint32_t chunk = 0, chunks = 1, chunk_vecs = UINT32_MAX;  // by default the whole row
   if (row >= rows || static_cast<uint32_t>(params.seq_lens[row]) > max(params.split_chunk, params.sampled_min_len)) {
     const auto chunk_len = chunk_plan(params, rows, row, chunk, &smem.plan);
-    if (row >= rows) return;
+    if (row >= rows) return split_trace_put(params, t0, rows, 0);
     const auto len = static_cast<uint32_t>(params.seq_lens[row]);
     if (len > max(chunk_len, params.sampled_min_len)) {
       const auto rem = params.row_starts == nullptr ? 0u : static_cast<uint32_t>(params.row_starts[row]) % kVecSize;
@@ -715,6 +732,7 @@ TOPK_KERNEL void topk_candidates_split_kernel(const __grid_constant__ TopKCandid
       .tail = chunk == chunks - 1,
   };
   candidates_sampled_one_block<kPDL, kPush, true>(params, row, &smem.sampled, &part);
+  split_trace_put(params, t0, row, chunk);
 }
 #endif  // !USE_ROCM
 
@@ -2259,7 +2277,8 @@ struct TopKKernel {
       const int64_t split_extra,
       const tvm::ffi::Optional<tvm::ffi::TensorView>& split_cand,
       const tvm::ffi::Optional<tvm::ffi::TensorView>& split_counters,
-      host::SymbolicDevice& device_) {
+      host::SymbolicDevice& device_,
+      const tvm::ffi::Optional<tvm::ffi::TensorView>& split_trace = {}) {
     using namespace host;
     const auto device = device_.unwrap();
     RuntimeCheck(
@@ -2287,6 +2306,12 @@ struct TopKKernel {
       params.split_counters = static_cast<uint32_t*>(split_counters.value().data_ptr());
       params.split_chunk = static_cast<uint32_t>(split_chunk);
       params.split_extra = static_cast<uint32_t>(extra);
+      if (split_trace.has_value()) {  // bench only: int64 [>= rows + extra, 4]
+        auto G = SymbolicSize{"split_trace_ctas"};
+        TensorMatcher({G, 4}).with_dtype<int64_t>().with_device(device_).verify(split_trace.value());
+        RuntimeCheck(G.unwrap() >= rows + params.split_extra, "split_trace has fewer rows than the grid");
+        params.split_trace = static_cast<int64_t*>(split_trace.value().data_ptr());
+      }
       return LaunchKernel(rows + params.split_extra, kBlockSize, device)
           .config({.use_pdl = kUsePDL})
           .launch(topk_candidates_split_kernel<kUsePDL, kPush>, params);
@@ -2319,7 +2344,8 @@ struct TopKKernel {
       const int64_t split_chunk,
       const int64_t split_extra,
       const tvm::ffi::Optional<tvm::ffi::TensorView> split_cand,
-      const tvm::ffi::Optional<tvm::ffi::TensorView> split_counters) {
+      const tvm::ffi::Optional<tvm::ffi::TensorView> split_counters,
+      const tvm::ffi::Optional<tvm::ffi::TensorView> split_trace) {
     using namespace host;
     auto B = SymbolicSize{"batch_size"};
     auto L = SymbolicSize{"max_seq_len"};
@@ -2401,7 +2427,7 @@ struct TopKKernel {
 #ifdef USE_ROCM
       RuntimeCheck(false, "the sampled candidate top-k needs CUDA");
 #else
-      return launch_sampled<false>(params, rows, split_chunk, split_extra, split_cand, split_counters, device_);
+      return launch_sampled<false>(params, rows, split_chunk, split_extra, split_cand, split_counters, device_, split_trace);
 #endif
     }
     LaunchKernel(rows, kBlockSize, device_.unwrap())
