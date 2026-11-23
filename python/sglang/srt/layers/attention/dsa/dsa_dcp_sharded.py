@@ -46,6 +46,7 @@ from sglang.kernels.ops.attention.dsa.dcp_topk_merge import (
     dcp_topk_merge_pushed,
 )
 from sglang.kernels.ops.attention.dsv4.topk import (
+    candidates_cluster_max_rows,
     candidates_cluster_size,
     topk_lpt_row_map,
     topk_transform_candidates_dcp_push,
@@ -270,6 +271,7 @@ class DcpTopKMerge:
         # owner merge blocks one GPU holds at once (512 threads, 64 registers): with fewer rows waiting for another
         # rank's t* than this, an owner's block always has a place, whatever order the blocks are dispatched in
         self.owner_slots = 2 * torch.cuda.get_device_properties(group.device).multi_processor_count
+        self.owner_cluster_rows = 0  # owner mode needs the plain launch: more rows than this (owner_call)
         if self.owner_merge:
             print_info_once(
                 f"DSA DCP4 push merge: owner mode, each row's candidates only to rank row % {world} "
@@ -304,6 +306,12 @@ class DcpTopKMerge:
         self.peer_ptrs = torch.tensor(
             handle.buffer_ptrs, dtype=torch.int64, device=group.device
         )
+        if self.owner_merge:
+            # per-GPU limits (cluster capacity follows each chip's GPCs); the push and the merge of a call must take the
+            # same mode on every rank, so the group decides on the most cluster rows and the fewest slots
+            lim = torch.tensor([candidates_cluster_max_rows(), -self.owner_slots], dtype=torch.int64)
+            torch.distributed.all_reduce(lim, op=torch.distributed.ReduceOp.MAX, group=group.cpu_group)
+            self.owner_cluster_rows, self.owner_slots = int(lim[0]), -int(lim[1])
         self.counters = torch.zeros(max_rows, dtype=torch.int64, device=group.device)
         self.fallback = torch.zeros(max_rows, dtype=torch.int32, device=group.device)
         self.stats = torch.zeros(
@@ -399,6 +407,11 @@ class DcpTopKMerge:
             stats=self.stats,
         )
 
+    def owner_call(self, rows: int) -> bool:
+        """Owner mode for a call of ``rows`` rows: the plain launch on every rank, and per rank fewer rows waiting for t*
+        than resident merge blocks. Group-agreed limits, so all ranks decide alike."""
+        return self.owner_merge and self.owner_cluster_rows < rows and rows - rows // self.world < self.owner_slots
+
     def merge_pushed(
         self,
         logits: torch.Tensor,
@@ -413,14 +426,13 @@ class DcpTopKMerge:
         and returns the same keys localized, as ``dcp_localize_compact(out)``."""
         rows = out.shape[0]
         cluster_size = candidates_cluster_size(rows)
-        # owner mode needs the plain launch and, per rank, fewer rows waiting for t* than resident merge blocks;
-        # every rank decides alike (same rows), so the push and the merge always agree
-        owner = self.owner_merge and cluster_size == 0 and rows - rows // self.world < self.owner_slots
+        owner = self.owner_call(rows)
         if self.owner_merge and not owner and not self._owner_fallback_logged:
             self._owner_fallback_logged = True
             print_info_once(
                 f"DSA DCP4 push merge: a call of {rows} rows takes the multicast push "
-                f"({'cluster launch' if cluster_size else f'over {self.owner_slots} rows wait for t*'}); logged once"
+                f"({'cluster launch' if rows <= self.owner_cluster_rows else f'over {self.owner_slots} rows wait for t*'}); "
+                "logged once"
             )
         topk_transform_candidates_dcp_push(
             logits,

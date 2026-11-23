@@ -27,7 +27,7 @@ import torch.distributed as dist
 
 import sglang.srt.distributed.parallel_state as ps
 from sglang.kernels.jit.utils import cache_once
-from sglang.kernels.ops.attention.dsv4.topk import topk_transform_candidates_v2
+from sglang.kernels.ops.attention.dsv4.topk import candidates_cluster_max_rows, topk_transform_candidates_v2
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.dsa_dcp_sharded import DcpTopKMerge
 from sglang.srt.runtime_context import get_parallel
@@ -611,12 +611,22 @@ def test_dcp4_topk_merge_pushed_owner(kind: str, variant: str) -> None:
             assert _all_ranks_ok(not bad), bad or "failed on another rank"
 
 
+def _owner_rows_failures(owner: DcpTopKMerge, rows: int, rank: int, world: int, span: int) -> list[str]:
+    g = torch.Generator().manual_seed(rows)
+    lens = torch.randint(1, 12000, (rows,), generator=g).tolist()
+    case = _Case("", 0, rank, world, span, glob=[torch.randn(n, generator=g) for n in lens])
+    for _ in range(3):
+        case.run_pushed(owner, span)
+    torch.cuda.synchronize()
+    return case.pushed_failures(rank, world)
+
+
 @pytest.mark.parametrize("rows", [1, 3, 5, 500, 600])
 @torch.inference_mode()
 def test_dcp4_topk_merge_pushed_owner_rows(rows: int) -> None:
-    """Owner mode with ranks that own no row (1-3 rows), 500 rows (more merge blocks than one GPU
-    holds: owners first) and 600 (more rows waiting for t* than resident blocks: the multicast
-    merge instead); exact either way, local rows of 1-3000 keys."""
+    """Owner mode on: 1-5 rows (the cluster launch, so the multicast merge), 500 rows (more merge
+    blocks than one GPU holds: owners first) and 600 (more rows waiting for t* than resident blocks:
+    the multicast merge instead); exact either way, local rows of 1-3000 keys."""
     _init_once()
     world, rank = ps._WORLD.world_size, ps._WORLD.rank_in_group
     if world != 4:
@@ -624,15 +634,34 @@ def test_dcp4_topk_merge_pushed_owner_rows(rows: int) -> None:
     owner = _owner_merge(4, max_rows=1024)
     if owner.buffer is None:
         pytest.skip("multimem multicast unavailable")
-    span = PAGE_SIZE * world
-    g = torch.Generator().manual_seed(rows)
-    lens = torch.randint(1, 12000, (rows,), generator=g).tolist()
-    case = _Case("", 0, rank, world, span, glob=[torch.randn(n, generator=g) for n in lens])
-    for _ in range(3):
-        case.run_pushed(owner, span)
-    torch.cuda.synchronize()
-    bad = case.pushed_failures(rank, world)
+    bad = _owner_rows_failures(owner, rows, rank, world, PAGE_SIZE * world)
     assert _all_ranks_ok(not bad), bad or "failed on another rank"
+
+
+@torch.inference_mode()
+def test_dcp4_topk_merge_pushed_owner_limits() -> None:
+    """The owner-mode limits are the group's (most cluster-launch rows, fewest resident merge
+    blocks), the same on every rank, so a call takes one mode on all of them even when the GPUs'
+    cluster capacities differ; exact on both sides of the cluster edge."""
+    _init_once()
+    world, rank = ps._WORLD.world_size, ps._WORLD.rank_in_group
+    if world != 4:
+        pytest.skip("the DCP4 push merge needs 4 ranks")
+    owner = _owner_merge(4, max_rows=1024)
+    if owner.buffer is None:
+        pytest.skip("multimem multicast unavailable")
+    edge = owner.owner_cluster_rows
+    if edge == 0:
+        pytest.skip("no cluster launch on this GPU")
+    lim = torch.tensor([edge, owner.owner_slots])
+    lo, hi = lim.clone(), lim.clone()
+    dist.all_reduce(lo, op=dist.ReduceOp.MIN)
+    dist.all_reduce(hi, op=dist.ReduceOp.MAX)
+    assert torch.equal(lo, hi) and edge >= candidates_cluster_max_rows(), (lim.tolist(), candidates_cluster_max_rows())
+    assert not owner.owner_call(edge) and owner.owner_call(edge + 1)
+    for rows in (edge, edge + 1):
+        bad = _owner_rows_failures(owner, rows, rank, world, PAGE_SIZE * world)
+        assert _all_ranks_ok(not bad), bad or "failed on another rank"
 
 
 @pytest.mark.parametrize("failing", ["stale1", "stale2"])
