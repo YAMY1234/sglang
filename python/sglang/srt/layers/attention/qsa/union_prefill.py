@@ -36,6 +36,7 @@ and the conditional rescale of FlashAttention-4 (Dao-AILab/flash-attention, flas
 
 from __future__ import annotations
 
+import functools
 import logging
 import os
 import time
@@ -99,11 +100,12 @@ except Exception:  # a Triton without Gluon's Blackwell API: the existing path s
     _GLUON = False
 
 
-def tile_for(device, nsk: int, nsv: int) -> int:
+@functools.lru_cache(maxsize=None)
+def tile_for(device_index: int, nsk: int, nsv: int) -> int:
     """TILE, or the largest tile whose Q + K/V rings (+ barriers) fit the device's shared memory."""
     if TILE:
         return TILE
-    smem = triton.runtime.driver.active.utils.get_device_properties(device.index or 0)["max_shared_mem"]
+    smem = triton.runtime.driver.active.utils.get_device_properties(device_index)["max_shared_mem"]
     return 128 if 2 * _HEAD_DIM * (_BM + 128 * (nsk + nsv)) + 1024 <= smem else 64
 
 
@@ -573,7 +575,7 @@ def attend(q, packed_k, packed_v, tok, mask, meta, nt, scale, *, groups, rows, s
     if groups == 0:
         return out
     nsk, nsv = stages or (STAGES_K, STAGES_V)
-    bn = tile or tile_for(q.device, nsk, nsv)
+    bn = tile or tile_for(q.device.index or 0, nsk, nsv)
     # Built per call: the packed K/V are fresh tensors every pass.
     layout = gl.NVMMASharedLayout.get_default_for([bn, _HEAD_DIM], gl.bfloat16)
     k_desc = TensorDescriptor.from_tensor(packed_k.view(packed_k.shape[0], -1), [1, _HEAD_DIM], layout)
@@ -637,7 +639,7 @@ def log_once(q, packed_k, indices) -> None:
         indices.shape[-1],
         STAGES_K,
         STAGES_V,
-        tile_for(q.device, STAGES_K, STAGES_V),
+        tile_for(q.device.index or 0, STAGES_K, STAGES_V),
         RESCALE_LOG2,
         MIN_ROWS,
         CHECK_CALLS,
