@@ -3871,12 +3871,8 @@ class Scheduler(
     def _linker_requery_after_device_loss(self, req: Req) -> bool:
         """Re-query an external-linker range lost to device eviction while queued."""
         max_attempts = get_memory().hicache_storage_prefetch_retry_max_attempts
-        over = req.storage_prefetch_retry_attempts >= max_attempts
-        linker = self.tree_cache.linker
-        if over and not linker.wait_fit_s:
+        if req.storage_prefetch_retry_attempts >= max_attempts:
             return False
-        # F6c7e: past the cap the linker re-queries only a room-refused load (PP0 decides).
-        linker.requery_over_attempts = over
         requeried = self.tree_cache.requery_prefetch_after_device_loss(req)
         if not requeried:
             return False
@@ -4727,6 +4723,7 @@ class Scheduler(
             mamba_allocator.alloc_group_begin(len(self.waiting_queue))
         buffer_pipeline = self.tree_cache.buffer_pipeline
         # Get requests from the waiting queue to a new prefill batch
+        cal_reserved = False  # CAL: the oldest waiting CAL request keeps its next piece's room
         for req in self.waiting_queue:
             # A spent pass budget admits no one, even before the first
             # candidate: the resumed chunk or mixed decode rows can spend it.
@@ -4788,6 +4785,16 @@ class Scheduler(
                                 ),
                             )
                         )
+                    if (
+                        self.enable_unified_cache_external_linker
+                        and self.tree_cache.linker.cal_enabled
+                        and not self.tree_cache.linker.one_batch_ahead  # that path already reserved its load
+                        and not cal_reserved
+                    ):
+                        cal_room = self.tree_cache.linker.cal_reserve_tokens(req)
+                        if cal_room:
+                            adder.memory_budget.total_offset += adder.ceil_paged_tokens(cal_room)
+                            cal_reserved = True
                     continue
                 # Pop the L3-loaded span. Unified cache exposes its absolute
                 # start so cache-mode L2/L3 attribution survives L3-tail eviction.
@@ -4811,6 +4818,11 @@ class Scheduler(
             if self.enable_unified_cache_external_linker and (
                 self._linker_requery_after_device_loss(req)
             ):
+                if self.tree_cache.linker.cal_enabled and not cal_reserved:
+                    cal_room = self.tree_cache.linker.cal_reserve_tokens(req)
+                    if cal_room:
+                        adder.memory_budget.total_offset += adder.ceil_paged_tokens(cal_room)
+                        cal_reserved = True
                 continue
             if self.enable_hicache_storage and buffer_pipeline is not None:
                 staging_ready = buffer_pipeline.prepare_staged_prefetch(req)
