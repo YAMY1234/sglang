@@ -67,6 +67,28 @@ def _use_flashinfer_kda_bt16_v074() -> str:
     return image
 
 
+def seed_decomp_plan(module, contents: tuple, heads: int, device: torch.device) -> None:
+    """Fill the vendored kernel's plan cache for one decomposed-route batch from host lengths, as its `_plan`
+    would, but copy cu_chunks from pinned memory: `_plan` builds it with a pageable H2D copy, which syncs the
+    current stream, so a pipelined forward would wait out the previous one. The copy is enqueued on the
+    current stream before the kernels that read it."""
+    n_seq = len(contents) - 1
+    if module._route_for_workspace(n_seq, heads, device, "auto") != "decomp":
+        return
+    key = (tuple(contents), str(device))
+    if key in module._PLAN_CACHE:
+        return
+    bt = module.BT
+    cu_chunks = [0, *accumulate((contents[i + 1] - contents[i] + bt - 1) // bt for i in range(n_seq))]
+    module._PLAN_CACHE[key] = {
+        "total_chunks": cu_chunks[-1],
+        "cu_chunks": torch.tensor(cu_chunks, dtype=torch.int32, pin_memory=True).to(
+            device, non_blocking=True
+        ),
+        "cu_list": list(contents),
+    }
+
+
 def build_flashinfer_kda_checkpoint_plan(
     forward_batch: ForwardBatch,
     metadata: ForwardMetadata,
@@ -154,9 +176,14 @@ class FlashInferKDAPrefillKernel(LinearAttnKernelBase):
         # a stream sync inside the forward; its contents memo can be filled from host.
         self._seed_mode = envs.SGLANG_K31_KDA_SEED_CU_SEQLENS.get()
         self._cu_contents_memo = None
+        # The vendored module (seeded plan cache), and the KDA head count once a forward has run.
+        self._plan_module = None
+        self._kda_heads = None
         if self._seed_mode:
             module = importlib.import_module(_BT16)
             self._cu_contents_memo = getattr(module, "_CU_CONTENTS_MEMO", None)
+            if envs.SGLANG_K31_KDA_PLAN_ASYNC_H2D.get() and hasattr(module, "_PLAN_CACHE"):
+                self._plan_module = module
             logger.info(
                 "KDA prefill cu_seqlens seeded from host (SGLANG_K31_KDA_SEED_CU_SEQLENS=%d): %s",
                 self._seed_mode,
@@ -192,6 +219,10 @@ class FlashInferKDAPrefillKernel(LinearAttnKernelBase):
             version,
             contents,
         )
+        if self._plan_module is not None and self._kda_heads is not None:
+            seed_decomp_plan(
+                self._plan_module, contents, self._kda_heads, query_start_loc_i64.device
+            )
 
     def extend(
         self,
@@ -216,6 +247,8 @@ class FlashInferKDAPrefillKernel(LinearAttnKernelBase):
         track_ssm_h_batch_src: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+        if self._plan_module is not None:
+            self._kda_heads = q.shape[2]
         needs_checkpoint = (
             return_intermediate_states and kwargs.get("track_state") is not None
         )
