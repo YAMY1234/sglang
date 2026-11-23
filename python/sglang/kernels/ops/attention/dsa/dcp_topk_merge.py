@@ -167,10 +167,13 @@ def _jit_dcp_topk_merge_pushed_wide_module(num_ranks: int, topk: int, warps_per_
         "dcp_topk_merge_pushed_wide",
         *args,
         cuda_files=["dsa/dcp_topk_merge.cuh"],
+        extra_cuda_cflags=[f"-DSGL_DCP_MERGE_WATCHDOG={int(envs.SGLANG_DCP_MERGE_WATCHDOG.get())}"],
         cuda_wrappers=[
             ("dcp_topk_merge_pushed_wide", f"DcpTopKMergePushedWideKernel<{args}>::run"),
-            # bench only: the same merge with a per-CTA globaltimer trace
+            ("dcp_topk_merge_pushed_owner", f"DcpTopKMergePushedWideKernel<{args}>::run_owner"),
+            # bench only: the merges with a per-CTA globaltimer trace
             ("dcp_topk_merge_pushed_wide_traced", f"DcpTopKMergePushedWideKernel<{args}>::run_traced"),
+            ("dcp_topk_merge_pushed_owner_traced", f"DcpTopKMergePushedWideKernel<{args}>::run_owner_traced"),
         ],
     )
 
@@ -193,6 +196,7 @@ def dcp_topk_merge_pushed(
     cand_k: int,
     stats: Optional[torch.Tensor] = None,
     warps_per_rank: int = 0,
+    owner_mc: Optional[int] = None,
 ) -> None:
     """``dcp_topk_merge`` for candidates the local top-k already pushed
     (``topk_transform_candidates_dcp_push`` with the same ``buffer``,
@@ -206,6 +210,9 @@ def dcp_topk_merge_pushed(
     their count (what ``dcp_localize_compact`` returns for ``out_slots``).
     ``stats`` as ``dcp_topk_merge``. ``warps_per_rank`` > 0 (``cand_k`` == topk
     only): the merge with that many warps per rank instead of one, same outputs.
+    ``owner_mc`` (with ``warps_per_rank`` > 0): the push went only to each row's owner
+    (``topk_transform_candidates_dcp_push`` ``owner_peers``); the buffer's multicast address,
+    for the owners' t*. Same outputs.
     """
     num_ranks = peer_ptrs.shape[0]
     topk = out_slots.shape[1]
@@ -214,7 +221,12 @@ def dcp_topk_merge_pushed(
             raise ValueError(f"warps_per_rank needs cand_k == topk, got {cand_k} != {topk}")
         module = _jit_dcp_topk_merge_pushed_wide_module(num_ranks, topk, warps_per_rank)
         run = module.dcp_topk_merge_pushed_wide
+        if owner_mc is not None:
+            owner = module.dcp_topk_merge_pushed_owner
+            run = lambda *args: owner(*args, owner_mc)  # noqa: E731
     else:
+        if owner_mc is not None:
+            raise ValueError("owner_mc needs warps_per_rank > 0")
         module = _jit_dcp_topk_merge_pushed_module(num_ranks, topk, cand_k)
         run = module.dcp_topk_merge_pushed
     run(

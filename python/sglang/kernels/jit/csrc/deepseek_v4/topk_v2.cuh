@@ -475,6 +475,9 @@ struct TopKCandidatesParams {
   uint32_t sampled_min_len = 0;  // sampled variant only: rows up to this length stay on the exact path
   const int32_t* row_map = nullptr;  // kLpt: [1 + rows] {rows built for, the row each block runs} (lpt_row_map_kernel)
   int64_t* lpt_trace = nullptr;      // bench only, kTrace: [rows, 16] per block, see topk_candidates_sampled_kernel
+  // Push, owner mode (kOwner): [cand_world] each rank's merge buffer; row r goes only to rank r % cand_world, and
+  // this rank's own block of every row is also kept in its own buffer for the merge's output step.
+  const int64_t* push_peers = nullptr;
 
   SGL_DEVICE int32_t global_position(int32_t local) const {
     const auto b = cand_page_bits;
@@ -485,20 +488,29 @@ struct TopKCandidatesParams {
 /// Where a candidate goes: the [rows, topk, 2] tensor, or (kPush) this rank's
 /// candidate block of the row in every rank's merge buffer, as the merge's
 /// tagged 64-bit entry (score bits << 32 | 24-bit position << 8 | call tag).
-template <bool kPush>
+/// kOwner: only into the block in the row owner's buffer (rank bx % cand_world), plus a copy in this rank's own.
+template <bool kPush, bool kOwner = false>
 struct CandidateSink {
   int2* out;
   uint64_t* push;
   uint64_t tag;
+  uint64_t* mine = nullptr;  // kOwner, row owned by another rank: this rank's own copy
 
   SGL_DEVICE static CandidateSink make(const TopKCandidatesParams& params, const uint32_t bx) {
     if constexpr (kPush) {
       // the merge kernel of the previous call has finished with this row slot
       const int64_t c = params.push_counters[bx];
       const int64_t row_slot = (c & 1) * params.push_max_rows + bx;
-      return {nullptr,
-              params.push_mc + row_slot * params.push_slot + static_cast<int64_t>(params.cand_rank) * params.topk,
-              static_cast<uint64_t>(c % 255) + 1};
+      const int64_t off = row_slot * params.push_slot + static_cast<int64_t>(params.cand_rank) * params.topk;
+      const auto tag = static_cast<uint64_t>(c % 255) + 1;
+      if constexpr (kOwner) {
+        const auto owner = static_cast<int32_t>(bx % static_cast<uint32_t>(params.cand_world));
+        auto* own = reinterpret_cast<uint64_t*>(params.push_peers[params.cand_rank]) + off;
+        if (owner == params.cand_rank) return {nullptr, own, tag, nullptr};
+        return {nullptr, reinterpret_cast<uint64_t*>(params.push_peers[owner]) + off, tag, own};
+      } else {
+        return {nullptr, params.push_mc + off, tag};
+      }
     } else {
       return {reinterpret_cast<int2*>(params.candidates) + bx * static_cast<int64_t>(params.topk), nullptr, 0};
     }
@@ -508,11 +520,16 @@ struct CandidateSink {
     if constexpr (kPush) {
       const uint64_t p = pos >= 0 ? static_cast<uint32_t>(pos) : 0xFFFFFFu;
       const uint64_t e = (static_cast<uint64_t>(static_cast<uint32_t>(score_bits)) << 32) | (p << 8) | tag;
+      if constexpr (kOwner) {
+        asm volatile("st.relaxed.sys.global.b64 [%0], %1;" ::"l"(push + slot), "l"(e) : "memory");
+        if (mine != nullptr) mine[slot] = e;
+      } else {
 #if SGL_ARCH_HOPPER_OR_GREATER
-      asm volatile("multimem.st.relaxed.sys.global.b64 [%0], %1;" ::"l"(push + slot), "l"(e) : "memory");
+        asm volatile("multimem.st.relaxed.sys.global.b64 [%0], %1;" ::"l"(push + slot), "l"(e) : "memory");
 #else
-      __trap();
+        __trap();
 #endif
+      }
     } else {
       out[slot] = make_int2(score_bits, pos);
     }
@@ -527,21 +544,21 @@ struct CandidateSink {
  * staged in shared memory; the epilogue then reads each selected score and
  * writes (score bits, global position), `(0, -1)` padded.
  */
-template <bool kPDL, bool kPush = false>
+template <bool kPDL, bool kPush = false, bool kOwner = false>
 SGL_DEVICE void
 candidates_one_block(const TopKCandidatesParams& params, const uint32_t bx, RaggedSmem* smem, int32_t* s_topk_indices) {
   const auto seq_len = static_cast<uint32_t>(params.seq_lens[bx]);
   const auto row_start = params.row_starts == nullptr ? 0u : params.row_starts[bx];
   const auto topk = params.topk;
   const auto score = params.scores + bx * params.score_stride;
-  const auto emit = [&](const CandidateSink<kPush>& sink, uint32_t tx, int32_t idx) {
+  const auto emit = [&](const CandidateSink<kPush, kOwner>& sink, uint32_t tx, int32_t idx) {
     sink.put(tx, idx >= 0 ? __float_as_int(score[row_start + idx]) : 0, idx >= 0 ? params.global_position(idx) : -1);
   };
 
   if (seq_len <= topk) {
     device::PDLWaitPrimary<kPDL>();
     device::PDLTriggerSecondary<kPDL>();
-    const auto sink = CandidateSink<kPush>::make(params, bx);
+    const auto sink = CandidateSink<kPush, kOwner>::make(params, bx);
     for_each_item(topk, [&](uint32_t tx, uint32_t) { emit(sink, tx, tx < seq_len ? static_cast<int32_t>(tx) : -1); });
     return;
   }
@@ -549,16 +566,16 @@ candidates_one_block(const TopKCandidatesParams& params, const uint32_t bx, Ragg
   ragged_window_topk<kPDL>(score, row_start, seq_len, topk, s_topk_indices, 0, smem);
   device::PDLTriggerSecondary<kPDL>();
   __syncthreads();
-  const auto sink = CandidateSink<kPush>::make(params, bx);
+  const auto sink = CandidateSink<kPush, kOwner>::make(params, bx);
   for_each_item(topk, [&](uint32_t tx, uint32_t) { emit(sink, tx, s_topk_indices[tx]); });
 }
 
-template <bool kPDL, bool kPush = false>
+template <bool kPDL, bool kPush = false, bool kOwner = false>
 TOPK_KERNEL void topk_candidates_kernel(const __grid_constant__ TopKCandidatesParams params) {
   device::enable_smem_spilling();
   __shared__ RaggedSmem smem;
   __shared__ int32_t s_topk_indices[kMaxTopK];
-  candidates_one_block<kPDL, kPush>(params, blockIdx.x, &smem, s_topk_indices);
+  candidates_one_block<kPDL, kPush, kOwner>(params, blockIdx.x, &smem, s_topk_indices);
 }
 
 #if !defined(USE_ROCM)
@@ -577,7 +594,7 @@ static_assert(sizeof(SampledCandidatesSmem) <= 48 * 1024, "static shared memory 
 /// register paths take the sampled single pass (impl::TopKSampled), falling back to the
 /// exact path when it misses, counted in `overflow_rows`. Same selected set; slot order differs.
 /// kStamp (bench only): stamps[0..6] as Sampled::forward, stamps[7] after the staged slots are emitted.
-template <bool kPDL, bool kPush, bool kStamp = false>
+template <bool kPDL, bool kPush, bool kStamp = false, bool kOwner = false>
 SGL_DEVICE void candidates_sampled_one_block(
     const TopKCandidatesParams& params, const uint32_t bx, SampledCandidatesSmem* smem, uint64_t* stamps = nullptr) {
   constexpr uint32_t kVecSize = impl::TopKStreaming::kVecSize;
@@ -586,14 +603,14 @@ SGL_DEVICE void candidates_sampled_one_block(
   const auto rem = row_start % kVecSize;
   const auto topk = params.topk;
   if (seq_len <= topk || seq_len + rem <= Register4::kMaxSeqLen || seq_len <= params.sampled_min_len) {
-    return candidates_one_block<kPDL, kPush>(params, bx, &smem->exact.ragged, smem->exact.staged);
+    return candidates_one_block<kPDL, kPush, kOwner>(params, bx, &smem->exact.ragged, smem->exact.staged);
   }
 
   // the sink reads the merge's row counter, and the head mask must land after the indexer
   device::PDLWaitPrimary<kPDL>();
   const auto score = params.scores + bx * params.score_stride;
   if (threadIdx.x < rem) score[row_start - rem + threadIdx.x] = impl::padding_value();
-  const auto sink = CandidateSink<kPush>::make(params, bx);
+  const auto sink = CandidateSink<kPush, kOwner>::make(params, bx);
   const auto problem = TopKProblem{
       .in = score + (row_start - rem),
       .out = nullptr,
@@ -621,7 +638,7 @@ SGL_DEVICE void candidates_sampled_one_block(
   }
   if (threadIdx.x == 0 && params.overflow_rows != nullptr) atomicAdd(params.overflow_rows, 1);
   __syncthreads();  // every thread has read n_ge before the exact path reuses the storage
-  candidates_one_block<kPDL, kPush>(params, bx, &smem->exact.ragged, smem->exact.staged);
+  candidates_one_block<kPDL, kPush, kOwner>(params, bx, &smem->exact.ragged, smem->exact.staged);
 }
 
 /// LPT row map, once per decode step (lpt_row_map_kernel, one block): row_map[0] = rows, the count it was built
@@ -654,7 +671,7 @@ __global__ __launch_bounds__(kBlockSize, 1) void lpt_row_map_kernel(
 /// kTrace (bench only, with kLpt): thread 0 writes {start, row read, the sampled row's 8 phase stamps (0 when the
 /// row takes another path), end, row} into params.lpt_trace [rows, 16];
 /// the production launch uses kTrace = false and carries no timestamp code.
-template <bool kPDL, bool kPush, bool kLpt = false, bool kTrace = false>
+template <bool kPDL, bool kPush, bool kLpt = false, bool kTrace = false, bool kOwner = false>
 SAMPLED_TOPK_KERNEL void topk_candidates_sampled_kernel(const __grid_constant__ TopKCandidatesParams params) {
   device::enable_smem_spilling();
   __shared__ SampledCandidatesSmem smem;
@@ -669,7 +686,7 @@ SAMPLED_TOPK_KERNEL void topk_candidates_sampled_kernel(const __grid_constant__ 
     const auto mapped = static_cast<uint32_t>(params.row_map[1 + blockIdx.x]);
     const auto row = built_for == rows && mapped < rows ? mapped : blockIdx.x;
     if constexpr (kTrace) asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t1));
-    candidates_sampled_one_block<kPDL, kPush, kTrace>(params, row, &smem, stamps);
+    candidates_sampled_one_block<kPDL, kPush, kTrace, kOwner>(params, row, &smem, stamps);
     if constexpr (kTrace) {
       __syncthreads();
       if (threadIdx.x == 0) {
@@ -685,7 +702,7 @@ SAMPLED_TOPK_KERNEL void topk_candidates_sampled_kernel(const __grid_constant__ 
       }
     }
   } else {
-    candidates_sampled_one_block<kPDL, kPush>(params, blockIdx.x, &smem);
+    candidates_sampled_one_block<kPDL, kPush, false, kOwner>(params, blockIdx.x, &smem);
   }
 }
 #endif  // !USE_ROCM
@@ -2403,7 +2420,8 @@ struct TopKKernel {
       const int64_t sampled_min_len,
       const tvm::ffi::Optional<tvm::ffi::TensorView> fallback_rows,
       const tvm::ffi::Optional<tvm::ffi::TensorView> row_map,
-      const tvm::ffi::Optional<tvm::ffi::TensorView> lpt_trace) {
+      const tvm::ffi::Optional<tvm::ffi::TensorView> lpt_trace,
+      const tvm::ffi::Optional<tvm::ffi::TensorView> owner_peers) {
     using namespace host;
     auto B = SymbolicSize{"batch_size"};
     auto L = SymbolicSize{"max_seq_len"};
@@ -2456,6 +2474,13 @@ struct TopKKernel {
     };
     const auto rows = static_cast<uint32_t>(B.unwrap());
     if (rows == 0) return;
+    if (owner_peers.has_value()) {  // owner mode: row r to rank r % world only (merge_pushed_owner_kernel)
+      TensorMatcher({world}).with_dtype<int64_t>().with_device(device_).verify(owner_peers.value());
+      RuntimeCheck(cluster_size == 0, "the owner-mode push has no cluster variant");
+      auto owner = params;
+      owner.push_peers = static_cast<const int64_t*>(owner_peers.value().data_ptr());
+      return launch_push<true>(owner, rows, sampled, row_map, lpt_trace, device_);
+    }
 #if SUPPORT_CLUSTER
     if (cluster_size != 0) {
       RuntimeCheck(cluster_floor >= 0 && cluster_floor <= UINT32_MAX, "invalid cluster_floor");
@@ -2478,6 +2503,20 @@ struct TopKKernel {
     RuntimeCheck(cluster_size == 0, "the cluster candidate top-k needs sm90 / sm100");
     static_cast<void>(cluster_floor);
 #endif
+    launch_push<false>(params, rows, sampled, row_map, lpt_trace, device_);
+  }
+
+  /// transform_candidates_dcp_push's launch after the cluster variant: multicast (kOwner = false) or owner mode.
+  template <bool kOwner>
+  static void launch_push(
+      const TopKCandidatesParams& params,
+      const uint32_t rows,
+      const bool sampled,
+      const tvm::ffi::Optional<tvm::ffi::TensorView>& row_map,
+      const tvm::ffi::Optional<tvm::ffi::TensorView>& lpt_trace,
+      host::SymbolicDevice& device_) {
+    using namespace host;
+    const auto device = device_.unwrap();
     if (sampled) {
 #ifdef USE_ROCM
       static_cast<void>(row_map);
@@ -2492,22 +2531,22 @@ struct TopKKernel {
           TensorMatcher({G, 16}).with_dtype<int64_t>().with_device(device_).verify(lpt_trace.value());
           RuntimeCheck(G.unwrap() >= rows, "lpt_trace has fewer rows than the grid");
           lpt.lpt_trace = static_cast<int64_t*>(lpt_trace.value().data_ptr());
-          return LaunchKernel(rows, kBlockSize, device_.unwrap())
+          return LaunchKernel(rows, kBlockSize, device)
               .config({.use_pdl = kUsePDL})
-              .launch(topk_candidates_sampled_kernel<kUsePDL, true, true, true>, lpt);
+              .launch(topk_candidates_sampled_kernel<kUsePDL, true, true, true, kOwner>, lpt);
         }
-        return LaunchKernel(rows, kBlockSize, device_.unwrap())
+        return LaunchKernel(rows, kBlockSize, device)
             .config({.use_pdl = kUsePDL})
-            .launch(topk_candidates_sampled_kernel<kUsePDL, true, true>, lpt);
+            .launch(topk_candidates_sampled_kernel<kUsePDL, true, true, false, kOwner>, lpt);
       }
-      return LaunchKernel(rows, kBlockSize, device_.unwrap())
+      return LaunchKernel(rows, kBlockSize, device)
           .config({.use_pdl = kUsePDL})
-          .launch(topk_candidates_sampled_kernel<kUsePDL, true>, params);
+          .launch(topk_candidates_sampled_kernel<kUsePDL, true, false, false, kOwner>, params);
 #endif
     }
-    LaunchKernel(rows, kBlockSize, device_.unwrap())
+    LaunchKernel(rows, kBlockSize, device)
         .config({.use_pdl = kUsePDL})
-        .launch(topk_candidates_kernel<kUsePDL, true>, params);
+        .launch(topk_candidates_kernel<kUsePDL, true, kOwner>, params);
   }
 
   /**
