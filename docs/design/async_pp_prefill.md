@@ -13,7 +13,9 @@ two things:
 - the previous stage's activations for this micro-batch;
 - its own prefix KV for this micro-batch, loaded back from host memory.
 
-When both are ready, the stage starts. Nobody tells it to.
+When both are ready, the stage starts. Nobody tells it to. One host-side wait is still outside this design: a stage after
+the first waits on the host for its own load-back to finish before it acknowledges it (17–22 ms, on about 4 of 5
+forwards). It does not idle the GPU while forwards are long, and it is being fixed separately.
 
 Results on Kimi-K3.1-Pro, 8 stages, 2 VR200 nodes:
 - **Three arms on the same nodes (test bench, 300 s each):** against lockstep with the three host fixes off, the fully
@@ -66,9 +68,13 @@ stage from 187.8 to 177.0 ms, yet the beat only moved to 195.6 ms.
 
 ![Lockstep PP, schematic](async_pp_prefill/fig-01-lockstep-en.svg)
 
-*Figure 1 (schematic): a lockstep pipeline of 4 stages and 5 micro-batches, stage costs within 3% of each other. Red
-lines are the per-beat rendezvous, grey slivers its host cost, dashed boxes idle time. Even with near-equal stages,
-every stage loses time at every barrier.*
+*Figure 1 (schematic): lockstep PP, 4 stages and 5 micro-batches, with three lanes per stage: host thread, GPU, and the
+host-to-GPU load stream. Each beat, the host chain for the next micro-batch (receive its requests and the
+bootstrap/release lists, build and admit it, receive its activation shapes, launch) can start only when the rendezvous
+releases it, about when the previous forward ends; the GPU idles for that chain (measured 7–11 ms per beat, 15–23 ms on
+PP0). The red lines are not one global barrier: they stand for several pairwise couplings (blocking receives from
+upstream, sends that wait for the downstream receive, PP0's output ring) that together act like one. The zoom numbers
+the steps listed below; their widths show order only.*
 
 In the old loop, every stage ran the same steps for every micro-batch:
 1. blocking receive of the requests relayed from upstream;
@@ -113,7 +119,9 @@ Ask of each row above "is this a data dependency?" and the answer is almost alwa
   1. **the previous stage's activations for this micro-batch.** This is the model's own data dependency. The
      micro-batch's control messages come from upstream together with it.
   2. **this stage's prefix KV for the micro-batch, loaded back into GPU memory.** This dependency is local and has
-     nothing to do with other stages.
+     nothing to do with other stages. It is local but not ready on its own schedule: the stage queues the load-back
+     when it builds the micro-batch, about 1.5 forwards ahead, yet today the copy waits on the GPU for the whole forward
+     stream, so it starts only when this stage's previous forward ends, just before forward j (Figure 2).
 
 Everything else is a *credit*: a send window or a slot in the next stage's input ring. A credit binds only when a stage
 runs several micro-batches ahead of its successor, so in steady state it never binds.
@@ -139,12 +147,46 @@ One rule makes independent stages safe:
 
 ![Fully asynchronous PP, schematic](async_pp_prefill/fig-02-async-en.svg)
 
-*Figure 2 (schematic): the same 4 stages, 5 micro-batches and near-equal costs. Green arrows are activation hand-offs;
-violet ticks mark this stage's prefix KV loaded. Without the rendezvous, every stage keeps only a small hand-off gap
-between forwards. Lockstep needs 16% longer for the same 5 micro-batches.*
+*Figure 2 (schematic): fully asynchronous PP as implemented, same lanes. The host runs about 1.7 forwards ahead of its
+GPU (bounded by the launch queue): while the GPU runs MB j, the host is launching MB j+1 and building MB j+2. A stage
+issues MB j's load-back when it builds MB j (violet tick), but the copy waits on the GPU for forward j−1 (violet bar), so
+it still lands just before forward j, whose layers wait on it. Green: copy-engine push and ready flag; pink: early KV
+send to decode; black: control messages, sent at the end of a round. Measured in one 12-step profile of one worker under
+long 16k forwards: on every stage the copy starts 6–11 µs after the previous forward ends, overlaps the first 1–3 layers
+of forward j and takes about 4–6 ms (4–8 ms). 2 of 10 batches, the same ones on every stage, carried a KDA-state
+copy-on-write and waited 1.7–4.8 ms at forward start for the whole load; the layer-by-layer waits added up to only
+0.02–0.19 ms over 10 forwards.*
+
+![Fully asynchronous PP, ideal load-back timing, schematic](async_pp_prefill/fig-02b-async-ideal-en.svg)
+
+*Figure 2b (schematic, not implemented): if PP0's decision for MB j reached every stage directly, every stage could start
+MB j's load-back at that moment, well before its forward. It needs a direct PP0 fan-out (one epoch record per
+micro-batch) and a copy that waits only for the pages it overwrites, not for the whole forward stream. The cost is KV
+pages taken about s beats earlier on stage s, which bites exactly when device KV is full.*
+
+In the same profile, waiting for the load-back costs the bottleneck stages only 0.67–0.85 ms per forward (≤ 0.5% of the
+beat), so the timing of Figure 2b would save at most that. The larger cost is that the SM copy kernel slows the
+overlapping GEMM and MoE kernels, by about 0.8–1.9 ms per forward (about 1%); moving the copy to the copy engine is worth
+more.
 
 In the asynchronous loop, a stage's idle time is the beat minus its own forward time. So the only gaps left come from
-per-stage cost differences (imbalance), not from synchronization.
+per-stage cost differences (imbalance), not from synchronization, as long as the host stays ahead of its GPU.
+
+**Where did lockstep's per-beat host work go?** It did not disappear. Every micro-batch still needs the same host chain
+on every stage: receive its requests and the relayed lists, replay admission (which also allocates KV pages and queues
+the prefix load-back), receive its activation shapes, and launch about 600 kernels. In lockstep that chain could start
+only after a rendezvous, and the rendezvous completed about when the previous forward ended, so the GPU waited for it
+every beat (7–11 ms, 15–23 ms on PP0). Decoupled, the chain runs while the GPU is still on earlier micro-batches: the
+host is about 1.7 forwards ahead, bounded by the 1,024-kernel launch queue. This hides the host only while one host
+round costs less than one forward. With 170 ms forwards the CPU part is about 65 ms. When device KV fills up, forwards
+shrink to about 60 ms while a host round still costs about 130 ms, and the GPU waits again (Figure 2c).
+
+![One stage, two micro-batches: host round against forward](async_pp_prefill/fig-02c-host-round-en.svg)
+
+*Figure 2c (host segments measured, phases schematic): one stage, two micro-batches. A: long forwards (~170 ms); one host
+round is ~171 ms but only ~65 ms of it is CPU work; the rest is waiting while the GPU still has queued work. B: short
+forwards (~59 ms, device KV full); one host round is ~130 ms of mostly CPU work, so the GPU idles ~60–70 ms per
+micro-batch. Host segments are to scale from per-iteration diagnostics (PP1–PP7 mean).*
 
 Each stage's loop then looks like this. It can only wait at the red nodes:
 
@@ -154,18 +196,18 @@ flowchart TD
     inbox -->|"not yet: caught up with upstream"| idle["send KV of micro-batches whose forward finished"]
     idle --> inbox
     inbox -->|yes| apply["apply PP0's inputs for j:<br/>new requests, bootstrap, release, HiCache counts"]
-    apply --> build["replay PP0's batch building, check the batch tag"]
-    build --> launch["enqueue forward j, host moves on"]
+    apply --> build["replay PP0's batch building, check the batch tag,<br/>allocate KV pages, queue this stage's prefix load-back"]
+    build --> credit{"next stage's input slot free (activation credit)?<br/>binds only when several micro-batches ahead"}
+    credit -->|yes| launch["enqueue forward j, host moves on"]
+    credit -->|"no, rare"| waitc["wait for the oldest push"]
+    waitc --> launch
     launch --> b1[["GPU waits, input 1:<br/>activations of j written into the input slot"]]
-    launch --> b2[["GPU waits, input 2:<br/>this stage's prefix KV loaded, layer by layer"]]
+    launch --> b2[["GPU waits, input 2:<br/>this stage's prefix KV loaded, the copy starts when forward j−1 ends,<br/>layer by layer, or the whole load if the batch has a KDA-state copy-on-write"]]
     b1 --> fwd["forward j"]
     b2 --> fwd
     launch --> post["complete an earlier micro-batch:<br/>local result, early KV send, release at PP0's epoch"]
     post --> send["send control messages and activations of j downstream"]
-    send --> credit{"send window or next stage's input ring full?<br/>only when several micro-batches ahead"}
-    credit -->|no| nxt(["micro-batch j+1"])
-    credit -->|"yes, rare"| waitc["wait for the oldest round"]
-    waitc --> nxt
+    send --> nxt(["micro-batch j+1"])
     classDef blocker fill:#fde2e1,stroke:#c0392b,color:#000
     class inbox,b1,b2 blocker
 ```
@@ -240,14 +282,16 @@ The new data path (`SGLANG_PP_CE_PUSH`) uses no kernel at all:
   FABRIC memory. The upstream stage holds a set of "free" flags. They are exported and mapped once at startup, which
   also works across nodes over multi-node NVLink (MNNVL).
 - **Push.** Micro-batch j uses slot j mod 2:
-  1. the upstream push stream waits for the forward and for the slot's "free" flag;
+  1. the upstream stage waits for the forward and for the slot's "free" flag. In the configuration measured here
+     (`SGLANG_PP_CE_PUSH_GATED=2`) a gate thread does this wait on the host, off the main loop, then enqueues the copy;
   2. the copy engine copies hidden states, the residual bank and the draft snapshots into the downstream slot, then
      writes the "full" flag;
   3. the downstream forward stream waits on the "full" flag with `cuStreamWaitValue32`, and the forward reads the slot
      in place;
-  4. after the downstream stage's own push has read the slot, it writes the "free" flag back.
-- **No host waits, no resident kernels.** Stream memory operations cannot target memory imported from another node, so
-  a flag is written to a local word and copied over by the copy engine, ordered after the data.
+  4. once the downstream forward has read the slot (anything its own push still needs is copied out first), the
+     downstream stage writes the "free" flag back with a single-thread store on its forward stream.
+- **No main-loop waits, no resident kernels.** Stream memory operations cannot target memory imported from another node,
+  so the "full" flag is written to a local word and copied over by the copy engine, ordered after the data.
 - **Slot size per stage.** Activations grow with depth, so slots are sized per stage (`SGLANG_PP_CE_PUSH_SLOT_MB`, or
   `auto` from the model's reported bytes per token): 673 to 2,689 MiB for PP1 to PP7 at 16k tokens.
 - **Fallback.** A message that does not fit goes over NCCL and is counted. Measured: 0 fallbacks on every stage, and

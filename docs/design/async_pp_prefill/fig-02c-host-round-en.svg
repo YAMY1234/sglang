@@ -1,0 +1,161 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1240 706" width="1240" height="706" role="img" aria-labelledby="t d">
+<title id="t">Host round vs forward</title>
+<desc id="d">One stage, two consecutive micro-batches: long vs short forward.</desc>
+<style>
+svg { font-family: system-ui, -apple-system, 'PingFang SC', 'Noto Sans CJK SC', 'Microsoft YaHei', sans-serif; }
+.bg { fill: #fcfcfb; }
+.ink { fill: #0b0b0b; } .ink2 { fill: #52514e; } .muted { fill: #898781; }
+.axis { stroke: #c3c2b7; stroke-width: 1; fill: none; }
+.grid { stroke: #e1e0d9; stroke-width: 1; fill: none; }
+.lane { stroke: #ecebe6; stroke-width: 1; fill: none; }
+.b0 { fill: #e6effa; } .b1 { fill: #d6e6f8; } .b2 { fill: #c6dcf5; }
+.b3 { fill: #b4d1f2; } .b4 { fill: #a2c5ef; } .b5 { fill: #8fb9ec; }
+.bstroke { stroke: #5b8fd0; stroke-width: 1.2; }
+.btext { fill: #0b0b0b; }
+.bubble { fill: #f3f3f1; stroke: #a8a7a1; stroke-width: 1.2; stroke-dasharray: 6 4; }
+.hcpu { fill: #dcdad3; stroke: #8f8d86; stroke-width: 1; }
+.hpeer { fill: #fbe1d6; stroke: #ec835a; stroke-width: 1; }
+.hgpu { fill: #fdf0d5; stroke: #eda100; stroke-width: 1; }
+.gapred { fill: #fde2e1; stroke: #d03b3b; stroke-width: 1.3; }
+.kvbar { fill: #e4e0fa; stroke: #6250d6; stroke-width: 1.2; }
+.kvtick { fill: #6250d6; }
+.kvline { stroke: #6250d6; stroke-width: 1.3; stroke-dasharray: 4 3; fill: none; }
+.kvhead { fill: #6250d6; }
+.ce { fill: #d9f2e6; stroke: #1baf7a; stroke-width: 1.2; }
+.xfer { fill: #fbe3ee; stroke: #c2417f; stroke-width: 1; }
+.handoff { stroke: #2e8b57; stroke-width: 1.6; fill: none; }
+.handoffhead { fill: #2e8b57; }
+.dep { stroke: #d03b3b; stroke-width: 1.8; fill: none; }
+.dephead { fill: #d03b3b; }
+.barrier { stroke: #d03b3b; stroke-width: 1.6; }
+.ctl { stroke: #3d3c39; stroke-width: 1.3; fill: none; }
+.ctlhead { fill: #3d3c39; }
+.ref { stroke: #898781; stroke-width: 1.2; fill: none; }
+.refhead { fill: #898781; }
+.hold { stroke: #6250d6; stroke-width: 2.2; fill: none; }
+.panel { fill: none; stroke: #e1e0d9; stroke-width: 1; }
+.note { fill: #f6f5f1; stroke: #e1e0d9; stroke-width: 1; }
+@media (prefers-color-scheme: dark) {
+  .bg { fill: #1a1a19; }
+  .ink { fill: #f0efec; } .ink2 { fill: #c3c2b7; } .muted { fill: #8f8e88; }
+  .axis { stroke: #383835; } .grid { stroke: #2c2c2a; } .lane { stroke: #262624; }
+  .b0 { fill: #1f3550; } .b1 { fill: #23405f; } .b2 { fill: #274b6f; }
+  .b3 { fill: #2b567f; } .b4 { fill: #2f6190; } .b5 { fill: #336ca0; }
+  .bstroke { stroke: #5598e7; } .btext { fill: #f0efec; }
+  .bubble { fill: #232322; stroke: #5e5d59; }
+  .hcpu { fill: #3a3a37; stroke: #77766f; }
+  .hpeer { fill: #4a2a1f; stroke: #ec835a; }
+  .hgpu { fill: #3a2f14; stroke: #c98500; }
+  .gapred { fill: #4a1f1f; stroke: #e5615f; }
+  .kvbar { fill: #2e2752; stroke: #9085e9; } .kvtick { fill: #9085e9; }
+  .kvline { stroke: #9085e9; } .kvhead { fill: #9085e9; } .hold { stroke: #9085e9; }
+  .ce { fill: #173b2d; stroke: #199e70; }
+  .xfer { fill: #4a2236; stroke: #e0679f; }
+  .handoff { stroke: #3fb56f; } .handoffhead { fill: #3fb56f; }
+  .ctl { stroke: #c3c2b7; } .ctlhead { fill: #c3c2b7; }
+  .panel { stroke: #2c2c2a; } .note { fill: #222221; stroke: #2c2c2a; }
+}
+</style>
+<rect x="0" y="0" width="1240" height="706" class="bg"/>
+<text x="32.0" y="40.0" class="ink" font-size="22" text-anchor="start" font-weight="650">One stage, two micro-batches: when the host round stops fitting under the forward</text>
+<text x="32.0" y="66.0" class="ink2" font-size="14" text-anchor="start" font-weight="400">Host rounds are drawn to scale from the measured per-round breakdown (PP1–PP7 mean, two 8-node test benches). Long forward: the CPU work is about 65</text>
+<text x="32.0" y="85.0" class="ink2" font-size="14" text-anchor="start" font-weight="400">ms of a 170 ms forward and the host runs ahead. Short forward (about 59 ms): one host round takes about 130 ms and the GPU waits for it.</text>
+<rect x="24.0" y="110.0" width="1192.0" height="232.0" rx="6" class="panel"/>
+<text x="32.0" y="132.0" class="ink" font-size="15" text-anchor="start" font-weight="600">A. Long forward (≈170 ms): host round ≈ 171 ms, CPU ≈ 65 ms; the host is about 1.7 forwards ahead, GPU busy</text>
+<text x="162.0" y="225.0" class="muted" font-size="12.6" text-anchor="end" font-weight="400">host</text>
+<text x="162.0" y="276.0" class="muted" font-size="12.6" text-anchor="end" font-weight="400">GPU</text>
+<rect x="291.3" y="256.0" width="490.1" height="30.0" rx="5" class="b1 bstroke"/>
+<text x="536.9" y="275.0" class="btext" font-size="13.8" text-anchor="middle" font-weight="500">forward j</text>
+<rect x="783.9" y="256.0" width="425.1" height="30.0" rx="5" class="b2 bstroke"/>
+<text x="996.9" y="275.0" class="btext" font-size="13.8" text-anchor="middle" font-weight="500">forward j+1</text>
+<rect x="170.0" y="212.0" width="112.9" height="18.0" rx="2" class="hcpu"/>
+<text x="226.8" y="225.5" class="ink" font-size="12.6" text-anchor="middle" font-weight="400">launch j+1 (CPU)</text>
+<rect x="283.5" y="212.0" width="124.5" height="18.0" rx="2" class="hgpu"/>
+<text x="346.1" y="225.5" class="ink" font-size="12.6" text-anchor="middle" font-weight="400">launch queue full</text>
+<rect x="408.6" y="212.0" width="19.9" height="18.0" rx="2" class="hcpu"/>
+<rect x="429.1" y="212.0" width="25.7" height="18.0" rx="2" class="hpeer"/>
+<rect x="455.4" y="212.0" width="1.1" height="18.0" rx="2" class="hpeer"/>
+<rect x="457.2" y="212.0" width="13.8" height="18.0" rx="2" class="hcpu"/>
+<rect x="471.6" y="212.0" width="78.6" height="18.0" rx="2" class="hgpu"/>
+<text x="511.2" y="225.5" class="ink" font-size="12.6" text-anchor="middle" font-weight="400">own load-back</text>
+<rect x="550.8" y="212.0" width="5.8" height="18.0" rx="2" class="hcpu"/>
+<rect x="557.1" y="212.0" width="45.0" height="18.0" rx="2" class="hcpu"/>
+<text x="579.9" y="208.0" class="ink2" font-size="12.1" text-anchor="middle" font-weight="400">admit j+2</text>
+<rect x="602.8" y="212.0" width="60.6" height="18.0" rx="2" class="hpeer"/>
+<text x="633.4" y="208.0" class="ink2" font-size="12.1" text-anchor="middle" font-weight="400">send credit</text>
+<line x1="664.0" y1="204.0" x2="664.0" y2="294.0" class="ref"/>
+<text x="668.0" y="192.0" class="ink2" font-size="12.6" text-anchor="start" font-weight="400">launch j+2 (one round = 171 ms)</text>
+<rect x="664.0" y="212.0" width="112.9" height="18.0" rx="2" class="hcpu"/>
+<rect x="777.5" y="212.0" width="124.5" height="18.0" rx="2" class="hgpu"/>
+<rect x="902.6" y="212.0" width="19.9" height="18.0" rx="2" class="hcpu"/>
+<rect x="923.1" y="212.0" width="25.7" height="18.0" rx="2" class="hpeer"/>
+<rect x="949.4" y="212.0" width="1.1" height="18.0" rx="2" class="hpeer"/>
+<rect x="951.2" y="212.0" width="13.8" height="18.0" rx="2" class="hcpu"/>
+<rect x="965.6" y="212.0" width="78.6" height="18.0" rx="2" class="hgpu"/>
+<rect x="1044.8" y="212.0" width="5.8" height="18.0" rx="2" class="hcpu"/>
+<rect x="1051.1" y="212.0" width="45.0" height="18.0" rx="2" class="hcpu"/>
+<rect x="1096.8" y="212.0" width="60.6" height="18.0" rx="2" class="hpeer"/>
+<rect x="1158.0" y="212.0" width="51.4" height="18.0" rx="2" class="hcpu"/>
+<line x1="170.0" y1="204.0" x2="170.0" y2="232.0" class="ref"/>
+<text x="170.0" y="308.0" class="ink2" font-size="13.8" text-anchor="start" font-weight="400">Most of the long round is waiting: launch queue full 43 ms, own load-back 27 ms, send credit 21 ms, upstream relay 9 ms. Waiting costs nothing while the GPU has queued work.</text>
+<rect x="24.0" y="362.0" width="1192.0" height="232.0" rx="6" class="panel"/>
+<text x="32.0" y="384.0" class="ink" font-size="15" text-anchor="start" font-weight="600">B. Short forward (≈59 ms): host round ≈ 130 ms; GPU waits for the host</text>
+<text x="162.0" y="477.0" class="muted" font-size="12.6" text-anchor="end" font-weight="400">host</text>
+<text x="162.0" y="528.0" class="muted" font-size="12.6" text-anchor="end" font-weight="400">GPU</text>
+<rect x="198.9" y="508.0" width="168.9" height="30.0" rx="5" class="b1 bstroke"/>
+<text x="283.8" y="527.0" class="btext" font-size="13.8" text-anchor="middle" font-weight="500">forward j</text>
+<rect x="368.8" y="508.0" width="204.8" height="30.0" rx="3" class="gapred"/>
+<text x="471.2" y="527.0" class="ink" font-size="13.8" text-anchor="middle" font-weight="600">GPU idle ≈ 60–70 ms</text>
+<rect x="573.6" y="508.0" width="168.9" height="30.0" rx="5" class="b2 bstroke"/>
+<text x="658.5" y="527.0" class="btext" font-size="13.8" text-anchor="middle" font-weight="500">forward j+1</text>
+<rect x="194.3" y="464.0" width="134.3" height="18.0" rx="2" class="hcpu"/>
+<text x="261.7" y="477.5" class="ink" font-size="12.6" text-anchor="middle" font-weight="400">launch j (CPU)</text>
+<rect x="329.2" y="464.0" width="11.2" height="18.0" rx="2" class="hcpu"/>
+<rect x="341.0" y="464.0" width="47.4" height="18.0" rx="2" class="hpeer"/>
+<text x="365.0" y="460.0" class="ink2" font-size="12.1" text-anchor="middle" font-weight="400">release relay</text>
+<rect x="389.0" y="464.0" width="8.4" height="18.0" rx="2" class="hcpu"/>
+<rect x="397.9" y="464.0" width="7.8" height="18.0" rx="2" class="hpeer"/>
+<rect x="406.3" y="464.0" width="3.2" height="18.0" rx="2" class="hpeer"/>
+<rect x="410.1" y="464.0" width="14.1" height="18.0" rx="2" class="hcpu"/>
+<rect x="424.8" y="464.0" width="7.5" height="18.0" rx="2" class="hgpu"/>
+<rect x="432.9" y="464.0" width="8.1" height="18.0" rx="2" class="hcpu"/>
+<rect x="441.6" y="464.0" width="67.6" height="18.0" rx="2" class="hcpu"/>
+<text x="475.6" y="477.5" class="ink" font-size="12.6" text-anchor="middle" font-weight="400">admit j+1</text>
+<rect x="509.7" y="464.0" width="58.6" height="18.0" rx="2" class="hpeer"/>
+<text x="539.3" y="460.0" class="ink2" font-size="12.1" text-anchor="middle" font-weight="400">send credit</text>
+<line x1="569.0" y1="456.0" x2="569.0" y2="546.0" class="ref"/>
+<text x="573.0" y="444.0" class="ink2" font-size="12.6" text-anchor="start" font-weight="400">launch j+1 (one round = 130 ms)</text>
+<rect x="569.0" y="464.0" width="134.3" height="18.0" rx="2" class="hcpu"/>
+<rect x="703.9" y="464.0" width="11.2" height="18.0" rx="2" class="hcpu"/>
+<rect x="715.7" y="464.0" width="47.4" height="18.0" rx="2" class="hpeer"/>
+<rect x="763.7" y="464.0" width="8.4" height="18.0" rx="2" class="hcpu"/>
+<rect x="772.6" y="464.0" width="7.8" height="18.0" rx="2" class="hpeer"/>
+<rect x="781.0" y="464.0" width="3.2" height="18.0" rx="2" class="hpeer"/>
+<rect x="784.8" y="464.0" width="14.1" height="18.0" rx="2" class="hcpu"/>
+<rect x="799.5" y="464.0" width="7.5" height="18.0" rx="2" class="hgpu"/>
+<rect x="807.6" y="464.0" width="8.1" height="18.0" rx="2" class="hcpu"/>
+<rect x="816.2" y="464.0" width="67.6" height="18.0" rx="2" class="hcpu"/>
+<rect x="884.4" y="464.0" width="58.6" height="18.0" rx="2" class="hpeer"/>
+<rect x="943.6" y="464.0" width="134.3" height="18.0" rx="2" class="hcpu"/>
+<rect x="1078.6" y="464.0" width="11.2" height="18.0" rx="2" class="hcpu"/>
+<rect x="1090.4" y="464.0" width="47.4" height="18.0" rx="2" class="hpeer"/>
+<rect x="1138.4" y="464.0" width="8.4" height="18.0" rx="2" class="hcpu"/>
+<rect x="1147.3" y="464.0" width="7.8" height="18.0" rx="2" class="hpeer"/>
+<rect x="1155.7" y="464.0" width="3.2" height="18.0" rx="2" class="hpeer"/>
+<rect x="1159.4" y="464.0" width="14.1" height="18.0" rx="2" class="hcpu"/>
+<rect x="1174.2" y="464.0" width="7.5" height="18.0" rx="2" class="hgpu"/>
+<rect x="1182.3" y="464.0" width="8.1" height="18.0" rx="2" class="hcpu"/>
+<rect x="1190.9" y="464.0" width="18.5" height="18.0" rx="2" class="hcpu"/>
+<line x1="194.3" y1="456.0" x2="194.3" y2="484.0" class="ref"/>
+<text x="170.0" y="560.0" class="ink2" font-size="13.8" text-anchor="start" font-weight="400">Short-forward runs (KV full): launch CPU 45, admission 24, send credit 21, relay waits 21 (mostly release drain), output 7, build 5, HiCache 3, ack 3 ms per round.</text>
+<rect x="32.0" y="628.0" width="16.0" height="14.0" rx="2" class="hcpu"/>
+<text x="56.0" y="640.0" class="ink2" font-size="13.8" text-anchor="start" font-weight="400">host CPU work</text>
+<rect x="332.0" y="628.0" width="16.0" height="14.0" rx="2" class="hpeer"/>
+<text x="356.0" y="640.0" class="ink2" font-size="13.8" text-anchor="start" font-weight="400">host waits: neighbour or send credit</text>
+<rect x="632.0" y="628.0" width="16.0" height="14.0" rx="2" class="hgpu"/>
+<text x="656.0" y="640.0" class="ink2" font-size="13.8" text-anchor="start" font-weight="400">host waits: own GPU (launch queue, load-back)</text>
+<rect x="932.0" y="628.0" width="16.0" height="14.0" rx="2" class="gapred"/>
+<text x="956.0" y="640.0" class="ink2" font-size="13.8" text-anchor="start" font-weight="400">GPU idle because the host is late</text>
+<text x="32.0" y="674.0" class="muted" font-size="12.6" text-anchor="start" font-weight="400">Measured: per-iteration host-chain diagnostics, iteration-weighted mean over PP1–PP7 (long: all iterations; short: iterations inside runs of short forwards).</text>
+<text x="32.0" y="692.0" class="muted" font-size="12.6" text-anchor="start" font-weight="400">Order within a round follows the loop; small items (bootstrap, HiCache host work, post-process) are unlabelled. Forward start after launch is schematic.</text>
+</svg>

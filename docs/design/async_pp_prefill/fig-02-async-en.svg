@@ -1,6 +1,6 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1240 470" width="1240" height="470" role="img" aria-labelledby="t d">
-<title id="t">Fully asynchronous PP (schematic)</title>
-<desc id="d">The same 4 stages and 5 micro-batches without a rendezvous: each stage starts once the upstream activations and its own prefix KV are ready, so the beat is the slowest stage's own forward.</desc>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1240 934" width="1240" height="934" role="img" aria-labelledby="t d">
+<title id="t">AsyncPP host view</title>
+<desc id="d">Fully asynchronous PP as implemented: what runs where, and when (schematic)</desc>
 <style>
 svg { font-family: system-ui, -apple-system, 'PingFang SC', 'Noto Sans CJK SC', 'Microsoft YaHei', sans-serif; }
 .bg { fill: #fcfcfb; }
@@ -13,185 +13,416 @@ svg { font-family: system-ui, -apple-system, 'PingFang SC', 'Noto Sans CJK SC', 
 .bstroke { stroke: #5b8fd0; stroke-width: 1.2; }
 .btext { fill: #0b0b0b; }
 .bubble { fill: #f3f3f1; stroke: #a8a7a1; stroke-width: 1.2; stroke-dasharray: 6 4; }
-.host { fill: #ecebe6; stroke: #b5b3ac; stroke-width: 1; }
-.block { fill: #fbe1d6; stroke: #ec835a; stroke-width: 1.2; }
-.spinbase { fill: #fdf0d5; stroke: #eda100; stroke-width: 1.2; }
-.hatch { stroke: #eda100; stroke-width: 1.4; }
+.hcpu { fill: #dcdad3; stroke: #8f8d86; stroke-width: 1; }
+.hpeer { fill: #fbe1d6; stroke: #ec835a; stroke-width: 1; }
+.hgpu { fill: #fdf0d5; stroke: #eda100; stroke-width: 1; }
+.gapred { fill: #fde2e1; stroke: #d03b3b; stroke-width: 1.3; }
+.kvbar { fill: #e4e0fa; stroke: #6250d6; stroke-width: 1.2; }
+.kvtick { fill: #6250d6; }
+.kvline { stroke: #6250d6; stroke-width: 1.3; stroke-dasharray: 4 3; fill: none; }
+.kvhead { fill: #6250d6; }
 .ce { fill: #d9f2e6; stroke: #1baf7a; stroke-width: 1.2; }
-.kv { fill: #6250d6; }
-.flag { fill: #1baf7a; }
-.handoff { stroke: #2e8b57; stroke-width: 1.8; fill: none; }
+.xfer { fill: #fbe3ee; stroke: #c2417f; stroke-width: 1; }
+.handoff { stroke: #2e8b57; stroke-width: 1.6; fill: none; }
 .handoffhead { fill: #2e8b57; }
 .dep { stroke: #d03b3b; stroke-width: 1.8; fill: none; }
 .dephead { fill: #d03b3b; }
 .barrier { stroke: #d03b3b; stroke-width: 1.6; }
-.ref { stroke: #898781; stroke-width: 1.4; fill: none; }
+.ctl { stroke: #3d3c39; stroke-width: 1.3; fill: none; }
+.ctlhead { fill: #3d3c39; }
+.ref { stroke: #898781; stroke-width: 1.2; fill: none; }
 .refhead { fill: #898781; }
-.gray { fill: #a3a29b; } .s1 { fill: #2a78d6; } .s2 { fill: #eb6834; } .s3 { fill: #1baf7a; } .s7 { fill: #6250d6; }
+.hold { stroke: #6250d6; stroke-width: 2.2; fill: none; }
 .panel { fill: none; stroke: #e1e0d9; stroke-width: 1; }
+.note { fill: #f6f5f1; stroke: #e1e0d9; stroke-width: 1; }
 @media (prefers-color-scheme: dark) {
   .bg { fill: #1a1a19; }
-  .ink { fill: #f0efec; } .ink2 { fill: #c3c2b7; }
+  .ink { fill: #f0efec; } .ink2 { fill: #c3c2b7; } .muted { fill: #8f8e88; }
   .axis { stroke: #383835; } .grid { stroke: #2c2c2a; } .lane { stroke: #262624; }
   .b0 { fill: #1f3550; } .b1 { fill: #23405f; } .b2 { fill: #274b6f; }
   .b3 { fill: #2b567f; } .b4 { fill: #2f6190; } .b5 { fill: #336ca0; }
-  .bstroke { stroke: #5598e7; }
-  .btext { fill: #f0efec; }
+  .bstroke { stroke: #5598e7; } .btext { fill: #f0efec; }
   .bubble { fill: #232322; stroke: #5e5d59; }
-  .host { fill: #2c2c2a; stroke: #55544f; }
-  .block { fill: #4a2a1f; stroke: #ec835a; }
-  .spinbase { fill: #3a2f14; stroke: #c98500; }
-  .hatch { stroke: #c98500; }
+  .hcpu { fill: #3a3a37; stroke: #77766f; }
+  .hpeer { fill: #4a2a1f; stroke: #ec835a; }
+  .hgpu { fill: #3a2f14; stroke: #c98500; }
+  .gapred { fill: #4a1f1f; stroke: #e5615f; }
+  .kvbar { fill: #2e2752; stroke: #9085e9; } .kvtick { fill: #9085e9; }
+  .kvline { stroke: #9085e9; } .kvhead { fill: #9085e9; } .hold { stroke: #9085e9; }
   .ce { fill: #173b2d; stroke: #199e70; }
-  .kv { fill: #9085e9; }
-  .flag { fill: #199e70; }
+  .xfer { fill: #4a2236; stroke: #e0679f; }
   .handoff { stroke: #3fb56f; } .handoffhead { fill: #3fb56f; }
-  .gray { fill: #6f6e68; } .s1 { fill: #3987e5; } .s2 { fill: #d95926; } .s3 { fill: #199e70; } .s7 { fill: #9085e9; }
-  .panel { stroke: #2c2c2a; }
+  .ctl { stroke: #c3c2b7; } .ctlhead { fill: #c3c2b7; }
+  .panel { stroke: #2c2c2a; } .note { fill: #222221; stroke: #2c2c2a; }
 }
 </style>
-<rect x="0" y="0" width="1240" height="470" class="bg"/>
-<text x="32.0" y="40.0" class="ink" font-size="22" text-anchor="start" font-weight="650">Fully asynchronous PP: a stage starts as soon as its two inputs are ready (schematic)</text>
-<text x="32.0" y="68.0" class="ink2" font-size="15" text-anchor="start" font-weight="400">Batch content: decided by PP0, identical on every stage. When to start: each stage decides. With similar stage costs, every stage keeps</text>
-<text x="32.0" y="90.0" class="ink2" font-size="15" text-anchor="start" font-weight="400">only a small gap.</text>
-<text x="32.0" y="144.0" class="ink" font-size="16" text-anchor="start" font-weight="600">PP0</text>
-<text x="32.0" y="206.0" class="ink" font-size="16" text-anchor="start" font-weight="600">PP1</text>
-<text x="32.0" y="268.0" class="ink" font-size="16" text-anchor="start" font-weight="600">PP2</text>
-<text x="32.0" y="330.0" class="ink" font-size="16" text-anchor="start" font-weight="600">PP3</text>
-<rect x="123.0" y="118.0" width="85.0" height="42.0" rx="6" class="b0 bstroke"></rect>
-<text x="165.5" y="143.7" class="btext" font-size="13" text-anchor="middle" font-weight="500">MB1</text>
-<rect x="123.0" y="163.0" width="14.0" height="4.0" rx="2" class="kv"></rect>
-<line x1="202.0" y1="162.0" x2="217.0" y2="178.0" class="handoff"/>
-<path d="M217.0,178.0 L214.1,168.4 L207.6,174.5 Z" class="handoffhead"/>
-<rect x="122.0" y="180.0" width="87.0" height="42.0" rx="6" class="bubble"></rect>
-<rect x="211.0" y="180.0" width="82.5" height="42.0" rx="6" class="b0 bstroke"></rect>
-<text x="252.2" y="205.7" class="btext" font-size="13" text-anchor="middle" font-weight="500">MB1</text>
-<rect x="211.0" y="225.0" width="14.0" height="4.0" rx="2" class="kv"></rect>
-<line x1="287.4" y1="224.0" x2="302.4" y2="240.0" class="handoff"/>
-<path d="M302.4,240.0 L299.6,230.4 L293.0,236.5 Z" class="handoffhead"/>
-<rect x="122.0" y="242.0" width="172.4" height="42.0" rx="6" class="bubble"></rect>
-<rect x="296.4" y="242.0" width="84.2" height="42.0" rx="6" class="b0 bstroke"></rect>
-<text x="338.5" y="267.7" class="btext" font-size="13" text-anchor="middle" font-weight="500">MB1</text>
-<rect x="296.4" y="287.0" width="14.0" height="4.0" rx="2" class="kv"></rect>
-<line x1="374.6" y1="286.0" x2="389.6" y2="302.0" class="handoff"/>
-<path d="M389.6,302.0 L386.7,292.4 L380.2,298.5 Z" class="handoffhead"/>
-<rect x="122.0" y="304.0" width="259.6" height="42.0" rx="6" class="bubble"></rect>
-<rect x="383.6" y="304.0" width="83.3" height="42.0" rx="6" class="b0 bstroke"></rect>
-<text x="425.2" y="329.7" class="btext" font-size="13" text-anchor="middle" font-weight="500">MB1</text>
-<rect x="383.6" y="349.0" width="14.0" height="4.0" rx="2" class="kv"></rect>
-<rect x="208.5" y="118.0" width="2.0" height="42.0" rx="2" class="bubble"></rect>
-<rect x="211.0" y="118.0" width="89.2" height="42.0" rx="6" class="b1 bstroke"></rect>
-<text x="255.6" y="143.7" class="btext" font-size="13" text-anchor="middle" font-weight="500">MB2</text>
-<rect x="211.0" y="163.0" width="14.0" height="4.0" rx="2" class="kv"></rect>
-<line x1="294.2" y1="162.0" x2="309.2" y2="178.0" class="handoff"/>
-<path d="M309.2,178.0 L306.4,168.4 L299.8,174.5 Z" class="handoffhead"/>
-<rect x="293.9" y="180.0" width="8.8" height="42.0" rx="2" class="bubble"></rect>
-<rect x="303.2" y="180.0" width="86.6" height="42.0" rx="6" class="b1 bstroke"></rect>
-<text x="346.5" y="205.7" class="btext" font-size="13" text-anchor="middle" font-weight="500">MB2</text>
-<rect x="303.2" y="225.0" width="14.0" height="4.0" rx="2" class="kv"></rect>
-<line x1="383.8" y1="224.0" x2="398.8" y2="240.0" class="handoff"/>
-<path d="M398.8,240.0 L395.9,230.4 L389.4,236.5 Z" class="handoffhead"/>
-<rect x="381.1" y="242.0" width="11.2" height="42.0" rx="2" class="bubble"></rect>
-<rect x="392.8" y="242.0" width="88.4" height="42.0" rx="6" class="b1 bstroke"></rect>
-<text x="437.0" y="267.7" class="btext" font-size="13" text-anchor="middle" font-weight="500">MB2</text>
-<rect x="392.8" y="287.0" width="14.0" height="4.0" rx="2" class="kv"></rect>
-<line x1="475.2" y1="286.0" x2="490.2" y2="302.0" class="handoff"/>
-<path d="M490.2,302.0 L487.3,292.4 L480.7,298.5 Z" class="handoffhead"/>
-<rect x="467.4" y="304.0" width="16.3" height="42.0" rx="2" class="bubble"></rect>
-<rect x="484.2" y="304.0" width="87.5" height="42.0" rx="6" class="b1 bstroke"></rect>
-<text x="527.9" y="329.7" class="btext" font-size="13" text-anchor="middle" font-weight="500">MB2</text>
-<rect x="484.2" y="349.0" width="14.0" height="4.0" rx="2" class="kv"></rect>
-<rect x="300.8" y="118.0" width="2.0" height="42.0" rx="2" class="bubble"></rect>
-<rect x="303.2" y="118.0" width="81.6" height="42.0" rx="6" class="b2 bstroke"></rect>
-<text x="344.1" y="143.7" class="btext" font-size="13" text-anchor="middle" font-weight="500">MB3</text>
-<rect x="303.2" y="163.0" width="14.0" height="4.0" rx="2" class="kv"></rect>
-<line x1="378.9" y1="162.0" x2="398.8" y2="178.0" class="handoff"/>
-<path d="M398.8,178.0 L394.6,168.9 L389.0,175.9 Z" class="handoffhead"/>
-<rect x="390.3" y="180.0" width="2.0" height="42.0" rx="2" class="bubble"></rect>
-<rect x="392.8" y="180.0" width="79.2" height="42.0" rx="6" class="b2 bstroke"></rect>
-<text x="432.4" y="205.7" class="btext" font-size="13" text-anchor="middle" font-weight="500">MB3</text>
-<rect x="392.8" y="225.0" width="14.0" height="4.0" rx="2" class="kv"></rect>
-<line x1="466.0" y1="224.0" x2="490.2" y2="240.0" class="handoff"/>
-<path d="M490.2,240.0 L485.2,231.3 L480.2,238.8 Z" class="handoffhead"/>
-<rect x="481.7" y="242.0" width="2.0" height="42.0" rx="2" class="bubble"></rect>
-<rect x="484.2" y="242.0" width="80.8" height="42.0" rx="6" class="b2 bstroke"></rect>
-<text x="524.6" y="267.7" class="btext" font-size="13" text-anchor="middle" font-weight="500">MB3</text>
-<rect x="484.2" y="287.0" width="14.0" height="4.0" rx="2" class="kv"></rect>
-<line x1="559.0" y1="286.0" x2="580.6" y2="302.0" class="handoff"/>
-<path d="M580.6,302.0 L576.1,293.0 L570.7,300.3 Z" class="handoffhead"/>
-<rect x="572.1" y="304.0" width="2.0" height="42.0" rx="2" class="bubble"></rect>
-<rect x="574.6" y="304.0" width="80.0" height="42.0" rx="6" class="b2 bstroke"></rect>
-<text x="614.6" y="329.7" class="btext" font-size="13" text-anchor="middle" font-weight="500">MB3</text>
-<rect x="574.6" y="349.0" width="14.0" height="4.0" rx="2" class="kv"></rect>
-<rect x="385.4" y="118.0" width="2.0" height="42.0" rx="2" class="bubble"></rect>
-<rect x="387.9" y="118.0" width="87.5" height="42.0" rx="6" class="b3 bstroke"></rect>
-<text x="431.6" y="143.7" class="btext" font-size="13" text-anchor="middle" font-weight="500">MB4</text>
-<rect x="387.9" y="163.0" width="14.0" height="4.0" rx="2" class="kv"></rect>
-<line x1="469.4" y1="162.0" x2="484.4" y2="178.0" class="handoff"/>
-<path d="M484.4,178.0 L481.5,168.4 L475.0,174.5 Z" class="handoffhead"/>
-<rect x="472.5" y="180.0" width="5.4" height="42.0" rx="2" class="bubble"></rect>
-<rect x="478.4" y="180.0" width="84.9" height="42.0" rx="6" class="b3 bstroke"></rect>
-<text x="520.9" y="205.7" class="btext" font-size="13" text-anchor="middle" font-weight="500">MB4</text>
-<rect x="478.4" y="225.0" width="14.0" height="4.0" rx="2" class="kv"></rect>
-<line x1="557.3" y1="224.0" x2="574.0" y2="240.0" class="handoff"/>
-<path d="M574.0,240.0 L570.6,230.5 L564.4,237.0 Z" class="handoffhead"/>
-<rect x="565.5" y="242.0" width="2.0" height="42.0" rx="2" class="bubble"></rect>
-<rect x="568.0" y="242.0" width="86.7" height="42.0" rx="6" class="b3 bstroke"></rect>
-<text x="611.3" y="267.7" class="btext" font-size="13" text-anchor="middle" font-weight="500">MB4</text>
-<rect x="568.0" y="287.0" width="14.0" height="4.0" rx="2" class="kv"></rect>
-<line x1="648.6" y1="286.0" x2="663.6" y2="302.0" class="handoff"/>
-<path d="M663.6,302.0 L660.8,292.4 L654.2,298.5 Z" class="handoffhead"/>
-<rect x="655.1" y="304.0" width="2.0" height="42.0" rx="2" class="bubble"></rect>
-<rect x="657.6" y="304.0" width="85.8" height="42.0" rx="6" class="b3 bstroke"></rect>
-<text x="700.5" y="329.7" class="btext" font-size="13" text-anchor="middle" font-weight="500">MB4</text>
-<rect x="657.6" y="349.0" width="14.0" height="4.0" rx="2" class="kv"></rect>
-<rect x="475.9" y="118.0" width="2.0" height="42.0" rx="2" class="bubble"></rect>
-<rect x="478.4" y="118.0" width="82.5" height="42.0" rx="6" class="b4 bstroke"></rect>
-<text x="519.6" y="143.7" class="btext" font-size="13" text-anchor="middle" font-weight="500">MB5</text>
-<rect x="478.4" y="163.0" width="14.0" height="4.0" rx="2" class="kv"></rect>
-<line x1="554.9" y1="162.0" x2="572.3" y2="178.0" class="handoff"/>
-<path d="M572.3,178.0 L568.7,168.6 L562.6,175.2 Z" class="handoffhead"/>
-<rect x="563.8" y="180.0" width="2.0" height="42.0" rx="2" class="bubble"></rect>
-<rect x="566.3" y="180.0" width="80.0" height="42.0" rx="6" class="b4 bstroke"></rect>
-<text x="606.3" y="205.7" class="btext" font-size="13" text-anchor="middle" font-weight="500">MB5</text>
-<rect x="566.3" y="225.0" width="14.0" height="4.0" rx="2" class="kv"></rect>
-<line x1="640.3" y1="224.0" x2="663.6" y2="240.0" class="handoff"/>
-<path d="M663.6,240.0 L658.8,231.2 L653.7,238.6 Z" class="handoffhead"/>
-<rect x="655.1" y="242.0" width="2.0" height="42.0" rx="2" class="bubble"></rect>
-<rect x="657.6" y="242.0" width="81.6" height="42.0" rx="6" class="b4 bstroke"></rect>
-<text x="698.5" y="267.7" class="btext" font-size="13" text-anchor="middle" font-weight="500">MB5</text>
-<rect x="657.6" y="287.0" width="14.0" height="4.0" rx="2" class="kv"></rect>
-<line x1="733.3" y1="286.0" x2="752.4" y2="302.0" class="handoff"/>
-<path d="M752.4,302.0 L748.4,292.8 L742.6,299.7 Z" class="handoffhead"/>
-<rect x="743.9" y="304.0" width="2.0" height="42.0" rx="2" class="bubble"></rect>
-<rect x="746.4" y="304.0" width="80.8" height="42.0" rx="6" class="b4 bstroke"></rect>
-<text x="786.8" y="329.7" class="btext" font-size="13" text-anchor="middle" font-weight="500">MB5</text>
-<rect x="746.4" y="349.0" width="14.0" height="4.0" rx="2" class="kv"></rect>
-<line x1="937.9" y1="106.0" x2="937.9" y2="368.0" class="ref"/>
-<text x="931.9" y="100.0" class="ink2" font-size="12" text-anchor="end" font-weight="400">lockstep finishes the same 5 micro-batches here (+16%)</text>
-<line x1="827.2" y1="114.0" x2="827.2" y2="368.0" class="handoff"/>
-<line x1="303.2" y1="372.0" x2="384.9" y2="372.0" class="ref"/>
-<line x1="303.2" y1="367.0" x2="303.2" y2="377.0" class="ref"/>
-<line x1="384.9" y1="367.0" x2="384.9" y2="377.0" class="ref"/>
-<text x="344.1" y="390.0" class="ink2" font-size="13" text-anchor="middle" font-weight="400">one beat = PP0's own forward</text>
-<line x1="120.0" y1="406.0" x2="967.9" y2="406.0" class="axis"/>
-<line x1="957.9" y1="406.0" x2="967.9" y2="406.0" class="ref"/>
-<path d="M967.9,406.0 L958.9,401.5 L958.9,410.5 Z" class="refhead"/>
-<text x="975.9" y="411.0" class="muted" font-size="13" text-anchor="start" font-weight="400">time</text>
-<line x1="994.0" y1="114.0" x2="1010.0" y2="128.0" class="handoff"/>
-<path d="M1010.0,128.0 L1006.2,118.7 L1000.3,125.5 Z" class="handoffhead"/>
-<text x="1020.0" y="126.0" class="ink2" font-size="13" text-anchor="start" font-weight="400">(1) the previous stage's</text>
-<text x="1020.0" y="144.0" class="ink2" font-size="13" text-anchor="start" font-weight="400">activations for this</text>
-<text x="1020.0" y="162.0" class="ink2" font-size="13" text-anchor="start" font-weight="400">micro-batch: copy engine</text>
-<text x="1020.0" y="180.0" class="ink2" font-size="13" text-anchor="start" font-weight="400">writes the input slot, the</text>
-<text x="1020.0" y="198.0" class="ink2" font-size="13" text-anchor="start" font-weight="400">GPU waits on a ready flag</text>
-<rect x="992.0" y="226.0" width="16.0" height="5.0" rx="2" class="kv"></rect>
-<text x="1020.0" y="232.0" class="ink2" font-size="13" text-anchor="start" font-weight="400">(2) this stage's prefix KV</text>
-<text x="1020.0" y="250.0" class="ink2" font-size="13" text-anchor="start" font-weight="400">loaded back from host memory</text>
-<rect x="992.0" y="270.0" width="18.0" height="18.0" rx="3" class="bubble"></rect>
-<text x="1020.0" y="284.0" class="ink2" font-size="13" text-anchor="start" font-weight="400">Dashed box: idle = beat −</text>
-<text x="1020.0" y="302.0" class="ink2" font-size="13" text-anchor="start" font-weight="400">this stage's forward; only</text>
-<text x="1020.0" y="320.0" class="ink2" font-size="13" text-anchor="start" font-weight="400">cost differences remain</text>
-<text x="1020.0" y="354.0" class="ink2" font-size="13" text-anchor="start" font-weight="400">No red lines: no per-beat</text>
-<text x="1020.0" y="372.0" class="ink2" font-size="13" text-anchor="start" font-weight="400">rendezvous</text>
+<rect x="0" y="0" width="1240" height="934" class="bg"/>
+<text x="32.0" y="40.0" class="ink" font-size="22" text-anchor="start" font-weight="650">Fully asynchronous PP as implemented: what runs where, and when (schematic)</text>
+<text x="32.0" y="66.0" class="ink2" font-size="14" text-anchor="start" font-weight="400">The host runs about 1.7 forwards ahead of its GPU and builds the next micro-batches while the GPU computes. A stage issues j's load-back when it</text>
+<text x="32.0" y="85.0" class="ink2" font-size="14" text-anchor="start" font-weight="400">builds j, but the copy waits on the GPU for forward j−1, so it still starts right before forward j.</text>
+<text x="32.0" y="167.0" class="ink" font-size="16" text-anchor="start" font-weight="600">PP0</text>
+<text x="142.0" y="140.0" class="muted" font-size="12.6" text-anchor="end" font-weight="400">host</text>
+<text x="142.0" y="174.0" class="muted" font-size="12.6" text-anchor="end" font-weight="400">GPU</text>
+<text x="142.0" y="189.0" class="muted" font-size="12.6" text-anchor="end" font-weight="400">H2D · CE</text>
+<rect x="150.0" y="128.0" width="19.3" height="15.0" rx="2" class="hcpu"/>
+<rect x="169.9" y="128.0" width="24.6" height="15.0" rx="2" class="hcpu"/>
+<rect x="195.1" y="128.0" width="4.0" height="15.0" rx="2" class="hcpu"/>
+<rect x="199.7" y="128.0" width="19.3" height="15.0" rx="2" class="hcpu"/>
+<rect x="219.6" y="128.0" width="24.6" height="15.0" rx="2" class="hcpu"/>
+<rect x="244.7" y="128.0" width="4.0" height="15.0" rx="2" class="hcpu"/>
+<rect x="249.4" y="128.0" width="19.3" height="15.0" rx="2" class="hcpu"/>
+<rect x="269.2" y="128.0" width="24.6" height="15.0" rx="2" class="hcpu"/>
+<rect x="294.4" y="128.0" width="23.8" height="15.0" rx="2" class="hgpu"/>
+<rect x="318.8" y="128.0" width="4.0" height="15.0" rx="2" class="hcpu"/>
+<rect x="323.4" y="128.0" width="19.3" height="15.0" rx="2" class="hcpu"/>
+<rect x="343.3" y="128.0" width="24.6" height="15.0" rx="2" class="hcpu"/>
+<rect x="368.5" y="128.0" width="70.8" height="15.0" rx="2" class="hgpu"/>
+<rect x="439.9" y="128.0" width="4.0" height="15.0" rx="2" class="hcpu"/>
+<rect x="444.5" y="128.0" width="19.3" height="15.0" rx="2" class="hcpu"/>
+<rect x="464.4" y="128.0" width="24.6" height="15.0" rx="2" class="hcpu"/>
+<rect x="489.6" y="128.0" width="67.2" height="15.0" rx="2" class="hgpu"/>
+<rect x="557.4" y="128.0" width="4.0" height="15.0" rx="2" class="hcpu"/>
+<rect x="150.0" y="147.0" width="19.5" height="30.0" rx="5" class="bubble bstroke"/>
+<rect x="170.5" y="147.0" width="118.2" height="30.0" rx="5" class="b0 bstroke"/>
+<text x="230.2" y="166.5" class="btext" font-size="14.9" text-anchor="middle" font-weight="500">MB1</text>
+<rect x="290.1" y="147.0" width="121.2" height="30.0" rx="5" class="b1 bstroke"/>
+<text x="351.2" y="166.5" class="btext" font-size="14.9" text-anchor="middle" font-weight="500">MB2</text>
+<rect x="412.5" y="147.0" width="115.3" height="30.0" rx="5" class="b2 bstroke"/>
+<text x="470.7" y="166.5" class="btext" font-size="14.9" text-anchor="middle" font-weight="500">MB3</text>
+<rect x="529.1" y="147.0" width="119.4" height="30.0" rx="5" class="b3 bstroke"/>
+<text x="589.3" y="166.5" class="btext" font-size="14.9" text-anchor="middle" font-weight="500">MB4</text>
+<rect x="649.8" y="147.0" width="116.5" height="30.0" rx="5" class="b4 bstroke"/>
+<text x="708.5" y="166.5" class="btext" font-size="14.9" text-anchor="middle" font-weight="500">MB5</text>
+<rect x="169.9" y="181.0" width="2.6" height="11.0" rx="1.5" class="kvbar"/>
+<rect x="289.8" y="181.0" width="2.0" height="11.0" rx="1.5" class="ce"/>
+<rect x="292.4" y="181.0" width="5.3" height="11.0" rx="1.5" class="xfer"/>
+<rect x="289.8" y="181.0" width="2.6" height="11.0" rx="1.5" class="kvbar"/>
+<rect x="412.3" y="181.0" width="2.0" height="11.0" rx="1.5" class="ce"/>
+<rect x="414.9" y="181.0" width="5.3" height="11.0" rx="1.5" class="xfer"/>
+<rect x="412.3" y="181.0" width="2.6" height="11.0" rx="1.5" class="kvbar"/>
+<rect x="528.8" y="181.0" width="2.0" height="11.0" rx="1.5" class="ce"/>
+<rect x="531.5" y="181.0" width="5.3" height="11.0" rx="1.5" class="xfer"/>
+<rect x="528.8" y="181.0" width="2.6" height="11.0" rx="1.5" class="kvbar"/>
+<rect x="649.5" y="181.0" width="2.0" height="11.0" rx="1.5" class="ce"/>
+<rect x="652.2" y="181.0" width="5.3" height="11.0" rx="1.5" class="xfer"/>
+<rect x="649.5" y="181.0" width="2.6" height="11.0" rx="1.5" class="kvbar"/>
+<rect x="767.3" y="181.0" width="2.0" height="11.0" rx="1.5" class="ce"/>
+<rect x="769.9" y="181.0" width="5.3" height="11.0" rx="1.5" class="xfer"/>
+<text x="32.0" y="257.0" class="ink" font-size="16" text-anchor="start" font-weight="600">PP1</text>
+<text x="142.0" y="230.0" class="muted" font-size="12.6" text-anchor="end" font-weight="400">host</text>
+<text x="142.0" y="264.0" class="muted" font-size="12.6" text-anchor="end" font-weight="400">GPU</text>
+<text x="142.0" y="279.0" class="muted" font-size="12.6" text-anchor="end" font-weight="400">H2D · CE</text>
+<rect x="150.0" y="218.0" width="49.4" height="15.0" rx="2" class="hpeer"/>
+<rect x="200.0" y="218.0" width="19.3" height="15.0" rx="2" class="hcpu"/>
+<rect x="219.9" y="218.0" width="24.6" height="15.0" rx="2" class="hcpu"/>
+<rect x="245.1" y="218.0" width="4.0" height="15.0" rx="2" class="hcpu"/>
+<rect x="249.7" y="218.0" width="19.3" height="15.0" rx="2" class="hcpu"/>
+<rect x="269.6" y="218.0" width="24.6" height="15.0" rx="2" class="hcpu"/>
+<rect x="294.8" y="218.0" width="23.2" height="15.0" rx="2" class="hgpu"/>
+<rect x="318.6" y="218.0" width="4.0" height="15.0" rx="2" class="hcpu"/>
+<rect x="323.7" y="218.0" width="19.3" height="15.0" rx="2" class="hcpu"/>
+<rect x="343.6" y="218.0" width="24.6" height="15.0" rx="2" class="hcpu"/>
+<rect x="368.8" y="218.0" width="70.4" height="15.0" rx="2" class="hgpu"/>
+<rect x="439.8" y="218.0" width="4.0" height="15.0" rx="2" class="hcpu"/>
+<rect x="444.8" y="218.0" width="19.3" height="15.0" rx="2" class="hcpu"/>
+<rect x="464.7" y="218.0" width="24.6" height="15.0" rx="2" class="hcpu"/>
+<rect x="489.9" y="218.0" width="66.7" height="15.0" rx="2" class="hgpu"/>
+<rect x="557.2" y="218.0" width="4.0" height="15.0" rx="2" class="hcpu"/>
+<rect x="562.4" y="218.0" width="19.3" height="15.0" rx="2" class="hcpu"/>
+<rect x="582.2" y="218.0" width="24.6" height="15.0" rx="2" class="hcpu"/>
+<rect x="607.4" y="218.0" width="69.3" height="15.0" rx="2" class="hgpu"/>
+<rect x="677.3" y="218.0" width="4.0" height="15.0" rx="2" class="hcpu"/>
+<rect x="150.0" y="237.0" width="140.3" height="30.0" rx="5" class="bubble bstroke"/>
+<rect x="291.3" y="237.0" width="115.1" height="30.0" rx="5" class="b0 bstroke"/>
+<text x="349.4" y="256.5" class="btext" font-size="14.9" text-anchor="middle" font-weight="500">MB1</text>
+<rect x="407.4" y="237.0" width="5.4" height="30.0" rx="5" class="bubble bstroke"/>
+<rect x="413.8" y="237.0" width="109.5" height="30.0" rx="5" class="b1 bstroke"/>
+<text x="469.0" y="256.5" class="btext" font-size="14.9" text-anchor="middle" font-weight="500">MB2</text>
+<rect x="524.3" y="237.0" width="5.1" height="30.0" rx="5" class="bubble bstroke"/>
+<rect x="530.3" y="237.0" width="113.4" height="30.0" rx="5" class="b2 bstroke"/>
+<text x="587.6" y="256.5" class="btext" font-size="14.9" text-anchor="middle" font-weight="500">MB3</text>
+<rect x="644.8" y="237.0" width="5.3" height="30.0" rx="5" class="bubble bstroke"/>
+<rect x="651.0" y="237.0" width="110.6" height="30.0" rx="5" class="b3 bstroke"/>
+<text x="706.8" y="256.5" class="btext" font-size="14.9" text-anchor="middle" font-weight="500">MB4</text>
+<rect x="762.6" y="237.0" width="5.1" height="30.0" rx="5" class="bubble bstroke"/>
+<rect x="768.8" y="237.0" width="112.3" height="30.0" rx="5" class="b4 bstroke"/>
+<text x="825.4" y="256.5" class="btext" font-size="14.9" text-anchor="middle" font-weight="500">MB5</text>
+<rect x="219.9" y="271.0" width="2.6" height="11.0" rx="1.5" class="kvbar"/>
+<rect x="407.4" y="271.0" width="2.0" height="11.0" rx="1.5" class="ce"/>
+<rect x="410.1" y="271.0" width="5.3" height="11.0" rx="1.5" class="xfer"/>
+<rect x="407.4" y="271.0" width="2.6" height="11.0" rx="1.5" class="kvbar"/>
+<rect x="524.3" y="271.0" width="2.0" height="11.0" rx="1.5" class="ce"/>
+<rect x="526.9" y="271.0" width="5.3" height="11.0" rx="1.5" class="xfer"/>
+<rect x="524.3" y="271.0" width="2.6" height="11.0" rx="1.5" class="kvbar"/>
+<rect x="644.8" y="271.0" width="2.0" height="11.0" rx="1.5" class="ce"/>
+<rect x="647.4" y="271.0" width="5.3" height="11.0" rx="1.5" class="xfer"/>
+<rect x="644.8" y="271.0" width="2.6" height="11.0" rx="1.5" class="kvbar"/>
+<rect x="762.6" y="271.0" width="2.0" height="11.0" rx="1.5" class="ce"/>
+<rect x="765.3" y="271.0" width="5.3" height="11.0" rx="1.5" class="xfer"/>
+<rect x="762.6" y="271.0" width="2.6" height="11.0" rx="1.5" class="kvbar"/>
+<rect x="882.1" y="271.0" width="2.0" height="11.0" rx="1.5" class="ce"/>
+<rect x="884.7" y="271.0" width="5.3" height="11.0" rx="1.5" class="xfer"/>
+<text x="32.0" y="347.0" class="ink" font-size="16" text-anchor="start" font-weight="600">PP2</text>
+<text x="142.0" y="320.0" class="muted" font-size="12.6" text-anchor="end" font-weight="400">host</text>
+<text x="142.0" y="354.0" class="muted" font-size="12.6" text-anchor="end" font-weight="400">GPU</text>
+<text x="142.0" y="369.0" class="muted" font-size="12.6" text-anchor="end" font-weight="400">H2D · CE</text>
+<rect x="150.0" y="308.0" width="99.4" height="15.0" rx="2" class="hpeer"/>
+<rect x="250.0" y="308.0" width="19.3" height="15.0" rx="2" class="hcpu"/>
+<rect x="269.9" y="308.0" width="24.6" height="15.0" rx="2" class="hcpu"/>
+<rect x="295.1" y="308.0" width="4.0" height="15.0" rx="2" class="hcpu"/>
+<rect x="299.7" y="308.0" width="23.2" height="15.0" rx="2" class="hpeer"/>
+<rect x="323.6" y="308.0" width="19.3" height="15.0" rx="2" class="hcpu"/>
+<rect x="343.4" y="308.0" width="24.6" height="15.0" rx="2" class="hcpu"/>
+<rect x="368.6" y="308.0" width="66.5" height="15.0" rx="2" class="hgpu"/>
+<rect x="435.7" y="308.0" width="4.0" height="15.0" rx="2" class="hcpu"/>
+<rect x="440.3" y="308.0" width="3.8" height="15.0" rx="2" class="hpeer"/>
+<rect x="444.7" y="308.0" width="19.3" height="15.0" rx="2" class="hcpu"/>
+<rect x="464.6" y="308.0" width="24.6" height="15.0" rx="2" class="hcpu"/>
+<rect x="489.8" y="308.0" width="63.1" height="15.0" rx="2" class="hgpu"/>
+<rect x="553.5" y="308.0" width="4.0" height="15.0" rx="2" class="hcpu"/>
+<rect x="558.1" y="308.0" width="3.5" height="15.0" rx="2" class="hpeer"/>
+<rect x="562.2" y="308.0" width="19.3" height="15.0" rx="2" class="hcpu"/>
+<rect x="582.1" y="308.0" width="24.6" height="15.0" rx="2" class="hcpu"/>
+<rect x="607.2" y="308.0" width="65.4" height="15.0" rx="2" class="hgpu"/>
+<rect x="673.3" y="308.0" width="4.0" height="15.0" rx="2" class="hcpu"/>
+<rect x="677.9" y="308.0" width="3.7" height="15.0" rx="2" class="hpeer"/>
+<rect x="682.2" y="308.0" width="19.3" height="15.0" rx="2" class="hcpu"/>
+<rect x="702.1" y="308.0" width="24.6" height="15.0" rx="2" class="hcpu"/>
+<rect x="727.3" y="308.0" width="63.7" height="15.0" rx="2" class="hgpu"/>
+<rect x="791.6" y="308.0" width="4.0" height="15.0" rx="2" class="hcpu"/>
+<rect x="150.0" y="327.0" width="258.0" height="30.0" rx="5" class="bubble bstroke"/>
+<rect x="409.0" y="327.0" width="112.7" height="30.0" rx="5" class="b0 bstroke"/>
+<text x="465.8" y="346.5" class="btext" font-size="14.9" text-anchor="middle" font-weight="500">MB1</text>
+<rect x="522.6" y="327.0" width="2.1" height="30.0" rx="5" class="bubble bstroke"/>
+<rect x="525.8" y="327.0" width="116.8" height="30.0" rx="5" class="b1 bstroke"/>
+<text x="584.7" y="346.5" class="btext" font-size="14.9" text-anchor="middle" font-weight="500">MB2</text>
+<rect x="643.6" y="327.0" width="1.7" height="30.0" rx="5" class="bubble bstroke"/>
+<rect x="646.3" y="327.0" width="113.9" height="30.0" rx="5" class="b2 bstroke"/>
+<text x="703.7" y="346.5" class="btext" font-size="14.9" text-anchor="middle" font-weight="500">MB3</text>
+<rect x="761.1" y="327.0" width="2.0" height="30.0" rx="5" class="bubble bstroke"/>
+<rect x="764.2" y="327.0" width="115.6" height="30.0" rx="5" class="b3 bstroke"/>
+<text x="822.5" y="346.5" class="btext" font-size="14.9" text-anchor="middle" font-weight="500">MB4</text>
+<rect x="880.8" y="327.0" width="1.8" height="30.0" rx="5" class="bubble bstroke"/>
+<rect x="883.6" y="327.0" width="118.5" height="30.0" rx="5" class="b4 bstroke"/>
+<text x="943.3" y="346.5" class="btext" font-size="14.9" text-anchor="middle" font-weight="500">MB5</text>
+<rect x="269.9" y="361.0" width="2.6" height="11.0" rx="1.5" class="kvbar"/>
+<rect x="522.6" y="361.0" width="2.0" height="11.0" rx="1.5" class="ce"/>
+<rect x="525.3" y="361.0" width="5.3" height="11.0" rx="1.5" class="xfer"/>
+<rect x="522.6" y="361.0" width="2.6" height="11.0" rx="1.5" class="kvbar"/>
+<rect x="643.6" y="361.0" width="2.0" height="11.0" rx="1.5" class="ce"/>
+<rect x="646.2" y="361.0" width="5.3" height="11.0" rx="1.5" class="xfer"/>
+<rect x="643.6" y="361.0" width="2.6" height="11.0" rx="1.5" class="kvbar"/>
+<rect x="761.1" y="361.0" width="2.0" height="11.0" rx="1.5" class="ce"/>
+<rect x="763.8" y="361.0" width="5.3" height="11.0" rx="1.5" class="xfer"/>
+<rect x="761.1" y="361.0" width="2.6" height="11.0" rx="1.5" class="kvbar"/>
+<rect x="880.8" y="361.0" width="2.0" height="11.0" rx="1.5" class="ce"/>
+<rect x="883.4" y="361.0" width="5.3" height="11.0" rx="1.5" class="xfer"/>
+<rect x="880.8" y="361.0" width="2.6" height="11.0" rx="1.5" class="kvbar"/>
+<rect x="1003.1" y="361.0" width="2.0" height="11.0" rx="1.5" class="ce"/>
+<rect x="1005.8" y="361.0" width="5.3" height="11.0" rx="1.5" class="xfer"/>
+<text x="32.0" y="437.0" class="ink" font-size="16" text-anchor="start" font-weight="600">PP3</text>
+<text x="142.0" y="410.0" class="muted" font-size="12.6" text-anchor="end" font-weight="400">host</text>
+<text x="142.0" y="444.0" class="muted" font-size="12.6" text-anchor="end" font-weight="400">GPU</text>
+<text x="142.0" y="459.0" class="muted" font-size="12.6" text-anchor="end" font-weight="400">H2D · CE</text>
+<rect x="150.0" y="398.0" width="149.5" height="15.0" rx="2" class="hpeer"/>
+<rect x="300.1" y="398.0" width="19.3" height="15.0" rx="2" class="hcpu"/>
+<rect x="319.9" y="398.0" width="24.6" height="15.0" rx="2" class="hcpu"/>
+<rect x="345.1" y="398.0" width="4.0" height="15.0" rx="2" class="hcpu"/>
+<rect x="349.7" y="398.0" width="90.3" height="15.0" rx="2" class="hpeer"/>
+<rect x="440.6" y="398.0" width="19.3" height="15.0" rx="2" class="hcpu"/>
+<rect x="460.5" y="398.0" width="24.6" height="15.0" rx="2" class="hcpu"/>
+<rect x="485.7" y="398.0" width="64.1" height="15.0" rx="2" class="hgpu"/>
+<rect x="550.4" y="398.0" width="4.0" height="15.0" rx="2" class="hcpu"/>
+<rect x="555.1" y="398.0" width="2.8" height="15.0" rx="2" class="hpeer"/>
+<rect x="558.4" y="398.0" width="19.3" height="15.0" rx="2" class="hcpu"/>
+<rect x="578.3" y="398.0" width="24.6" height="15.0" rx="2" class="hcpu"/>
+<rect x="603.5" y="398.0" width="66.6" height="15.0" rx="2" class="hgpu"/>
+<rect x="670.7" y="398.0" width="4.0" height="15.0" rx="2" class="hcpu"/>
+<rect x="675.3" y="398.0" width="2.3" height="15.0" rx="2" class="hpeer"/>
+<rect x="678.2" y="398.0" width="19.3" height="15.0" rx="2" class="hcpu"/>
+<rect x="698.1" y="398.0" width="24.6" height="15.0" rx="2" class="hcpu"/>
+<rect x="723.3" y="398.0" width="64.8" height="15.0" rx="2" class="hgpu"/>
+<rect x="788.7" y="398.0" width="4.0" height="15.0" rx="2" class="hcpu"/>
+<rect x="793.3" y="398.0" width="2.6" height="15.0" rx="2" class="hpeer"/>
+<rect x="796.5" y="398.0" width="19.3" height="15.0" rx="2" class="hcpu"/>
+<rect x="816.4" y="398.0" width="24.6" height="15.0" rx="2" class="hcpu"/>
+<rect x="841.6" y="398.0" width="66.8" height="15.0" rx="2" class="hgpu"/>
+<rect x="908.9" y="398.0" width="4.0" height="15.0" rx="2" class="hcpu"/>
+<rect x="150.0" y="417.0" width="373.2" height="30.0" rx="5" class="bubble bstroke"/>
+<rect x="524.2" y="417.0" width="110.7" height="30.0" rx="5" class="b0 bstroke"/>
+<text x="580.0" y="436.5" class="btext" font-size="14.9" text-anchor="middle" font-weight="500">MB1</text>
+<rect x="635.9" y="417.0" width="8.2" height="30.0" rx="5" class="bubble bstroke"/>
+<rect x="645.1" y="417.0" width="108.0" height="30.0" rx="5" class="b1 bstroke"/>
+<text x="699.6" y="436.5" class="btext" font-size="14.9" text-anchor="middle" font-weight="500">MB2</text>
+<rect x="754.1" y="417.0" width="7.6" height="30.0" rx="5" class="bubble bstroke"/>
+<rect x="762.7" y="417.0" width="109.6" height="30.0" rx="5" class="b2 bstroke"/>
+<text x="818.0" y="436.5" class="btext" font-size="14.9" text-anchor="middle" font-weight="500">MB3</text>
+<rect x="873.3" y="417.0" width="8.0" height="30.0" rx="5" class="bubble bstroke"/>
+<rect x="882.3" y="417.0" width="112.4" height="30.0" rx="5" class="b3 bstroke"/>
+<text x="939.0" y="436.5" class="btext" font-size="14.9" text-anchor="middle" font-weight="500">MB4</text>
+<rect x="995.7" y="417.0" width="7.9" height="30.0" rx="5" class="bubble bstroke"/>
+<rect x="1004.6" y="417.0" width="106.9" height="30.0" rx="5" class="b4 bstroke"/>
+<text x="1058.6" y="436.5" class="btext" font-size="14.9" text-anchor="middle" font-weight="500">MB5</text>
+<rect x="319.9" y="451.0" width="2.6" height="11.0" rx="1.5" class="kvbar"/>
+<rect x="638.6" y="451.0" width="5.3" height="11.0" rx="1.5" class="xfer"/>
+<rect x="635.9" y="451.0" width="2.6" height="11.0" rx="1.5" class="kvbar"/>
+<rect x="756.7" y="451.0" width="5.3" height="11.0" rx="1.5" class="xfer"/>
+<rect x="754.1" y="451.0" width="2.6" height="11.0" rx="1.5" class="kvbar"/>
+<rect x="875.9" y="451.0" width="5.3" height="11.0" rx="1.5" class="xfer"/>
+<rect x="873.3" y="451.0" width="2.6" height="11.0" rx="1.5" class="kvbar"/>
+<rect x="998.3" y="451.0" width="5.3" height="11.0" rx="1.5" class="xfer"/>
+<rect x="995.7" y="451.0" width="2.6" height="11.0" rx="1.5" class="kvbar"/>
+<rect x="1115.1" y="451.0" width="5.3" height="11.0" rx="1.5" class="xfer"/>
+<line x1="291.1" y1="178.0" x2="293.3" y2="236.0" class="handoff"/>
+<path d="M293.3,236.0 L290.8,230.6 L295.4,230.4 Z" class="handoffhead"/>
+<line x1="413.6" y1="178.0" x2="415.8" y2="236.0" class="handoff"/>
+<path d="M415.8,236.0 L413.3,230.6 L417.9,230.4 Z" class="handoffhead"/>
+<line x1="530.1" y1="178.0" x2="532.3" y2="236.0" class="handoff"/>
+<path d="M532.3,236.0 L529.8,230.6 L534.5,230.4 Z" class="handoffhead"/>
+<line x1="650.8" y1="178.0" x2="653.0" y2="236.0" class="handoff"/>
+<path d="M653.0,236.0 L650.5,230.6 L655.2,230.4 Z" class="handoffhead"/>
+<line x1="768.6" y1="178.0" x2="770.8" y2="236.0" class="handoff"/>
+<path d="M770.8,236.0 L768.2,230.6 L772.9,230.4 Z" class="handoffhead"/>
+<line x1="408.8" y1="268.0" x2="411.0" y2="326.0" class="handoff"/>
+<path d="M411.0,326.0 L408.4,320.6 L413.1,320.4 Z" class="handoffhead"/>
+<line x1="525.6" y1="268.0" x2="527.8" y2="326.0" class="handoff"/>
+<path d="M527.8,326.0 L525.2,320.6 L529.9,320.4 Z" class="handoffhead"/>
+<line x1="646.1" y1="268.0" x2="648.3" y2="326.0" class="handoff"/>
+<path d="M648.3,326.0 L645.7,320.6 L650.4,320.4 Z" class="handoffhead"/>
+<line x1="764.0" y1="268.0" x2="766.2" y2="326.0" class="handoff"/>
+<path d="M766.2,326.0 L763.6,320.6 L768.3,320.4 Z" class="handoffhead"/>
+<line x1="883.4" y1="268.0" x2="885.6" y2="326.0" class="handoff"/>
+<path d="M885.6,326.0 L883.0,320.6 L887.7,320.4 Z" class="handoffhead"/>
+<line x1="524.0" y1="358.0" x2="526.2" y2="416.0" class="handoff"/>
+<path d="M526.2,416.0 L523.6,410.6 L528.3,410.4 Z" class="handoffhead"/>
+<line x1="644.9" y1="358.0" x2="647.1" y2="416.0" class="handoff"/>
+<path d="M647.1,416.0 L644.5,410.6 L649.2,410.4 Z" class="handoffhead"/>
+<line x1="762.5" y1="358.0" x2="764.7" y2="416.0" class="handoff"/>
+<path d="M764.7,416.0 L762.1,410.6 L766.8,410.4 Z" class="handoffhead"/>
+<line x1="882.1" y1="358.0" x2="884.3" y2="416.0" class="handoff"/>
+<path d="M884.3,416.0 L881.7,410.6 L886.4,410.4 Z" class="handoffhead"/>
+<line x1="1004.4" y1="358.0" x2="1006.6" y2="416.0" class="handoff"/>
+<path d="M1006.6,416.0 L1004.1,410.6 L1008.8,410.4 Z" class="handoffhead"/>
+<line x1="150.0" y1="492.0" x2="1210.0" y2="492.0" class="axis"/>
+<line x1="150.0" y1="492.0" x2="150.0" y2="497.0" class="axis"/>
+<text x="150.0" y="510.0" class="muted" font-size="12.6" text-anchor="middle" font-weight="400">0</text>
+<line x1="282.5" y1="492.0" x2="282.5" y2="497.0" class="axis"/>
+<text x="282.5" y="510.0" class="muted" font-size="12.6" text-anchor="middle" font-weight="400">200</text>
+<line x1="415.0" y1="492.0" x2="415.0" y2="497.0" class="axis"/>
+<text x="415.0" y="510.0" class="muted" font-size="12.6" text-anchor="middle" font-weight="400">400</text>
+<line x1="547.5" y1="492.0" x2="547.5" y2="497.0" class="axis"/>
+<text x="547.5" y="510.0" class="muted" font-size="12.6" text-anchor="middle" font-weight="400">600</text>
+<line x1="680.0" y1="492.0" x2="680.0" y2="497.0" class="axis"/>
+<text x="680.0" y="510.0" class="muted" font-size="12.6" text-anchor="middle" font-weight="400">800</text>
+<line x1="812.5" y1="492.0" x2="812.5" y2="497.0" class="axis"/>
+<text x="812.5" y="510.0" class="muted" font-size="12.6" text-anchor="middle" font-weight="400">1000</text>
+<line x1="945.0" y1="492.0" x2="945.0" y2="497.0" class="axis"/>
+<text x="945.0" y="510.0" class="muted" font-size="12.6" text-anchor="middle" font-weight="400">1200</text>
+<line x1="1077.5" y1="492.0" x2="1077.5" y2="497.0" class="axis"/>
+<text x="1077.5" y="510.0" class="muted" font-size="12.6" text-anchor="middle" font-weight="400">1400</text>
+<line x1="1210.0" y1="492.0" x2="1210.0" y2="497.0" class="axis"/>
+<text x="1210.0" y="510.0" class="muted" font-size="12.6" text-anchor="middle" font-weight="400">1600</text>
+<text x="1210.0" y="524.0" class="muted" font-size="12.6" text-anchor="end" font-weight="400">time (ms, schematic)</text>
+<rect x="168.4" y="143.0" width="3.0" height="5.0" rx="0" class="kvtick"/>
+<rect x="218.1" y="143.0" width="3.0" height="5.0" rx="0" class="kvtick"/>
+<rect x="267.8" y="143.0" width="3.0" height="5.0" rx="0" class="kvtick"/>
+<rect x="341.8" y="143.0" width="3.0" height="5.0" rx="0" class="kvtick"/>
+<rect x="462.9" y="143.0" width="3.0" height="5.0" rx="0" class="kvtick"/>
+<rect x="218.4" y="233.0" width="3.0" height="5.0" rx="0" class="kvtick"/>
+<rect x="268.1" y="233.0" width="3.0" height="5.0" rx="0" class="kvtick"/>
+<rect x="342.1" y="233.0" width="3.0" height="5.0" rx="0" class="kvtick"/>
+<rect x="463.2" y="233.0" width="3.0" height="5.0" rx="0" class="kvtick"/>
+<rect x="580.7" y="233.0" width="3.0" height="5.0" rx="0" class="kvtick"/>
+<rect x="268.4" y="323.0" width="3.0" height="5.0" rx="0" class="kvtick"/>
+<rect x="341.9" y="323.0" width="3.0" height="5.0" rx="0" class="kvtick"/>
+<rect x="463.1" y="323.0" width="3.0" height="5.0" rx="0" class="kvtick"/>
+<rect x="580.6" y="323.0" width="3.0" height="5.0" rx="0" class="kvtick"/>
+<rect x="700.6" y="323.0" width="3.0" height="5.0" rx="0" class="kvtick"/>
+<rect x="318.4" y="413.0" width="3.0" height="5.0" rx="0" class="kvtick"/>
+<rect x="459.0" y="413.0" width="3.0" height="5.0" rx="0" class="kvtick"/>
+<rect x="576.8" y="413.0" width="3.0" height="5.0" rx="0" class="kvtick"/>
+<rect x="696.6" y="413.0" width="3.0" height="5.0" rx="0" class="kvtick"/>
+<rect x="814.9" y="413.0" width="3.0" height="5.0" rx="0" class="kvtick"/>
+<path d="M582.1,328.0 C582.1,366.5 721.1,366.5 759.1,366.5" class="kvline"/>
+<path d="M761.1,366.5 L753.1,362.5 L753.1,370.5 Z" class="kvhead"/>
+<text x="586.1" y="387.0" class="ink2" font-size="12.6" text-anchor="middle" font-weight="400">MB4 load-back: issued at build, copy waits for forward MB3 (fence)</text>
+<line x1="444.5" y1="130.0" x2="447.8" y2="220.0" class="ctl"/>
+<path d="M447.8,220.0 L445.3,214.6 L450.0,214.4 Z" class="ctlhead"/>
+<line x1="561.9" y1="220.0" x2="565.2" y2="310.0" class="ctl"/>
+<path d="M565.2,310.0 L562.7,304.6 L567.3,304.4 Z" class="ctlhead"/>
+<line x1="677.9" y1="310.0" x2="681.2" y2="400.0" class="ctl"/>
+<path d="M681.2,400.0 L678.7,394.6 L683.4,394.4 Z" class="ctlhead"/>
+<rect x="24.0" y="528.0" width="1192.0" height="280.0" rx="6" class="panel"/>
+<text x="32.0" y="550.0" class="ink" font-size="14" text-anchor="start" font-weight="600">Zoom: PP2 while the GPU runs MB3 (same model, 2.3× wider)</text>
+<text x="142.0" y="618.0" class="muted" font-size="12.6" text-anchor="end" font-weight="400">host</text>
+<text x="142.0" y="660.0" class="muted" font-size="12.6" text-anchor="end" font-weight="400">GPU</text>
+<text x="142.0" y="692.0" class="muted" font-size="12.6" text-anchor="end" font-weight="400">H2D · CE</text>
+<rect x="150.0" y="606.0" width="11.1" height="18.0" rx="2" class="hcpu"/>
+<rect x="174.6" y="606.0" width="60.6" height="18.0" rx="2" class="hcpu"/>
+<text x="176.6" y="601.0" class="ink2" font-size="12.6" text-anchor="start" font-weight="400">build+admit MB4</text>
+<rect x="236.0" y="606.0" width="77.0" height="18.0" rx="2" class="hcpu"/>
+<text x="274.9" y="619.5" class="ink" font-size="12.6" text-anchor="middle" font-weight="400">launch MB4</text>
+<rect x="313.8" y="606.0" width="203.2" height="18.0" rx="2" class="hgpu"/>
+<text x="415.8" y="619.5" class="ink" font-size="12.6" text-anchor="middle" font-weight="400">waits: launch queue full</text>
+<rect x="517.8" y="606.0" width="13.5" height="18.0" rx="2" class="hcpu"/>
+<rect x="234.5" y="624.0" width="3.0" height="6.0" rx="0" class="kvtick"/>
+<rect x="545.5" y="606.0" width="60.6" height="18.0" rx="2" class="hcpu"/>
+<text x="547.5" y="601.0" class="ink2" font-size="12.6" text-anchor="start" font-weight="400">build+admit MB5</text>
+<rect x="607.0" y="606.0" width="77.0" height="18.0" rx="2" class="hcpu"/>
+<text x="645.9" y="619.5" class="ink" font-size="12.6" text-anchor="middle" font-weight="400">launch MB5</text>
+<rect x="684.8" y="606.0" width="197.8" height="18.0" rx="2" class="hgpu"/>
+<text x="784.1" y="619.5" class="ink" font-size="12.6" text-anchor="middle" font-weight="400">waits: launch queue full</text>
+<rect x="883.4" y="606.0" width="13.5" height="18.0" rx="2" class="hcpu"/>
+<rect x="605.5" y="624.0" width="3.0" height="6.0" rx="0" class="kvtick"/>
+<rect x="150.0" y="640.0" width="275.0" height="30.0" rx="5" class="b1 bstroke"/>
+<text x="288.0" y="659.0" class="btext" font-size="13.8" text-anchor="middle" font-weight="500">forward MB2</text>
+<rect x="426.0" y="640.0" width="7.4" height="30.0" rx="5" class="bubble bstroke"/>
+<rect x="434.4" y="640.0" width="353.9" height="30.0" rx="5" class="b2 bstroke"/>
+<text x="611.9" y="659.0" class="btext" font-size="13.8" text-anchor="middle" font-weight="500">forward MB3</text>
+<rect x="789.4" y="640.0" width="8.3" height="30.0" rx="5" class="bubble bstroke"/>
+<rect x="798.7" y="640.0" width="359.3" height="30.0" rx="5" class="b3 bstroke"/>
+<text x="978.9" y="659.0" class="btext" font-size="13.8" text-anchor="middle" font-weight="500">forward MB4</text>
+<rect x="1159.1" y="640.0" width="7.7" height="30.0" rx="5" class="bubble bstroke"/>
+<rect x="1167.8" y="640.0" width="31.2" height="30.0" rx="5" class="b4 bstroke"/>
+<rect x="426.0" y="682.0" width="4.1" height="12.0" rx="1.5" class="ce"/>
+<rect x="434.2" y="682.0" width="16.4" height="12.0" rx="1.5" class="xfer"/>
+<rect x="426.0" y="682.0" width="8.2" height="12.0" rx="1.5" class="kvbar"/>
+<rect x="789.4" y="682.0" width="4.1" height="12.0" rx="1.5" class="ce"/>
+<rect x="797.6" y="682.0" width="16.4" height="12.0" rx="1.5" class="xfer"/>
+<rect x="789.4" y="682.0" width="8.2" height="12.0" rx="1.5" class="kvbar"/>
+<rect x="1159.1" y="682.0" width="4.1" height="12.0" rx="1.5" class="ce"/>
+<rect x="1167.2" y="682.0" width="16.4" height="12.0" rx="1.5" class="xfer"/>
+<rect x="1159.1" y="682.0" width="8.2" height="12.0" rx="1.5" class="kvbar"/>
+<path d="M236.0,630.0 C236.0,712.0 729.4,712.0 789.4,695.0" class="kvline"/>
+<path d="M789.4,695.0 L781.4,701.0 L787.4,704.0 Z" class="kvhead"/>
+<text x="240.0" y="728.0" class="ink2" font-size="12.6" text-anchor="start" font-weight="400">① admit MB4 → load-back MB4 enqueued on the host (H2D stream waits for the forward stream)</text>
+<text x="240.0" y="744.0" class="ink2" font-size="12.6" text-anchor="start" font-weight="400">② copy runs only after forward MB3 ends, ≈270 ms later; forward MB4 waits on it per layer (whole load if a KDA-state copy-on-write is in the batch)</text>
+<text x="795.4" y="678.0" class="ink2" font-size="12.6" text-anchor="start" font-weight="400">push MB3 → PP3 + flag; early KV send MB3</text>
+<text x="150.0" y="574.0" class="ink2" font-size="13.8" text-anchor="start" font-weight="400">Host builds MB5 while forward MB3 runs: host ≈1.7 forwards ahead (measured lead 1.7–2.0, bounded by the 1,024-kernel launch queue).</text>
+<text x="32.0" y="768.0" class="ink2" font-size="13.8" text-anchor="start" font-weight="400">Host per round, long forwards (PP1–PP7 mean, measured): CPU work ≈ 65 ms (admission 16, build 5, launch ≈ 38, post-process 7); the rest is waiting.</text>
+<text x="32.0" y="788.0" class="ink2" font-size="13.8" text-anchor="start" font-weight="400">Not drawn: the CE gate thread host-waits forward j and the downstream free flag before it enqueues the push; the transfer worker sends KV.</text>
+<rect x="32.0" y="824.0" width="16.0" height="14.0" rx="2" class="hcpu"/>
+<text x="56.0" y="836.0" class="ink2" font-size="13.8" text-anchor="start" font-weight="400">host CPU work (build + admit, launch, post-process)</text>
+<rect x="427.0" y="824.0" width="16.0" height="14.0" rx="2" class="hpeer"/>
+<text x="451.0" y="836.0" class="ink2" font-size="13.8" text-anchor="start" font-weight="400">host waits: upstream message or send credit</text>
+<rect x="822.0" y="824.0" width="16.0" height="14.0" rx="2" class="hgpu"/>
+<text x="846.0" y="836.0" class="ink2" font-size="13.8" text-anchor="start" font-weight="400">host waits for its own GPU (launch queue full)</text>
+<rect x="32.0" y="846.0" width="16.0" height="14.0" rx="2" class="gapred"/>
+<text x="56.0" y="858.0" class="ink2" font-size="13.8" text-anchor="start" font-weight="400">GPU idle because the host is late</text>
+<rect x="427.0" y="846.0" width="16.0" height="14.0" rx="2" class="bubble"/>
+<text x="451.0" y="858.0" class="ink2" font-size="13.8" text-anchor="start" font-weight="400">GPU idle: waits for upstream input</text>
+<rect x="822.0" y="846.0" width="16.0" height="14.0" rx="2" class="kvbar"/>
+<text x="846.0" y="858.0" class="ink2" font-size="13.8" text-anchor="start" font-weight="400">prefix KV load-back, host → GPU (H2D kernel)</text>
+<rect x="32.0" y="868.0" width="16.0" height="14.0" rx="2" class="kvtick"/>
+<text x="56.0" y="880.0" class="ink2" font-size="13.8" text-anchor="start" font-weight="400">load-back of that micro-batch issued on the host</text>
+<rect x="427.0" y="868.0" width="16.0" height="14.0" rx="2" class="ce"/>
+<text x="451.0" y="880.0" class="ink2" font-size="13.8" text-anchor="start" font-weight="400">activation push (copy engine) + ready flag</text>
+<line x1="822.0" y1="870.0" x2="838.0" y2="882.0" class="handoff"/>
+<path d="M838.0,882.0 L832.2,880.6 L835.0,876.8 Z" class="handoffhead"/>
+<text x="846.0" y="880.0" class="ink2" font-size="13.8" text-anchor="start" font-weight="400">next stage's forward waits on the flag (GPU-side)</text>
+<rect x="32.0" y="890.0" width="16.0" height="14.0" rx="2" class="xfer"/>
+<text x="56.0" y="902.0" class="ink2" font-size="13.8" text-anchor="start" font-weight="400">early KV send to decode (RDMA, after the forward)</text>
+<line x1="427.0" y1="892.0" x2="443.0" y2="904.0" class="ctl"/>
+<path d="M443.0,904.0 L437.2,902.6 L440.0,898.8 Z" class="ctlhead"/>
+<text x="451.0" y="902.0" class="ink2" font-size="13.8" text-anchor="start" font-weight="400">control messages of MB4 (sent at the end of a round)</text>
 </svg>
