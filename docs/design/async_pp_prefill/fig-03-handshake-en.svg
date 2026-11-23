@@ -1,0 +1,152 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1240 488" width="1240" height="488" role="img" aria-labelledby="t d">
+<title id="t">Per-micro-batch host handshake: request relay and activation metadata</title>
+<desc id="d">Before: PP1's main thread blocks on the upstream request and shape messages and the GPU idles. Now: a background inbox thread receives them ahead, the loop pops them and forwards run back to back.</desc>
+<style>
+svg { font-family: system-ui, -apple-system, 'PingFang SC', 'Noto Sans CJK SC', 'Microsoft YaHei', sans-serif; }
+.bg { fill: #fcfcfb; }
+.ink { fill: #0b0b0b; } .ink2 { fill: #52514e; } .muted { fill: #898781; }
+.axis { stroke: #c3c2b7; stroke-width: 1; fill: none; }
+.grid { stroke: #e1e0d9; stroke-width: 1; fill: none; }
+.lane { stroke: #ecebe6; stroke-width: 1; fill: none; }
+.b0 { fill: #e6effa; } .b1 { fill: #d6e6f8; } .b2 { fill: #c6dcf5; }
+.b3 { fill: #b4d1f2; } .b4 { fill: #a2c5ef; } .b5 { fill: #8fb9ec; }
+.bstroke { stroke: #5b8fd0; stroke-width: 1.2; }
+.btext { fill: #0b0b0b; }
+.bubble { fill: #f3f3f1; stroke: #a8a7a1; stroke-width: 1.2; stroke-dasharray: 6 4; }
+.host { fill: #ecebe6; stroke: #b5b3ac; stroke-width: 1; }
+.block { fill: #fbe1d6; stroke: #ec835a; stroke-width: 1.2; }
+.spinbase { fill: #fdf0d5; stroke: #eda100; stroke-width: 1.2; }
+.hatch { stroke: #eda100; stroke-width: 1.4; }
+.ce { fill: #d9f2e6; stroke: #1baf7a; stroke-width: 1.2; }
+.kv { fill: #6250d6; }
+.flag { fill: #1baf7a; }
+.handoff { stroke: #2e8b57; stroke-width: 1.8; fill: none; }
+.handoffhead { fill: #2e8b57; }
+.dep { stroke: #d03b3b; stroke-width: 1.8; fill: none; }
+.dephead { fill: #d03b3b; }
+.barrier { stroke: #d03b3b; stroke-width: 1.6; }
+.ref { stroke: #898781; stroke-width: 1.4; fill: none; }
+.refhead { fill: #898781; }
+.gray { fill: #a3a29b; } .s1 { fill: #2a78d6; } .s2 { fill: #eb6834; } .s3 { fill: #1baf7a; } .s7 { fill: #6250d6; }
+.panel { fill: none; stroke: #e1e0d9; stroke-width: 1; }
+@media (prefers-color-scheme: dark) {
+  .bg { fill: #1a1a19; }
+  .ink { fill: #f0efec; } .ink2 { fill: #c3c2b7; }
+  .axis { stroke: #383835; } .grid { stroke: #2c2c2a; } .lane { stroke: #262624; }
+  .b0 { fill: #1f3550; } .b1 { fill: #23405f; } .b2 { fill: #274b6f; }
+  .b3 { fill: #2b567f; } .b4 { fill: #2f6190; } .b5 { fill: #336ca0; }
+  .bstroke { stroke: #5598e7; }
+  .btext { fill: #f0efec; }
+  .bubble { fill: #232322; stroke: #5e5d59; }
+  .host { fill: #2c2c2a; stroke: #55544f; }
+  .block { fill: #4a2a1f; stroke: #ec835a; }
+  .spinbase { fill: #3a2f14; stroke: #c98500; }
+  .hatch { stroke: #c98500; }
+  .ce { fill: #173b2d; stroke: #199e70; }
+  .kv { fill: #9085e9; }
+  .flag { fill: #199e70; }
+  .handoff { stroke: #3fb56f; } .handoffhead { fill: #3fb56f; }
+  .gray { fill: #6f6e68; } .s1 { fill: #3987e5; } .s2 { fill: #d95926; } .s3 { fill: #199e70; } .s7 { fill: #9085e9; }
+  .panel { stroke: #2c2c2a; }
+}
+</style>
+<rect x="0" y="0" width="1240" height="488" class="bg"/>
+<text x="32.0" y="40.0" class="ink" font-size="22" text-anchor="start" font-weight="650">Per-micro-batch host handshake: request relay and activation metadata</text>
+<text x="32.0" y="68.0" class="ink2" font-size="15" text-anchor="start" font-weight="400">A downstream loop needs the upstream requests and activation shapes before it can build the batch. It used to block on the main thread;</text>
+<text x="32.0" y="90.0" class="ink2" font-size="15" text-anchor="start" font-weight="400">now a background thread receives them ahead.</text>
+<text x="40.0" y="136.0" class="ink" font-size="17" text-anchor="start" font-weight="650">Before</text>
+<line x1="158.0" y1="197.0" x2="600.0" y2="197.0" class="lane"/>
+<text x="40.0" y="179.0" class="ink2" font-size="13" text-anchor="start" font-weight="500">PP0 host</text>
+<line x1="158.0" y1="243.0" x2="600.0" y2="243.0" class="lane"/>
+<text x="40.0" y="225.0" class="ink2" font-size="13" text-anchor="start" font-weight="500">PP1 host</text>
+<line x1="158.0" y1="289.0" x2="600.0" y2="289.0" class="lane"/>
+<text x="40.0" y="271.0" class="ink2" font-size="13" text-anchor="start" font-weight="500">PP1 GPU</text>
+<rect x="158.0" y="158.0" width="77.6" height="32.0" rx="6" class="host"></rect>
+<text x="196.8" y="178.3" class="ink" font-size="12" text-anchor="middle" font-weight="500">build j</text>
+<rect x="237.6" y="158.0" width="51.0" height="32.0" rx="6" class="host"></rect>
+<text x="263.1" y="178.3" class="ink" font-size="12" text-anchor="middle" font-weight="500">→ req</text>
+<rect x="290.6" y="158.0" width="95.2" height="32.0" rx="6" class="host"></rect>
+<text x="338.2" y="178.3" class="ink" font-size="12" text-anchor="middle" font-weight="500">launch fwd j</text>
+<rect x="387.8" y="158.0" width="51.0" height="32.0" rx="6" class="host"></rect>
+<text x="413.4" y="178.0" class="ink" font-size="11" text-anchor="middle" font-weight="500">→ shape</text>
+<rect x="440.9" y="158.0" width="157.1" height="32.0" rx="6" class="host"></rect>
+<text x="519.4" y="178.3" class="ink" font-size="12" text-anchor="middle" font-weight="500">build j+1 …</text>
+<rect x="158.0" y="204.0" width="130.6" height="32.0" rx="6" class="block"></rect>
+<text x="223.3" y="224.3" class="ink" font-size="12" text-anchor="middle" font-weight="500">wait: req j</text>
+<rect x="290.6" y="204.0" width="68.7" height="32.0" rx="6" class="host"></rect>
+<text x="325.0" y="224.3" class="ink" font-size="12" text-anchor="middle" font-weight="500">build j</text>
+<rect x="361.3" y="204.0" width="77.6" height="32.0" rx="6" class="block"></rect>
+<text x="400.1" y="224.0" class="ink" font-size="11" text-anchor="middle" font-weight="500">wait: shape</text>
+<rect x="440.9" y="204.0" width="42.2" height="32.0" rx="6" class="host"></rect>
+<text x="462.0" y="223.6" class="ink" font-size="10" text-anchor="middle" font-weight="500">launch</text>
+<rect x="158.0" y="250.0" width="325.1" height="32.0" rx="6" class="bubble"></rect>
+<text x="320.5" y="270.3" class="muted" font-size="12" text-anchor="middle" font-weight="500">GPU idle</text>
+<rect x="485.1" y="250.0" width="112.9" height="32.0" rx="6" class="b1 bstroke"></rect>
+<text x="541.5" y="270.3" class="btext" font-size="12" text-anchor="middle" font-weight="500">forward j</text>
+<line x1="281.8" y1="192.0" x2="290.6" y2="202.0" class="handoff"/>
+<path d="M290.6,202.0 L288.0,192.3 L281.3,198.2 Z" class="handoffhead"/>
+<line x1="432.0" y1="192.0" x2="440.9" y2="202.0" class="handoff"/>
+<path d="M440.9,202.0 L438.3,192.3 L431.5,198.2 Z" class="handoffhead"/>
+<text x="40.0" y="310.0" class="ink2" font-size="13" text-anchor="start" font-weight="400">Waits for: the upstream host to send this batch's requests and shapes</text>
+<text x="40.0" y="330.0" class="ink2" font-size="13" text-anchor="start" font-weight="400">If not ready: the main thread blocks in a gloo recv and the GPU idles</text>
+<text x="660.0" y="136.0" class="ink" font-size="17" text-anchor="start" font-weight="650">Now</text>
+<line x1="778.0" y1="197.0" x2="1220.0" y2="197.0" class="lane"/>
+<text x="660.0" y="179.0" class="ink2" font-size="13" text-anchor="start" font-weight="500">PP0 host</text>
+<line x1="778.0" y1="243.0" x2="1220.0" y2="243.0" class="lane"/>
+<text x="660.0" y="225.0" class="ink2" font-size="13" text-anchor="start" font-weight="500">PP1 inbox thread</text>
+<line x1="778.0" y1="289.0" x2="1220.0" y2="289.0" class="lane"/>
+<text x="660.0" y="271.0" class="ink2" font-size="13" text-anchor="start" font-weight="500">PP1 host</text>
+<line x1="778.0" y1="335.0" x2="1220.0" y2="335.0" class="lane"/>
+<text x="660.0" y="317.0" class="ink2" font-size="13" text-anchor="start" font-weight="500">PP1 GPU</text>
+<rect x="778.0" y="158.0" width="51.0" height="32.0" rx="6" class="host"></rect>
+<text x="803.5" y="178.3" class="ink" font-size="12" text-anchor="middle" font-weight="500">→ req</text>
+<rect x="831.0" y="158.0" width="51.0" height="32.0" rx="6" class="host"></rect>
+<text x="856.6" y="178.0" class="ink" font-size="11" text-anchor="middle" font-weight="500">→ shape</text>
+<rect x="884.1" y="158.0" width="148.3" height="32.0" rx="6" class="host"></rect>
+<text x="958.2" y="178.3" class="ink" font-size="12" text-anchor="middle" font-weight="500">build j+1, launch …</text>
+<rect x="1034.4" y="158.0" width="51.0" height="32.0" rx="6" class="host"></rect>
+<text x="1059.9" y="178.3" class="ink" font-size="12" text-anchor="middle" font-weight="500">→ req</text>
+<rect x="1087.4" y="158.0" width="130.6" height="32.0" rx="6" class="host"></rect>
+<text x="1152.7" y="178.3" class="ink" font-size="12" text-anchor="middle" font-weight="500">…</text>
+<rect x="826.6" y="204.0" width="51.0" height="32.0" rx="6" class="host"></rect>
+<text x="852.1" y="224.3" class="ink" font-size="12" text-anchor="middle" font-weight="500">recv'd</text>
+<rect x="884.1" y="204.0" width="51.0" height="32.0" rx="6" class="host"></rect>
+<text x="909.6" y="224.3" class="ink" font-size="12" text-anchor="middle" font-weight="500">recv'd</text>
+<rect x="1083.0" y="204.0" width="51.0" height="32.0" rx="6" class="host"></rect>
+<text x="1108.5" y="224.3" class="ink" font-size="12" text-anchor="middle" font-weight="500">recv'd</text>
+<rect x="778.0" y="250.0" width="166.0" height="32.0" rx="6" class="host"></rect>
+<text x="861.0" y="270.3" class="ink" font-size="12" text-anchor="middle" font-weight="500">earlier batches</text>
+<rect x="946.0" y="250.0" width="28.9" height="32.0" rx="6" class="host"></rect>
+<text x="960.4" y="270.3" class="ink" font-size="12" text-anchor="middle" font-weight="500">pop</text>
+<rect x="976.9" y="250.0" width="64.3" height="32.0" rx="6" class="host"></rect>
+<text x="1009.0" y="270.3" class="ink" font-size="12" text-anchor="middle" font-weight="500">build j</text>
+<rect x="1043.2" y="250.0" width="42.2" height="32.0" rx="6" class="host"></rect>
+<text x="1064.3" y="269.6" class="ink" font-size="10" text-anchor="middle" font-weight="500">launch</text>
+<rect x="1087.4" y="250.0" width="130.6" height="32.0" rx="6" class="host"></rect>
+<text x="1152.7" y="270.3" class="ink" font-size="12" text-anchor="middle" font-weight="500">…</text>
+<rect x="778.0" y="296.0" width="316.2" height="32.0" rx="6" class="b1 bstroke"></rect>
+<text x="936.1" y="316.3" class="btext" font-size="12" text-anchor="middle" font-weight="500">forward j−1</text>
+<rect x="1096.2" y="296.0" width="121.8" height="32.0" rx="6" class="b1 bstroke"></rect>
+<text x="1157.1" y="316.3" class="btext" font-size="12" text-anchor="middle" font-weight="500">forward j</text>
+<line x1="822.2" y1="192.0" x2="831.0" y2="202.0" class="handoff"/>
+<path d="M831.0,202.0 L828.5,192.3 L821.7,198.2 Z" class="handoffhead"/>
+<line x1="875.2" y1="192.0" x2="888.5" y2="202.0" class="handoff"/>
+<path d="M888.5,202.0 L884.0,193.0 L878.6,200.2 Z" class="handoffhead"/>
+<line x1="932.7" y1="238.0" x2="954.8" y2="248.0" class="handoff"/>
+<path d="M954.8,248.0 L948.5,240.2 L944.7,248.4 Z" class="handoffhead"/>
+<text x="660.0" y="356.0" class="ink2" font-size="13" text-anchor="start" font-weight="400">The inbox thread receives ahead; the message is usually there when the</text>
+<text x="660.0" y="376.0" class="ink2" font-size="13" text-anchor="start" font-weight="400">loop pops it</text>
+<text x="660.0" y="396.0" class="ink2" font-size="13" text-anchor="start" font-weight="400">It only waits when it has caught up with upstream; the GPU keeps running</text>
+<line x1="620.0" y1="122.0" x2="620.0" y2="436.0" class="grid"/>
+<rect x="40.0" y="449.0" width="18.0" height="18.0" rx="3" class="b1 bstroke"></rect>
+<text x="64.0" y="463.0" class="ink2" font-size="13" text-anchor="start" font-weight="400">compute (forward)</text>
+<rect x="214.2" y="449.0" width="18.0" height="18.0" rx="3" class="host"></rect>
+<text x="238.2" y="463.0" class="ink2" font-size="13" text-anchor="start" font-weight="400">normal host work</text>
+<rect x="380.8" y="449.0" width="18.0" height="18.0" rx="3" class="block"></rect>
+<text x="404.8" y="463.0" class="ink2" font-size="13" text-anchor="start" font-weight="400">blocked: host thread stalls</text>
+<rect x="630.4" y="449.0" width="18.0" height="18.0" rx="3" class="bubble"></rect>
+<text x="654.4" y="463.0" class="ink2" font-size="13" text-anchor="start" font-weight="400">idle</text>
+<line x1="706.6" y1="458.0" x2="724.6" y2="458.0" class="handoff"/>
+<path d="M724.6,458.0 L715.6,453.5 L715.6,462.5 Z" class="handoffhead"/>
+<text x="730.6" y="463.0" class="ink2" font-size="13" text-anchor="start" font-weight="400">data hand-off</text>
+</svg>

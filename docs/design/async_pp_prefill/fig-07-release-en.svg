@@ -1,0 +1,128 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1240 482" width="1240" height="482" role="img" aria-labelledby="t d">
+<title id="t">Release and write-back acknowledgements</title>
+<desc id="d">Before: the release list waited for the downstream receive every round and acks waited for the local copy. Now: epoch-tagged and asynchronous, acks lag; KV is still freed only after all stages have sent.</desc>
+<style>
+svg { font-family: system-ui, -apple-system, 'PingFang SC', 'Noto Sans CJK SC', 'Microsoft YaHei', sans-serif; }
+.bg { fill: #fcfcfb; }
+.ink { fill: #0b0b0b; } .ink2 { fill: #52514e; } .muted { fill: #898781; }
+.axis { stroke: #c3c2b7; stroke-width: 1; fill: none; }
+.grid { stroke: #e1e0d9; stroke-width: 1; fill: none; }
+.lane { stroke: #ecebe6; stroke-width: 1; fill: none; }
+.b0 { fill: #e6effa; } .b1 { fill: #d6e6f8; } .b2 { fill: #c6dcf5; }
+.b3 { fill: #b4d1f2; } .b4 { fill: #a2c5ef; } .b5 { fill: #8fb9ec; }
+.bstroke { stroke: #5b8fd0; stroke-width: 1.2; }
+.btext { fill: #0b0b0b; }
+.bubble { fill: #f3f3f1; stroke: #a8a7a1; stroke-width: 1.2; stroke-dasharray: 6 4; }
+.host { fill: #ecebe6; stroke: #b5b3ac; stroke-width: 1; }
+.block { fill: #fbe1d6; stroke: #ec835a; stroke-width: 1.2; }
+.spinbase { fill: #fdf0d5; stroke: #eda100; stroke-width: 1.2; }
+.hatch { stroke: #eda100; stroke-width: 1.4; }
+.ce { fill: #d9f2e6; stroke: #1baf7a; stroke-width: 1.2; }
+.kv { fill: #6250d6; }
+.flag { fill: #1baf7a; }
+.handoff { stroke: #2e8b57; stroke-width: 1.8; fill: none; }
+.handoffhead { fill: #2e8b57; }
+.dep { stroke: #d03b3b; stroke-width: 1.8; fill: none; }
+.dephead { fill: #d03b3b; }
+.barrier { stroke: #d03b3b; stroke-width: 1.6; }
+.ref { stroke: #898781; stroke-width: 1.4; fill: none; }
+.refhead { fill: #898781; }
+.gray { fill: #a3a29b; } .s1 { fill: #2a78d6; } .s2 { fill: #eb6834; } .s3 { fill: #1baf7a; } .s7 { fill: #6250d6; }
+.panel { fill: none; stroke: #e1e0d9; stroke-width: 1; }
+@media (prefers-color-scheme: dark) {
+  .bg { fill: #1a1a19; }
+  .ink { fill: #f0efec; } .ink2 { fill: #c3c2b7; }
+  .axis { stroke: #383835; } .grid { stroke: #2c2c2a; } .lane { stroke: #262624; }
+  .b0 { fill: #1f3550; } .b1 { fill: #23405f; } .b2 { fill: #274b6f; }
+  .b3 { fill: #2b567f; } .b4 { fill: #2f6190; } .b5 { fill: #336ca0; }
+  .bstroke { stroke: #5598e7; }
+  .btext { fill: #f0efec; }
+  .bubble { fill: #232322; stroke: #5e5d59; }
+  .host { fill: #2c2c2a; stroke: #55544f; }
+  .block { fill: #4a2a1f; stroke: #ec835a; }
+  .spinbase { fill: #3a2f14; stroke: #c98500; }
+  .hatch { stroke: #c98500; }
+  .ce { fill: #173b2d; stroke: #199e70; }
+  .kv { fill: #9085e9; }
+  .flag { fill: #199e70; }
+  .handoff { stroke: #3fb56f; } .handoffhead { fill: #3fb56f; }
+  .gray { fill: #6f6e68; } .s1 { fill: #3987e5; } .s2 { fill: #d95926; } .s3 { fill: #199e70; } .s7 { fill: #9085e9; }
+  .panel { stroke: #2c2c2a; }
+}
+</style>
+<rect x="0" y="0" width="1240" height="482" class="bg"/>
+<text x="32.0" y="40.0" class="ink" font-size="22" text-anchor="start" font-weight="650">Release and write-back acknowledgements</text>
+<text x="32.0" y="68.0" class="ink2" font-size="15" text-anchor="start" font-weight="400">PP0 decides the release list and the write-back ack counts and relays them down. Each round used to wait for the message to be taken</text>
+<text x="32.0" y="90.0" class="ink2" font-size="15" text-anchor="start" font-weight="400">and for the local copy; now they flow asynchronously and acks lag a few steps, but KV is still freed on all stages together.</text>
+<text x="40.0" y="136.0" class="ink" font-size="17" text-anchor="start" font-weight="650">Before</text>
+<line x1="158.0" y1="197.0" x2="600.0" y2="197.0" class="lane"/>
+<text x="40.0" y="179.0" class="ink2" font-size="13" text-anchor="start" font-weight="500">PP0 host</text>
+<line x1="158.0" y1="243.0" x2="600.0" y2="243.0" class="lane"/>
+<text x="40.0" y="225.0" class="ink2" font-size="13" text-anchor="start" font-weight="500">PP1 host</text>
+<rect x="158.0" y="158.0" width="77.6" height="32.0" rx="6" class="host"></rect>
+<text x="196.8" y="177.6" class="ink" font-size="10" text-anchor="middle" font-weight="500">release list</text>
+<rect x="237.6" y="158.0" width="95.2" height="32.0" rx="6" class="block"></rect>
+<text x="285.2" y="177.6" class="ink" font-size="10" text-anchor="middle" font-weight="500">wait: PP1 recv</text>
+<rect x="334.8" y="158.0" width="263.2" height="32.0" rx="6" class="host"></rect>
+<text x="466.4" y="178.3" class="ink" font-size="12" text-anchor="middle" font-weight="500">…</text>
+<rect x="158.0" y="204.0" width="121.8" height="32.0" rx="6" class="host"></rect>
+<text x="218.9" y="224.3" class="ink" font-size="12" text-anchor="middle" font-weight="500">previous batch</text>
+<rect x="281.8" y="204.0" width="51.0" height="32.0" rx="6" class="host"></rect>
+<text x="307.3" y="224.3" class="ink" font-size="12" text-anchor="middle" font-weight="500">recv</text>
+<rect x="334.8" y="204.0" width="42.2" height="32.0" rx="6" class="host"></rect>
+<text x="355.9" y="224.3" class="ink" font-size="12" text-anchor="middle" font-weight="500">free</text>
+<rect x="379.0" y="204.0" width="104.1" height="32.0" rx="6" class="block"></rect>
+<text x="431.0" y="224.0" class="ink" font-size="11" text-anchor="middle" font-weight="500">wait write-back</text>
+<rect x="485.1" y="204.0" width="112.9" height="32.0" rx="6" class="host"></rect>
+<text x="541.5" y="224.3" class="ink" font-size="12" text-anchor="middle" font-weight="500">…</text>
+<line x1="330.4" y1="202.0" x2="326.0" y2="192.0" class="dep"/>
+<path d="M326.0,192.0 L325.5,202.1 L333.7,198.4 Z" class="dephead"/>
+<text x="40.0" y="264.0" class="ink2" font-size="13" text-anchor="start" font-weight="400">Waits for: the release list to be taken; this rank's write-back copy to</text>
+<text x="40.0" y="284.0" class="ink2" font-size="13" text-anchor="start" font-weight="400">finish</text>
+<text x="40.0" y="304.0" class="ink2" font-size="13" text-anchor="start" font-weight="400">If not ready: the host blocks (window-1 send; draining acks by count)</text>
+<text x="40.0" y="324.0" class="ink2" font-size="13" text-anchor="start" font-weight="400">Requests whose transfer is not done: skipped this round, retried next (no</text>
+<text x="40.0" y="344.0" class="ink2" font-size="13" text-anchor="start" font-weight="400">block)</text>
+<text x="660.0" y="136.0" class="ink" font-size="17" text-anchor="start" font-weight="650">Now</text>
+<line x1="778.0" y1="197.0" x2="1220.0" y2="197.0" class="lane"/>
+<text x="660.0" y="179.0" class="ink2" font-size="13" text-anchor="start" font-weight="500">PP0 host</text>
+<line x1="778.0" y1="243.0" x2="1220.0" y2="243.0" class="lane"/>
+<text x="660.0" y="225.0" class="ink2" font-size="13" text-anchor="start" font-weight="500">PP1 host</text>
+<line x1="778.0" y1="289.0" x2="1220.0" y2="289.0" class="lane"/>
+<text x="660.0" y="271.0" class="ink2" font-size="13" text-anchor="start" font-weight="500">KV of request r</text>
+<rect x="778.0" y="158.0" width="104.1" height="32.0" rx="6" class="host"></rect>
+<text x="830.0" y="178.3" class="ink" font-size="12" text-anchor="middle" font-weight="500">list + epoch</text>
+<rect x="884.1" y="158.0" width="333.9" height="32.0" rx="6" class="host"></rect>
+<text x="1051.0" y="178.3" class="ink" font-size="12" text-anchor="middle" font-weight="500">keeps building, launching …</text>
+<rect x="778.0" y="204.0" width="192.5" height="32.0" rx="6" class="host"></rect>
+<text x="874.2" y="224.3" class="ink" font-size="12" text-anchor="middle" font-weight="500">earlier batches</text>
+<rect x="972.5" y="204.0" width="95.2" height="32.0" rx="6" class="host"></rect>
+<text x="1020.1" y="224.0" class="ink" font-size="11" text-anchor="middle" font-weight="500">free at epoch</text>
+<rect x="1069.7" y="204.0" width="148.3" height="32.0" rx="6" class="host"></rect>
+<text x="1143.9" y="224.3" class="ink" font-size="12" text-anchor="middle" font-weight="500">…</text>
+<rect x="778.0" y="250.0" width="77.6" height="32.0" rx="6" class="b1 bstroke"></rect>
+<text x="816.8" y="270.3" class="btext" font-size="12" text-anchor="middle" font-weight="500">PP0 sent</text>
+<rect x="857.6" y="250.0" width="68.7" height="32.0" rx="6" class="b1 bstroke"></rect>
+<text x="891.9" y="270.3" class="btext" font-size="12" text-anchor="middle" font-weight="500">PP3 sent</text>
+<rect x="928.3" y="250.0" width="139.4" height="32.0" rx="6" class="block"></rect>
+<text x="998.0" y="270.0" class="ink" font-size="11" text-anchor="middle" font-weight="500">held until last send</text>
+<line x1="875.2" y1="192.0" x2="981.3" y2="202.0" class="handoff"/>
+<path d="M981.3,202.0 L972.8,196.7 L971.9,205.6 Z" class="handoffhead"/>
+<text x="660.0" y="310.0" class="ink2" font-size="13" text-anchor="start" font-weight="400">The list travels asynchronously with an epoch; write-back acks publish 4</text>
+<text x="660.0" y="330.0" class="ink2" font-size="13" text-anchor="start" font-weight="400">steps late and rarely wait</text>
+<text x="660.0" y="350.0" class="ink2" font-size="13" text-anchor="start" font-weight="400">Remaining coupling: KV is freed at one epoch only after all 8 stages have</text>
+<text x="660.0" y="370.0" class="ink2" font-size="13" text-anchor="start" font-weight="400">sent</text>
+<text x="660.0" y="390.0" class="ink2" font-size="13" text-anchor="start" font-weight="400">Cost: 0.16–0.30 points lower prefix hit rate in the serving benchmark</text>
+<line x1="620.0" y1="122.0" x2="620.0" y2="430.0" class="grid"/>
+<rect x="40.0" y="443.0" width="18.0" height="18.0" rx="3" class="b1 bstroke"></rect>
+<text x="64.0" y="457.0" class="ink2" font-size="13" text-anchor="start" font-weight="400">compute (forward)</text>
+<rect x="214.2" y="443.0" width="18.0" height="18.0" rx="3" class="host"></rect>
+<text x="238.2" y="457.0" class="ink2" font-size="13" text-anchor="start" font-weight="400">normal host work</text>
+<rect x="380.8" y="443.0" width="18.0" height="18.0" rx="3" class="block"></rect>
+<text x="404.8" y="457.0" class="ink2" font-size="13" text-anchor="start" font-weight="400">blocked: host thread stalls</text>
+<line x1="630.4" y1="452.0" x2="648.4" y2="452.0" class="handoff"/>
+<path d="M648.4,452.0 L639.4,447.5 L639.4,456.5 Z" class="handoffhead"/>
+<text x="654.4" y="457.0" class="ink2" font-size="13" text-anchor="start" font-weight="400">data hand-off</text>
+<line x1="774.4" y1="452.0" x2="792.4" y2="452.0" class="dep"/>
+<path d="M792.4,452.0 L783.4,447.5 L783.4,456.5 Z" class="dephead"/>
+<text x="798.4" y="457.0" class="ink2" font-size="13" text-anchor="start" font-weight="400">dependency waited on</text>
+</svg>

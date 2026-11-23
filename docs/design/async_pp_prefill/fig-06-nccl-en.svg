@@ -1,0 +1,107 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1240 436" width="1240" height="436" role="img" aria-labelledby="t d">
+<title id="t">Resident NCCL kernels stretch the forward</title>
+<desc id="d">Before: a resident NCCL recv kernel holds SMs, the cooperative routing kernel queues and the forward stretches. Now: the copy engine copies and the stream waits on a flag, using no SMs.</desc>
+<style>
+svg { font-family: system-ui, -apple-system, 'PingFang SC', 'Noto Sans CJK SC', 'Microsoft YaHei', sans-serif; }
+.bg { fill: #fcfcfb; }
+.ink { fill: #0b0b0b; } .ink2 { fill: #52514e; } .muted { fill: #898781; }
+.axis { stroke: #c3c2b7; stroke-width: 1; fill: none; }
+.grid { stroke: #e1e0d9; stroke-width: 1; fill: none; }
+.lane { stroke: #ecebe6; stroke-width: 1; fill: none; }
+.b0 { fill: #e6effa; } .b1 { fill: #d6e6f8; } .b2 { fill: #c6dcf5; }
+.b3 { fill: #b4d1f2; } .b4 { fill: #a2c5ef; } .b5 { fill: #8fb9ec; }
+.bstroke { stroke: #5b8fd0; stroke-width: 1.2; }
+.btext { fill: #0b0b0b; }
+.bubble { fill: #f3f3f1; stroke: #a8a7a1; stroke-width: 1.2; stroke-dasharray: 6 4; }
+.host { fill: #ecebe6; stroke: #b5b3ac; stroke-width: 1; }
+.block { fill: #fbe1d6; stroke: #ec835a; stroke-width: 1.2; }
+.spinbase { fill: #fdf0d5; stroke: #eda100; stroke-width: 1.2; }
+.hatch { stroke: #eda100; stroke-width: 1.4; }
+.ce { fill: #d9f2e6; stroke: #1baf7a; stroke-width: 1.2; }
+.kv { fill: #6250d6; }
+.flag { fill: #1baf7a; }
+.handoff { stroke: #2e8b57; stroke-width: 1.8; fill: none; }
+.handoffhead { fill: #2e8b57; }
+.dep { stroke: #d03b3b; stroke-width: 1.8; fill: none; }
+.dephead { fill: #d03b3b; }
+.barrier { stroke: #d03b3b; stroke-width: 1.6; }
+.ref { stroke: #898781; stroke-width: 1.4; fill: none; }
+.refhead { fill: #898781; }
+.gray { fill: #a3a29b; } .s1 { fill: #2a78d6; } .s2 { fill: #eb6834; } .s3 { fill: #1baf7a; } .s7 { fill: #6250d6; }
+.panel { fill: none; stroke: #e1e0d9; stroke-width: 1; }
+@media (prefers-color-scheme: dark) {
+  .bg { fill: #1a1a19; }
+  .ink { fill: #f0efec; } .ink2 { fill: #c3c2b7; }
+  .axis { stroke: #383835; } .grid { stroke: #2c2c2a; } .lane { stroke: #262624; }
+  .b0 { fill: #1f3550; } .b1 { fill: #23405f; } .b2 { fill: #274b6f; }
+  .b3 { fill: #2b567f; } .b4 { fill: #2f6190; } .b5 { fill: #336ca0; }
+  .bstroke { stroke: #5598e7; }
+  .btext { fill: #f0efec; }
+  .bubble { fill: #232322; stroke: #5e5d59; }
+  .host { fill: #2c2c2a; stroke: #55544f; }
+  .block { fill: #4a2a1f; stroke: #ec835a; }
+  .spinbase { fill: #3a2f14; stroke: #c98500; }
+  .hatch { stroke: #c98500; }
+  .ce { fill: #173b2d; stroke: #199e70; }
+  .kv { fill: #9085e9; }
+  .flag { fill: #199e70; }
+  .handoff { stroke: #3fb56f; } .handoffhead { fill: #3fb56f; }
+  .gray { fill: #6f6e68; } .s1 { fill: #3987e5; } .s2 { fill: #d95926; } .s3 { fill: #199e70; } .s7 { fill: #9085e9; }
+  .panel { stroke: #2c2c2a; }
+}
+</style>
+<rect x="0" y="0" width="1240" height="436" class="bg"/>
+<text x="32.0" y="40.0" class="ink" font-size="22" text-anchor="start" font-weight="650">Resident NCCL kernels stretch the forward</text>
+<text x="32.0" y="68.0" class="ink2" font-size="15" text-anchor="start" font-weight="400">One side of an NCCL point-to-point transfer spins on the GPU holding SMs; the cooperative MoE routing kernel needs every SM free at</text>
+<text x="32.0" y="90.0" class="ink2" font-size="15" text-anchor="start" font-weight="400">once, so it queues.</text>
+<text x="40.0" y="136.0" class="ink" font-size="17" text-anchor="start" font-weight="650">Before</text>
+<line x1="158.0" y1="197.0" x2="600.0" y2="197.0" class="lane"/>
+<text x="40.0" y="179.0" class="ink2" font-size="13" text-anchor="start" font-weight="500">SMs (compute)</text>
+<line x1="158.0" y1="243.0" x2="600.0" y2="243.0" class="lane"/>
+<text x="40.0" y="225.0" class="ink2" font-size="13" text-anchor="start" font-weight="500">comm</text>
+<rect x="158.0" y="158.0" width="130.6" height="32.0" rx="6" class="b1 bstroke"></rect>
+<text x="223.3" y="178.3" class="btext" font-size="12" text-anchor="middle" font-weight="500">attention etc.</text>
+<rect x="290.6" y="158.0" width="86.4" height="32.0" rx="6" class="block"></rect>
+<rect x="379.0" y="158.0" width="121.8" height="32.0" rx="6" class="b1 bstroke"></rect>
+<text x="439.9" y="178.3" class="btext" font-size="12" text-anchor="middle" font-weight="500">MoE etc.</text>
+<rect x="502.8" y="158.0" width="51.0" height="32.0" rx="6" class="block"></rect>
+<text x="528.3" y="178.3" class="ink" font-size="12" text-anchor="middle" font-weight="500">queued</text>
+<rect x="555.8" y="158.0" width="42.2" height="32.0" rx="6" class="b1 bstroke"></rect>
+<text x="576.9" y="178.3" class="btext" font-size="12" text-anchor="middle" font-weight="500">…</text>
+<clipPath id="clip17"><rect x="158.0" y="204.0" width="440.0" height="32.0" rx="6"/></clipPath>
+<rect x="158.0" y="204.0" width="440.0" height="32.0" rx="6" class="spinbase"></rect>
+<g clip-path="url(#clip17)" opacity="0.55"><line x1="126.0" y1="236.0" x2="158.0" y2="204.0" class="hatch"/><line x1="135.0" y1="236.0" x2="167.0" y2="204.0" class="hatch"/><line x1="144.0" y1="236.0" x2="176.0" y2="204.0" class="hatch"/><line x1="153.0" y1="236.0" x2="185.0" y2="204.0" class="hatch"/><line x1="162.0" y1="236.0" x2="194.0" y2="204.0" class="hatch"/><line x1="171.0" y1="236.0" x2="203.0" y2="204.0" class="hatch"/><line x1="180.0" y1="236.0" x2="212.0" y2="204.0" class="hatch"/><line x1="189.0" y1="236.0" x2="221.0" y2="204.0" class="hatch"/><line x1="198.0" y1="236.0" x2="230.0" y2="204.0" class="hatch"/><line x1="207.0" y1="236.0" x2="239.0" y2="204.0" class="hatch"/><line x1="216.0" y1="236.0" x2="248.0" y2="204.0" class="hatch"/><line x1="225.0" y1="236.0" x2="257.0" y2="204.0" class="hatch"/><line x1="234.0" y1="236.0" x2="266.0" y2="204.0" class="hatch"/><line x1="243.0" y1="236.0" x2="275.0" y2="204.0" class="hatch"/><line x1="252.0" y1="236.0" x2="284.0" y2="204.0" class="hatch"/><line x1="261.0" y1="236.0" x2="293.0" y2="204.0" class="hatch"/><line x1="270.0" y1="236.0" x2="302.0" y2="204.0" class="hatch"/><line x1="279.0" y1="236.0" x2="311.0" y2="204.0" class="hatch"/><line x1="288.0" y1="236.0" x2="320.0" y2="204.0" class="hatch"/><line x1="297.0" y1="236.0" x2="329.0" y2="204.0" class="hatch"/><line x1="306.0" y1="236.0" x2="338.0" y2="204.0" class="hatch"/><line x1="315.0" y1="236.0" x2="347.0" y2="204.0" class="hatch"/><line x1="324.0" y1="236.0" x2="356.0" y2="204.0" class="hatch"/><line x1="333.0" y1="236.0" x2="365.0" y2="204.0" class="hatch"/><line x1="342.0" y1="236.0" x2="374.0" y2="204.0" class="hatch"/><line x1="351.0" y1="236.0" x2="383.0" y2="204.0" class="hatch"/><line x1="360.0" y1="236.0" x2="392.0" y2="204.0" class="hatch"/><line x1="369.0" y1="236.0" x2="401.0" y2="204.0" class="hatch"/><line x1="378.0" y1="236.0" x2="410.0" y2="204.0" class="hatch"/><line x1="387.0" y1="236.0" x2="419.0" y2="204.0" class="hatch"/><line x1="396.0" y1="236.0" x2="428.0" y2="204.0" class="hatch"/><line x1="405.0" y1="236.0" x2="437.0" y2="204.0" class="hatch"/><line x1="414.0" y1="236.0" x2="446.0" y2="204.0" class="hatch"/><line x1="423.0" y1="236.0" x2="455.0" y2="204.0" class="hatch"/><line x1="432.0" y1="236.0" x2="464.0" y2="204.0" class="hatch"/><line x1="441.0" y1="236.0" x2="473.0" y2="204.0" class="hatch"/><line x1="450.0" y1="236.0" x2="482.0" y2="204.0" class="hatch"/><line x1="459.0" y1="236.0" x2="491.0" y2="204.0" class="hatch"/><line x1="468.0" y1="236.0" x2="500.0" y2="204.0" class="hatch"/><line x1="477.0" y1="236.0" x2="509.0" y2="204.0" class="hatch"/><line x1="486.0" y1="236.0" x2="518.0" y2="204.0" class="hatch"/><line x1="495.0" y1="236.0" x2="527.0" y2="204.0" class="hatch"/><line x1="504.0" y1="236.0" x2="536.0" y2="204.0" class="hatch"/><line x1="513.0" y1="236.0" x2="545.0" y2="204.0" class="hatch"/><line x1="522.0" y1="236.0" x2="554.0" y2="204.0" class="hatch"/><line x1="531.0" y1="236.0" x2="563.0" y2="204.0" class="hatch"/><line x1="540.0" y1="236.0" x2="572.0" y2="204.0" class="hatch"/><line x1="549.0" y1="236.0" x2="581.0" y2="204.0" class="hatch"/><line x1="558.0" y1="236.0" x2="590.0" y2="204.0" class="hatch"/><line x1="567.0" y1="236.0" x2="599.0" y2="204.0" class="hatch"/><line x1="576.0" y1="236.0" x2="608.0" y2="204.0" class="hatch"/><line x1="585.0" y1="236.0" x2="617.0" y2="204.0" class="hatch"/><line x1="594.0" y1="236.0" x2="626.0" y2="204.0" class="hatch"/></g>
+<text x="378.0" y="224.3" class="ink" font-size="12" text-anchor="middle" font-weight="500">NCCL recv kernel resident, spinning for upstream</text>
+<text x="40.0" y="264.0" class="ink2" font-size="13" text-anchor="start" font-weight="400">Waits for: upstream activations (NCCL handshake)</text>
+<text x="40.0" y="284.0" class="ink2" font-size="13" text-anchor="start" font-weight="400">If not ready: the kernel spins on SMs and the forward on the same GPU</text>
+<text x="40.0" y="304.0" class="ink2" font-size="13" text-anchor="start" font-weight="400">stretches</text>
+<text x="40.0" y="324.0" class="ink2" font-size="13" text-anchor="start" font-weight="400">Measured: waiting side's forward +4–7.7% (microbench); last stage +17% on</text>
+<text x="40.0" y="344.0" class="ink2" font-size="13" text-anchor="start" font-weight="400">the test bench</text>
+<text x="660.0" y="136.0" class="ink" font-size="17" text-anchor="start" font-weight="650">Now</text>
+<line x1="778.0" y1="197.0" x2="1220.0" y2="197.0" class="lane"/>
+<text x="660.0" y="179.0" class="ink2" font-size="13" text-anchor="start" font-weight="500">SMs (compute)</text>
+<line x1="778.0" y1="243.0" x2="1220.0" y2="243.0" class="lane"/>
+<text x="660.0" y="225.0" class="ink2" font-size="13" text-anchor="start" font-weight="500">copy engine</text>
+<rect x="778.0" y="158.0" width="130.6" height="32.0" rx="6" class="b1 bstroke"></rect>
+<text x="843.3" y="178.3" class="btext" font-size="12" text-anchor="middle" font-weight="500">attention etc.</text>
+<rect x="910.6" y="158.0" width="148.3" height="32.0" rx="6" class="b1 bstroke"></rect>
+<text x="984.7" y="178.0" class="btext" font-size="11" text-anchor="middle" font-weight="500">MoE etc., no queueing</text>
+<rect x="1060.9" y="158.0" width="42.2" height="32.0" rx="6" class="b1 bstroke"></rect>
+<text x="1082.0" y="178.3" class="btext" font-size="12" text-anchor="middle" font-weight="500">…</text>
+<rect x="822.2" y="204.0" width="95.2" height="32.0" rx="6" class="ce"></rect>
+<rect x="917.4" y="208.0" width="4.0" height="24.0" rx="1" class="flag"></rect>
+<text x="660.0" y="264.0" class="ink2" font-size="13" text-anchor="start" font-weight="400">The copy engine writes the next stage's input slot, then a ready flag</text>
+<text x="660.0" y="284.0" class="ink2" font-size="13" text-anchor="start" font-weight="400">The downstream stream waits on the flag (cuStreamWaitValue32) using no SMs</text>
+<text x="660.0" y="304.0" class="ink2" font-size="13" text-anchor="start" font-weight="400">Measured: no stretch; last stage forward 189.0 → 152.2 ms</text>
+<line x1="620.0" y1="122.0" x2="620.0" y2="384.0" class="grid"/>
+<rect x="40.0" y="397.0" width="18.0" height="18.0" rx="3" class="b1 bstroke"></rect>
+<text x="64.0" y="411.0" class="ink2" font-size="13" text-anchor="start" font-weight="400">compute (forward)</text>
+<rect x="214.2" y="397.0" width="18.0" height="18.0" rx="3" class="block"></rect>
+<text x="238.2" y="411.0" class="ink2" font-size="13" text-anchor="start" font-weight="400">forward waits for SMs (the stretch)</text>
+<clipPath id="clip47"><rect x="524.1" y="397.0" width="18.0" height="18.0" rx="6"/></clipPath>
+<rect x="524.1" y="397.0" width="18.0" height="18.0" rx="6" class="spinbase"></rect>
+<g clip-path="url(#clip47)" opacity="0.55"><line x1="506.1" y1="415.0" x2="524.1" y2="397.0" class="hatch"/><line x1="515.1" y1="415.0" x2="533.1" y2="397.0" class="hatch"/><line x1="524.1" y1="415.0" x2="542.1" y2="397.0" class="hatch"/><line x1="533.1" y1="415.0" x2="551.1" y2="397.0" class="hatch"/></g>
+<text x="548.1" y="411.0" class="ink2" font-size="13" text-anchor="start" font-weight="400">spinning: a kernel holds SMs while waiting</text>
+<rect x="886.8" y="397.0" width="18.0" height="18.0" rx="3" class="ce"></rect>
+<text x="910.8" y="411.0" class="ink2" font-size="13" text-anchor="start" font-weight="400">copy engine copy (no SMs)</text>
+</svg>

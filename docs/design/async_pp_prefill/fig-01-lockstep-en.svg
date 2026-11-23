@@ -1,0 +1,206 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1240 470" width="1240" height="470" role="img" aria-labelledby="t d">
+<title id="t">Lockstep PP (schematic)</title>
+<desc id="d">A lockstep pipeline of 4 stages and 5 micro-batches: every beat all stages meet once on the host, so the beat is the slowest micro-batch in flight plus the rendezvous.</desc>
+<style>
+svg { font-family: system-ui, -apple-system, 'PingFang SC', 'Noto Sans CJK SC', 'Microsoft YaHei', sans-serif; }
+.bg { fill: #fcfcfb; }
+.ink { fill: #0b0b0b; } .ink2 { fill: #52514e; } .muted { fill: #898781; }
+.axis { stroke: #c3c2b7; stroke-width: 1; fill: none; }
+.grid { stroke: #e1e0d9; stroke-width: 1; fill: none; }
+.lane { stroke: #ecebe6; stroke-width: 1; fill: none; }
+.b0 { fill: #e6effa; } .b1 { fill: #d6e6f8; } .b2 { fill: #c6dcf5; }
+.b3 { fill: #b4d1f2; } .b4 { fill: #a2c5ef; } .b5 { fill: #8fb9ec; }
+.bstroke { stroke: #5b8fd0; stroke-width: 1.2; }
+.btext { fill: #0b0b0b; }
+.bubble { fill: #f3f3f1; stroke: #a8a7a1; stroke-width: 1.2; stroke-dasharray: 6 4; }
+.host { fill: #ecebe6; stroke: #b5b3ac; stroke-width: 1; }
+.block { fill: #fbe1d6; stroke: #ec835a; stroke-width: 1.2; }
+.spinbase { fill: #fdf0d5; stroke: #eda100; stroke-width: 1.2; }
+.hatch { stroke: #eda100; stroke-width: 1.4; }
+.ce { fill: #d9f2e6; stroke: #1baf7a; stroke-width: 1.2; }
+.kv { fill: #6250d6; }
+.flag { fill: #1baf7a; }
+.handoff { stroke: #2e8b57; stroke-width: 1.8; fill: none; }
+.handoffhead { fill: #2e8b57; }
+.dep { stroke: #d03b3b; stroke-width: 1.8; fill: none; }
+.dephead { fill: #d03b3b; }
+.barrier { stroke: #d03b3b; stroke-width: 1.6; }
+.ref { stroke: #898781; stroke-width: 1.4; fill: none; }
+.refhead { fill: #898781; }
+.gray { fill: #a3a29b; } .s1 { fill: #2a78d6; } .s2 { fill: #eb6834; } .s3 { fill: #1baf7a; } .s7 { fill: #6250d6; }
+.panel { fill: none; stroke: #e1e0d9; stroke-width: 1; }
+@media (prefers-color-scheme: dark) {
+  .bg { fill: #1a1a19; }
+  .ink { fill: #f0efec; } .ink2 { fill: #c3c2b7; }
+  .axis { stroke: #383835; } .grid { stroke: #2c2c2a; } .lane { stroke: #262624; }
+  .b0 { fill: #1f3550; } .b1 { fill: #23405f; } .b2 { fill: #274b6f; }
+  .b3 { fill: #2b567f; } .b4 { fill: #2f6190; } .b5 { fill: #336ca0; }
+  .bstroke { stroke: #5598e7; }
+  .btext { fill: #f0efec; }
+  .bubble { fill: #232322; stroke: #5e5d59; }
+  .host { fill: #2c2c2a; stroke: #55544f; }
+  .block { fill: #4a2a1f; stroke: #ec835a; }
+  .spinbase { fill: #3a2f14; stroke: #c98500; }
+  .hatch { stroke: #c98500; }
+  .ce { fill: #173b2d; stroke: #199e70; }
+  .kv { fill: #9085e9; }
+  .flag { fill: #199e70; }
+  .handoff { stroke: #3fb56f; } .handoffhead { fill: #3fb56f; }
+  .gray { fill: #6f6e68; } .s1 { fill: #3987e5; } .s2 { fill: #d95926; } .s3 { fill: #199e70; } .s7 { fill: #9085e9; }
+  .panel { stroke: #2c2c2a; }
+}
+</style>
+<rect x="0" y="0" width="1240" height="470" class="bg"/>
+<text x="32.0" y="40.0" class="ink" font-size="22" text-anchor="start" font-weight="650">Lockstep PP: every beat, all stages meet once (schematic)</text>
+<text x="32.0" y="68.0" class="ink2" font-size="15" text-anchor="start" font-weight="400">Stage costs are within 3% of each other, yet the beat = the slowest micro-batch in flight + host rendezvous, and every stage loses time</text>
+<text x="32.0" y="90.0" class="ink2" font-size="15" text-anchor="start" font-weight="400">at every barrier.</text>
+<text x="32.0" y="144.0" class="ink" font-size="16" text-anchor="start" font-weight="600">PP0</text>
+<text x="32.0" y="206.0" class="ink" font-size="16" text-anchor="start" font-weight="600">PP1</text>
+<text x="32.0" y="268.0" class="ink" font-size="16" text-anchor="start" font-weight="600">PP2</text>
+<text x="32.0" y="330.0" class="ink" font-size="16" text-anchor="start" font-weight="600">PP3</text>
+<rect x="122.0" y="118.0" width="9.0" height="42.0" rx="3" class="host"></rect>
+<rect x="132.0" y="118.0" width="85.0" height="42.0" rx="6" class="b0 bstroke"></rect>
+<text x="174.5" y="143.7" class="btext" font-size="13" text-anchor="middle" font-weight="500">MB1</text>
+<rect x="122.0" y="180.0" width="97.0" height="42.0" rx="6" class="bubble"></rect>
+<rect x="122.0" y="242.0" width="97.0" height="42.0" rx="6" class="bubble"></rect>
+<rect x="122.0" y="304.0" width="97.0" height="42.0" rx="6" class="bubble"></rect>
+<line x1="120.0" y1="106.0" x2="120.0" y2="358.0" class="barrier"/>
+<rect x="223.0" y="118.0" width="9.0" height="42.0" rx="3" class="host"></rect>
+<rect x="233.0" y="118.0" width="89.2" height="42.0" rx="6" class="b1 bstroke"></rect>
+<text x="277.6" y="143.7" class="btext" font-size="13" text-anchor="middle" font-weight="500">MB2</text>
+<rect x="223.0" y="180.0" width="9.0" height="42.0" rx="3" class="host"></rect>
+<rect x="233.0" y="180.0" width="82.5" height="42.0" rx="6" class="b0 bstroke"></rect>
+<text x="274.2" y="205.7" class="btext" font-size="13" text-anchor="middle" font-weight="500">MB1</text>
+<rect x="317.4" y="180.0" width="6.8" height="42.0" rx="6" class="bubble"></rect>
+<rect x="223.0" y="242.0" width="101.2" height="42.0" rx="6" class="bubble"></rect>
+<rect x="223.0" y="304.0" width="101.2" height="42.0" rx="6" class="bubble"></rect>
+<line x1="221.0" y1="106.0" x2="221.0" y2="358.0" class="barrier"/>
+<rect x="328.2" y="118.0" width="9.0" height="42.0" rx="3" class="host"></rect>
+<rect x="338.2" y="118.0" width="81.6" height="42.0" rx="6" class="b2 bstroke"></rect>
+<text x="379.1" y="143.7" class="btext" font-size="13" text-anchor="middle" font-weight="500">MB3</text>
+<rect x="328.2" y="180.0" width="9.0" height="42.0" rx="3" class="host"></rect>
+<rect x="338.2" y="180.0" width="86.6" height="42.0" rx="6" class="b1 bstroke"></rect>
+<text x="381.5" y="205.7" class="btext" font-size="13" text-anchor="middle" font-weight="500">MB2</text>
+<rect x="328.2" y="242.0" width="9.0" height="42.0" rx="3" class="host"></rect>
+<rect x="338.2" y="242.0" width="84.2" height="42.0" rx="6" class="b0 bstroke"></rect>
+<text x="380.3" y="267.7" class="btext" font-size="13" text-anchor="middle" font-weight="500">MB1</text>
+<rect x="328.2" y="304.0" width="98.6" height="42.0" rx="6" class="bubble"></rect>
+<line x1="326.2" y1="106.0" x2="326.2" y2="358.0" class="barrier"/>
+<rect x="430.8" y="118.0" width="9.0" height="42.0" rx="3" class="host"></rect>
+<rect x="440.8" y="118.0" width="87.5" height="42.0" rx="6" class="b3 bstroke"></rect>
+<text x="484.6" y="143.7" class="btext" font-size="13" text-anchor="middle" font-weight="500">MB4</text>
+<rect x="430.8" y="180.0" width="9.0" height="42.0" rx="3" class="host"></rect>
+<rect x="440.8" y="180.0" width="79.2" height="42.0" rx="6" class="b2 bstroke"></rect>
+<text x="480.4" y="205.7" class="btext" font-size="13" text-anchor="middle" font-weight="500">MB3</text>
+<rect x="522.0" y="180.0" width="9.2" height="42.0" rx="6" class="bubble"></rect>
+<rect x="430.8" y="242.0" width="9.0" height="42.0" rx="3" class="host"></rect>
+<rect x="440.8" y="242.0" width="88.4" height="42.0" rx="6" class="b1 bstroke"></rect>
+<text x="485.0" y="267.7" class="btext" font-size="13" text-anchor="middle" font-weight="500">MB2</text>
+<rect x="430.8" y="304.0" width="9.0" height="42.0" rx="3" class="host"></rect>
+<rect x="440.8" y="304.0" width="83.3" height="42.0" rx="6" class="b0 bstroke"></rect>
+<text x="482.5" y="329.7" class="btext" font-size="13" text-anchor="middle" font-weight="500">MB1</text>
+<line x1="428.8" y1="106.0" x2="428.8" y2="358.0" class="barrier"/>
+<rect x="535.2" y="118.0" width="9.0" height="42.0" rx="3" class="host"></rect>
+<rect x="545.2" y="118.0" width="82.5" height="42.0" rx="6" class="b4 bstroke"></rect>
+<text x="586.4" y="143.7" class="btext" font-size="13" text-anchor="middle" font-weight="500">MB5</text>
+<rect x="535.2" y="180.0" width="9.0" height="42.0" rx="3" class="host"></rect>
+<rect x="545.2" y="180.0" width="84.9" height="42.0" rx="6" class="b3 bstroke"></rect>
+<text x="587.6" y="205.7" class="btext" font-size="13" text-anchor="middle" font-weight="500">MB4</text>
+<rect x="535.2" y="242.0" width="9.0" height="42.0" rx="3" class="host"></rect>
+<rect x="545.2" y="242.0" width="80.8" height="42.0" rx="6" class="b2 bstroke"></rect>
+<text x="585.6" y="267.7" class="btext" font-size="13" text-anchor="middle" font-weight="500">MB3</text>
+<rect x="628.0" y="242.0" width="6.7" height="42.0" rx="6" class="bubble"></rect>
+<rect x="535.2" y="304.0" width="9.0" height="42.0" rx="3" class="host"></rect>
+<rect x="545.2" y="304.0" width="87.5" height="42.0" rx="6" class="b1 bstroke"></rect>
+<text x="588.9" y="329.7" class="btext" font-size="13" text-anchor="middle" font-weight="500">MB2</text>
+<line x1="533.2" y1="106.0" x2="533.2" y2="358.0" class="barrier"/>
+<rect x="638.6" y="118.0" width="98.7" height="42.0" rx="6" class="bubble"></rect>
+<rect x="638.6" y="180.0" width="9.0" height="42.0" rx="3" class="host"></rect>
+<rect x="648.6" y="180.0" width="80.0" height="42.0" rx="6" class="b4 bstroke"></rect>
+<text x="688.6" y="205.7" class="btext" font-size="13" text-anchor="middle" font-weight="500">MB5</text>
+<rect x="730.6" y="180.0" width="6.7" height="42.0" rx="6" class="bubble"></rect>
+<rect x="638.6" y="242.0" width="9.0" height="42.0" rx="3" class="host"></rect>
+<rect x="648.6" y="242.0" width="86.7" height="42.0" rx="6" class="b3 bstroke"></rect>
+<text x="692.0" y="267.7" class="btext" font-size="13" text-anchor="middle" font-weight="500">MB4</text>
+<rect x="638.6" y="304.0" width="9.0" height="42.0" rx="3" class="host"></rect>
+<rect x="648.6" y="304.0" width="80.0" height="42.0" rx="6" class="b2 bstroke"></rect>
+<text x="688.6" y="329.7" class="btext" font-size="13" text-anchor="middle" font-weight="500">MB3</text>
+<rect x="730.6" y="304.0" width="6.7" height="42.0" rx="6" class="bubble"></rect>
+<line x1="636.6" y1="106.0" x2="636.6" y2="358.0" class="barrier"/>
+<rect x="741.3" y="118.0" width="97.8" height="42.0" rx="6" class="bubble"></rect>
+<rect x="741.3" y="180.0" width="97.8" height="42.0" rx="6" class="bubble"></rect>
+<rect x="741.3" y="242.0" width="9.0" height="42.0" rx="3" class="host"></rect>
+<rect x="751.3" y="242.0" width="81.6" height="42.0" rx="6" class="b4 bstroke"></rect>
+<text x="792.1" y="267.7" class="btext" font-size="13" text-anchor="middle" font-weight="500">MB5</text>
+<rect x="741.3" y="304.0" width="9.0" height="42.0" rx="3" class="host"></rect>
+<rect x="751.3" y="304.0" width="85.8" height="42.0" rx="6" class="b3 bstroke"></rect>
+<text x="794.2" y="329.7" class="btext" font-size="13" text-anchor="middle" font-weight="500">MB4</text>
+<line x1="739.3" y1="106.0" x2="739.3" y2="358.0" class="barrier"/>
+<rect x="843.1" y="118.0" width="92.8" height="42.0" rx="6" class="bubble"></rect>
+<rect x="843.1" y="180.0" width="92.8" height="42.0" rx="6" class="bubble"></rect>
+<rect x="843.1" y="242.0" width="92.8" height="42.0" rx="6" class="bubble"></rect>
+<rect x="843.1" y="304.0" width="9.0" height="42.0" rx="3" class="host"></rect>
+<rect x="853.1" y="304.0" width="80.8" height="42.0" rx="6" class="b4 bstroke"></rect>
+<text x="893.5" y="329.7" class="btext" font-size="13" text-anchor="middle" font-weight="500">MB5</text>
+<line x1="841.1" y1="106.0" x2="841.1" y2="358.0" class="barrier"/>
+<line x1="937.9" y1="106.0" x2="937.9" y2="358.0" class="barrier"/>
+<line x1="211.0" y1="162.0" x2="239.0" y2="178.0" class="handoff"/>
+<path d="M239.0,178.0 L233.4,169.6 L229.0,177.4 Z" class="handoffhead"/>
+<line x1="316.2" y1="162.0" x2="344.2" y2="178.0" class="handoff"/>
+<path d="M344.2,178.0 L338.7,169.6 L334.2,177.4 Z" class="handoffhead"/>
+<line x1="309.4" y1="224.0" x2="344.2" y2="240.0" class="handoff"/>
+<path d="M344.2,240.0 L338.0,232.2 L334.2,240.3 Z" class="handoffhead"/>
+<line x1="413.9" y1="162.0" x2="446.8" y2="178.0" class="handoff"/>
+<path d="M446.8,178.0 L440.7,170.0 L436.8,178.1 Z" class="handoffhead"/>
+<line x1="418.8" y1="224.0" x2="446.8" y2="240.0" class="handoff"/>
+<path d="M446.8,240.0 L441.2,231.6 L436.8,239.4 Z" class="handoffhead"/>
+<line x1="416.4" y1="286.0" x2="446.8" y2="302.0" class="handoff"/>
+<path d="M446.8,302.0 L441.0,293.8 L436.8,301.8 Z" class="handoffhead"/>
+<line x1="522.4" y1="162.0" x2="551.2" y2="178.0" class="handoff"/>
+<path d="M551.2,178.0 L545.5,169.7 L541.1,177.6 Z" class="handoffhead"/>
+<line x1="514.0" y1="224.0" x2="551.2" y2="240.0" class="handoff"/>
+<path d="M551.2,240.0 L544.7,232.3 L541.1,240.6 Z" class="handoffhead"/>
+<line x1="523.2" y1="286.0" x2="551.2" y2="302.0" class="handoff"/>
+<path d="M551.2,302.0 L545.6,293.6 L541.1,301.4 Z" class="handoffhead"/>
+<line x1="621.6" y1="162.0" x2="654.6" y2="178.0" class="handoff"/>
+<path d="M654.6,178.0 L648.5,170.0 L644.6,178.1 Z" class="handoffhead"/>
+<line x1="624.1" y1="224.0" x2="654.6" y2="240.0" class="handoff"/>
+<path d="M654.6,240.0 L648.8,231.8 L644.6,239.8 Z" class="handoffhead"/>
+<line x1="620.0" y1="286.0" x2="654.6" y2="302.0" class="handoff"/>
+<path d="M654.6,302.0 L648.4,294.1 L644.6,302.3 Z" class="handoffhead"/>
+<line x1="722.6" y1="224.0" x2="757.3" y2="240.0" class="handoff"/>
+<path d="M757.3,240.0 L751.0,232.1 L747.3,240.3 Z" class="handoffhead"/>
+<line x1="729.3" y1="286.0" x2="757.3" y2="302.0" class="handoff"/>
+<path d="M757.3,302.0 L751.7,293.6 L747.3,301.4 Z" class="handoffhead"/>
+<line x1="826.9" y1="286.0" x2="859.1" y2="302.0" class="handoff"/>
+<path d="M859.1,302.0 L853.1,294.0 L849.1,302.0 Z" class="handoffhead"/>
+<path d="M528.1,308.0 Q547.7,198.0 567.2,168.0" class="dep"/>
+<path d="M567.2,168.0 L558.5,173.1 L566.0,178.0 Z" class="dephead"/>
+<line x1="533.2" y1="372.0" x2="636.6" y2="372.0" class="ref"/>
+<line x1="533.2" y1="367.0" x2="533.2" y2="377.0" class="ref"/>
+<line x1="636.6" y1="367.0" x2="636.6" y2="377.0" class="ref"/>
+<text x="584.9" y="390.0" class="ink2" font-size="13" text-anchor="middle" font-weight="400">one beat</text>
+<line x1="120.0" y1="406.0" x2="967.9" y2="406.0" class="axis"/>
+<line x1="957.9" y1="406.0" x2="967.9" y2="406.0" class="ref"/>
+<path d="M967.9,406.0 L958.9,401.5 L958.9,410.5 Z" class="refhead"/>
+<text x="975.9" y="411.0" class="muted" font-size="13" text-anchor="start" font-weight="400">time</text>
+<line x1="1000.0" y1="113.0" x2="1000.0" y2="129.0" class="barrier"/>
+<text x="1020.0" y="126.0" class="ink2" font-size="13" text-anchor="start" font-weight="400">Red line: the per-beat</text>
+<text x="1020.0" y="144.0" class="ink2" font-size="13" text-anchor="start" font-weight="400">rendezvous; all stages wait</text>
+<text x="1020.0" y="162.0" class="ink2" font-size="13" text-anchor="start" font-weight="400">for each other on the host</text>
+<rect x="992.0" y="182.0" width="18.0" height="18.0" rx="3" class="host"></rect>
+<text x="1020.0" y="196.0" class="ink2" font-size="13" text-anchor="start" font-weight="400">Grey sliver: host cost of the</text>
+<text x="1020.0" y="214.0" class="ink2" font-size="13" text-anchor="start" font-weight="400">rendezvous itself</text>
+<rect x="992.0" y="234.0" width="18.0" height="18.0" rx="3" class="bubble"></rect>
+<text x="1020.0" y="248.0" class="ink2" font-size="13" text-anchor="start" font-weight="400">Dashed box: idle; every stage</text>
+<text x="1020.0" y="266.0" class="ink2" font-size="13" text-anchor="start" font-weight="400">waits for the slowest</text>
+<text x="1020.0" y="284.0" class="ink2" font-size="13" text-anchor="start" font-weight="400">micro-batch in flight</text>
+<line x1="994.0" y1="306.0" x2="1010.0" y2="320.0" class="handoff"/>
+<path d="M1010.0,320.0 L1006.2,310.7 L1000.3,317.5 Z" class="handoffhead"/>
+<text x="1020.0" y="318.0" class="ink2" font-size="13" text-anchor="start" font-weight="400">Green arrow: activations</text>
+<text x="1020.0" y="336.0" class="ink2" font-size="13" text-anchor="start" font-weight="400">handed to the next stage</text>
+<line x1="994.0" y1="358.0" x2="1010.0" y2="372.0" class="dep"/>
+<path d="M1010.0,372.0 L1006.2,362.7 L1000.3,369.5 Z" class="dephead"/>
+<text x="1020.0" y="370.0" class="ink2" font-size="13" text-anchor="start" font-weight="400">Red curve: PP0 waits for the</text>
+<text x="1020.0" y="388.0" class="ink2" font-size="13" text-anchor="start" font-weight="400">result to come back around</text>
+</svg>

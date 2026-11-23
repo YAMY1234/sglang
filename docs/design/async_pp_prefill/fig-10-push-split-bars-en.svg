@@ -1,0 +1,370 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1240 1018" width="1240" height="1018" role="img" aria-labelledby="t d">
+<title id="t">Where each stage's beat goes (measured)</title>
+<desc id="d">Each bar is one stage's time per beat: forward, host gap and waiting for upstream input add up to the beat. Left: lockstep vs decoupled on the same nodes; right: decoupled vs push + split on another set of nodes. Axes start at 0.</desc>
+<style>
+svg { font-family: system-ui, -apple-system, 'PingFang SC', 'Noto Sans CJK SC', 'Microsoft YaHei', sans-serif; }
+.bg { fill: #fcfcfb; }
+.ink { fill: #0b0b0b; } .ink2 { fill: #52514e; } .muted { fill: #898781; }
+.axis { stroke: #c3c2b7; stroke-width: 1; fill: none; }
+.grid { stroke: #e1e0d9; stroke-width: 1; fill: none; }
+.lane { stroke: #ecebe6; stroke-width: 1; fill: none; }
+.b0 { fill: #e6effa; } .b1 { fill: #d6e6f8; } .b2 { fill: #c6dcf5; }
+.b3 { fill: #b4d1f2; } .b4 { fill: #a2c5ef; } .b5 { fill: #8fb9ec; }
+.bstroke { stroke: #5b8fd0; stroke-width: 1.2; }
+.btext { fill: #0b0b0b; }
+.bubble { fill: #f3f3f1; stroke: #a8a7a1; stroke-width: 1.2; stroke-dasharray: 6 4; }
+.host { fill: #ecebe6; stroke: #b5b3ac; stroke-width: 1; }
+.block { fill: #fbe1d6; stroke: #ec835a; stroke-width: 1.2; }
+.spinbase { fill: #fdf0d5; stroke: #eda100; stroke-width: 1.2; }
+.hatch { stroke: #eda100; stroke-width: 1.4; }
+.ce { fill: #d9f2e6; stroke: #1baf7a; stroke-width: 1.2; }
+.kv { fill: #6250d6; }
+.flag { fill: #1baf7a; }
+.handoff { stroke: #2e8b57; stroke-width: 1.8; fill: none; }
+.handoffhead { fill: #2e8b57; }
+.dep { stroke: #d03b3b; stroke-width: 1.8; fill: none; }
+.dephead { fill: #d03b3b; }
+.barrier { stroke: #d03b3b; stroke-width: 1.6; }
+.ref { stroke: #898781; stroke-width: 1.4; fill: none; }
+.refhead { fill: #898781; }
+.gray { fill: #a3a29b; } .s1 { fill: #2a78d6; } .s2 { fill: #eb6834; } .s3 { fill: #1baf7a; } .s7 { fill: #6250d6; }
+.panel { fill: none; stroke: #e1e0d9; stroke-width: 1; }
+@media (prefers-color-scheme: dark) {
+  .bg { fill: #1a1a19; }
+  .ink { fill: #f0efec; } .ink2 { fill: #c3c2b7; }
+  .axis { stroke: #383835; } .grid { stroke: #2c2c2a; } .lane { stroke: #262624; }
+  .b0 { fill: #1f3550; } .b1 { fill: #23405f; } .b2 { fill: #274b6f; }
+  .b3 { fill: #2b567f; } .b4 { fill: #2f6190; } .b5 { fill: #336ca0; }
+  .bstroke { stroke: #5598e7; }
+  .btext { fill: #f0efec; }
+  .bubble { fill: #232322; stroke: #5e5d59; }
+  .host { fill: #2c2c2a; stroke: #55544f; }
+  .block { fill: #4a2a1f; stroke: #ec835a; }
+  .spinbase { fill: #3a2f14; stroke: #c98500; }
+  .hatch { stroke: #c98500; }
+  .ce { fill: #173b2d; stroke: #199e70; }
+  .kv { fill: #9085e9; }
+  .flag { fill: #199e70; }
+  .handoff { stroke: #3fb56f; } .handoffhead { fill: #3fb56f; }
+  .gray { fill: #6f6e68; } .s1 { fill: #3987e5; } .s2 { fill: #d95926; } .s3 { fill: #199e70; } .s7 { fill: #9085e9; }
+  .panel { stroke: #2c2c2a; }
+}
+</style>
+<rect x="0" y="0" width="1240" height="1018" class="bg"/>
+<text x="32.0" y="40.0" class="ink" font-size="22" text-anchor="start" font-weight="650">Where each stage's beat goes (measured)</text>
+<text x="32.0" y="68.0" class="ink2" font-size="15" text-anchor="start" font-weight="400">Each bar = forward + host gap + waiting for upstream input = the beat, so a shorter bar is faster; dashed lines mark each arm's beat.</text>
+<text x="32.0" y="90.0" class="ink2" font-size="15" text-anchor="start" font-weight="400">Each side ran back to back on one set of nodes (left 300 s each, right 1200 s each).</text>
+<text x="32.0" y="150.0" class="ink" font-size="15" text-anchor="start" font-weight="650">Lockstep -&gt; decoupled: beat 198.3 -&gt; 184.7 ms (-6.9%)</text>
+<text x="632.0" y="150.0" class="ink" font-size="15" text-anchor="start" font-weight="650">Decoupled -&gt; push + split: beat 188.4 -&gt; 181.2 / 179.8 ms (-3.8% / -4.6%)</text>
+<rect x="32.0" y="168.0" width="12.0" height="12.0" rx="2" class="gray"></rect>
+<text x="50.0" y="178.0" class="ink2" font-size="13" text-anchor="start" font-weight="400">lockstep</text>
+<rect x="132.3" y="168.0" width="12.0" height="12.0" rx="2" class="s1"></rect>
+<text x="150.3" y="178.0" class="ink2" font-size="13" text-anchor="start" font-weight="400">decoupled (NCCL)</text>
+<rect x="32.0" y="190.0" width="12.0" height="12.0" rx="2" class="block"></rect>
+<text x="50.0" y="200.0" class="ink2" font-size="13" text-anchor="start" font-weight="400">host gap (host thread waits on a rendezvous / sync)</text>
+<rect x="32.0" y="212.0" width="12.0" height="12.0" rx="2" class="bubble"></rect>
+<text x="50.0" y="222.0" class="ink2" font-size="13" text-anchor="start" font-weight="400">waiting for upstream input</text>
+<rect x="632.0" y="168.0" width="12.0" height="12.0" rx="2" class="s1"></rect>
+<text x="650.0" y="178.0" class="ink2" font-size="13" text-anchor="start" font-weight="400">decoupled (NCCL)</text>
+<rect x="792.6" y="168.0" width="12.0" height="12.0" rx="2" class="s2"></rect>
+<text x="810.6" y="178.0" class="ink2" font-size="13" text-anchor="start" font-weight="400">push + split, KV 100%</text>
+<rect x="991.0" y="168.0" width="12.0" height="12.0" rx="2" class="s3"></rect>
+<text x="1009.0" y="178.0" class="ink2" font-size="13" text-anchor="start" font-weight="400">push + split, KV 94%</text>
+<text x="32.0" y="252.0" class="ink" font-size="15" text-anchor="start" font-weight="650">One beat = forward + host gap + upstream wait (ms)</text>
+<line x1="84.0" y1="570.0" x2="604.0" y2="570.0" class="axis"/>
+<text x="76.0" y="574.0" class="muted" font-size="12" text-anchor="end" font-weight="400">0</text>
+<line x1="84.0" y1="498.6" x2="604.0" y2="498.6" class="grid"/>
+<text x="76.0" y="502.6" class="muted" font-size="12" text-anchor="end" font-weight="400">50</text>
+<line x1="84.0" y1="427.1" x2="604.0" y2="427.1" class="grid"/>
+<text x="76.0" y="431.1" class="muted" font-size="12" text-anchor="end" font-weight="400">100</text>
+<line x1="84.0" y1="355.7" x2="604.0" y2="355.7" class="grid"/>
+<text x="76.0" y="359.7" class="muted" font-size="12" text-anchor="end" font-weight="400">150</text>
+<line x1="84.0" y1="284.3" x2="604.0" y2="284.3" class="grid"/>
+<text x="76.0" y="288.3" class="muted" font-size="12" text-anchor="end" font-weight="400">200</text>
+<rect x="97.0" y="301.7" width="18.0" height="268.3" class="gray"><title>lockstep PP0 forward: 187.8 ms</title></rect>
+<rect x="97.0" y="285.7" width="18.0" height="15.9" class="block"><title>lockstep PP0 host gap: 11.2 ms</title></rect>
+<rect x="97.0" y="285.7" width="18.0" height="0.0" class="bubble"><title>lockstep PP0 waiting for upstream input: 0.0 ms</title></rect>
+<rect x="118.0" y="307.2" width="18.0" height="262.8" class="s1"><title>decoupled (NCCL) PP0 forward: 183.9 ms</title></rect>
+<rect x="118.0" y="306.2" width="18.0" height="1.0" class="block"><title>decoupled (NCCL) PP0 host gap: 0.7 ms</title></rect>
+<rect x="118.0" y="306.1" width="18.0" height="0.1" class="bubble"><title>decoupled (NCCL) PP0 waiting for upstream input: 0.1 ms</title></rect>
+<text x="116.5" y="588.0" class="muted" font-size="12" text-anchor="middle" font-weight="400">PP0</text>
+<rect x="162.0" y="323.8" width="18.0" height="246.2" class="gray"><title>lockstep PP1 forward: 172.4 ms</title></rect>
+<rect x="162.0" y="307.3" width="18.0" height="16.5" class="block"><title>lockstep PP1 host gap: 11.5 ms</title></rect>
+<rect x="162.0" y="285.7" width="18.0" height="21.6" class="bubble"><title>lockstep PP1 waiting for upstream input: 15.1 ms</title></rect>
+<rect x="183.0" y="316.0" width="18.0" height="254.0" class="s1"><title>decoupled (NCCL) PP1 forward: 177.8 ms</title></rect>
+<rect x="183.0" y="315.1" width="18.0" height="0.8" class="block"><title>decoupled (NCCL) PP1 host gap: 0.6 ms</title></rect>
+<rect x="183.0" y="306.1" width="18.0" height="9.0" class="bubble"><title>decoupled (NCCL) PP1 waiting for upstream input: 6.3 ms</title></rect>
+<text x="181.5" y="588.0" class="muted" font-size="12" text-anchor="middle" font-weight="400">PP1</text>
+<rect x="227.0" y="320.8" width="18.0" height="249.2" class="gray"><title>lockstep PP2 forward: 174.4 ms</title></rect>
+<rect x="227.0" y="307.8" width="18.0" height="13.0" class="block"><title>lockstep PP2 host gap: 9.1 ms</title></rect>
+<rect x="227.0" y="285.7" width="18.0" height="22.1" class="bubble"><title>lockstep PP2 waiting for upstream input: 15.5 ms</title></rect>
+<rect x="248.0" y="316.4" width="18.0" height="253.6" class="s1"><title>decoupled (NCCL) PP2 forward: 177.5 ms</title></rect>
+<rect x="248.0" y="315.4" width="18.0" height="1.0" class="block"><title>decoupled (NCCL) PP2 host gap: 0.7 ms</title></rect>
+<rect x="248.0" y="306.1" width="18.0" height="9.4" class="bubble"><title>decoupled (NCCL) PP2 waiting for upstream input: 6.6 ms</title></rect>
+<text x="246.5" y="588.0" class="muted" font-size="12" text-anchor="middle" font-weight="400">PP2</text>
+<rect x="292.0" y="330.8" width="18.0" height="239.2" class="gray"><title>lockstep PP3 forward: 167.4 ms</title></rect>
+<rect x="292.0" y="318.3" width="18.0" height="12.5" class="block"><title>lockstep PP3 host gap: 8.7 ms</title></rect>
+<rect x="292.0" y="285.7" width="18.0" height="32.6" class="bubble"><title>lockstep PP3 waiting for upstream input: 22.8 ms</title></rect>
+<rect x="313.0" y="322.9" width="18.0" height="247.1" class="s1"><title>decoupled (NCCL) PP3 forward: 173.0 ms</title></rect>
+<rect x="313.0" y="322.0" width="18.0" height="0.9" class="block"><title>decoupled (NCCL) PP3 host gap: 0.7 ms</title></rect>
+<rect x="313.0" y="306.1" width="18.0" height="15.9" class="bubble"><title>decoupled (NCCL) PP3 waiting for upstream input: 11.1 ms</title></rect>
+<text x="311.5" y="588.0" class="muted" font-size="12" text-anchor="middle" font-weight="400">PP3</text>
+<rect x="357.0" y="320.1" width="18.0" height="249.9" class="gray"><title>lockstep PP4 forward: 174.9 ms</title></rect>
+<rect x="357.0" y="308.8" width="18.0" height="11.3" class="block"><title>lockstep PP4 host gap: 7.9 ms</title></rect>
+<rect x="357.0" y="285.7" width="18.0" height="23.1" class="bubble"><title>lockstep PP4 waiting for upstream input: 16.2 ms</title></rect>
+<rect x="378.0" y="316.7" width="18.0" height="253.3" class="s1"><title>decoupled (NCCL) PP4 forward: 177.3 ms</title></rect>
+<rect x="378.0" y="315.8" width="18.0" height="0.9" class="block"><title>decoupled (NCCL) PP4 host gap: 0.6 ms</title></rect>
+<rect x="378.0" y="306.1" width="18.0" height="9.7" class="bubble"><title>decoupled (NCCL) PP4 waiting for upstream input: 6.8 ms</title></rect>
+<text x="376.5" y="588.0" class="muted" font-size="12" text-anchor="middle" font-weight="400">PP4</text>
+<rect x="422.0" y="324.0" width="18.0" height="246.0" class="gray"><title>lockstep PP5 forward: 172.2 ms</title></rect>
+<rect x="422.0" y="313.1" width="18.0" height="10.8" class="block"><title>lockstep PP5 host gap: 7.6 ms</title></rect>
+<rect x="422.0" y="285.7" width="18.0" height="27.4" class="bubble"><title>lockstep PP5 waiting for upstream input: 19.2 ms</title></rect>
+<rect x="443.0" y="319.0" width="18.0" height="251.0" class="s1"><title>decoupled (NCCL) PP5 forward: 175.7 ms</title></rect>
+<rect x="443.0" y="318.2" width="18.0" height="0.7" class="block"><title>decoupled (NCCL) PP5 host gap: 0.5 ms</title></rect>
+<rect x="443.0" y="306.1" width="18.0" height="12.2" class="bubble"><title>decoupled (NCCL) PP5 waiting for upstream input: 8.5 ms</title></rect>
+<text x="441.5" y="588.0" class="muted" font-size="12" text-anchor="middle" font-weight="400">PP5</text>
+<rect x="487.0" y="356.1" width="18.0" height="213.9" class="gray"><title>lockstep PP6 forward: 149.7 ms</title></rect>
+<rect x="487.0" y="345.8" width="18.0" height="10.3" class="block"><title>lockstep PP6 host gap: 7.2 ms</title></rect>
+<rect x="487.0" y="285.8" width="18.0" height="60.0" class="bubble"><title>lockstep PP6 waiting for upstream input: 42.0 ms</title></rect>
+<rect x="508.0" y="357.0" width="18.0" height="213.0" class="s1"><title>decoupled (NCCL) PP6 forward: 149.1 ms</title></rect>
+<rect x="508.0" y="353.4" width="18.0" height="3.7" class="block"><title>decoupled (NCCL) PP6 host gap: 2.6 ms</title></rect>
+<rect x="508.0" y="306.0" width="18.0" height="47.3" class="bubble"><title>decoupled (NCCL) PP6 waiting for upstream input: 33.1 ms</title></rect>
+<text x="506.5" y="588.0" class="muted" font-size="12" text-anchor="middle" font-weight="400">PP6</text>
+<rect x="552.0" y="345.2" width="18.0" height="224.8" class="gray"><title>lockstep PP7 forward: 157.4 ms</title></rect>
+<rect x="552.0" y="333.9" width="18.0" height="11.3" class="block"><title>lockstep PP7 host gap: 7.9 ms</title></rect>
+<rect x="552.0" y="285.8" width="18.0" height="48.0" class="bubble"><title>lockstep PP7 waiting for upstream input: 33.6 ms</title></rect>
+<rect x="573.0" y="307.0" width="18.0" height="263.0" class="s1"><title>decoupled (NCCL) PP7 forward: 184.1 ms</title></rect>
+<rect x="573.0" y="306.7" width="18.0" height="0.3" class="block"><title>decoupled (NCCL) PP7 host gap: 0.2 ms</title></rect>
+<rect x="573.0" y="306.1" width="18.0" height="0.6" class="bubble"><title>decoupled (NCCL) PP7 waiting for upstream input: 0.4 ms</title></rect>
+<text x="571.5" y="588.0" class="muted" font-size="12" text-anchor="middle" font-weight="400">PP7</text>
+<line x1="84.0" y1="286.7" x2="604.0" y2="286.7" class="ref" stroke-dasharray="5 4"/>
+<line x1="84.0" y1="306.1" x2="604.0" y2="306.1" class="ref" stroke-dasharray="5 4"/>
+<text x="632.0" y="252.0" class="ink" font-size="15" text-anchor="start" font-weight="650">One beat = forward + host gap + upstream wait (ms)</text>
+<line x1="684.0" y1="570.0" x2="1204.0" y2="570.0" class="axis"/>
+<text x="676.0" y="574.0" class="muted" font-size="12" text-anchor="end" font-weight="400">0</text>
+<line x1="684.0" y1="498.6" x2="1204.0" y2="498.6" class="grid"/>
+<text x="676.0" y="502.6" class="muted" font-size="12" text-anchor="end" font-weight="400">50</text>
+<line x1="684.0" y1="427.1" x2="1204.0" y2="427.1" class="grid"/>
+<text x="676.0" y="431.1" class="muted" font-size="12" text-anchor="end" font-weight="400">100</text>
+<line x1="684.0" y1="355.7" x2="1204.0" y2="355.7" class="grid"/>
+<text x="676.0" y="359.7" class="muted" font-size="12" text-anchor="end" font-weight="400">150</text>
+<line x1="684.0" y1="284.3" x2="1204.0" y2="284.3" class="grid"/>
+<text x="676.0" y="288.3" class="muted" font-size="12" text-anchor="end" font-weight="400">200</text>
+<rect x="686.5" y="301.6" width="18.0" height="268.4" class="s1"><title>decoupled (NCCL) PP0 forward: 187.9 ms</title></rect>
+<rect x="686.5" y="300.8" width="18.0" height="0.9" class="block"><title>decoupled (NCCL) PP0 host gap: 0.6 ms</title></rect>
+<rect x="686.5" y="300.8" width="18.0" height="0.0" class="bubble"><title>decoupled (NCCL) PP0 waiting for upstream input: 0.0 ms</title></rect>
+<rect x="707.5" y="312.4" width="18.0" height="257.6" class="s2"><title>push + split, KV 100% PP0 forward: 180.3 ms</title></rect>
+<rect x="707.5" y="311.2" width="18.0" height="1.2" class="block"><title>push + split, KV 100% PP0 host gap: 0.8 ms</title></rect>
+<rect x="707.5" y="311.2" width="18.0" height="0.0" class="bubble"><title>push + split, KV 100% PP0 waiting for upstream input: 0.0 ms</title></rect>
+<rect x="728.5" y="341.6" width="18.0" height="228.4" class="s3"><title>push + split, KV 94% PP0 forward: 159.9 ms</title></rect>
+<rect x="728.5" y="313.1" width="18.0" height="28.5" class="block"><title>push + split, KV 94% PP0 host gap: 20.0 ms</title></rect>
+<rect x="728.5" y="312.9" width="18.0" height="0.1" class="bubble"><title>push + split, KV 94% PP0 waiting for upstream input: 0.1 ms</title></rect>
+<text x="716.5" y="588.0" class="muted" font-size="12" text-anchor="middle" font-weight="400">PP0</text>
+<rect x="751.5" y="306.7" width="18.0" height="263.3" class="s1"><title>decoupled (NCCL) PP1 forward: 184.3 ms</title></rect>
+<rect x="751.5" y="305.9" width="18.0" height="0.8" class="block"><title>decoupled (NCCL) PP1 host gap: 0.5 ms</title></rect>
+<rect x="751.5" y="300.8" width="18.0" height="5.2" class="bubble"><title>decoupled (NCCL) PP1 waiting for upstream input: 3.6 ms</title></rect>
+<rect x="772.5" y="316.7" width="18.0" height="253.3" class="s2"><title>push + split, KV 100% PP1 forward: 177.3 ms</title></rect>
+<rect x="772.5" y="315.6" width="18.0" height="1.1" class="block"><title>push + split, KV 100% PP1 host gap: 0.7 ms</title></rect>
+<rect x="772.5" y="311.2" width="18.0" height="4.4" class="bubble"><title>push + split, KV 100% PP1 waiting for upstream input: 3.1 ms</title></rect>
+<rect x="793.5" y="315.4" width="18.0" height="254.6" class="s3"><title>push + split, KV 94% PP1 forward: 178.2 ms</title></rect>
+<rect x="793.5" y="314.3" width="18.0" height="1.1" class="block"><title>push + split, KV 94% PP1 host gap: 0.8 ms</title></rect>
+<rect x="793.5" y="313.0" width="18.0" height="1.3" class="bubble"><title>push + split, KV 94% PP1 waiting for upstream input: 0.9 ms</title></rect>
+<text x="781.5" y="588.0" class="muted" font-size="12" text-anchor="middle" font-weight="400">PP1</text>
+<rect x="816.5" y="307.3" width="18.0" height="262.7" class="s1"><title>decoupled (NCCL) PP2 forward: 183.9 ms</title></rect>
+<rect x="816.5" y="306.5" width="18.0" height="0.8" class="block"><title>decoupled (NCCL) PP2 host gap: 0.6 ms</title></rect>
+<rect x="816.5" y="300.8" width="18.0" height="5.7" class="bubble"><title>decoupled (NCCL) PP2 waiting for upstream input: 4.0 ms</title></rect>
+<rect x="837.5" y="323.9" width="18.0" height="246.1" class="s2"><title>push + split, KV 100% PP2 forward: 172.3 ms</title></rect>
+<rect x="837.5" y="322.9" width="18.0" height="1.1" class="block"><title>push + split, KV 100% PP2 host gap: 0.7 ms</title></rect>
+<rect x="837.5" y="311.2" width="18.0" height="11.7" class="bubble"><title>push + split, KV 100% PP2 waiting for upstream input: 8.2 ms</title></rect>
+<rect x="858.5" y="326.1" width="18.0" height="243.9" class="s3"><title>push + split, KV 94% PP2 forward: 170.7 ms</title></rect>
+<rect x="858.5" y="324.7" width="18.0" height="1.4" class="block"><title>push + split, KV 94% PP2 host gap: 1.0 ms</title></rect>
+<rect x="858.5" y="313.1" width="18.0" height="11.7" class="bubble"><title>push + split, KV 94% PP2 waiting for upstream input: 8.2 ms</title></rect>
+<text x="846.5" y="588.0" class="muted" font-size="12" text-anchor="middle" font-weight="400">PP2</text>
+<rect x="881.5" y="308.8" width="18.0" height="261.2" class="s1"><title>decoupled (NCCL) PP3 forward: 182.9 ms</title></rect>
+<rect x="881.5" y="307.9" width="18.0" height="0.9" class="block"><title>decoupled (NCCL) PP3 host gap: 0.6 ms</title></rect>
+<rect x="881.5" y="300.8" width="18.0" height="7.1" class="bubble"><title>decoupled (NCCL) PP3 waiting for upstream input: 5.0 ms</title></rect>
+<rect x="902.5" y="328.2" width="18.0" height="241.8" class="s2"><title>push + split, KV 100% PP3 forward: 169.2 ms</title></rect>
+<rect x="902.5" y="327.1" width="18.0" height="1.1" class="block"><title>push + split, KV 100% PP3 host gap: 0.8 ms</title></rect>
+<rect x="902.5" y="311.2" width="18.0" height="15.9" class="bubble"><title>push + split, KV 100% PP3 waiting for upstream input: 11.2 ms</title></rect>
+<rect x="923.5" y="328.3" width="18.0" height="241.7" class="s3"><title>push + split, KV 94% PP3 forward: 169.2 ms</title></rect>
+<rect x="923.5" y="326.7" width="18.0" height="1.5" class="block"><title>push + split, KV 94% PP3 host gap: 1.1 ms</title></rect>
+<rect x="923.5" y="313.1" width="18.0" height="13.7" class="bubble"><title>push + split, KV 94% PP3 waiting for upstream input: 9.6 ms</title></rect>
+<text x="911.5" y="588.0" class="muted" font-size="12" text-anchor="middle" font-weight="400">PP3</text>
+<rect x="946.5" y="307.3" width="18.0" height="262.7" class="s1"><title>decoupled (NCCL) PP4 forward: 183.9 ms</title></rect>
+<rect x="946.5" y="306.5" width="18.0" height="0.8" class="block"><title>decoupled (NCCL) PP4 host gap: 0.5 ms</title></rect>
+<rect x="946.5" y="300.8" width="18.0" height="5.7" class="bubble"><title>decoupled (NCCL) PP4 waiting for upstream input: 4.0 ms</title></rect>
+<rect x="967.5" y="347.1" width="18.0" height="222.9" class="s2"><title>push + split, KV 100% PP4 forward: 156.0 ms</title></rect>
+<rect x="967.5" y="345.3" width="18.0" height="1.8" class="block"><title>push + split, KV 100% PP4 host gap: 1.3 ms</title></rect>
+<rect x="967.5" y="311.2" width="18.0" height="34.1" class="bubble"><title>push + split, KV 100% PP4 waiting for upstream input: 23.9 ms</title></rect>
+<rect x="988.5" y="334.5" width="18.0" height="235.5" class="s3"><title>push + split, KV 94% PP4 forward: 164.8 ms</title></rect>
+<rect x="988.5" y="332.9" width="18.0" height="1.6" class="block"><title>push + split, KV 94% PP4 host gap: 1.2 ms</title></rect>
+<rect x="988.5" y="313.1" width="18.0" height="19.8" class="bubble"><title>push + split, KV 94% PP4 waiting for upstream input: 13.9 ms</title></rect>
+<text x="976.5" y="588.0" class="muted" font-size="12" text-anchor="middle" font-weight="400">PP4</text>
+<rect x="1011.5" y="321.6" width="18.0" height="248.4" class="s1"><title>decoupled (NCCL) PP5 forward: 173.9 ms</title></rect>
+<rect x="1011.5" y="320.9" width="18.0" height="0.7" class="block"><title>decoupled (NCCL) PP5 host gap: 0.5 ms</title></rect>
+<rect x="1011.5" y="300.8" width="18.0" height="20.2" class="bubble"><title>decoupled (NCCL) PP5 waiting for upstream input: 14.1 ms</title></rect>
+<rect x="1032.5" y="319.7" width="18.0" height="250.3" class="s2"><title>push + split, KV 100% PP5 forward: 175.2 ms</title></rect>
+<rect x="1032.5" y="317.2" width="18.0" height="2.5" class="block"><title>push + split, KV 100% PP5 host gap: 1.7 ms</title></rect>
+<rect x="1032.5" y="311.2" width="18.0" height="6.0" class="bubble"><title>push + split, KV 100% PP5 waiting for upstream input: 4.2 ms</title></rect>
+<rect x="1053.5" y="322.6" width="18.0" height="247.4" class="s3"><title>push + split, KV 94% PP5 forward: 173.2 ms</title></rect>
+<rect x="1053.5" y="320.5" width="18.0" height="2.1" class="block"><title>push + split, KV 94% PP5 host gap: 1.5 ms</title></rect>
+<rect x="1053.5" y="313.0" width="18.0" height="7.5" class="bubble"><title>push + split, KV 94% PP5 waiting for upstream input: 5.3 ms</title></rect>
+<text x="1041.5" y="588.0" class="muted" font-size="12" text-anchor="middle" font-weight="400">PP5</text>
+<rect x="1076.5" y="352.3" width="18.0" height="217.7" class="s1"><title>decoupled (NCCL) PP6 forward: 152.4 ms</title></rect>
+<rect x="1076.5" y="348.8" width="18.0" height="3.5" class="block"><title>decoupled (NCCL) PP6 host gap: 2.4 ms</title></rect>
+<rect x="1076.5" y="300.8" width="18.0" height="48.0" class="bubble"><title>decoupled (NCCL) PP6 waiting for upstream input: 33.6 ms</title></rect>
+<rect x="1097.5" y="314.5" width="18.0" height="255.5" class="s2"><title>push + split, KV 100% PP6 forward: 178.9 ms</title></rect>
+<rect x="1097.5" y="313.7" width="18.0" height="0.8" class="block"><title>push + split, KV 100% PP6 host gap: 0.6 ms</title></rect>
+<rect x="1097.5" y="311.2" width="18.0" height="2.5" class="bubble"><title>push + split, KV 100% PP6 waiting for upstream input: 1.7 ms</title></rect>
+<rect x="1118.5" y="315.9" width="18.0" height="254.1" class="s3"><title>push + split, KV 94% PP6 forward: 177.9 ms</title></rect>
+<rect x="1118.5" y="315.2" width="18.0" height="0.7" class="block"><title>push + split, KV 94% PP6 host gap: 0.5 ms</title></rect>
+<rect x="1118.5" y="313.1" width="18.0" height="2.1" class="bubble"><title>push + split, KV 94% PP6 waiting for upstream input: 1.5 ms</title></rect>
+<text x="1106.5" y="588.0" class="muted" font-size="12" text-anchor="middle" font-weight="400">PP6</text>
+<rect x="1141.5" y="301.6" width="18.0" height="268.4" class="s1"><title>decoupled (NCCL) PP7 forward: 187.9 ms</title></rect>
+<rect x="1141.5" y="301.3" width="18.0" height="0.3" class="block"><title>decoupled (NCCL) PP7 host gap: 0.2 ms</title></rect>
+<rect x="1141.5" y="300.8" width="18.0" height="0.5" class="bubble"><title>decoupled (NCCL) PP7 waiting for upstream input: 0.4 ms</title></rect>
+<rect x="1162.5" y="346.1" width="18.0" height="223.9" class="s2"><title>push + split, KV 100% PP7 forward: 156.7 ms</title></rect>
+<rect x="1162.5" y="345.8" width="18.0" height="0.3" class="block"><title>push + split, KV 100% PP7 host gap: 0.2 ms</title></rect>
+<rect x="1162.5" y="311.2" width="18.0" height="34.6" class="bubble"><title>push + split, KV 100% PP7 waiting for upstream input: 24.2 ms</title></rect>
+<rect x="1183.5" y="327.7" width="18.0" height="242.3" class="s3"><title>push + split, KV 94% PP7 forward: 169.6 ms</title></rect>
+<rect x="1183.5" y="327.4" width="18.0" height="0.3" class="block"><title>push + split, KV 94% PP7 host gap: 0.2 ms</title></rect>
+<rect x="1183.5" y="313.0" width="18.0" height="14.3" class="bubble"><title>push + split, KV 94% PP7 waiting for upstream input: 10.0 ms</title></rect>
+<text x="1171.5" y="588.0" class="muted" font-size="12" text-anchor="middle" font-weight="400">PP7</text>
+<line x1="684.0" y1="300.9" x2="1204.0" y2="300.9" class="ref" stroke-dasharray="5 4"/>
+<line x1="684.0" y1="311.1" x2="1204.0" y2="311.1" class="ref" stroke-dasharray="5 4"/>
+<line x1="684.0" y1="313.1" x2="1204.0" y2="313.1" class="ref" stroke-dasharray="5 4"/>
+<text x="32.0" y="616.0" class="ink" font-size="15" text-anchor="start" font-weight="650">Time per beat not computing = host gap (solid) + upstream wait (dashed) (ms)</text>
+<line x1="84.0" y1="834.0" x2="604.0" y2="834.0" class="axis"/>
+<text x="76.0" y="838.0" class="muted" font-size="12" text-anchor="end" font-weight="400">0</text>
+<line x1="84.0" y1="794.0" x2="604.0" y2="794.0" class="grid"/>
+<text x="76.0" y="798.0" class="muted" font-size="12" text-anchor="end" font-weight="400">10</text>
+<line x1="84.0" y1="754.0" x2="604.0" y2="754.0" class="grid"/>
+<text x="76.0" y="758.0" class="muted" font-size="12" text-anchor="end" font-weight="400">20</text>
+<line x1="84.0" y1="714.0" x2="604.0" y2="714.0" class="grid"/>
+<text x="76.0" y="718.0" class="muted" font-size="12" text-anchor="end" font-weight="400">30</text>
+<line x1="84.0" y1="674.0" x2="604.0" y2="674.0" class="grid"/>
+<text x="76.0" y="678.0" class="muted" font-size="12" text-anchor="end" font-weight="400">40</text>
+<line x1="84.0" y1="634.0" x2="604.0" y2="634.0" class="grid"/>
+<text x="76.0" y="638.0" class="muted" font-size="12" text-anchor="end" font-weight="400">50</text>
+<rect x="97.0" y="789.3" width="18.0" height="44.7" class="gray"><title>lockstep PP0 host gap: 11.2 ms</title></rect>
+<rect x="97.0" y="789.3" width="18.0" height="0.0" class="bubble"><title>lockstep PP0 waiting for upstream input: 0.0 ms</title></rect>
+<rect x="118.0" y="831.1" width="18.0" height="2.9" class="s1"><title>decoupled (NCCL) PP0 host gap: 0.7 ms</title></rect>
+<rect x="118.0" y="830.8" width="18.0" height="0.3" class="bubble"><title>decoupled (NCCL) PP0 waiting for upstream input: 0.1 ms</title></rect>
+<text x="116.5" y="852.0" class="muted" font-size="12" text-anchor="middle" font-weight="400">PP0</text>
+<rect x="162.0" y="787.9" width="18.0" height="46.1" class="gray"><title>lockstep PP1 host gap: 11.5 ms</title></rect>
+<rect x="162.0" y="727.4" width="18.0" height="60.5" class="bubble"><title>lockstep PP1 waiting for upstream input: 15.1 ms</title></rect>
+<rect x="183.0" y="831.7" width="18.0" height="2.3" class="s1"><title>decoupled (NCCL) PP1 host gap: 0.6 ms</title></rect>
+<rect x="183.0" y="806.4" width="18.0" height="25.3" class="bubble"><title>decoupled (NCCL) PP1 waiting for upstream input: 6.3 ms</title></rect>
+<text x="181.5" y="852.0" class="muted" font-size="12" text-anchor="middle" font-weight="400">PP1</text>
+<rect x="227.0" y="797.5" width="18.0" height="36.5" class="gray"><title>lockstep PP2 host gap: 9.1 ms</title></rect>
+<rect x="227.0" y="735.7" width="18.0" height="61.8" class="bubble"><title>lockstep PP2 waiting for upstream input: 15.5 ms</title></rect>
+<rect x="248.0" y="831.3" width="18.0" height="2.7" class="s1"><title>decoupled (NCCL) PP2 host gap: 0.7 ms</title></rect>
+<rect x="248.0" y="805.1" width="18.0" height="26.2" class="bubble"><title>decoupled (NCCL) PP2 waiting for upstream input: 6.6 ms</title></rect>
+<text x="246.5" y="852.0" class="muted" font-size="12" text-anchor="middle" font-weight="400">PP2</text>
+<rect x="292.0" y="799.0" width="18.0" height="35.0" class="gray"><title>lockstep PP3 host gap: 8.7 ms</title></rect>
+<rect x="292.0" y="707.7" width="18.0" height="91.3" class="bubble"><title>lockstep PP3 waiting for upstream input: 22.8 ms</title></rect>
+<rect x="313.0" y="831.4" width="18.0" height="2.6" class="s1"><title>decoupled (NCCL) PP3 host gap: 0.7 ms</title></rect>
+<rect x="313.0" y="786.8" width="18.0" height="44.5" class="bubble"><title>decoupled (NCCL) PP3 waiting for upstream input: 11.1 ms</title></rect>
+<text x="311.5" y="852.0" class="muted" font-size="12" text-anchor="middle" font-weight="400">PP3</text>
+<rect x="357.0" y="802.4" width="18.0" height="31.6" class="gray"><title>lockstep PP4 host gap: 7.9 ms</title></rect>
+<rect x="357.0" y="737.6" width="18.0" height="64.7" class="bubble"><title>lockstep PP4 waiting for upstream input: 16.2 ms</title></rect>
+<rect x="378.0" y="831.5" width="18.0" height="2.5" class="s1"><title>decoupled (NCCL) PP4 host gap: 0.6 ms</title></rect>
+<rect x="378.0" y="804.3" width="18.0" height="27.2" class="bubble"><title>decoupled (NCCL) PP4 waiting for upstream input: 6.8 ms</title></rect>
+<text x="376.5" y="852.0" class="muted" font-size="12" text-anchor="middle" font-weight="400">PP4</text>
+<rect x="422.0" y="803.7" width="18.0" height="30.3" class="gray"><title>lockstep PP5 host gap: 7.6 ms</title></rect>
+<rect x="422.0" y="727.0" width="18.0" height="76.7" class="bubble"><title>lockstep PP5 waiting for upstream input: 19.2 ms</title></rect>
+<rect x="443.0" y="831.9" width="18.0" height="2.1" class="s1"><title>decoupled (NCCL) PP5 host gap: 0.5 ms</title></rect>
+<rect x="443.0" y="797.8" width="18.0" height="34.1" class="bubble"><title>decoupled (NCCL) PP5 waiting for upstream input: 8.5 ms</title></rect>
+<text x="441.5" y="852.0" class="muted" font-size="12" text-anchor="middle" font-weight="400">PP5</text>
+<rect x="487.0" y="805.3" width="18.0" height="28.7" class="gray"><title>lockstep PP6 host gap: 7.2 ms</title></rect>
+<rect x="487.0" y="637.2" width="18.0" height="168.0" class="bubble"><title>lockstep PP6 waiting for upstream input: 42.0 ms</title></rect>
+<rect x="508.0" y="823.7" width="18.0" height="10.3" class="s1"><title>decoupled (NCCL) PP6 host gap: 2.6 ms</title></rect>
+<rect x="508.0" y="691.2" width="18.0" height="132.5" class="bubble"><title>decoupled (NCCL) PP6 waiting for upstream input: 33.1 ms</title></rect>
+<text x="506.5" y="852.0" class="muted" font-size="12" text-anchor="middle" font-weight="400">PP6</text>
+<rect x="552.0" y="802.3" width="18.0" height="31.7" class="gray"><title>lockstep PP7 host gap: 7.9 ms</title></rect>
+<rect x="552.0" y="667.8" width="18.0" height="134.5" class="bubble"><title>lockstep PP7 waiting for upstream input: 33.6 ms</title></rect>
+<rect x="573.0" y="833.2" width="18.0" height="0.8" class="s1"><title>decoupled (NCCL) PP7 host gap: 0.2 ms</title></rect>
+<rect x="573.0" y="831.5" width="18.0" height="1.7" class="bubble"><title>decoupled (NCCL) PP7 waiting for upstream input: 0.4 ms</title></rect>
+<text x="571.5" y="852.0" class="muted" font-size="12" text-anchor="middle" font-weight="400">PP7</text>
+<text x="632.0" y="616.0" class="ink" font-size="15" text-anchor="start" font-weight="650">Time per beat not computing = host gap (solid) + upstream wait (dashed) (ms)</text>
+<line x1="684.0" y1="834.0" x2="1204.0" y2="834.0" class="axis"/>
+<text x="676.0" y="838.0" class="muted" font-size="12" text-anchor="end" font-weight="400">0</text>
+<line x1="684.0" y1="794.0" x2="1204.0" y2="794.0" class="grid"/>
+<text x="676.0" y="798.0" class="muted" font-size="12" text-anchor="end" font-weight="400">10</text>
+<line x1="684.0" y1="754.0" x2="1204.0" y2="754.0" class="grid"/>
+<text x="676.0" y="758.0" class="muted" font-size="12" text-anchor="end" font-weight="400">20</text>
+<line x1="684.0" y1="714.0" x2="1204.0" y2="714.0" class="grid"/>
+<text x="676.0" y="718.0" class="muted" font-size="12" text-anchor="end" font-weight="400">30</text>
+<line x1="684.0" y1="674.0" x2="1204.0" y2="674.0" class="grid"/>
+<text x="676.0" y="678.0" class="muted" font-size="12" text-anchor="end" font-weight="400">40</text>
+<line x1="684.0" y1="634.0" x2="1204.0" y2="634.0" class="grid"/>
+<text x="676.0" y="638.0" class="muted" font-size="12" text-anchor="end" font-weight="400">50</text>
+<rect x="686.5" y="831.6" width="18.0" height="2.4" class="s1"><title>decoupled (NCCL) PP0 host gap: 0.6 ms</title></rect>
+<rect x="686.5" y="831.6" width="18.0" height="0.0" class="bubble"><title>decoupled (NCCL) PP0 waiting for upstream input: 0.0 ms</title></rect>
+<rect x="707.5" y="830.7" width="18.0" height="3.3" class="s2"><title>push + split, KV 100% PP0 host gap: 0.8 ms</title></rect>
+<rect x="707.5" y="830.7" width="18.0" height="0.0" class="bubble"><title>push + split, KV 100% PP0 waiting for upstream input: 0.0 ms</title></rect>
+<rect x="728.5" y="754.1" width="18.0" height="79.9" class="s3"><title>push + split, KV 94% PP0 host gap: 20.0 ms</title></rect>
+<rect x="728.5" y="753.7" width="18.0" height="0.4" class="bubble"><title>push + split, KV 94% PP0 waiting for upstream input: 0.1 ms</title></rect>
+<text x="716.5" y="852.0" class="muted" font-size="12" text-anchor="middle" font-weight="400">PP0</text>
+<rect x="751.5" y="831.9" width="18.0" height="2.1" class="s1"><title>decoupled (NCCL) PP1 host gap: 0.5 ms</title></rect>
+<rect x="751.5" y="817.5" width="18.0" height="14.4" class="bubble"><title>decoupled (NCCL) PP1 waiting for upstream input: 3.6 ms</title></rect>
+<rect x="772.5" y="831.0" width="18.0" height="3.0" class="s2"><title>push + split, KV 100% PP1 host gap: 0.7 ms</title></rect>
+<rect x="772.5" y="818.7" width="18.0" height="12.4" class="bubble"><title>push + split, KV 100% PP1 waiting for upstream input: 3.1 ms</title></rect>
+<rect x="793.5" y="830.9" width="18.0" height="3.1" class="s3"><title>push + split, KV 94% PP1 host gap: 0.8 ms</title></rect>
+<rect x="793.5" y="827.4" width="18.0" height="3.6" class="bubble"><title>push + split, KV 94% PP1 waiting for upstream input: 0.9 ms</title></rect>
+<text x="781.5" y="852.0" class="muted" font-size="12" text-anchor="middle" font-weight="400">PP1</text>
+<rect x="816.5" y="831.6" width="18.0" height="2.4" class="s1"><title>decoupled (NCCL) PP2 host gap: 0.6 ms</title></rect>
+<rect x="816.5" y="815.7" width="18.0" height="15.9" class="bubble"><title>decoupled (NCCL) PP2 waiting for upstream input: 4.0 ms</title></rect>
+<rect x="837.5" y="831.1" width="18.0" height="2.9" class="s2"><title>push + split, KV 100% PP2 host gap: 0.7 ms</title></rect>
+<rect x="837.5" y="798.4" width="18.0" height="32.7" class="bubble"><title>push + split, KV 100% PP2 waiting for upstream input: 8.2 ms</title></rect>
+<rect x="858.5" y="830.1" width="18.0" height="3.9" class="s3"><title>push + split, KV 94% PP2 host gap: 1.0 ms</title></rect>
+<rect x="858.5" y="797.5" width="18.0" height="32.6" class="bubble"><title>push + split, KV 94% PP2 waiting for upstream input: 8.2 ms</title></rect>
+<text x="846.5" y="852.0" class="muted" font-size="12" text-anchor="middle" font-weight="400">PP2</text>
+<rect x="881.5" y="831.5" width="18.0" height="2.5" class="s1"><title>decoupled (NCCL) PP3 host gap: 0.6 ms</title></rect>
+<rect x="881.5" y="811.6" width="18.0" height="19.8" class="bubble"><title>decoupled (NCCL) PP3 waiting for upstream input: 5.0 ms</title></rect>
+<rect x="902.5" y="830.9" width="18.0" height="3.1" class="s2"><title>push + split, KV 100% PP3 host gap: 0.8 ms</title></rect>
+<rect x="902.5" y="786.3" width="18.0" height="44.6" class="bubble"><title>push + split, KV 100% PP3 waiting for upstream input: 11.2 ms</title></rect>
+<rect x="923.5" y="829.7" width="18.0" height="4.3" class="s3"><title>push + split, KV 94% PP3 host gap: 1.1 ms</title></rect>
+<rect x="923.5" y="791.4" width="18.0" height="38.3" class="bubble"><title>push + split, KV 94% PP3 waiting for upstream input: 9.6 ms</title></rect>
+<text x="911.5" y="852.0" class="muted" font-size="12" text-anchor="middle" font-weight="400">PP3</text>
+<rect x="946.5" y="831.9" width="18.0" height="2.1" class="s1"><title>decoupled (NCCL) PP4 host gap: 0.5 ms</title></rect>
+<rect x="946.5" y="815.8" width="18.0" height="16.1" class="bubble"><title>decoupled (NCCL) PP4 waiting for upstream input: 4.0 ms</title></rect>
+<rect x="967.5" y="828.9" width="18.0" height="5.1" class="s2"><title>push + split, KV 100% PP4 host gap: 1.3 ms</title></rect>
+<rect x="967.5" y="733.4" width="18.0" height="95.4" class="bubble"><title>push + split, KV 100% PP4 waiting for upstream input: 23.9 ms</title></rect>
+<rect x="988.5" y="829.4" width="18.0" height="4.6" class="s3"><title>push + split, KV 94% PP4 host gap: 1.2 ms</title></rect>
+<rect x="988.5" y="773.8" width="18.0" height="55.5" class="bubble"><title>push + split, KV 94% PP4 waiting for upstream input: 13.9 ms</title></rect>
+<text x="976.5" y="852.0" class="muted" font-size="12" text-anchor="middle" font-weight="400">PP4</text>
+<rect x="1011.5" y="832.0" width="18.0" height="2.0" class="s1"><title>decoupled (NCCL) PP5 host gap: 0.5 ms</title></rect>
+<rect x="1011.5" y="775.6" width="18.0" height="56.5" class="bubble"><title>decoupled (NCCL) PP5 waiting for upstream input: 14.1 ms</title></rect>
+<rect x="1032.5" y="827.1" width="18.0" height="6.9" class="s2"><title>push + split, KV 100% PP5 host gap: 1.7 ms</title></rect>
+<rect x="1032.5" y="810.3" width="18.0" height="16.8" class="bubble"><title>push + split, KV 100% PP5 waiting for upstream input: 4.2 ms</title></rect>
+<rect x="1053.5" y="828.2" width="18.0" height="5.8" class="s3"><title>push + split, KV 94% PP5 host gap: 1.5 ms</title></rect>
+<rect x="1053.5" y="807.1" width="18.0" height="21.0" class="bubble"><title>push + split, KV 94% PP5 waiting for upstream input: 5.3 ms</title></rect>
+<text x="1041.5" y="852.0" class="muted" font-size="12" text-anchor="middle" font-weight="400">PP5</text>
+<rect x="1076.5" y="824.2" width="18.0" height="9.8" class="s1"><title>decoupled (NCCL) PP6 host gap: 2.4 ms</title></rect>
+<rect x="1076.5" y="689.8" width="18.0" height="134.4" class="bubble"><title>decoupled (NCCL) PP6 waiting for upstream input: 33.6 ms</title></rect>
+<rect x="1097.5" y="831.8" width="18.0" height="2.2" class="s2"><title>push + split, KV 100% PP6 host gap: 0.6 ms</title></rect>
+<rect x="1097.5" y="824.9" width="18.0" height="6.9" class="bubble"><title>push + split, KV 100% PP6 waiting for upstream input: 1.7 ms</title></rect>
+<rect x="1118.5" y="832.0" width="18.0" height="2.0" class="s3"><title>push + split, KV 94% PP6 host gap: 0.5 ms</title></rect>
+<rect x="1118.5" y="826.1" width="18.0" height="5.9" class="bubble"><title>push + split, KV 94% PP6 waiting for upstream input: 1.5 ms</title></rect>
+<text x="1106.5" y="852.0" class="muted" font-size="12" text-anchor="middle" font-weight="400">PP6</text>
+<rect x="1141.5" y="833.3" width="18.0" height="0.7" class="s1"><title>decoupled (NCCL) PP7 host gap: 0.2 ms</title></rect>
+<rect x="1141.5" y="831.8" width="18.0" height="1.5" class="bubble"><title>decoupled (NCCL) PP7 waiting for upstream input: 0.4 ms</title></rect>
+<rect x="1162.5" y="833.2" width="18.0" height="0.8" class="s2"><title>push + split, KV 100% PP7 host gap: 0.2 ms</title></rect>
+<rect x="1162.5" y="736.3" width="18.0" height="96.8" class="bubble"><title>push + split, KV 100% PP7 waiting for upstream input: 24.2 ms</title></rect>
+<rect x="1183.5" y="833.0" width="18.0" height="1.0" class="s3"><title>push + split, KV 94% PP7 host gap: 0.2 ms</title></rect>
+<rect x="1183.5" y="792.9" width="18.0" height="40.1" class="bubble"><title>push + split, KV 94% PP7 waiting for upstream input: 10.0 ms</title></rect>
+<text x="1171.5" y="852.0" class="muted" font-size="12" text-anchor="middle" font-weight="400">PP7</text>
+<text x="32.0" y="880.0" class="ink2" font-size="13" text-anchor="start" font-weight="400">• Every stage's host gap fell from 7-11 ms to under 1 ms; that is where the</text>
+<text x="32.0" y="899.0" class="ink2" font-size="13" text-anchor="start" font-weight="400">13.6 ms of beat went.</text>
+<text x="32.0" y="922.0" class="ink2" font-size="13" text-anchor="start" font-weight="400">• Idle per beat fell from 11-49 ms to 1-36 ms (bottom row).</text>
+<text x="32.0" y="945.0" class="ink2" font-size="13" text-anchor="start" font-weight="400">• The forward segment grows a little: activations still go over NCCL, whose</text>
+<text x="32.0" y="964.0" class="ink2" font-size="13" text-anchor="start" font-weight="400">receive kernel waits on the GPU, so the wait is counted as forward</text>
+<text x="32.0" y="983.0" class="ink2" font-size="13" text-anchor="start" font-weight="400">(clearest on PP7, whose upstream wait moved almost entirely inside).</text>
+<text x="632.0" y="880.0" class="ink2" font-size="13" text-anchor="start" font-weight="400">• On the right the gain is in the forward segment, not in idle time: NCCL</text>
+<text x="632.0" y="899.0" class="ink2" font-size="13" text-anchor="start" font-weight="400">hides its waiting inside the forward, so the NCCL arm looks less idle. Push</text>
+<text x="632.0" y="918.0" class="ink2" font-size="13" text-anchor="start" font-weight="400">no longer holds SMs while waiting: PP1-PP4 forward drops 5-28 ms; the</text>
+<text x="632.0" y="937.0" class="ink2" font-size="13" text-anchor="start" font-weight="400">per-GPU split moves a layer off PP4, which sits on the slowest GPU.</text>
+<text x="632.0" y="960.0" class="ink2" font-size="13" text-anchor="start" font-weight="400">• The remaining upstream waits come from unequal stage costs (about 6% from</text>
+<text x="632.0" y="979.0" class="ink2" font-size="13" text-anchor="start" font-weight="400">perfect balance), not from synchronization.</text>
+</svg>

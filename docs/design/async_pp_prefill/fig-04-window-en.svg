@@ -1,0 +1,129 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1240 456" width="1240" height="456" role="img" aria-labelledby="t d">
+<title id="t">Window-1 reverse waits: a send waits for the downstream receive</title>
+<desc id="d">Before: PP0 waits for PP1 to take every round (red reverse arrows). Now: PP0 keeps sending and PP1 receives at its own pace.</desc>
+<style>
+svg { font-family: system-ui, -apple-system, 'PingFang SC', 'Noto Sans CJK SC', 'Microsoft YaHei', sans-serif; }
+.bg { fill: #fcfcfb; }
+.ink { fill: #0b0b0b; } .ink2 { fill: #52514e; } .muted { fill: #898781; }
+.axis { stroke: #c3c2b7; stroke-width: 1; fill: none; }
+.grid { stroke: #e1e0d9; stroke-width: 1; fill: none; }
+.lane { stroke: #ecebe6; stroke-width: 1; fill: none; }
+.b0 { fill: #e6effa; } .b1 { fill: #d6e6f8; } .b2 { fill: #c6dcf5; }
+.b3 { fill: #b4d1f2; } .b4 { fill: #a2c5ef; } .b5 { fill: #8fb9ec; }
+.bstroke { stroke: #5b8fd0; stroke-width: 1.2; }
+.btext { fill: #0b0b0b; }
+.bubble { fill: #f3f3f1; stroke: #a8a7a1; stroke-width: 1.2; stroke-dasharray: 6 4; }
+.host { fill: #ecebe6; stroke: #b5b3ac; stroke-width: 1; }
+.block { fill: #fbe1d6; stroke: #ec835a; stroke-width: 1.2; }
+.spinbase { fill: #fdf0d5; stroke: #eda100; stroke-width: 1.2; }
+.hatch { stroke: #eda100; stroke-width: 1.4; }
+.ce { fill: #d9f2e6; stroke: #1baf7a; stroke-width: 1.2; }
+.kv { fill: #6250d6; }
+.flag { fill: #1baf7a; }
+.handoff { stroke: #2e8b57; stroke-width: 1.8; fill: none; }
+.handoffhead { fill: #2e8b57; }
+.dep { stroke: #d03b3b; stroke-width: 1.8; fill: none; }
+.dephead { fill: #d03b3b; }
+.barrier { stroke: #d03b3b; stroke-width: 1.6; }
+.ref { stroke: #898781; stroke-width: 1.4; fill: none; }
+.refhead { fill: #898781; }
+.gray { fill: #a3a29b; } .s1 { fill: #2a78d6; } .s2 { fill: #eb6834; } .s3 { fill: #1baf7a; } .s7 { fill: #6250d6; }
+.panel { fill: none; stroke: #e1e0d9; stroke-width: 1; }
+@media (prefers-color-scheme: dark) {
+  .bg { fill: #1a1a19; }
+  .ink { fill: #f0efec; } .ink2 { fill: #c3c2b7; }
+  .axis { stroke: #383835; } .grid { stroke: #2c2c2a; } .lane { stroke: #262624; }
+  .b0 { fill: #1f3550; } .b1 { fill: #23405f; } .b2 { fill: #274b6f; }
+  .b3 { fill: #2b567f; } .b4 { fill: #2f6190; } .b5 { fill: #336ca0; }
+  .bstroke { stroke: #5598e7; }
+  .btext { fill: #f0efec; }
+  .bubble { fill: #232322; stroke: #5e5d59; }
+  .host { fill: #2c2c2a; stroke: #55544f; }
+  .block { fill: #4a2a1f; stroke: #ec835a; }
+  .spinbase { fill: #3a2f14; stroke: #c98500; }
+  .hatch { stroke: #c98500; }
+  .ce { fill: #173b2d; stroke: #199e70; }
+  .kv { fill: #9085e9; }
+  .flag { fill: #199e70; }
+  .handoff { stroke: #3fb56f; } .handoffhead { fill: #3fb56f; }
+  .gray { fill: #6f6e68; } .s1 { fill: #3987e5; } .s2 { fill: #d95926; } .s3 { fill: #199e70; } .s7 { fill: #9085e9; }
+  .panel { stroke: #2c2c2a; }
+}
+</style>
+<rect x="0" y="0" width="1240" height="456" class="bg"/>
+<text x="32.0" y="40.0" class="ink" font-size="22" text-anchor="start" font-weight="650">Window-1 reverse waits: a send waits for the downstream receive</text>
+<text x="32.0" y="68.0" class="ink2" font-size="15" text-anchor="start" font-weight="400">gloo and NCCL sends complete only once the peer posts its receive. Waiting on the previous round every time tied each stage to its</text>
+<text x="32.0" y="90.0" class="ink2" font-size="15" text-anchor="start" font-weight="400">successor; a window lets it run ahead and wait only when far ahead.</text>
+<text x="40.0" y="136.0" class="ink" font-size="17" text-anchor="start" font-weight="650">Before</text>
+<line x1="158.0" y1="197.0" x2="600.0" y2="197.0" class="lane"/>
+<text x="40.0" y="179.0" class="ink2" font-size="13" text-anchor="start" font-weight="500">PP0</text>
+<line x1="158.0" y1="243.0" x2="600.0" y2="243.0" class="lane"/>
+<text x="40.0" y="225.0" class="ink2" font-size="13" text-anchor="start" font-weight="500">PP1</text>
+<rect x="158.0" y="158.0" width="42.2" height="32.0" rx="6" class="host"></rect>
+<text x="179.1" y="177.6" class="ink" font-size="10" text-anchor="middle" font-weight="500">send j</text>
+<rect x="202.2" y="158.0" width="130.6" height="32.0" rx="6" class="block"></rect>
+<text x="267.5" y="178.3" class="ink" font-size="12" text-anchor="middle" font-weight="500">wait: PP1 takes j</text>
+<rect x="334.8" y="158.0" width="51.0" height="32.0" rx="6" class="host"></rect>
+<rect x="387.8" y="158.0" width="130.6" height="32.0" rx="6" class="block"></rect>
+<text x="453.1" y="178.0" class="ink" font-size="11" text-anchor="middle" font-weight="500">wait: PP1 takes j+1</text>
+<rect x="520.4" y="158.0" width="51.0" height="32.0" rx="6" class="host"></rect>
+<rect x="158.0" y="204.0" width="174.8" height="32.0" rx="6" class="host"></rect>
+<text x="245.4" y="224.3" class="ink" font-size="12" text-anchor="middle" font-weight="500">still on j−1</text>
+<rect x="334.8" y="204.0" width="42.2" height="32.0" rx="6" class="host"></rect>
+<text x="355.9" y="223.6" class="ink" font-size="10" text-anchor="middle" font-weight="500">recv j</text>
+<rect x="379.0" y="204.0" width="139.4" height="32.0" rx="6" class="host"></rect>
+<text x="448.7" y="224.3" class="ink" font-size="12" text-anchor="middle" font-weight="500">process j</text>
+<rect x="520.4" y="204.0" width="51.0" height="32.0" rx="6" class="host"></rect>
+<line x1="339.2" y1="202.0" x2="330.4" y2="192.0" class="dep"/>
+<path d="M330.4,192.0 L333.0,201.7 L339.7,195.8 Z" class="dephead"/>
+<line x1="524.9" y1="202.0" x2="516.0" y2="192.0" class="dep"/>
+<path d="M516.0,192.0 L518.6,201.7 L525.4,195.8 Z" class="dephead"/>
+<text x="40.0" y="264.0" class="ink2" font-size="13" text-anchor="start" font-weight="400">Waits for: the downstream stage to take the previous round (a reverse</text>
+<text x="40.0" y="284.0" class="ink2" font-size="13" text-anchor="start" font-weight="400">dependency)</text>
+<text x="40.0" y="304.0" class="ink2" font-size="13" text-anchor="start" font-weight="400">If not ready: a gloo send blocks the host; an NCCL send kernel spins on</text>
+<text x="40.0" y="324.0" class="ink2" font-size="13" text-anchor="start" font-weight="400">the GPU</text>
+<text x="40.0" y="344.0" class="ink2" font-size="13" text-anchor="start" font-weight="400">Result: upstream leads by at most one round, so the whole pipeline locks</text>
+<text x="40.0" y="364.0" class="ink2" font-size="13" text-anchor="start" font-weight="400">into one beat</text>
+<text x="660.0" y="136.0" class="ink" font-size="17" text-anchor="start" font-weight="650">Now</text>
+<line x1="778.0" y1="197.0" x2="1220.0" y2="197.0" class="lane"/>
+<text x="660.0" y="179.0" class="ink2" font-size="13" text-anchor="start" font-weight="500">PP0</text>
+<line x1="778.0" y1="243.0" x2="1220.0" y2="243.0" class="lane"/>
+<text x="660.0" y="225.0" class="ink2" font-size="13" text-anchor="start" font-weight="500">PP1</text>
+<rect x="778.0" y="158.0" width="42.2" height="32.0" rx="6" class="host"></rect>
+<text x="799.1" y="177.6" class="ink" font-size="10" text-anchor="middle" font-weight="500">send j</text>
+<rect x="822.2" y="158.0" width="86.4" height="32.0" rx="6" class="host"></rect>
+<text x="865.4" y="178.3" class="ink" font-size="12" text-anchor="middle" font-weight="500">own work</text>
+<rect x="910.6" y="158.0" width="51.0" height="32.0" rx="6" class="host"></rect>
+<rect x="963.6" y="158.0" width="86.4" height="32.0" rx="6" class="host"></rect>
+<text x="1006.8" y="178.3" class="ink" font-size="12" text-anchor="middle" font-weight="500">own work</text>
+<rect x="1052.0" y="158.0" width="51.0" height="32.0" rx="6" class="host"></rect>
+<rect x="1105.1" y="158.0" width="112.9" height="32.0" rx="6" class="host"></rect>
+<text x="1161.5" y="178.3" class="ink" font-size="12" text-anchor="middle" font-weight="500">…</text>
+<rect x="778.0" y="204.0" width="174.8" height="32.0" rx="6" class="host"></rect>
+<text x="865.4" y="224.3" class="ink" font-size="12" text-anchor="middle" font-weight="500">still on j−1</text>
+<rect x="954.8" y="204.0" width="42.2" height="32.0" rx="6" class="host"></rect>
+<text x="975.9" y="223.6" class="ink" font-size="10" text-anchor="middle" font-weight="500">recv j</text>
+<rect x="999.0" y="204.0" width="139.4" height="32.0" rx="6" class="host"></rect>
+<text x="1068.7" y="224.3" class="ink" font-size="12" text-anchor="middle" font-weight="500">process j</text>
+<rect x="1140.4" y="204.0" width="51.0" height="32.0" rx="6" class="host"></rect>
+<line x1="813.4" y1="192.0" x2="963.6" y2="202.0" class="handoff"/>
+<path d="M963.6,202.0 L955.0,196.9 L954.4,205.9 Z" class="handoffhead"/>
+<line x1="954.8" y1="192.0" x2="1149.3" y2="202.0" class="handoff"/>
+<path d="M1149.3,202.0 L1140.5,197.0 L1140.1,206.0 Z" class="handoffhead"/>
+<text x="660.0" y="264.0" class="ink2" font-size="13" text-anchor="start" font-weight="400">Send and move on; wait for the oldest round only beyond D unconfirmed</text>
+<text x="660.0" y="284.0" class="ink2" font-size="13" text-anchor="start" font-weight="400">rounds</text>
+<text x="660.0" y="304.0" class="ink2" font-size="13" text-anchor="start" font-weight="400">Control messages D = pp_size + depth; activations D = 2 (about 0.47 GB per</text>
+<text x="660.0" y="324.0" class="ink2" font-size="13" text-anchor="start" font-weight="400">round)</text>
+<text x="660.0" y="344.0" class="ink2" font-size="13" text-anchor="start" font-weight="400">In steady state the window never fills; stages run at their own pace</text>
+<line x1="620.0" y1="122.0" x2="620.0" y2="404.0" class="grid"/>
+<rect x="40.0" y="417.0" width="18.0" height="18.0" rx="3" class="host"></rect>
+<text x="64.0" y="431.0" class="ink2" font-size="13" text-anchor="start" font-weight="400">normal host work</text>
+<rect x="206.6" y="417.0" width="18.0" height="18.0" rx="3" class="block"></rect>
+<text x="230.6" y="431.0" class="ink2" font-size="13" text-anchor="start" font-weight="400">blocked: host thread stalls</text>
+<line x1="456.2" y1="426.0" x2="474.2" y2="426.0" class="handoff"/>
+<path d="M474.2,426.0 L465.2,421.5 L465.2,430.5 Z" class="handoffhead"/>
+<text x="480.2" y="431.0" class="ink2" font-size="13" text-anchor="start" font-weight="400">data hand-off</text>
+<line x1="600.2" y1="426.0" x2="618.2" y2="426.0" class="dep"/>
+<path d="M618.2,426.0 L609.2,421.5 L609.2,430.5 Z" class="dephead"/>
+<text x="624.2" y="431.0" class="ink2" font-size="13" text-anchor="start" font-weight="400">dependency waited on</text>
+</svg>

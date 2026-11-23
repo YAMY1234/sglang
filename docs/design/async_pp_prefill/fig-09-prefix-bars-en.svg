@@ -1,0 +1,149 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1240 524" width="1240" height="524" role="img" aria-labelledby="t d">
+<title id="t">Per-stage mean forward and GPU busy, three arms on the same nodes (measured)</title>
+<desc id="d">Lockstep before the fixes, lockstep today and fully asynchronous, run back to back on the same nodes, 300 s each. Left: mean forward time; right: GPU busy; axes start at 0.</desc>
+<style>
+svg { font-family: system-ui, -apple-system, 'PingFang SC', 'Noto Sans CJK SC', 'Microsoft YaHei', sans-serif; }
+.bg { fill: #fcfcfb; }
+.ink { fill: #0b0b0b; } .ink2 { fill: #52514e; } .muted { fill: #898781; }
+.axis { stroke: #c3c2b7; stroke-width: 1; fill: none; }
+.grid { stroke: #e1e0d9; stroke-width: 1; fill: none; }
+.lane { stroke: #ecebe6; stroke-width: 1; fill: none; }
+.b0 { fill: #e6effa; } .b1 { fill: #d6e6f8; } .b2 { fill: #c6dcf5; }
+.b3 { fill: #b4d1f2; } .b4 { fill: #a2c5ef; } .b5 { fill: #8fb9ec; }
+.bstroke { stroke: #5b8fd0; stroke-width: 1.2; }
+.btext { fill: #0b0b0b; }
+.bubble { fill: #f3f3f1; stroke: #a8a7a1; stroke-width: 1.2; stroke-dasharray: 6 4; }
+.host { fill: #ecebe6; stroke: #b5b3ac; stroke-width: 1; }
+.block { fill: #fbe1d6; stroke: #ec835a; stroke-width: 1.2; }
+.spinbase { fill: #fdf0d5; stroke: #eda100; stroke-width: 1.2; }
+.hatch { stroke: #eda100; stroke-width: 1.4; }
+.ce { fill: #d9f2e6; stroke: #1baf7a; stroke-width: 1.2; }
+.kv { fill: #6250d6; }
+.flag { fill: #1baf7a; }
+.handoff { stroke: #2e8b57; stroke-width: 1.8; fill: none; }
+.handoffhead { fill: #2e8b57; }
+.dep { stroke: #d03b3b; stroke-width: 1.8; fill: none; }
+.dephead { fill: #d03b3b; }
+.barrier { stroke: #d03b3b; stroke-width: 1.6; }
+.ref { stroke: #898781; stroke-width: 1.4; fill: none; }
+.refhead { fill: #898781; }
+.gray { fill: #a3a29b; } .s1 { fill: #2a78d6; } .s2 { fill: #eb6834; } .s3 { fill: #1baf7a; } .s7 { fill: #6250d6; }
+.panel { fill: none; stroke: #e1e0d9; stroke-width: 1; }
+@media (prefers-color-scheme: dark) {
+  .bg { fill: #1a1a19; }
+  .ink { fill: #f0efec; } .ink2 { fill: #c3c2b7; }
+  .axis { stroke: #383835; } .grid { stroke: #2c2c2a; } .lane { stroke: #262624; }
+  .b0 { fill: #1f3550; } .b1 { fill: #23405f; } .b2 { fill: #274b6f; }
+  .b3 { fill: #2b567f; } .b4 { fill: #2f6190; } .b5 { fill: #336ca0; }
+  .bstroke { stroke: #5598e7; }
+  .btext { fill: #f0efec; }
+  .bubble { fill: #232322; stroke: #5e5d59; }
+  .host { fill: #2c2c2a; stroke: #55544f; }
+  .block { fill: #4a2a1f; stroke: #ec835a; }
+  .spinbase { fill: #3a2f14; stroke: #c98500; }
+  .hatch { stroke: #c98500; }
+  .ce { fill: #173b2d; stroke: #199e70; }
+  .kv { fill: #9085e9; }
+  .flag { fill: #199e70; }
+  .handoff { stroke: #3fb56f; } .handoffhead { fill: #3fb56f; }
+  .gray { fill: #6f6e68; } .s1 { fill: #3987e5; } .s2 { fill: #d95926; } .s3 { fill: #199e70; } .s7 { fill: #9085e9; }
+  .panel { stroke: #2c2c2a; }
+}
+</style>
+<rect x="0" y="0" width="1240" height="524" class="bg"/>
+<text x="32.0" y="40.0" class="ink" font-size="22" text-anchor="start" font-weight="650">Three arms on the same nodes: per-stage mean forward and GPU busy (measured)</text>
+<text x="32.0" y="68.0" class="ink2" font-size="15" text-anchor="start" font-weight="400">The beat is in the legend. The fully asynchronous arm is the busiest (87–99.5%) and PP4 sets its beat; lockstep before the fixes</text>
+<text x="32.0" y="90.0" class="ink2" font-size="15" text-anchor="start" font-weight="400">reaches only 71–89%.</text>
+<rect x="32.0" y="122.0" width="12.0" height="12.0" rx="2" class="s7"></rect>
+<text x="50.0" y="132.0" class="ink2" font-size="13" text-anchor="start" font-weight="400">lockstep before the fixes · beat 203.0 ms</text>
+<rect x="381.1" y="122.0" width="12.0" height="12.0" rx="2" class="gray"></rect>
+<text x="399.1" y="132.0" class="ink2" font-size="13" text-anchor="start" font-weight="400">lockstep today · 199.9 ms</text>
+<rect x="609.6" y="122.0" width="12.0" height="12.0" rx="2" class="s2"></rect>
+<text x="627.6" y="132.0" class="ink2" font-size="13" text-anchor="start" font-weight="400">fully asynchronous · 183.0 ms</text>
+<text x="32.0" y="178.0" class="ink" font-size="15" text-anchor="start" font-weight="650">Mean forward time (ms)</text>
+<line x1="84.0" y1="478.0" x2="604.0" y2="478.0" class="axis"/>
+<text x="76.0" y="482.0" class="muted" font-size="12" text-anchor="end" font-weight="400">0</text>
+<line x1="84.0" y1="407.5" x2="604.0" y2="407.5" class="grid"/>
+<text x="76.0" y="411.5" class="muted" font-size="12" text-anchor="end" font-weight="400">50</text>
+<line x1="84.0" y1="337.0" x2="604.0" y2="337.0" class="grid"/>
+<text x="76.0" y="341.0" class="muted" font-size="12" text-anchor="end" font-weight="400">100</text>
+<line x1="84.0" y1="266.5" x2="604.0" y2="266.5" class="grid"/>
+<text x="76.0" y="270.5" class="muted" font-size="12" text-anchor="end" font-weight="400">150</text>
+<line x1="84.0" y1="196.0" x2="604.0" y2="196.0" class="grid"/>
+<text x="76.0" y="200.0" class="muted" font-size="12" text-anchor="end" font-weight="400">200</text>
+<path d="M90.5,478.0 L90.5,226.0 Q90.5,223.0 93.5,223.0 L103.5,223.0 Q106.5,223.0 106.5,226.0 L106.5,478.0 Z" class="s7"><title>lockstep before the fixes · beat 203.0 ms PP0: 180.8 ms</title></path>
+<path d="M108.5,478.0 L108.5,217.9 Q108.5,214.9 111.5,214.9 L121.5,214.9 Q124.5,214.9 124.5,217.9 L124.5,478.0 Z" class="gray"><title>lockstep today · 199.9 ms PP0: 186.6 ms</title></path>
+<path d="M126.5,478.0 L126.5,231.1 Q126.5,228.1 129.5,228.1 L139.5,228.1 Q142.5,228.1 142.5,231.1 L142.5,478.0 Z" class="s2"><title>fully asynchronous · 183.0 ms PP0: 177.2 ms</title></path>
+<text x="116.5" y="496.0" class="muted" font-size="12" text-anchor="middle" font-weight="400">PP0</text>
+<path d="M155.5,478.0 L155.5,250.7 Q155.5,247.7 158.5,247.7 L168.5,247.7 Q171.5,247.7 171.5,250.7 L171.5,478.0 Z" class="s7"><title>lockstep before the fixes · beat 203.0 ms PP1: 163.3 ms</title></path>
+<path d="M173.5,478.0 L173.5,245.5 Q173.5,242.5 176.5,242.5 L186.5,242.5 Q189.5,242.5 189.5,245.5 L189.5,478.0 Z" class="gray"><title>lockstep today · 199.9 ms PP1: 167.0 ms</title></path>
+<path d="M191.5,478.0 L191.5,238.9 Q191.5,235.9 194.5,235.9 L204.5,235.9 Q207.5,235.9 207.5,238.9 L207.5,478.0 Z" class="s2"><title>fully asynchronous · 183.0 ms PP1: 171.7 ms</title></path>
+<text x="181.5" y="496.0" class="muted" font-size="12" text-anchor="middle" font-weight="400">PP1</text>
+<path d="M220.5,478.0 L220.5,254.3 Q220.5,251.3 223.5,251.3 L233.5,251.3 Q236.5,251.3 236.5,254.3 L236.5,478.0 Z" class="s7"><title>lockstep before the fixes · beat 203.0 ms PP2: 160.8 ms</title></path>
+<path d="M238.5,478.0 L238.5,247.4 Q238.5,244.4 241.5,244.4 L251.5,244.4 Q254.5,244.4 254.5,247.4 L254.5,478.0 Z" class="gray"><title>lockstep today · 199.9 ms PP2: 165.7 ms</title></path>
+<path d="M256.5,478.0 L256.5,246.2 Q256.5,243.2 259.5,243.2 L269.5,243.2 Q272.5,243.2 272.5,246.2 L272.5,478.0 Z" class="s2"><title>fully asynchronous · 183.0 ms PP2: 166.5 ms</title></path>
+<text x="246.5" y="496.0" class="muted" font-size="12" text-anchor="middle" font-weight="400">PP2</text>
+<path d="M285.5,478.0 L285.5,247.1 Q285.5,244.1 288.5,244.1 L298.5,244.1 Q301.5,244.1 301.5,247.1 L301.5,478.0 Z" class="s7"><title>lockstep before the fixes · beat 203.0 ms PP3: 165.9 ms</title></path>
+<path d="M303.5,478.0 L303.5,239.7 Q303.5,236.7 306.5,236.7 L316.5,236.7 Q319.5,236.7 319.5,239.7 L319.5,478.0 Z" class="gray"><title>lockstep today · 199.9 ms PP3: 171.2 ms</title></path>
+<path d="M321.5,478.0 L321.5,251.2 Q321.5,248.2 324.5,248.2 L334.5,248.2 Q337.5,248.2 337.5,251.2 L337.5,478.0 Z" class="s2"><title>fully asynchronous · 183.0 ms PP3: 163.0 ms</title></path>
+<text x="311.5" y="496.0" class="muted" font-size="12" text-anchor="middle" font-weight="400">PP3</text>
+<path d="M350.5,478.0 L350.5,229.2 Q350.5,226.2 353.5,226.2 L363.5,226.2 Q366.5,226.2 366.5,229.2 L366.5,478.0 Z" class="s7"><title>lockstep before the fixes · beat 203.0 ms PP4: 178.6 ms</title></path>
+<path d="M368.5,478.0 L368.5,221.2 Q368.5,218.2 371.5,218.2 L381.5,218.2 Q384.5,218.2 384.5,221.2 L384.5,478.0 Z" class="gray"><title>lockstep today · 199.9 ms PP4: 184.2 ms</title></path>
+<path d="M386.5,478.0 L386.5,224.2 Q386.5,221.2 389.5,221.2 L399.5,221.2 Q402.5,221.2 402.5,224.2 L402.5,478.0 Z" class="s2"><title>fully asynchronous · 183.0 ms PP4: 182.1 ms</title></path>
+<text x="376.5" y="496.0" class="muted" font-size="12" text-anchor="middle" font-weight="400">PP4</text>
+<path d="M415.5,478.0 L415.5,229.4 Q415.5,226.4 418.5,226.4 L428.5,226.4 Q431.5,226.4 431.5,229.4 L431.5,478.0 Z" class="s7"><title>lockstep before the fixes · beat 203.0 ms PP5: 178.5 ms</title></path>
+<path d="M433.5,478.0 L433.5,221.6 Q433.5,218.6 436.5,218.6 L446.5,218.6 Q449.5,218.6 449.5,221.6 L449.5,478.0 Z" class="gray"><title>lockstep today · 199.9 ms PP5: 184.0 ms</title></path>
+<path d="M451.5,478.0 L451.5,254.4 Q451.5,251.4 454.5,251.4 L464.5,251.4 Q467.5,251.4 467.5,254.4 L467.5,478.0 Z" class="s2"><title>fully asynchronous · 183.0 ms PP5: 160.7 ms</title></path>
+<text x="441.5" y="496.0" class="muted" font-size="12" text-anchor="middle" font-weight="400">PP5</text>
+<path d="M480.5,478.0 L480.5,276.9 Q480.5,273.9 483.5,273.9 L493.5,273.9 Q496.5,273.9 496.5,276.9 L496.5,478.0 Z" class="s7"><title>lockstep before the fixes · beat 203.0 ms PP6: 144.7 ms</title></path>
+<path d="M498.5,478.0 L498.5,272.4 Q498.5,269.4 501.5,269.4 L511.5,269.4 Q514.5,269.4 514.5,272.4 L514.5,478.0 Z" class="gray"><title>lockstep today · 199.9 ms PP6: 148.0 ms</title></path>
+<path d="M516.5,478.0 L516.5,232.2 Q516.5,229.2 519.5,229.2 L529.5,229.2 Q532.5,229.2 532.5,232.2 L532.5,478.0 Z" class="s2"><title>fully asynchronous · 183.0 ms PP6: 176.5 ms</title></path>
+<text x="506.5" y="496.0" class="muted" font-size="12" text-anchor="middle" font-weight="400">PP6</text>
+<path d="M545.5,478.0 L545.5,256.3 Q545.5,253.3 548.5,253.3 L558.5,253.3 Q561.5,253.3 561.5,256.3 L561.5,478.0 Z" class="s7"><title>lockstep before the fixes · beat 203.0 ms PP7: 159.3 ms</title></path>
+<path d="M563.5,478.0 L563.5,249.9 Q563.5,246.9 566.5,246.9 L576.5,246.9 Q579.5,246.9 579.5,249.9 L579.5,478.0 Z" class="gray"><title>lockstep today · 199.9 ms PP7: 163.9 ms</title></path>
+<path d="M581.5,478.0 L581.5,257.5 Q581.5,254.5 584.5,254.5 L594.5,254.5 Q597.5,254.5 597.5,257.5 L597.5,478.0 Z" class="s2"><title>fully asynchronous · 183.0 ms PP7: 158.5 ms</title></path>
+<text x="571.5" y="496.0" class="muted" font-size="12" text-anchor="middle" font-weight="400">PP7</text>
+<text x="632.0" y="178.0" class="ink" font-size="15" text-anchor="start" font-weight="650">GPU busy (%)</text>
+<line x1="684.0" y1="478.0" x2="1204.0" y2="478.0" class="axis"/>
+<text x="676.0" y="482.0" class="muted" font-size="12" text-anchor="end" font-weight="400">0</text>
+<line x1="684.0" y1="407.5" x2="1204.0" y2="407.5" class="grid"/>
+<text x="676.0" y="411.5" class="muted" font-size="12" text-anchor="end" font-weight="400">25</text>
+<line x1="684.0" y1="337.0" x2="1204.0" y2="337.0" class="grid"/>
+<text x="676.0" y="341.0" class="muted" font-size="12" text-anchor="end" font-weight="400">50</text>
+<line x1="684.0" y1="266.5" x2="1204.0" y2="266.5" class="grid"/>
+<text x="676.0" y="270.5" class="muted" font-size="12" text-anchor="end" font-weight="400">75</text>
+<line x1="684.0" y1="196.0" x2="1204.0" y2="196.0" class="grid"/>
+<text x="676.0" y="200.0" class="muted" font-size="12" text-anchor="end" font-weight="400">100</text>
+<path d="M690.5,478.0 L690.5,229.7 Q690.5,226.7 693.5,226.7 L703.5,226.7 Q706.5,226.7 706.5,229.7 L706.5,478.0 Z" class="s7"><title>lockstep before the fixes · beat 203.0 ms PP0: 89.1%</title></path>
+<path d="M708.5,478.0 L708.5,217.8 Q708.5,214.8 711.5,214.8 L721.5,214.8 Q724.5,214.8 724.5,217.8 L724.5,478.0 Z" class="gray"><title>lockstep today · 199.9 ms PP0: 93.3%</title></path>
+<path d="M726.5,478.0 L726.5,207.9 Q726.5,204.9 729.5,204.9 L739.5,204.9 Q742.5,204.9 742.5,207.9 L742.5,478.0 Z" class="s2"><title>fully asynchronous · 183.0 ms PP0: 96.8%</title></path>
+<text x="716.5" y="496.0" class="muted" font-size="12" text-anchor="middle" font-weight="400">PP0</text>
+<path d="M755.5,478.0 L755.5,254.2 Q755.5,251.2 758.5,251.2 L768.5,251.2 Q771.5,251.2 771.5,254.2 L771.5,478.0 Z" class="s7"><title>lockstep before the fixes · beat 203.0 ms PP1: 80.4%</title></path>
+<path d="M773.5,478.0 L773.5,245.6 Q773.5,242.6 776.5,242.6 L786.5,242.6 Q789.5,242.6 789.5,245.6 L789.5,478.0 Z" class="gray"><title>lockstep today · 199.9 ms PP1: 83.5%</title></path>
+<path d="M791.5,478.0 L791.5,216.4 Q791.5,213.4 794.5,213.4 L804.5,213.4 Q807.5,213.4 807.5,216.4 L807.5,478.0 Z" class="s2"><title>fully asynchronous · 183.0 ms PP1: 93.8%</title></path>
+<text x="781.5" y="496.0" class="muted" font-size="12" text-anchor="middle" font-weight="400">PP1</text>
+<path d="M820.5,478.0 L820.5,258.0 Q820.5,255.0 823.5,255.0 L833.5,255.0 Q836.5,255.0 836.5,258.0 L836.5,478.0 Z" class="s7"><title>lockstep before the fixes · beat 203.0 ms PP2: 79.1%</title></path>
+<path d="M838.5,478.0 L838.5,247.7 Q838.5,244.7 841.5,244.7 L851.5,244.7 Q854.5,244.7 854.5,247.7 L854.5,478.0 Z" class="gray"><title>lockstep today · 199.9 ms PP2: 82.7%</title></path>
+<path d="M856.5,478.0 L856.5,224.4 Q856.5,221.4 859.5,221.4 L869.5,221.4 Q872.5,221.4 872.5,224.4 L872.5,478.0 Z" class="s2"><title>fully asynchronous · 183.0 ms PP2: 91.0%</title></path>
+<text x="846.5" y="496.0" class="muted" font-size="12" text-anchor="middle" font-weight="400">PP2</text>
+<path d="M885.5,478.0 L885.5,251.0 Q885.5,248.0 888.5,248.0 L898.5,248.0 Q901.5,248.0 901.5,251.0 L901.5,478.0 Z" class="s7"><title>lockstep before the fixes · beat 203.0 ms PP3: 81.6%</title></path>
+<path d="M903.5,478.0 L903.5,240.2 Q903.5,237.2 906.5,237.2 L916.5,237.2 Q919.5,237.2 919.5,240.2 L919.5,478.0 Z" class="gray"><title>lockstep today · 199.9 ms PP3: 85.4%</title></path>
+<path d="M921.5,478.0 L921.5,230.3 Q921.5,227.3 924.5,227.3 L934.5,227.3 Q937.5,227.3 937.5,230.3 L937.5,478.0 Z" class="s2"><title>fully asynchronous · 183.0 ms PP3: 88.9%</title></path>
+<text x="911.5" y="496.0" class="muted" font-size="12" text-anchor="middle" font-weight="400">PP3</text>
+<path d="M950.5,478.0 L950.5,233.4 Q950.5,230.4 953.5,230.4 L963.5,230.4 Q966.5,230.4 966.5,233.4 L966.5,478.0 Z" class="s7"><title>lockstep before the fixes · beat 203.0 ms PP4: 87.8%</title></path>
+<path d="M968.5,478.0 L968.5,222.0 Q968.5,219.0 971.5,219.0 L981.5,219.0 Q984.5,219.0 984.5,222.0 L984.5,478.0 Z" class="gray"><title>lockstep today · 199.9 ms PP4: 91.9%</title></path>
+<path d="M986.5,478.0 L986.5,200.4 Q986.5,197.4 989.5,197.4 L999.5,197.4 Q1002.5,197.4 1002.5,200.4 L1002.5,478.0 Z" class="s2"><title>fully asynchronous · 183.0 ms PP4: 99.5%</title></path>
+<text x="976.5" y="496.0" class="muted" font-size="12" text-anchor="middle" font-weight="400">PP4</text>
+<path d="M1015.5,478.0 L1015.5,233.9 Q1015.5,230.9 1018.5,230.9 L1028.5,230.9 Q1031.5,230.9 1031.5,233.9 L1031.5,478.0 Z" class="s7"><title>lockstep before the fixes · beat 203.0 ms PP5: 87.6%</title></path>
+<path d="M1033.5,478.0 L1033.5,222.5 Q1033.5,219.5 1036.5,219.5 L1046.5,219.5 Q1049.5,219.5 1049.5,222.5 L1049.5,478.0 Z" class="gray"><title>lockstep today · 199.9 ms PP5: 91.7%</title></path>
+<path d="M1051.5,478.0 L1051.5,233.2 Q1051.5,230.2 1054.5,230.2 L1064.5,230.2 Q1067.5,230.2 1067.5,233.2 L1067.5,478.0 Z" class="s2"><title>fully asynchronous · 183.0 ms PP5: 87.9%</title></path>
+<text x="1041.5" y="496.0" class="muted" font-size="12" text-anchor="middle" font-weight="400">PP5</text>
+<path d="M1080.5,478.0 L1080.5,280.6 Q1080.5,277.6 1083.5,277.6 L1093.5,277.6 Q1096.5,277.6 1096.5,280.6 L1096.5,478.0 Z" class="s7"><title>lockstep before the fixes · beat 203.0 ms PP6: 71.1%</title></path>
+<path d="M1098.5,478.0 L1098.5,273.1 Q1098.5,270.1 1101.5,270.1 L1111.5,270.1 Q1114.5,270.1 1114.5,273.1 L1114.5,478.0 Z" class="gray"><title>lockstep today · 199.9 ms PP6: 73.7%</title></path>
+<path d="M1116.5,478.0 L1116.5,208.3 Q1116.5,205.3 1119.5,205.3 L1129.5,205.3 Q1132.5,205.3 1132.5,208.3 L1132.5,478.0 Z" class="s2"><title>fully asynchronous · 183.0 ms PP6: 96.7%</title></path>
+<text x="1106.5" y="496.0" class="muted" font-size="12" text-anchor="middle" font-weight="400">PP6</text>
+<path d="M1145.5,478.0 L1145.5,260.6 Q1145.5,257.6 1148.5,257.6 L1158.5,257.6 Q1161.5,257.6 1161.5,260.6 L1161.5,478.0 Z" class="s7"><title>lockstep before the fixes · beat 203.0 ms PP7: 78.2%</title></path>
+<path d="M1163.5,478.0 L1163.5,250.9 Q1163.5,247.9 1166.5,247.9 L1176.5,247.9 Q1179.5,247.9 1179.5,250.9 L1179.5,478.0 Z" class="gray"><title>lockstep today · 199.9 ms PP7: 81.6%</title></path>
+<path d="M1181.5,478.0 L1181.5,236.3 Q1181.5,233.3 1184.5,233.3 L1194.5,233.3 Q1197.5,233.3 1197.5,236.3 L1197.5,478.0 Z" class="s2"><title>fully asynchronous · 183.0 ms PP7: 86.8%</title></path>
+<text x="1171.5" y="496.0" class="muted" font-size="12" text-anchor="middle" font-weight="400">PP7</text>
+</svg>
