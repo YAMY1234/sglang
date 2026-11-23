@@ -2444,7 +2444,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         if not envs.SGLANG_K31_TM_UNTRACK_PROMPT.get():
             return
         ids = obj.input_ids
-        if not isinstance(ids, list) or not ids or not isinstance(ids[0], int):
+        # Short prompts cost nothing to scan; leaving them alone also keeps small reused payloads (health checks) intact.
+        if not isinstance(ids, list) or len(ids) < 1024 or not isinstance(ids[0], int):
             return
         obj.input_ids = tuple(ids)
         ids.clear()
