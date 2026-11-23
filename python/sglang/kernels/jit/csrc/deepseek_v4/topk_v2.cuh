@@ -70,6 +70,13 @@ static_assert(kMinWavesPerSimd > 0, "kBlockSize must cover at least one wave per
 // parameter and CLUSTER_TOPK_KERNEL relies on that, so leave the CUDA spelling.
 #define TOPK_KERNEL __global__ __launch_bounds__(kBlockSize, kOccupancy)
 #endif
+// The sampled kernel asks for one block per SM where that is all an SM holds: no residency lost, and its
+// 8-deep collect gets up to 64 registers.
+#if defined(USE_ROCM)
+#define SAMPLED_TOPK_KERNEL TOPK_KERNEL
+#else
+#define SAMPLED_TOPK_KERNEL __global__ __launch_bounds__(kBlockSize, SGL_TOPK_ONE_CTA_PER_SM ? 1 : kOccupancy)
+#endif
 
 /// Metadata tensor rows (each 8 B / 2 int32). Row 0 is the global plan result;
 /// rows 1..N are the (batch_id, seq_len) of items routed to the cluster pool.
@@ -641,7 +648,7 @@ __global__ __launch_bounds__(kBlockSize, 1) void lpt_row_map_kernel(
 /// kTrace (bench only, with kLpt): thread 0 stamps {start, row read, end, row} in params.lpt_trace;
 /// the production launch uses kTrace = false and carries no timestamp code.
 template <bool kPDL, bool kPush, bool kLpt = false, bool kTrace = false>
-TOPK_KERNEL void topk_candidates_sampled_kernel(const __grid_constant__ TopKCandidatesParams params) {
+SAMPLED_TOPK_KERNEL void topk_candidates_sampled_kernel(const __grid_constant__ TopKCandidatesParams params) {
   device::enable_smem_spilling();
   __shared__ SampledCandidatesSmem smem;
   static_assert(kLpt || !kTrace);
