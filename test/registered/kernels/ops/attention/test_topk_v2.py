@@ -1066,6 +1066,67 @@ def test_topk_v2_candidates_sampled_min_len(dist: str, min_len: int) -> None:
     _assert_sampled_rows(scores, rows, got, ref, k, True, (dist, min_len))
 
 
+def _lpt_case(rows, dist, k, seed):
+    width = (max(n + s for n, s in rows) + 3) // 4 * 4
+    torch.manual_seed(seed)
+    scores = _sampled_scores(
+        dist, k, rows, width, torch.Generator(device="cuda").manual_seed(seed)
+    )
+    seq_lens = torch.tensor([n for n, _ in rows], dtype=torch.int32, device="cuda")
+    starts = torch.tensor([s for _, s in rows], dtype=torch.int32, device="cuda")
+    ref = _dcp_candidates(scores, seq_lens, k, row_starts=starts, stable_ties=True)
+    redone = [torch.zeros(1, dtype=torch.int32, device="cuda") for _ in range(2)]
+    off, on = (
+        _dcp_candidates(
+            scores,
+            seq_lens,
+            k,
+            row_starts=starts,
+            stable_ties=True,
+            sampled=True,
+            overflow_rows=redone[lpt],
+            lpt=bool(lpt),
+        )
+        for lpt in (0, 1)
+    )
+    assert int(redone[1]) == int(redone[0]), (int(redone[1]), int(redone[0]))
+    return scores, ref, off, on
+
+
+@pytest.mark.skipif(is_hip(), reason="CUDA sampled candidate top-k")
+@pytest.mark.parametrize("with_row_starts", [False, True])
+@pytest.mark.parametrize("dist", ["randn", "ties", "planted", "all_equal"])
+@torch.inference_mode()
+def test_topk_v2_candidates_sampled_lpt(dist: str, with_row_starts: bool) -> None:
+    """lpt launches the blocks longest row first: on shuffled rows with repeated lengths
+    (ranks tie by row index), every row keeps the exact set and the same rows are redone."""
+    k = 2048
+    base = SAMPLED_ROWS + [(65537, 1), (16385, 0), (200000, 3), (100, 0)]
+    perm = torch.randperm(len(base), generator=torch.Generator().manual_seed(7)).tolist()
+    rows = [(base[i][0], base[i][1] if with_row_starts else 0) for i in perm]
+    scores, ref, _, on = _lpt_case(rows, dist, k, 31 + len(dist))
+    _assert_sampled_rows(scores, rows, on, ref, k, True, (dist, "lpt"))
+
+
+@pytest.mark.skipif(is_hip(), reason="CUDA sampled candidate top-k")
+@pytest.mark.parametrize("num_rows", [300, 1025])
+@torch.inference_mode()
+def test_topk_v2_candidates_sampled_lpt_rows(num_rows: int) -> None:
+    """Every row ranked once at 300 rows (two waves on a 212-SM part), and past 1024 rows
+    (more than one rank per thread) lpt keeps the launch order: same sets either way."""
+    k = 2048
+    g = torch.Generator().manual_seed(num_rows)
+    hi = 140000 if num_rows <= 1024 else 20000
+    lens = torch.randint(100, hi, (num_rows,), generator=g).tolist()
+    rows = [(n, i % 4) for i, n in enumerate(lens)]
+    scores, ref, off, on = _lpt_case(rows, "randn", k, num_rows)
+    for row in range(num_rows):
+        assert torch.equal(
+            on[row, :, 1].sort().values, off[row, :, 1].sort().values
+        ), (num_rows, row)
+    _assert_sampled_rows(scores, rows[:40], on, ref, k, True, ("lpt", num_rows))
+
+
 @pytest.mark.skipif(not is_hip(), reason="ROCm split path")
 @pytest.mark.parametrize("nvals", [64, 1024, 16384])
 @pytest.mark.parametrize("batch,seq", [(1, 131072), (8, 131072)])
