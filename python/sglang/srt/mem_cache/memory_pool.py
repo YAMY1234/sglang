@@ -1444,6 +1444,10 @@ class HybridReqToTokenPool(ReqToTokenPool):
     """A memory pool that maps a request to its token locations."""
 
     mamba_pool_cls = MambaPool
+    # (src, dst, mamba layer ids not yet copied) of a per-layer COW in flight; class-level
+    # defaults because subclasses (the PD decode pool) skip this __init__.
+    _pending_cow = None
+    _cow_per_layer_logged = False
 
     def __init__(
         self,
@@ -1491,9 +1495,6 @@ class HybridReqToTokenPool(ReqToTokenPool):
         self.enable_memory_saver = enable_memory_saver
         self.start_layer = start_layer if start_layer is not None else 0
         self.layer_transfer_counter = None
-        # (src, dst, mamba layer ids not yet copied) of a per-layer COW in flight.
-        self._pending_cow = None
-        self._cow_per_layer_logged = False
         self.ple_window_cache = None
         self._init_mamba_pool(
             mamba_size=mamba_size,
