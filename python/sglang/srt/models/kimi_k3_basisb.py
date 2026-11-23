@@ -39,9 +39,27 @@ from sglang.srt.utils.common import log_info_on_rank0
 logger = logging.getLogger(__name__)
 
 
+# FlashInfer's MXFP8 GEMM rejects n < 128 (KDA b_proj: 96 rows, 24 per rank at TP4);
+# such weights get zero rows (scale byte 0) and the output is sliced back.
+_MIN_N = 128
+
+
 class _BasisBMxfp8LinearMethod(Fp8LinearMethod):
     def _mxfp8_weight_cast(self, weight: torch.Tensor):
-        return mxfp8_quantize_modelopt(weight)
+        qweight, scale = mxfp8_quantize_modelopt(weight)
+        n = qweight.shape[0]
+        if n >= _MIN_N:
+            return qweight, scale
+        q_pad = qweight.new_zeros((_MIN_N, qweight.shape[1]), dtype=torch.uint8)
+        q_pad[:n] = qweight.view(torch.uint8)
+        s_pad = scale.new_zeros((_MIN_N, scale.shape[1]))
+        s_pad[:n] = scale
+        return q_pad.view(torch.float8_e4m3fn), s_pad
+
+    def apply(self, layer, x, bias=None):
+        out = super().apply(layer, x, bias=bias)
+        n = layer.output_size_per_partition
+        return out if out.shape[-1] == n else out[..., :n]
 
     def apply_into(self, layer, x, output, bias=None):
         # SP o_proj writes into K3's symmetric buffer; FlashInfer's MXFP8 GEMM
