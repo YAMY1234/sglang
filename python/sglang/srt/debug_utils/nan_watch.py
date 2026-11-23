@@ -79,6 +79,15 @@ def _dups(sorted_ids: torch.Tensor) -> torch.Tensor:
     return (sorted_ids[1:] == sorted_ids[:-1]).sum()
 
 
+def _count_in(elements: torch.Tensor, test: torch.Tensor) -> torch.Tensor:
+    # Not torch.isin: for large test sets it takes a unique-based path whose output size syncs the host.
+    if test.numel() == 0:
+        return torch.zeros((), dtype=torch.int64, device=elements.device)
+    sorted_test = torch.sort(test).values
+    idx = torch.searchsorted(sorted_test, elements).clamp_max(test.numel() - 1)
+    return (sorted_test[idx] == elements).sum()
+
+
 def begin(
     forward_batch: ForwardBatch, pp_proxy_tensors, *, model_runner, rids, stage
 ) -> None:
@@ -114,7 +123,7 @@ def begin(
         dev[:bs, _SLOT] = slots
         dev[bs, 0] = _dups(torch.sort(slots).values)
         free = pool.mamba_allocator.free_slots.long()
-        dev[bs, 1] = torch.isin(slots, free).sum()
+        dev[bs, 1] = _count_in(slots, free)
         dev[bs, 2] = _dups(torch.sort(free).values)
 
     loc = forward_batch.out_cache_loc[:num_tokens].long()
@@ -129,8 +138,7 @@ def begin(
     allocator = model_runner.token_to_kv_pool_allocator
     free_pages = allocator.get_all_free_pages()
     if free_pages is not None:
-        # Counts new tokens on a free page (no torch.unique: its output size would sync).
-        dev[bs, 4] = torch.isin(loc // allocator.page_size, free_pages.long()).sum()
+        dev[bs, 4] = _count_in(loc // allocator.page_size, free_pages.long())
     rows_cpu = forward_batch.req_pool_indices_cpu
     if rows_cpu is not None and not model_runner.kv_index_translator.is_translating:
         rtt = pool.req_to_token
@@ -140,7 +148,7 @@ def begin(
             if p > 0
         ]
         if prefix:
-            dev[bs, 5] = torch.isin(loc, torch.cat(prefix).long()).sum()
+            dev[bs, 5] = _count_in(loc, torch.cat(prefix).long())
     else:
         dev[bs, 5] = -1  # ids not comparable with req_to_token, or no host row ids
     _active = _Forward(
