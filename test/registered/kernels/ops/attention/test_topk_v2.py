@@ -1004,8 +1004,12 @@ def test_topk_v2_candidates_sampled(
         assert int(redone) == sampled_rows, (int(redone), sampled_rows)
     elif dist in SAMPLED_NONE_REDONE:
         assert int(redone) == 0, int(redone)
+    _assert_sampled_rows(scores, rows, got, ref, k, stable_ties, dist)
+
+
+def _assert_sampled_rows(scores, rows, got, ref, k, stable_ties, tag):
     for row, (n, start) in enumerate(rows):
-        msg = (dist, k, row, n, start)
+        msg = (tag, k, row, n, start)
         window = scores[row, start : start + n]
         pos, order = got[row, :, 1].long().sort()
         valid = pos >= 0
@@ -1024,6 +1028,42 @@ def test_topk_v2_candidates_sampled(
             stable = torch.sort(-window, stable=True).indices[: min(n, k)].sort().values
             assert torch.equal(local, stable), msg
             assert torch.equal(pos, ref[row, :, 1].long().sort().values), msg
+
+
+@pytest.mark.skipif(is_hip(), reason="CUDA sampled candidate top-k")
+@pytest.mark.parametrize("min_len", [0, 65536])
+@pytest.mark.parametrize("dist", ["randn", "all_equal"])
+@torch.inference_mode()
+def test_topk_v2_candidates_sampled_min_len(dist: str, min_len: int) -> None:
+    """Rows up to ``sampled_min_len`` keep the exact path and longer ones take the sampled
+    pass, each with the exact set; on all-equal rows every sampled row is redone, so the
+    redo count names exactly the rows dispatched to it."""
+    k = 2048
+    lens = [200000, 98304, 65537, 65536, 65535, 40000, 16385, 9000, 100]
+    rows = [(n, i % 4) for i, n in enumerate(lens)]
+    width = (max(n + s for n, s in rows) + 3) // 4 * 4
+    torch.manual_seed(min_len + len(dist))
+    if dist == "randn":
+        scores = torch.randn(len(rows), width, device="cuda")
+    else:
+        scores = _single_bin_scores(dist, len(rows), width, "cuda")
+    seq_lens = torch.tensor(lens, dtype=torch.int32, device="cuda")
+    starts = torch.tensor([s for _, s in rows], dtype=torch.int32, device="cuda")
+    redone = torch.zeros(1, dtype=torch.int32, device="cuda")
+    ref = _dcp_candidates(scores, seq_lens, k, row_starts=starts, stable_ties=True)
+    got = _dcp_candidates(
+        scores,
+        seq_lens,
+        k,
+        row_starts=starts,
+        stable_ties=True,
+        sampled=True,
+        sampled_min_len=min_len,
+        overflow_rows=redone,
+    )
+    sampled_rows = sum(n > min_len and n + s % 4 > 16384 for n, s in rows)
+    assert int(redone) == (sampled_rows if dist == "all_equal" else 0), int(redone)
+    _assert_sampled_rows(scores, rows, got, ref, k, True, (dist, min_len))
 
 
 @pytest.mark.skipif(not is_hip(), reason="ROCm split path")
