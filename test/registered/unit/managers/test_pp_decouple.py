@@ -510,6 +510,23 @@ class TestPPCEPush(CustomTestCase):
         self.assertEqual([w.waits for w in host], [1, 1])
 
 
+class TestPPDebugFileFastInherit(CustomTestCase):
+    def test_a_fifth_field_switches_the_fast_bank_inherit(self):
+        import tempfile
+
+        from sglang.srt.environ import envs
+
+        with tempfile.NamedTemporaryFile("w", suffix=".lead", delete=False) as f:
+            f.write("0 2 1 0 1")
+        s = SchedulerPPMixin()
+        s._pp_ce = None
+        s._pp_host_lead_file, s._pp_host_lead_read_at, s._pp_host_lead_max = f.name, 0.0, 0
+        s._pp_launch_events, s._pp_early_send_when_ready = deque(), True
+        with envs.SGLANG_ATTN_RES_FAST_INHERIT.override(False):
+            s._pp_reread_host_lead_max()
+            self.assertTrue(envs.SGLANG_ATTN_RES_FAST_INHERIT.get())
+
+
 class _StageModel:
     """One PP stage's allocator and radix tree, driven by per-epoch operations."""
 

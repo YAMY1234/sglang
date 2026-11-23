@@ -950,6 +950,11 @@ class SchedulerPPMixin:
         if len(fields) > 2 and bool(fields[2]) != self._pp_early_send_when_ready:
             logger.info("PP early send when ready -> %s (%s)", bool(fields[2]), self._pp_host_lead_file)
             self._pp_early_send_when_ready = bool(fields[2])
+        # A fifth switches SGLANG_ATTN_RES_FAST_INHERIT (the K3 attention-residual bank's inherit copy); a fourth is
+        # reserved for the launch credit bound.
+        if len(fields) > 4 and bool(fields[4]) != envs.SGLANG_ATTN_RES_FAST_INHERIT.get():
+            logger.info("K3 attn-res fast inherit -> %s (%s)", bool(fields[4]), self._pp_host_lead_file)
+            envs.SGLANG_ATTN_RES_FAST_INHERIT.set(bool(fields[4]))
 
     def _pp_bound_host_lead(self: Scheduler) -> None:
         """SGLANG_PP_HOST_LEAD_MAX: wait until fewer than that many of this stage's forwards are not yet

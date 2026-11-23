@@ -22,6 +22,7 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.utils import is_cuda, is_hip, is_npu
@@ -444,6 +445,24 @@ def _aggregate(
     return _aggregate_fused(prefix_sum, bank, nvb, score_proj, score_norm, out_norm)
 
 
+@triton.jit
+def _copy_rows_pitched_kernel(dst_ptr, src_ptr, row_elems, dst_stride, src_stride, BLOCK: tl.constexpr):
+    row = tl.program_id(0).to(tl.int64)
+    offs = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < row_elems
+    tl.store(dst_ptr + row * dst_stride + offs, tl.load(src_ptr + row * src_stride + offs, mask=mask), mask=mask)
+
+
+def copy_rows_pitched(dst: torch.Tensor, src: torch.Tensor) -> None:
+    """dst[r, :] = src[r, :] for 2D views with unit-stride rows; torch's copy_ into a pitched destination falls back to
+    a scalar elementwise kernel (about 1.3 TB/s on a K3 bank)."""
+    rows, row_elems = src.shape
+    block = 4096
+    _copy_rows_pitched_kernel[(rows, triton.cdiv(row_elems, block))](
+        dst, src, row_elems, dst.stride(0), src.stride(0), BLOCK=block
+    )
+
+
 class AttnResidual:
     """Snapshot bank + aggregation of one K3 attention-residual stream,
     backed by the capability-dispatched kernels above.
@@ -469,7 +488,18 @@ class AttnResidual:
         self.written_on_slice = False
         if block_residual is not None:  # inherited from the previous PP rank
             self.num_valid_blocks = block_residual.size(1)
-            self.block_residual[:, : self.num_valid_blocks, :].copy_(block_residual)
+            dst = self.block_residual[:, : self.num_valid_blocks, :]
+            if (
+                envs.SGLANG_ATTN_RES_FAST_INHERIT.get()
+                and block_residual.is_cuda
+                and block_residual.is_contiguous()
+                and block_residual.numel() > 0
+            ):
+                copy_rows_pitched(
+                    dst.view(num_tokens, -1), block_residual.view(num_tokens, -1)
+                )
+            else:
+                dst.copy_(block_residual)
 
     def write(self, prefix_sum: torch.Tensor, rows: Optional[slice] = None) -> None:
         """Snapshot the pre-attention prefix into the next bank row.

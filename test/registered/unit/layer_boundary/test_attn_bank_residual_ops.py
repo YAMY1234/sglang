@@ -276,6 +276,33 @@ class TestAttnBankResidualOps(CustomTestCase):
             self.assertTrue(readout.reads_before_dp_gather)
 
 
+class TestAttnBankFastInherit(CustomTestCase):
+    """SGLANG_ATTN_RES_FAST_INHERIT: a later pipeline rank copies the inherited bank rows with a pitched row copy
+    instead of a strided copy_, and gets the same bytes."""
+
+    def _bank(self, tokens, blocks, inherited, fast):
+        from sglang.srt.environ import envs
+
+        with envs.SGLANG_ATTN_RES_FAST_INHERIT.override(fast):
+            hidden = torch.zeros(tokens, inherited.size(2), dtype=inherited.dtype, device=inherited.device)
+            return attn_residual.AttnResidual(hidden, blocks, inherited)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "the pitched copy is a Triton kernel")
+    def test_the_pitched_copy_matches_copy_bitwise(self):
+        for tokens, n, blocks, hidden in ((37, 3, 5, 7168), (5, 1, 8, 24), (4099, 7, 8, 7168)):
+            inherited = torch.randn(tokens, n, hidden, device="cuda", dtype=torch.bfloat16)
+            fast = self._bank(tokens, blocks, inherited, True)
+            ref = self._bank(tokens, blocks, inherited, False)
+            self.assertEqual(fast.num_valid_blocks, n)
+            self.assertTrue(torch.equal(fast.block_residual[:, :n], ref.block_residual[:, :n]))
+            self.assertTrue(torch.equal(fast.block_residual[:, :n], inherited))
+
+    def test_a_cpu_bank_keeps_copy(self):
+        inherited = torch.randn(3, 2, 8)
+        bank = self._bank(3, 4, inherited, True)
+        self.assertTrue(torch.equal(bank.block_residual[:, :2], inherited))
+
+
 class TestAttnBankFusedAllReduce(CustomTestCase):
     """A bank's FFN read can supply a kernel that completes the attention
     output's sum together with the pending residual add on every row; the
