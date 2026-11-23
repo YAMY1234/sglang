@@ -458,7 +458,7 @@ struct TopKCandidatesParams {
   int32_t cand_rank;
   uint32_t static_cluster_floor;  // cluster variant only: longer rows split across a cluster
   int32_t cand_page_bits;
-  int32_t* overflow_rows;  // cluster variant only, nullable: counts rows redone past the tie buffer
+  int32_t* overflow_rows;  // nullable: rows the cluster (tie buffer) or sampled variant redoes
   // Push variant only (DSA DCP decode merge, dsa/dcp_topk_merge.cuh): the row's
   // entries go straight to its candidate block on every rank, not to `candidates`.
   uint64_t* push_mc = nullptr;                 // multicast address of the merge buffer
@@ -550,6 +550,61 @@ TOPK_KERNEL void topk_candidates_kernel(const __grid_constant__ TopKCandidatesPa
   __shared__ int32_t s_topk_indices[kMaxTopK];
   candidates_one_block<kPDL, kPush>(params, blockIdx.x, &smem, s_topk_indices);
 }
+
+#if !defined(USE_ROCM)
+using Sampled = impl::TopKSampled;
+
+union SampledCandidatesSmem {
+  struct {
+    RaggedSmem ragged;
+    int32_t staged[kMaxTopK];
+  } exact;  // rows the sampled path does not take, or misses
+  Sampled::Smem sampled;
+};
+static_assert(sizeof(SampledCandidatesSmem) <= 48 * 1024, "static shared memory limit");
+
+/// `candidates_one_block`, except that rows past the register paths take the sampled
+/// single pass (impl::TopKSampled) and fall back to the exact path when it misses,
+/// counted in `overflow_rows`. Same selected set; slot order differs.
+template <bool kPDL, bool kPush>
+SGL_DEVICE void
+candidates_sampled_one_block(const TopKCandidatesParams& params, const uint32_t bx, SampledCandidatesSmem* smem) {
+  constexpr uint32_t kVecSize = impl::TopKStreaming::kVecSize;
+  const auto seq_len = static_cast<uint32_t>(params.seq_lens[bx]);
+  const auto row_start = params.row_starts == nullptr ? 0u : static_cast<uint32_t>(params.row_starts[bx]);
+  const auto rem = row_start % kVecSize;
+  if (seq_len <= params.topk || seq_len + rem <= Register4::kMaxSeqLen) {
+    return candidates_one_block<kPDL, kPush>(params, bx, &smem->exact.ragged, smem->exact.staged);
+  }
+
+  // the sink reads the merge's row counter, and the head mask must land after the indexer
+  device::PDLWaitPrimary<kPDL>();
+  const auto score = params.scores + bx * params.score_stride;
+  if (threadIdx.x < rem) score[row_start - rem + threadIdx.x] = impl::padding_value();
+  const auto sink = CandidateSink<kPush>::make(params, bx);
+  const auto problem = TopKProblem{
+      .in = score + (row_start - rem),
+      .out = nullptr,
+      .topk = params.topk,
+      .seq_len = seq_len + rem,
+      .input_start = rem,
+  };
+  const bool done = Sampled::forward<kPDL>(problem, &smem->sampled, [&](uint32_t slot, float val, uint32_t idx) {
+    sink.put(slot, __float_as_int(val), params.global_position(static_cast<int32_t>(idx - rem)));
+  });
+  if (done) return;
+  if (threadIdx.x == 0 && params.overflow_rows != nullptr) atomicAdd(params.overflow_rows, 1);
+  __syncthreads();  // every thread has read n_ge before the exact path reuses the storage
+  candidates_one_block<kPDL, kPush>(params, bx, &smem->exact.ragged, smem->exact.staged);
+}
+
+template <bool kPDL, bool kPush>
+TOPK_KERNEL void topk_candidates_sampled_kernel(const __grid_constant__ TopKCandidatesParams params) {
+  device::enable_smem_spilling();
+  __shared__ SampledCandidatesSmem smem;
+  candidates_sampled_one_block<kPDL, kPush>(params, blockIdx.x, &smem);
+}
+#endif  // !USE_ROCM
 
 // Packed DSA extend layout.
 
@@ -2077,7 +2132,9 @@ struct TopKKernel {
 
   /**
    * \brief DCP decode variant of `transform_candidates` (token interleave): `cluster_size` 2 / 4
-   * runs rows longer than `cluster_floor` on that many blocks, 0 one block.
+   * runs rows longer than `cluster_floor` on that many blocks, 0 one block. With `cluster_size` 0,
+   * `sampled` takes rows past the register paths through the sampled single pass, counting
+   * the rows it redoes on the exact path in `fallback_rows` (int32 [1], optional).
    */
   static void transform_candidates_dcp(
       const tvm::ffi::TensorView scores,
@@ -2087,7 +2144,9 @@ struct TopKKernel {
       const int64_t world,
       const int64_t rank,
       const int64_t cluster_size,
-      const int64_t cluster_floor) {
+      const int64_t cluster_floor,
+      const bool sampled,
+      const tvm::ffi::Optional<tvm::ffi::TensorView> fallback_rows) {
     using namespace host;
     auto B = SymbolicSize{"batch_size"};
     auto L = SymbolicSize{"max_seq_len"};
@@ -2122,6 +2181,11 @@ struct TopKKernel {
     const auto topk = static_cast<uint32_t>(K.unwrap());
     RuntimeCheck(topk > 0 && topk <= kMaxTopK, "topk must be in (0, 2048]");
     RuntimeCheck(world >= 1 && rank >= 0 && rank < world, "invalid world/rank");
+    int32_t* fallback_ptr = nullptr;
+    if (fallback_rows.has_value()) {
+      TensorMatcher({1}).with_dtype<int32_t>().with_device(device_).verify(fallback_rows.value());
+      fallback_ptr = static_cast<int32_t*>(fallback_rows.value().data_ptr());
+    }
 
     const auto params = TopKCandidatesParams{
         .scores = static_cast<float*>(scores.data_ptr()),
@@ -2132,6 +2196,7 @@ struct TopKKernel {
         .topk = topk,
         .cand_world = static_cast<int32_t>(world),
         .cand_rank = static_cast<int32_t>(rank),
+        .overflow_rows = fallback_ptr,
     };
     const auto rows = static_cast<uint32_t>(B.unwrap());
 #if SUPPORT_CLUSTER
@@ -2157,6 +2222,15 @@ struct TopKKernel {
     RuntimeCheck(cluster_size == 0, "the cluster candidate top-k needs sm90 / sm100");
     static_cast<void>(cluster_floor);
 #endif
+    if (sampled) {
+#ifdef USE_ROCM
+      RuntimeCheck(false, "the sampled candidate top-k needs CUDA");
+#else
+      return LaunchKernel(rows, kBlockSize, device_.unwrap())
+          .config({.use_pdl = kUsePDL})
+          .launch(topk_candidates_sampled_kernel<kUsePDL, false>, params);
+#endif
+    }
     LaunchKernel(rows, kBlockSize, device_.unwrap())
         .config({.use_pdl = kUsePDL})
         .launch(topk_candidates_kernel<kUsePDL>, params);
@@ -2168,7 +2242,7 @@ struct TopKKernel {
    * every rank's DCP merge buffer (multicast address `push_mc`; the int64 layout
    * of dsa/dcp_topk_merge.cuh, `slot` entries per row slot, `max_rows` slots per
    * parity), tagged with the call of `counters[i]`. The merge kernel that reads
-   * them advances the counters.
+   * them advances the counters. `sampled` / `fallback_rows`: as in `transform_candidates_dcp`.
    */
   static void transform_candidates_dcp_push(
       const tvm::ffi::TensorView scores,
@@ -2180,7 +2254,9 @@ struct TopKKernel {
       const int64_t cand_k,
       const int64_t slot,
       const int64_t cluster_size,
-      const int64_t cluster_floor) {
+      const int64_t cluster_floor,
+      const bool sampled,
+      const tvm::ffi::Optional<tvm::ffi::TensorView> fallback_rows) {
     using namespace host;
     auto B = SymbolicSize{"batch_size"};
     auto L = SymbolicSize{"max_seq_len"};
@@ -2208,6 +2284,11 @@ struct TopKKernel {
     RuntimeCheck(world >= 1 && rank >= 0 && rank < world, "invalid world/rank");
     RuntimeCheck(push_mc != 0 && slot >= world * cand_k, "invalid push buffer");
     RuntimeCheck(B.unwrap() <= M.unwrap(), "more rows than merge row slots");
+    int32_t* fallback_ptr = nullptr;
+    if (fallback_rows.has_value()) {
+      TensorMatcher({1}).with_dtype<int32_t>().with_device(device_).verify(fallback_rows.value());
+      fallback_ptr = static_cast<int32_t*>(fallback_rows.value().data_ptr());
+    }
 
     const auto params = TopKCandidatesParams{
         .scores = static_cast<float*>(scores.data_ptr()),
@@ -2218,6 +2299,7 @@ struct TopKKernel {
         .topk = static_cast<uint32_t>(cand_k),
         .cand_world = static_cast<int32_t>(world),
         .cand_rank = static_cast<int32_t>(rank),
+        .overflow_rows = fallback_ptr,
         .push_mc = reinterpret_cast<uint64_t*>(push_mc),
         .push_counters = static_cast<const int64_t*>(counters.data_ptr()),
         .push_slot = slot,
@@ -2247,6 +2329,15 @@ struct TopKKernel {
     RuntimeCheck(cluster_size == 0, "the cluster candidate top-k needs sm90 / sm100");
     static_cast<void>(cluster_floor);
 #endif
+    if (sampled) {
+#ifdef USE_ROCM
+      RuntimeCheck(false, "the sampled candidate top-k needs CUDA");
+#else
+      return LaunchKernel(rows, kBlockSize, device_.unwrap())
+          .config({.use_pdl = kUsePDL})
+          .launch(topk_candidates_sampled_kernel<kUsePDL, true>, params);
+#endif
+    }
     LaunchKernel(rows, kBlockSize, device_.unwrap())
         .config({.use_pdl = kUsePDL})
         .launch(topk_candidates_kernel<kUsePDL, true>, params);
