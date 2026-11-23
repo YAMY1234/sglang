@@ -651,6 +651,7 @@ struct PushedParams {
   int32_t span;  // page_size * kNumRanks
   int32_t max_rows;
   int64_t* trace = nullptr;  // bench only (merge_pushed_wide_traced_kernel): [rows, 8] per CTA
+  uint64_t* mc = nullptr;     // owner mode (merge_pushed_owner_kernel): the buffer's multicast address, for t*
 };
 
 // This rank failed the certificate: its keys >= t_lo, tagged into its full slot
@@ -925,9 +926,79 @@ __global__ void __launch_bounds__(32 * kNumRanks, kNumRanks == 8 ? 4 : 1)
 // kTopK / (32 * kWarpsPerRank) keys and the select's rounds have that many more warps in
 // flight. Same buffer protocol, same t*, and this rank's keys >= t* in candidate order, so
 // out / out_local / out_lengths equal merge_pushed_kernel's.
+#ifndef SGL_DCP_MERGE_WATCHDOG  // 1 (env SGLANG_DCP_MERGE_WATCHDOG, debug builds): owner-mode spins trap after ~1 s
+#define SGL_DCP_MERGE_WATCHDOG 0
+#endif
+
+// Owner mode: the owner of a row publishes its t* to every rank as one tagged 64-bit word in the row slot's
+// kPushExtra entry 1 (entry 0 is the fallback stamp, unused when cand_k == topk). A key's low 32 bits are ~position
+// with a 24-bit position, so bits 24-31 are always 0xFF and bits 0-23 never 0: the tag takes bits 24-31, and t* = 0
+// (a row without keys) is bits 0-23 == 0. A reader that sees the tag sees the key, as with the candidate entries.
+constexpr int kTStarEntry = 1;
+
+SGL_DEVICE uint64_t pack_tstar(uint64_t key, uint64_t tag) {
+  return (key & ~uint64_t{0xFF000000}) | (tag << 24);
+}
+
+SGL_DEVICE uint64_t unpack_tstar(uint64_t v) {
+  return (v & 0xFFFFFF) == 0 ? 0 : (v | uint64_t{0xFF000000});
+}
+
+/// SGL_DCP_MERGE_WATCHDOG: trap once a spin has lasted ~1 s, naming what it waited for.
+SGL_DEVICE void spin_watchdog(uint64_t& t0, uint32_t& n, int rank, int row, int64_t c, const char* what) {
+  if constexpr (SGL_DCP_MERGE_WATCHDOG) {
+    if (++n % 1024 != 0) return;
+    uint64_t now;
+    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(now));
+    if (t0 == 0) t0 = now;
+    if (now - t0 > 1000000000ull) {
+      printf("DCP owner merge watchdog: rank %d row %d call %lld parity %lld waited >1 s for %s\n", rank, row,
+             static_cast<long long>(c), static_cast<long long>(c & 1), what);
+      __trap();
+    }
+  } else {
+    static_cast<void>(t0), static_cast<void>(n), static_cast<void>(rank), static_cast<void>(row),
+        static_cast<void>(c), static_cast<void>(what);
+  }
+}
+
+/// poll_tagged, with the debug watchdog.
+template <int kPer>
+SGL_DEVICE void poll_tagged_wd(const uint64_t* src, int step, uint64_t tag, uint64_t (&v)[kPer], int rank, int row, int64_t c) {
+  static_assert(kPer >= 1 && kPer <= 64);
+  uint64_t pending = kPer == 64 ? ~uint64_t{0} : (uint64_t{1} << kPer) - 1;
+  uint64_t t0 = 0;
+  uint32_t n = 0;
+  while (pending) {
+#pragma unroll
+    for (int j = 0; j < kPer; ++j)
+      if (pending >> j & 1) v[j] = device::ptx::load_relaxed_sys(src + j * step);
+#pragma unroll
+    for (int j = 0; j < kPer; ++j)
+      if ((v[j] & 255) == tag) pending &= ~(uint64_t{1} << j);
+    if (pending) spin_watchdog(t0, n, rank, row, c, "candidates");
+  }
+}
+
+/// A non-owner's wait for the row's t*, with backoff (the owner CTAs may share its SM).
+SGL_DEVICE uint64_t poll_tstar(const uint64_t* slot, uint64_t tag, int rank, int row, int64_t c) {
+  uint64_t t0 = 0, v;
+  uint32_t n = 0, ns = 32;
+  while (((v = device::ptx::load_relaxed_sys(slot)) >> 24 & 255) != tag) {
+    __nanosleep(ns);
+    ns = ns < 256 ? ns * 2 : ns;
+    spin_watchdog(t0, n, rank, row, c, "t*");
+  }
+  return unpack_tstar(v);
+}
+
 /// kTrace (bench only, merge_pushed_wide_traced_kernel): thread 0 writes p.trace[row] = {start, PDL wait done, every
 /// rank's candidates in, t* known, end, row} (globaltimer).
-template <int kNumRanks, int kTopK, int kWarpsPerRank, bool kUsePDL, bool kTrace>
+/// kOwner (merge_pushed_owner_kernel): blocks [0, rows this rank owns) run its rows r % kNumRanks == rank: they poll
+/// the four candidate blocks, select t* and publish it; the other blocks wait for their row's t* and write this rank's
+/// keys >= t* from its own block. Owners never wait on a non-owner. kSkipNonOwner (bench only): non-owner blocks only
+/// advance the row counter, to time the owners without them.
+template <int kNumRanks, int kTopK, int kWarpsPerRank, bool kUsePDL, bool kTrace, bool kOwner = false, bool kSkipNonOwner = false>
 SGL_DEVICE void merge_pushed_wide_body(const PushedParams& p) {
   constexpr int kRankThreads = 32 * kWarpsPerRank;
   constexpr int kPer = kTopK / kRankThreads;
@@ -939,7 +1010,18 @@ SGL_DEVICE void merge_pushed_wide_body(const PushedParams& p) {
   __shared__ int sel_before[kWords];
   __shared__ int n_cand_smem, n_sel_smem;
 
-  const int row = blockIdx.x, tid = threadIdx.x;
+  const int tid = threadIdx.x;
+  const int n_own = kOwner && static_cast<int>(gridDim.x) > p.rank
+                        ? (static_cast<int>(gridDim.x) - p.rank + kNumRanks - 1) / kNumRanks
+                        : 0;
+  const bool owner = !kOwner || static_cast<int>(blockIdx.x) < n_own;
+  const int row = [&] {
+    const int b = blockIdx.x;
+    if constexpr (!kOwner) return b;
+    if (b < n_own) return p.rank + b * kNumRanks;
+    const int j = b - n_own, g = j / (kNumRanks - 1), k = j % (kNumRanks - 1);  // the j-th row another rank owns
+    return g * kNumRanks + (k < p.rank ? k : k + 1);
+  }();
   const int q = tid / kRankThreads, t = tid % kRankThreads;
   const uint32_t lane = device::get_lane_id();
   const auto stamp = [&](int k) {  // straight to global: no register held across the kernel
@@ -959,22 +1041,54 @@ SGL_DEVICE void merge_pushed_wide_body(const PushedParams& p) {
   const uint64_t tag = static_cast<uint64_t>(c % 255) + 1;
   const int64_t base = ((c & 1) * p.max_rows + row) * kSlot;
 
-  uint64_t cand[kPer];
-  poll_tagged<kPer>(p.buffer + base + q * kTopK + t, kRankThreads, tag, cand);
-  int mine = 0;
-#pragma unroll
-  for (int i = 0; i < kPer; ++i) {
-    cand[i] = entry_key(cand[i]);
-    mine += cand[i] != 0;
+  if constexpr (kSkipNonOwner) {
+    if (!owner) {
+      if (tid == 0) p.counters[row] = c + 1;
+      return;
+    }
   }
-  mine = device::warp::reduce_sum(mine);
-  __syncthreads();  // n_cand_smem zeroed
-  stamp(2);
-  if (lane == 0) atomicAdd(&n_cand_smem, mine);
-  __syncthreads();
-  const int want = min(n_cand_smem, kTopK);
-  const uint64_t ts = select_kth_adaptive(visit_keys(cand), want, s);
-  stamp(3);
+  uint64_t cand[kPer];
+  uint64_t ts;
+  if (owner) {
+    if constexpr (kOwner) {
+      poll_tagged_wd<kPer>(p.buffer + base + q * kTopK + t, kRankThreads, tag, cand, p.rank, row, c);
+    } else {
+      poll_tagged<kPer>(p.buffer + base + q * kTopK + t, kRankThreads, tag, cand);
+    }
+    int mine = 0;
+#pragma unroll
+    for (int i = 0; i < kPer; ++i) {
+      cand[i] = entry_key(cand[i]);
+      mine += cand[i] != 0;
+    }
+    mine = device::warp::reduce_sum(mine);
+    __syncthreads();  // n_cand_smem zeroed
+    stamp(2);
+    if (lane == 0) atomicAdd(&n_cand_smem, mine);
+    __syncthreads();
+    const int want = min(n_cand_smem, kTopK);
+    ts = select_kth_adaptive(visit_keys(cand), want, s);
+    stamp(3);
+    if constexpr (kOwner) {  // t* to every rank's slot of this row
+      if (tid == 0) {
+        asm volatile("multimem.st.relaxed.sys.global.b64 [%0], %1;" ::"l"(p.mc + base + kNumRanks * kTopK + kTopK + kTStarEntry),
+                     "l"(pack_tstar(ts, tag))
+                     : "memory");
+      }
+    }
+  } else {  // kOwner, another rank's row: this rank's own block (its top-k wrote it before the PDL wait), then t*
+    if (q == p.rank) {
+      poll_tagged_wd<kPer>(p.buffer + base + q * kTopK + t, kRankThreads, tag, cand, p.rank, row, c);
+#pragma unroll
+      for (int i = 0; i < kPer; ++i) cand[i] = entry_key(cand[i]);
+    }
+    stamp(2);
+    __shared__ uint64_t ts_smem;
+    if (tid == 0) ts_smem = poll_tstar(p.buffer + base + kNumRanks * kTopK + kTopK + kTStarEntry, tag, p.rank, row, c);
+    __syncthreads();
+    ts = ts_smem;
+    stamp(3);
+  }
   if (tid == 0) {
     p.fallback[row] = 0;
     if (row == 0) atomicAdd(&p.stats[kStatRows], static_cast<unsigned long long>(gridDim.x));
@@ -1048,6 +1162,20 @@ template <int kNumRanks, int kTopK, int kWarpsPerRank, bool kUsePDL>
 __global__ void __launch_bounds__(32 * kNumRanks * kWarpsPerRank, 2)
     merge_pushed_wide_traced_kernel(const __grid_constant__ PushedParams p) {
   merge_pushed_wide_body<kNumRanks, kTopK, kWarpsPerRank, kUsePDL, true>(p);
+}
+
+/// Owner mode (merge_pushed_wide_body kOwner): the push went only to each row's owner.
+template <int kNumRanks, int kTopK, int kWarpsPerRank, bool kUsePDL>
+__global__ void __launch_bounds__(32 * kNumRanks * kWarpsPerRank, 2)
+    merge_pushed_owner_kernel(const __grid_constant__ PushedParams p) {
+  merge_pushed_wide_body<kNumRanks, kTopK, kWarpsPerRank, kUsePDL, false, true>(p);
+}
+
+/// Bench only: owner mode with stamps; kSkipNonOwner times the owners without the non-owner blocks.
+template <int kNumRanks, int kTopK, int kWarpsPerRank, bool kUsePDL, bool kSkipNonOwner>
+__global__ void __launch_bounds__(32 * kNumRanks * kWarpsPerRank, 2)
+    merge_pushed_owner_traced_kernel(const __grid_constant__ PushedParams p) {
+  merge_pushed_wide_body<kNumRanks, kTopK, kWarpsPerRank, kUsePDL, true, true, kSkipNonOwner>(p);
 }
 
 }  // namespace dcp_topk_merge
@@ -1226,7 +1354,51 @@ struct DcpTopKMergePushedWideKernel {
       tvm::ffi::TensorView stats,
       int64_t rank,
       int64_t span) {
-    run_impl<false>(logits, local_lens, buffer, peer_ptrs, counters, global_lens, page_table, out_slots, out_local, out_lengths, out_fallback, stats, rank, span, nullptr);
+    run_impl<0>(logits, local_lens, buffer, peer_ptrs, counters, global_lens, page_table, out_slots, out_local, out_lengths, out_fallback, stats, rank, span, 0, nullptr);
+  }
+
+  /// Owner mode: the push went only to each row's owner (topk_transform_candidates_dcp_push owner_peers); `mc` is
+  /// the buffer's multicast address, for the owners' t*. Same outputs as `run`.
+  static void
+  run_owner(tvm::ffi::TensorView logits,
+      tvm::ffi::TensorView local_lens,
+      tvm::ffi::TensorView buffer,
+      tvm::ffi::TensorView peer_ptrs,
+      tvm::ffi::TensorView counters,
+      tvm::ffi::TensorView global_lens,
+      tvm::ffi::TensorView page_table,
+      tvm::ffi::TensorView out_slots,
+      tvm::ffi::TensorView out_local,
+      tvm::ffi::TensorView out_lengths,
+      tvm::ffi::TensorView out_fallback,
+      tvm::ffi::TensorView stats,
+      int64_t rank,
+      int64_t span,
+      int64_t mc) {
+    run_impl<1>(logits, local_lens, buffer, peer_ptrs, counters, global_lens, page_table, out_slots, out_local, out_lengths, out_fallback, stats, rank, span, mc, nullptr);
+  }
+
+  /// Bench only: run_owner with the trace; skip_non_owner: the non-owner blocks only advance the counters.
+  static void
+  run_owner_traced(tvm::ffi::TensorView logits,
+      tvm::ffi::TensorView local_lens,
+      tvm::ffi::TensorView buffer,
+      tvm::ffi::TensorView peer_ptrs,
+      tvm::ffi::TensorView counters,
+      tvm::ffi::TensorView global_lens,
+      tvm::ffi::TensorView page_table,
+      tvm::ffi::TensorView out_slots,
+      tvm::ffi::TensorView out_local,
+      tvm::ffi::TensorView out_lengths,
+      tvm::ffi::TensorView out_fallback,
+      tvm::ffi::TensorView stats,
+      int64_t rank,
+      int64_t span,
+      int64_t mc,
+      tvm::ffi::TensorView trace,
+      bool skip_non_owner) {
+    if (skip_non_owner) return run_impl<3>(logits, local_lens, buffer, peer_ptrs, counters, global_lens, page_table, out_slots, out_local, out_lengths, out_fallback, stats, rank, span, mc, &trace);
+    run_impl<2>(logits, local_lens, buffer, peer_ptrs, counters, global_lens, page_table, out_slots, out_local, out_lengths, out_fallback, stats, rank, span, mc, &trace);
   }
 
   /// Bench only: `run`, plus each CTA's {start, PDL wait done, candidates in, t* known, end, row} into trace [rows, 8].
@@ -1246,10 +1418,11 @@ struct DcpTopKMergePushedWideKernel {
       int64_t rank,
       int64_t span,
       tvm::ffi::TensorView trace) {
-    run_impl<true>(logits, local_lens, buffer, peer_ptrs, counters, global_lens, page_table, out_slots, out_local, out_lengths, out_fallback, stats, rank, span, &trace);
+    run_impl<-1>(logits, local_lens, buffer, peer_ptrs, counters, global_lens, page_table, out_slots, out_local, out_lengths, out_fallback, stats, rank, span, 0, &trace);
   }
 
-  template <bool kTrace>
+  /// kMode: 0 wide, -1 wide traced, 1 owner, 2 owner traced, 3 owner traced without the non-owner blocks.
+  template <int kMode>
   static void
   run_impl(tvm::ffi::TensorView logits,
       tvm::ffi::TensorView local_lens,
@@ -1265,7 +1438,9 @@ struct DcpTopKMergePushedWideKernel {
       tvm::ffi::TensorView stats,
       int64_t rank,
       int64_t span,
+      int64_t mc,
       const tvm::ffi::TensorView* trace) {
+    constexpr bool kTrace = kMode == -1 || kMode >= 2;
     using namespace host;
 
     auto R = SymbolicSize{"rows"};
@@ -1314,16 +1489,25 @@ struct DcpTopKMergePushedWideKernel {
         .span = static_cast<int32_t>(span),
         .max_rows = max_rows,
     };
+    auto q = params;
     if constexpr (kTrace) {
       TensorMatcher({R, 8}).with_strides({8, 1}).with_dtype<int64_t>().with_device(device_).verify(*trace);
-      auto traced = params;
-      traced.trace = static_cast<int64_t*>(trace->data_ptr());
-      LaunchKernel(rows, static_cast<int>(32 * kNumRanks * kWarpsPerRank), device_.unwrap())
-          .enable_pdl(kUsePDL)(
-              dcp_topk_merge::merge_pushed_wide_traced_kernel<kNumRanks, kTopK, kWarpsPerRank, kUsePDL>, traced);
+      q.trace = static_cast<int64_t*>(trace->data_ptr());
+    }
+    if constexpr (kMode >= 1) {
+      RuntimeCheck(mc != 0, "dcp_topk_merge_pushed_owner: no multicast address");
+      q.mc = reinterpret_cast<uint64_t*>(mc);
+    }
+    LaunchKernel launch(rows, static_cast<int>(32 * kNumRanks * kWarpsPerRank), device_.unwrap());
+    if constexpr (kMode == 0) {
+      launch.enable_pdl(kUsePDL)(kernel, q);
+    } else if constexpr (kMode == -1) {
+      launch.enable_pdl(kUsePDL)(dcp_topk_merge::merge_pushed_wide_traced_kernel<kNumRanks, kTopK, kWarpsPerRank, kUsePDL>, q);
+    } else if constexpr (kMode == 1) {
+      launch.enable_pdl(kUsePDL)(dcp_topk_merge::merge_pushed_owner_kernel<kNumRanks, kTopK, kWarpsPerRank, kUsePDL>, q);
     } else {
-      LaunchKernel(rows, static_cast<int>(32 * kNumRanks * kWarpsPerRank), device_.unwrap())
-          .enable_pdl(kUsePDL)(kernel, params);
+      launch.enable_pdl(kUsePDL)(
+          dcp_topk_merge::merge_pushed_owner_traced_kernel<kNumRanks, kTopK, kWarpsPerRank, kUsePDL, kMode == 3>, q);
     }
   }
 };

@@ -344,6 +344,7 @@ def topk_transform_candidates_dcp_push(
     fallback_rows: Optional[torch.Tensor] = None,
     lpt_row_map: Optional[torch.Tensor] = None,
     lpt_trace: Optional[torch.Tensor] = None,
+    owner_peers: Optional[torch.Tensor] = None,
 ) -> None:
     """DCP decode top-k that pushes its candidates to the merge.
 
@@ -357,7 +358,9 @@ def topk_transform_candidates_dcp_push(
     int64 merge calls per row slot; the merge advances them. ``sampled``,
     ``sampled_min_len`` and ``fallback_rows``: as ``sampled``, ``sampled_min_len`` and
     ``overflow_rows`` of :func:`topk_transform_candidates_v2`, and ``lpt_row_map`` and
-    ``lpt_trace`` (bench only) as there.
+    ``lpt_trace`` (bench only) as there. ``owner_peers`` (owner mode, ``cluster_size`` 0): [world]
+    int64, each rank's merge buffer: row ``i`` goes only to rank ``i % world``, and this rank's
+    block of every row is also kept in its own buffer (``dcp_topk_merge_pushed`` ``owner_mc``).
     """
     _jit_topk_v2_push_module().topk_transform_candidates_dcp_push(
         scores,
@@ -375,6 +378,7 @@ def topk_transform_candidates_dcp_push(
         fallback_rows,
         lpt_row_map,
         lpt_trace,
+        owner_peers,
     )
 
 

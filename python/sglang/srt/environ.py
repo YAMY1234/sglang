@@ -2492,6 +2492,11 @@ class Envs:
     SGLANG_DSA_DCP_TOPK_PUSH_LPT = EnvBool(False)
     # Tests: check every LPT launch's row map against its lengths (syncs; raises on a mismatch).
     SGLANG_DSA_DCP_TOPK_LPT_CHECK = EnvBool(False)
+    # DCP4 push merge with MERGE_WARPS > 0: each row's candidates go only to its owner rank (row % 4), which selects
+    # its t* and sends it to the others; each rank writes its own keys >= t*. Same output, a quarter of the push bytes.
+    SGLANG_DCP4_PUSH_OWNER_MERGE = EnvBool(False)
+    # Debug builds of the owner merge: a spin that lasts ~1 s prints rank / row / call and traps.
+    SGLANG_DCP_MERGE_WATCHDOG = EnvBool(False)
     # merge_kernel (push off): stage the candidate push in smem, register fallback
     # for <= 2 failed ranks (sgl-project/sglang#49922); same output. MIN_BLOCKS: its
     # launch bounds' minimum blocks per SM.

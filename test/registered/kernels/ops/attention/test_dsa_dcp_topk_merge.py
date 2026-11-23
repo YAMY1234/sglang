@@ -150,9 +150,9 @@ def _keys(scores: torch.Tensor, pos: torch.Tensor) -> torch.Tensor:
 class _Case:
     """One input set: this rank's shard of the rows and its expected results."""
 
-    def __init__(self, kind: str, seed: int, rank: int, world: int, span: int):
+    def __init__(self, kind: str, seed: int, rank: int, world: int, span: int, glob: Optional[list] = None):
         device = torch.device("cuda", torch.cuda.current_device())
-        glob = _rows(kind, seed)
+        glob = _rows(kind, seed) if glob is None else glob
         self.rows = len(glob)
         lens = [x.numel() for x in glob]
         self.local_lens = torch.tensor(
@@ -466,8 +466,9 @@ def test_dcp4_topk_merge_pushed_sampled(kind: str, cand_k: int, min_len: int, lp
         assert _all_ranks_ok(not bad), bad or "failed on another rank"
 
 
+@pytest.mark.parametrize("owner", [False, True])
 @torch.inference_mode()
-def test_dcp4_topk_merge_pushed_lpt_forwards() -> None:
+def test_dcp4_topk_merge_pushed_lpt_forwards(owner: bool) -> None:
     """LPT across forwards as the indexer drives it (prepare_step in every DSA layer, the map built
     at the lowest layer id, 0 as in the other tests that share this merge): forwards of 2, 11, 3 and
     1 rows, each over three layers, with
@@ -478,9 +479,10 @@ def test_dcp4_topk_merge_pushed_lpt_forwards() -> None:
     world, rank = ps._WORLD.world_size, ps._WORLD.rank_in_group
     if world != 4:
         pytest.skip("the DCP4 push merge needs 4 ranks")
-    merge = _sampled_merge(2048, 0, True)
+    merge = _owner_merge(4, sampled=True, lpt=True) if owner else _sampled_merge(2048, 0, True)
     if merge.buffer is None:
         pytest.skip("multimem multicast unavailable")
+    assert merge.owner_merge == owner
     span = PAGE_SIZE * world
     bad = []
     with envs.SGLANG_DSA_DCP_TOPK_LPT_CHECK.override(True):
@@ -498,6 +500,95 @@ def test_dcp4_topk_merge_pushed_lpt_forwards() -> None:
     case.run_pushed_only(merge, span)
     torch.cuda.synchronize()
     bad += [f"skipped map: {b}" for b in case.pushed_failures(rank, world)]
+    assert _all_ranks_ok(not bad), bad or "failed on another rank"
+
+
+_VARIANT_MERGES: dict[tuple, DcpTopKMerge] = {}
+
+
+def _owner_merge(warps: int, sampled: bool = False, lpt: bool = False, owner: bool = True, max_rows: int = MAX_ROWS) -> DcpTopKMerge:
+    """cand_k == top-k push merge with `warps` warps per rank; owner: SGLANG_DCP4_PUSH_OWNER_MERGE."""
+    key = (warps, sampled, lpt, owner, max_rows)
+    if key not in _VARIANT_MERGES:
+        with (
+            envs.SGLANG_DCP4_PUSH_CAND_K.override(TOPK),
+            envs.SGLANG_DCP4_PUSH_MERGE_WARPS.override(warps),
+            envs.SGLANG_DSA_DCP_TOPK_PUSH_SAMPLED.override(sampled),
+            envs.SGLANG_DSA_DCP_TOPK_PUSH_SAMPLED_MIN_LEN.override(0),
+            envs.SGLANG_DSA_DCP_TOPK_PUSH_LPT.override(lpt),
+            envs.SGLANG_DCP4_PUSH_OWNER_MERGE.override(owner),
+        ):
+            _VARIANT_MERGES[key] = DcpTopKMerge(ps._WORLD, max_rows, TOPK, push=True)
+    return _VARIANT_MERGES[key]
+
+
+@pytest.mark.parametrize("variant", ["exact", "sampled", "sampled_lpt"])
+@pytest.mark.parametrize(
+    "kind", ["random", "dense_top", "ties", "periodic", "skew", "skew2", "short", "long"]
+)
+@torch.inference_mode()
+def test_dcp4_topk_merge_pushed_owner(kind: str, variant: str) -> None:
+    """SGLANG_DCP4_PUSH_OWNER_MERGE: each row's candidates go only to its owner (row % 4), which
+    sends t* to the others. Every rank's slots, localized rows and lengths equal the multicast
+    merge's element for element on the same inputs (same local top-k), and are exact. Then three
+    inputs, one CUDA graph each, replayed in turn for 300 calls per row slot (past the 255 tags):
+    a non-owner reading a stale t* would write another input's keys."""
+    _init_once()
+    world, rank = ps._WORLD.world_size, ps._WORLD.rank_in_group
+    if world != 4:
+        pytest.skip("the DCP4 push merge needs 4 ranks")
+    sampled, lpt = variant != "exact", variant == "sampled_lpt"
+    owner, multicast = _owner_merge(4, sampled, lpt), _owner_merge(4, sampled, lpt, owner=False)
+    if owner.buffer is None:
+        pytest.skip("multimem multicast unavailable")
+    assert owner.owner_merge and not multicast.owner_merge
+    span = PAGE_SIZE * world
+    cases = [_Case(kind, seed, rank, world, span) for seed in SEEDS]
+    for case in cases:
+        case.run_pushed(multicast, span)
+        torch.cuda.synchronize()
+        ref = (case.out.clone(), case.local.clone(), case.lengths.clone())
+        case.run_pushed(owner, span)
+        torch.cuda.synchronize()
+        bad = case.pushed_failures(rank, world)
+        same = all(torch.equal(x, y) for x, y in zip((case.out, case.local, case.lengths), ref))
+        assert _all_ranks_ok(not bad and same), bad or ("outputs differ from the multicast merge" if not same else "failed on another rank")
+
+    graphs = []
+    for case in cases:
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            case.run_pushed(owner, span)
+        graphs.append(graph)
+    for i in range(300):
+        graphs[i % 3].replay()
+        if i % 25 == 24 or i >= 297:
+            torch.cuda.synchronize()
+            bad = cases[i % 3].pushed_failures(rank, world)
+            assert _all_ranks_ok(not bad), bad or "failed on another rank"
+
+
+@pytest.mark.parametrize("rows", [1, 3, 5, 500, 600])
+@torch.inference_mode()
+def test_dcp4_topk_merge_pushed_owner_rows(rows: int) -> None:
+    """Owner mode with ranks that own no row (1-3 rows), 500 rows (more merge blocks than one GPU
+    holds: owners first) and 600 (more rows waiting for t* than resident blocks: the multicast
+    merge instead); exact either way, local rows of 1-3000 keys."""
+    _init_once()
+    world, rank = ps._WORLD.world_size, ps._WORLD.rank_in_group
+    if world != 4:
+        pytest.skip("the DCP4 push merge needs 4 ranks")
+    owner = _owner_merge(4, max_rows=1024)
+    if owner.buffer is None:
+        pytest.skip("multimem multicast unavailable")
+    span = PAGE_SIZE * world
+    g = torch.Generator().manual_seed(rows)
+    lens = torch.randint(1, 12000, (rows,), generator=g).tolist()
+    case = _Case("", 0, rank, world, span, glob=[torch.randn(n, generator=g) for n in lens])
+    for _ in range(3):
+        case.run_pushed(owner, span)
+    torch.cuda.synchronize()
+    bad = case.pushed_failures(rank, world)
     assert _all_ranks_ok(not bad), bad or "failed on another rank"
 
 
