@@ -844,6 +844,9 @@ class Envs:
     # Tokenizer manager: gc.freeze() once after this many finished requests (0 off), so long-lived
     # objects leave gen2 scans when no post-warm-up /freeze_gc runs (e.g. a Dynamo worker).
     SGLANG_K31_TM_GC_FREEZE_AFTER = EnvInt(0)
+    # Tokenizer manager: once a request is dispatched, keep its prompt ids as an array and empty the caller's
+    # list (the dynamo handler shares it), so full GCs no longer walk every prompt token of in-flight requests.
+    SGLANG_K31_TM_UNTRACK_PROMPT = EnvBool(False)
     SGLANG_K31_PARK_CHUNKED_PREFILL = EnvBool(True)
     SGLANG_K31_PF_SPF_RESERVE_CHUNKED_TAIL = EnvBool(True)
     # Shortest-prefill-first: re-match each waiting request at least every N

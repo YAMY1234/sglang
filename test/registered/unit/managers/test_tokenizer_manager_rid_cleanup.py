@@ -15,8 +15,11 @@ Covers:
 """
 
 import asyncio
+import gc
+import pickle
 import time
 import unittest
+from array import array
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
@@ -29,6 +32,7 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 maybe_stub_sgl_kernel()
 
 from sglang.srt.disaggregation.utils import DisaggregationMode  # noqa: E402
+from sglang.srt.environ import envs  # noqa: E402
 from sglang.srt.lora.lora_registry import LoRARef, LoRARegistry  # noqa: E402
 from sglang.srt.managers.io_struct import (  # noqa: E402
     AbortReq,
@@ -1447,6 +1451,77 @@ class TestPriorityRange(CustomTestCase):
                         with self.assertRaisesRegex(ValueError, "signed 64-bit"):
                             asyncio.run(tm.generate_request(obj).__anext__())
                         tm._init_req_state.assert_not_called()
+
+
+
+class TestUntrackPromptIdsAfterDispatch(CustomTestCase):
+    """SGLANG_K31_TM_UNTRACK_PROMPT: after dispatch the prompt ids leave every GC container.
+
+    The caller (the dynamo handler) passes its own list as input_ids and keeps it for the whole stream, so the
+    switch stores the ids as an array and empties that shared list; the scheduler's copy is unaffected.
+    """
+
+    def _drive(self, ids, enabled):
+        tm = _make_tm_for_generate(self)
+        sent = []
+
+        async def tokenize(obj):
+            return SimpleNamespace(input_ids=array("q", obj.input_ids), mm_inputs=None)
+
+        async def send(tokenized):
+            sent.append(tokenized)
+
+        async def wait(obj, request=None):
+            yield {"text": "x", "meta_info": {"id": obj.rid}}
+
+        tm._tokenize_one_request = tokenize
+        tm._send_one_request = send
+        tm._wait_one_response = wait
+        caller_ids = list(ids)
+        obj = GenerateReqInput(input_ids=caller_ids, rid="untrack")
+
+        async def run():
+            return await tm.generate_request(obj).__anext__()
+
+        with envs.SGLANG_K31_TM_UNTRACK_PROMPT.override(enabled):
+            out = asyncio.run(run())
+        self.assertEqual(out["text"], "x")
+        self.assertEqual(len(sent), 1)
+        return obj, caller_ids, sent[0]
+
+    def test_off_by_default_keeps_the_callers_list(self):
+        ids = list(range(1000, 3000))
+        obj, caller_ids, tokenized = self._drive(ids, enabled=False)
+        self.assertIs(obj.input_ids, caller_ids)
+        self.assertEqual(caller_ids, ids)
+        self.assertTrue(gc.is_tracked(obj.input_ids))
+        self.assertEqual(list(tokenized.input_ids), ids)
+
+    def test_on_untracks_after_dispatch_with_parity(self):
+        ids = list(range(1000, 3000))
+        obj, caller_ids, tokenized = self._drive(ids, enabled=True)
+        # the scheduler got the full prompt before anything changed
+        self.assertEqual(list(tokenized.input_ids), ids)
+        # the tokenizer manager keeps every id, in a container full GCs never walk
+        self.assertIsInstance(obj.input_ids, array)
+        self.assertFalse(gc.is_tracked(obj.input_ids))
+        self.assertEqual(list(obj.input_ids), ids)
+        self.assertEqual(len(obj.input_ids), len(ids))
+        self.assertEqual(list(obj.input_ids[:3]), ids[:3])
+        self.assertEqual(pickle.loads(pickle.dumps(obj.input_ids)), array("q", ids))
+        # the caller's list (shared with the dynamo handler) no longer holds the prompt
+        self.assertEqual(caller_ids, [])
+
+    def test_only_flat_int_lists_are_converted(self):
+        tm = _make_tokenizer_manager(self)
+        nested = [[1, 2], [3]]
+        cases = [None, [], nested, "text", array("q", [1, 2])]
+        with envs.SGLANG_K31_TM_UNTRACK_PROMPT.override(True):
+            for value in cases:
+                obj = SimpleNamespace(input_ids=value)
+                tm._maybe_untrack_prompt_ids(obj)
+                self.assertIs(obj.input_ids, value)
+        self.assertEqual(nested, [[1, 2], [3]])
 
 
 if __name__ == "__main__":

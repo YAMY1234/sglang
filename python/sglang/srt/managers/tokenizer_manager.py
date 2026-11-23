@@ -951,6 +951,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     if obj.return_prompt_token_ids:
                         state.prompt_token_ids = list(tokenized_obj.input_ids)
                     await self._send_one_request(tokenized_obj)
+                    self._maybe_untrack_prompt_ids(obj)
                     async for response in self._wait_one_response(obj, request):
                         yield response
                 else:
@@ -2113,6 +2114,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                         if tmp_obj.return_prompt_token_ids:
                             state.prompt_token_ids = list(tokenized_obj.input_ids)
                         await self._send_one_request(tokenized_obj)
+                        self._maybe_untrack_prompt_ids(tmp_obj)
                         generators.append(self._wait_one_response(tmp_obj, request))
                         rids.append(tmp_obj.rid)
         else:
@@ -2434,6 +2436,20 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 f"K31 TM gc freeze after {n} finished requests: "
                 f"{gc.get_freeze_count()} objects frozen"
             )
+
+    def _maybe_untrack_prompt_ids(self, obj: GenerateReqInput):
+        # A dispatched prompt's ids stay referenced for the whole stream, here and by the caller (the dynamo handler
+        # passes its own list), and every full GC walks each element. The scheduler already has its own copy.
+        if not envs.SGLANG_K31_TM_UNTRACK_PROMPT.get():
+            return
+        ids = obj.input_ids
+        if not isinstance(ids, list) or not ids or not isinstance(ids[0], int):
+            return
+        obj.input_ids = array("q", ids)
+        ids.clear()
+        if not getattr(self, "_untrack_prompt_logged", False):
+            self._untrack_prompt_logged = True
+            logger.info("K31 TM prompt ids untracked after dispatch (SGLANG_K31_TM_UNTRACK_PROMPT)")
 
     async def freeze_gc(self):
         """Send a freeze_gc message to the scheduler first, then freeze locally."""
