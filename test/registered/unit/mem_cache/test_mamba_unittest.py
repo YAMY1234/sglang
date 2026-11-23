@@ -512,6 +512,39 @@ class TestMamba(unittest.TestCase):
         for layer_id in self.COW_MAMBA_LAYERS:
             self.assertTrue(self._cow_layer_copied(pool, src, dst, layer_id))
 
+    def test_cow_per_layer_state_on_decode_pool(self):
+        """The PD decode pool skips HybridReqToTokenPool.__init__; its per-layer state
+        accessor and the forward-end flush must still work."""
+        from sglang.srt.disaggregation.decode import HybridMambaDecodeReqToTokenPool
+
+        with envs.SGLANG_MAMBA_SSM_DTYPE.override("bfloat16"):
+            shape = Mamba2StateShape.create(
+                tp_world_size=1,
+                intermediate_size=4096,
+                n_groups=16,
+                num_heads=32,
+                head_dim=128,
+                state_size=128,
+                conv_kernel=4,
+            )
+            cache_params = Mamba2CacheParams(shape=shape, layers=self.COW_MAMBA_LAYERS)
+        pool = HybridMambaDecodeReqToTokenPool(
+            size=4,
+            max_context_len=128,
+            device=get_device(),
+            enable_memory_saver=False,
+            cache_params=cache_params,
+            mamba_layer_ids=self.COW_MAMBA_LAYERS,
+            speculative_num_draft_tokens=3,
+            enable_mamba_extra_buffer=False,
+            pre_alloc_size=1,
+            enable_overlap_schedule=False,
+            start_layer=self.COW_START_LAYER,
+        )
+        self.assertIsNone(pool._pending_cow)
+        pool.mamba2_layer_cache(self.COW_MAMBA_LAYERS[0])
+        pool.flush_pending_cow()
+
     def test_ngram_cpu_offload_roundtrip(self):
         """The window survives a host offload round-trip along with mamba state."""
         pool = self._setup_pool_with_ngram()
