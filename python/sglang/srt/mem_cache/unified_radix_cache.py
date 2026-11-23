@@ -969,8 +969,24 @@ class UnifiedRadixCache(BasePrefixCache):
             **(self.mamba_retention_counts or {}),
             "demote_state_drops": 0,
             "demote_state_copies": 0,
+            # Load-backs of a host-only Mamba state refused, by reason; and those
+            # where the request then continues from a device anchor past the root.
+            "lb_refused_held": 0,
+            "lb_refused_quota": 0,
+            "lb_refused_capacity": 0,
+            "lb_refused_alloc": 0,
+            "lb_refused_nonzero_prefix": 0,
         }
         logger.info("Mamba demote watch on, back up before demote %s", backup)
+
+    def _count_mamba_load_back_refusal(self, req, reason: str) -> None:
+        """A refused load-back of a request that matched a host-only Mamba state."""
+        if (
+            self._mamba_demote_watch
+            and req is not None
+            and req.mamba_host_hit_length > 0
+        ):
+            self.mamba_retention_counts[f"lb_refused_{reason}"] += 1
 
     def _watch_backed_leaf_state(self, node_id: NodeId) -> None:
         """Before a backed leaf's demote: copy its device-only Mamba state to host
@@ -2685,6 +2701,9 @@ class UnifiedRadixCache(BasePrefixCache):
         if (kv_tokens < max(1, self.load_back_threshold) and not comp_xfers) or (
             mem_quota is not None and kv_tokens + result.delta > mem_quota
         ):
+            # An empty spec: the node is held by another load-back (or pinned).
+            empty = kv_tokens == 0 and not comp_xfers
+            self._count_mamba_load_back_refusal(req, "held" if empty else "quota")
             self.dec_lock_ref(node_id, ancestor_lock_params)
             self.dec_host_lock_ref(node_id, host_anchor_params)
             return False
@@ -2700,6 +2719,7 @@ class UnifiedRadixCache(BasePrefixCache):
             if not self.token_to_kv_pool_allocator.ensure_c128_capacity(
                 self, c128_num_pages
             ):
+                self._count_mamba_load_back_refusal(req, "capacity")
                 self.dec_lock_ref(node_id, ancestor_lock_params)
                 self.dec_host_lock_ref(node_id, host_anchor_params)
                 return False
@@ -2709,6 +2729,7 @@ class UnifiedRadixCache(BasePrefixCache):
             needed = kv_tokens - avail
             self.evict_for_alloc(EvictParams(num_tokens=needed))
             if self._component_available_size(ComponentType.FULL) < kv_tokens:
+                self._count_mamba_load_back_refusal(req, "capacity")
                 self.dec_lock_ref(node_id, ancestor_lock_params)
                 self.dec_host_lock_ref(node_id, host_anchor_params)
                 return False
@@ -2724,6 +2745,7 @@ class UnifiedRadixCache(BasePrefixCache):
 
         self.dec_lock_ref(node_id, ancestor_lock_params)
         if device_indices is None:
+            self._count_mamba_load_back_refusal(req, "alloc")
             self.dec_host_lock_ref(node_id, host_anchor_params)
             return False
 

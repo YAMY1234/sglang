@@ -879,6 +879,12 @@ class MambaComponent(TreeComponent):
     def finalize_load_back(
         self, req: Optional[Req], prep: PrepareLoadBackResult, success: bool
     ) -> None:
+        if not success and req is not None and req.mamba_host_hit_length > 0:
+            anchor_state = self.tree_core.get_component_device_value(
+                req.last_node, self.component_type
+            )
+            if self.cache._mamba_demote_watch and anchor_state is not None:
+                self.cache.mamba_retention_counts["lb_refused_nonzero_prefix"] += 1
         # A called-off load-back returns the slot prepare allocated and clears req (the H->D copy never ran).
         if not success and prep.allocated_mamba_slot is not None:
             self.cache.req_to_token_pool.mamba_allocator.free(prep.allocated_mamba_slot)
