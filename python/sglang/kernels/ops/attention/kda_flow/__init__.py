@@ -105,7 +105,8 @@ def _compile(args, *, heads, tokens, requests, fused_fb, device_index):
         )
     conv_size = args[2].element_size()
     budget = smem_budget(props.major, props.minor, props.shared_memory_per_block_optin)
-    if shared_bytes(tokens, conv_size) > budget:
+    smem_bytes = shared_bytes(tokens, conv_size)
+    if smem_bytes > budget:
         raise ValueError(f"KdaFlow q{tokens}: shared memory over {budget} B")
     fakes = []
     for a in args:
@@ -118,7 +119,7 @@ def _compile(args, *, heads, tokens, requests, fused_fb, device_index):
             import cutlass
 
             fakes.append(cutlass.Float32(a))
-    kernel = KdaFlow(heads, tokens, requests, ctas, fused_fb)
+    kernel = KdaFlow(heads, tokens, requests, ctas, fused_fb, smem_bytes)
     with torch.cuda.device(device_index):
         return cute.compile(kernel, *fakes, make_fake_stream())
 
