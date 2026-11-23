@@ -820,5 +820,30 @@ class TestPPRankInvariantDigest(CustomTestCase):
         self.assertEqual((record.digest, record.parts), ("abc", {}))
 
 
+class TestPPLaunchQueueScale(CustomTestCase):
+    """SGLANG_PP_LAUNCH_QUEUE_SCALE sets CUDA_SCALE_LAUNCH_QUEUES for the listed PP ranks' processes only."""
+
+    def test_scale_applies_from_min_rank_and_never_over_an_explicit_value(self):
+        f = pp_decouple.launch_queue_scale
+        self.assertIsNone(f(1, "", 1, None))
+        self.assertIsNone(f(0, "4x", 1, None))
+        self.assertEqual(f(1, "4x", 1, None), "4x")
+        self.assertEqual(f(0, "4x", 0, None), "4x")
+        self.assertIsNone(f(3, "4x", 1, "2x"))
+
+    def test_env_is_set_around_the_start_and_restored(self):
+        import os
+
+        from sglang.srt.environ import envs
+
+        os.environ.pop("CUDA_SCALE_LAUNCH_QUEUES", None)
+        with envs.SGLANG_PP_LAUNCH_QUEUE_SCALE.override("4x"):
+            with pp_decouple.launch_queue_env(2):
+                self.assertEqual(os.environ["CUDA_SCALE_LAUNCH_QUEUES"], "4x")
+            self.assertNotIn("CUDA_SCALE_LAUNCH_QUEUES", os.environ)
+            with pp_decouple.launch_queue_env(0):
+                self.assertNotIn("CUDA_SCALE_LAUNCH_QUEUES", os.environ)
+
+
 if __name__ == "__main__":
     unittest.main()

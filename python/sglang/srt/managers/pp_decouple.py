@@ -12,9 +12,11 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 import queue
 import threading
 from collections import defaultdict, deque
+from contextlib import contextmanager
 from typing import Any, Callable, Deque, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import msgspec
@@ -23,6 +25,38 @@ import torch
 logger = logging.getLogger(__name__)
 
 DIGEST_LOG_PREFIX = "PP state digest: "
+_LAUNCH_QUEUE_ENV = "CUDA_SCALE_LAUNCH_QUEUES"
+
+
+def launch_queue_scale(pp_rank: int, scale: str, min_rank: int, current: Optional[str]) -> Optional[str]:
+    """CUDA_SCALE_LAUNCH_QUEUES for one PP rank's scheduler process, or None to leave the environment as is.
+    The device launch queue holds ~1k commands at 1x (VR200), about 1.7 forwards of a 12-layer K3.1 stage, so it
+    caps how far that stage's host runs ahead of its GPU. An explicit CUDA_SCALE_LAUNCH_QUEUES wins."""
+    if not scale or pp_rank < min_rank or current is not None:
+        return None
+    return scale
+
+
+@contextmanager
+def launch_queue_env(pp_rank: int):
+    """Around a scheduler process start (SGLANG_PP_LAUNCH_QUEUE_SCALE): CUDA reads the variable once, at
+    cuInit, which a spawned child runs during its imports, so it is set in the parent for that child only."""
+    from sglang.srt.environ import envs
+
+    value = launch_queue_scale(
+        pp_rank,
+        envs.SGLANG_PP_LAUNCH_QUEUE_SCALE.get(),
+        envs.SGLANG_PP_LAUNCH_QUEUE_SCALE_MIN_RANK.get(),
+        os.environ.get(_LAUNCH_QUEUE_ENV),
+    )
+    if value is None:
+        yield
+        return
+    os.environ[_LAUNCH_QUEUE_ENV] = value
+    try:
+        yield
+    finally:
+        del os.environ[_LAUNCH_QUEUE_ENV]
 
 
 class PPSendWindow:

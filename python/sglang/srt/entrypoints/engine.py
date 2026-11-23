@@ -99,6 +99,7 @@ from sglang.srt.managers.io_struct import (
     sock_recv,
     sock_send,
 )
+from sglang.srt.managers import pp_decouple
 from sglang.srt.managers.multi_tokenizer_mixin import (
     MultiTokenizerRouter,
     get_main_process_id,
@@ -957,6 +958,7 @@ class Engine(EngineScoreMixin, EngineBase):
                         with (
                             memory_saver_adapter.configure_subprocess(),
                             numa_utils.configure_subprocess(server_args, gpu_id),
+                            pp_decouple.launch_queue_env(pp_rank),
                         ):
                             proc.start()
 

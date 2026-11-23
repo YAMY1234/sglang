@@ -957,6 +957,10 @@ class Envs:
     # With the diag on: count every synchronizing CUDA call by call site and diag label
     # (sync debug mode plus timed Event / Stream / tensor host reads), one line per interval.
     SGLANG_PP_SYNC_AUDIT = EnvBool(False)
+    # PP: CUDA_SCALE_LAUNCH_QUEUES ("2x" / "4x") for the scheduler processes of PP ranks
+    # >= MIN_RANK, so those hosts can queue more than ~1.7 forwards ahead of their GPU.
+    SGLANG_PP_LAUNCH_QUEUE_SCALE = EnvStr("")
+    SGLANG_PP_LAUNCH_QUEUE_SCALE_MIN_RANK = EnvInt(1)
     # PP PD prefill (Mooncake): each stage sends a request's last KV chunk when its
     # own forward of that chunk completes, not when the result returns pp_size - 1
     # micro-batches later; only the last stage, which samples the first token, sends
