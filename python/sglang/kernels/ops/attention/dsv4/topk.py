@@ -391,6 +391,25 @@ def topk_lpt_row_map(seq_lens: torch.Tensor, row_map: torch.Tensor) -> None:
     _jit_topk_v2_push_module().topk_lpt_row_map(seq_lens, row_map)
 
 
+def candidates_cluster_max_rows() -> int:
+    """The most rows ``candidates_cluster_size`` gives a cluster launch (0: none). It follows this
+    GPU's GPCs, so two GPUs of one SKU can differ."""
+    if is_hip_runtime() or get_jit_cuda_arch().major not in (9, 10):
+        return 0
+    from sglang.kernels.jit.utils.occupancy import (
+        NoSchedulableClustersError,
+        get_max_active_clusters,
+    )
+
+    rows = 0
+    for size in (4, 2):
+        try:
+            rows = max(rows, get_max_active_clusters(size, occupancy=1))
+        except NoSchedulableClustersError:
+            continue
+    return rows
+
+
 def candidates_cluster_size(rows: int) -> int:
     if rows <= 0 or is_hip_runtime() or get_jit_cuda_arch().major not in (9, 10):
         return 0
