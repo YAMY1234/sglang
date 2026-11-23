@@ -646,31 +646,23 @@ Each line below was checked against the paper, document or code itself.
 
 ## Appendix: code and the upstream plan
 
-The implementation is on branch `k31-fullasync-pp`: 30 commits, about 1,840 non-test and 800 test lines. Every new
-feature is off by default.
+Every new behaviour is behind a switch that is off by default. The upstream plan is a series of 9 SGLang PRs, titled
+`(AsyncPP N/9)`, on top of two prerequisite PRs already in review. Line counts for open PRs are their diffs; the others
+are estimates from the implementation branch and will shift when ported to main.
 
-The plan is 9 SGLang PRs, plus 3 prerequisite PRs that are already in flight. Line counts are the branch's net diff
-attributed line by line to each PR. The prerequisites were measured on their own upstream branches. Sizes will shift
-when ported to main.
-
-| # | PR | non-test +/− | test +/− | depends on | model-agnostic? |
+| # | PR | What | non-test +/− | test +/− | depends on |
 |---|---|---|---|---|---|
-| pre-1 | PP0-decided release of PP prefill transfers (#47618, another author; our fix and tests are on it) | +167/−120 | +352/−77 | — | yes |
-| pre-2 | early last-chunk KV send per PP prefill stage (#50958) | +235/−8 | +281/−0 | — | yes |
-| pre-3 | hold an early-sent request's checkpoint frees until its transfer ends (may fold into pre-2) | +59/−14 | +129/−23 | pre-2 | yes |
-| 1 | wait un-waited gloo sends once before the torch profiler stops (use-after-free fix) | +97/−15 | +40 | none | yes |
-| 2 | PD prefill: each stage completes its own result, no output ring | +120/−8 | 0, to write | pre-2 | yes, Mooncake only |
-| 3 | send windows, background receive inboxes, CPU half of `recv_tensor_dict` | +219/−7 | +130 | none (reuse main's `PPSyncSendWindow`) | yes |
-| 4 | decoupled PD prefill loop with the batch-tag check | +209/−30 | +58/−1 | 1, 2, 3, pre-1, pre-3 | yes, not NPU |
-| 5 | rank-invariant state digest (debug) | +214 | +287 | 4 | yes |
-| 6 | copy-engine activation push into the next stage's input ring | +557/−7 | +119 | 4 | yes; needs FABRIC memory and attention TP 1 |
-| 7 | size each input ring from the model's proxy bytes per token | +27 | 0, to write | 6 | interface generic, implementation per model |
-| 8 | choose the layer split at boot from each GPU's measured speed | +361 | +143 | 7 | search, burn and agreement generic; cost model and hybrid-layer constraints model-specific |
-| 9 | move top-logprob slices to CPU before the PP output message is pickled | +12/−4 | 0, to write | none | yes; check main first |
+| pre-1 | [#47618](https://github.com/sgl-project/sglang/pull/47618) | release PP prefill transfers by PP0's decision once every stage concludes (another author; our fix and tests are on it) | +167/−120 | +352/−77 | — |
+| pre-2 | [#50958](https://github.com/sgl-project/sglang/pull/50958) | send each PP prefill stage's last KV chunk when its forward ends | +235/−8 | +281/−0 | — |
+| 1/9 | [#52196](https://github.com/sgl-project/sglang/pull/52196) | copy the output message's device logprob rows to the host before pickling | +19/−0 | +68/−0 | none |
+| 2/9 | [#52197](https://github.com/sgl-project/sglang/pull/52197) | wait a stage's un-waited gloo sends before the torch profiler stops (use-after-free fix) | +94/−10 | +96/−3 | none |
+| 3/9 | [#52198](https://github.com/sgl-project/sglang/pull/52198) | receive PP host messages ahead on a thread; split `recv_tensor_dict`'s host half | +106/−9 | +140/−1 | none |
+| 4/9 | — | PD prefill: each stage completes its own result, no output ring | ~+120/−10 | ~+120 | pre-2 |
+| 5/9 | — | decoupled PD prefill loop with the batch-tag check (includes early send when ready) | ~+250/−30 | ~+150 | 2/9, 3/9, 4/9, pre-1 |
+| 6/9 | — | rank-invariant per-epoch state digest (debug) | ~+214 | ~+287 | 5/9 |
+| 7/9 | — | copy-engine activation push into the next stage's input ring, with the gated push | ~+560/−7 | ~+180 | 5/9 |
+| 8/9 | — | size each stage's input ring from a model hook | ~+40 | ~+60 | 7/9 |
+| 9/9 | [#52199](https://github.com/sgl-project/sglang/pull/52199) (draft) | choose the layer split at boot from each GPU's measured speed | +434/−0 | +215/−0 | none |
 
-Totals:
-- our 9 PRs: +1,816 / −71 non-test and +777 / −1 test lines;
-- the 3 prerequisites: +461 / −142 non-test and +762 / −100 test lines.
-
-PRs 1, 3 and 9 can go up now. The critical path is pre-1 and pre-2 → 2 → 4 → 6. Rough effort: about 20 engineer-days,
-4–6 calendar weeks with review.
+1/9–3/9 are in review now. The critical path is pre-1 and pre-2 → 4/9 → 5/9 → 7/9. 9/9 goes back to ready once it
+shows a measured end-to-end gain (section 8).
