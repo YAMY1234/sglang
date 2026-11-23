@@ -290,8 +290,8 @@ def topk_transform_candidates_v2(
     ``overflow_rows`` counts those. ``lpt_row_map`` (with ``sampled``, rows <= 1024; from
     :func:`topk_lpt_row_map`) launches the blocks longest row first, so a launch of more rows
     than resident blocks queues the shortest; each block reads its row after the PDL wait.
-    ``lpt_trace`` (bench only): int64 [rows, 4], each block's {start, row read, end} in
-    globaltimer ns and its row.
+    ``lpt_trace`` (bench only): int64 [rows, 16], each block's {start, row read, 8 phase stamps
+    of a sampled row, end} in globaltimer ns and its row (see the kernel).
 
     NOTE: ``scores`` is written in place as for the ragged entry point.
     """
