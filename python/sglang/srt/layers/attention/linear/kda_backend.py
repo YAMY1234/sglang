@@ -704,7 +704,8 @@ class KDAAttnBackend(MambaAttnBackendBase):
             dt_bias=layer.dt_bias.reshape(-1),
             slots=cache_indices[:requests].to(torch.int32),
             state=ssm_states,
-            out_gate=onorm_gate.reshape(seq_len, -1),
+            # The gate keeps the MoE token padding that forward_extend cut from the rows.
+            out_gate=onorm_gate.reshape(-1, heads * layer.head_v_dim)[:seq_len],
             norm_weight=onorm_args[0],
             f_b=f_b,
             conv_windows=mamba_cache_params.intermediate_conv_window[0],

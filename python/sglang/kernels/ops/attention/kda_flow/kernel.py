@@ -224,10 +224,10 @@ class KdaFlow:
     ``heads`` heads; ``ctas`` persistent CTAs; ``fused_fb``: the gate input is F_A
     [R, 128] and the kernel applies F_B, else it is the raw gate [R, heads * 128]."""
 
-    def __init__(self, heads, tokens, requests, ctas, fused_fb, prefetch=False):
+    def __init__(self, heads, tokens, requests, ctas, fused_fb, smem_bytes, prefetch=False):
         assert 2 <= tokens <= 5
         self.heads, self.tokens, self.requests = heads, tokens, requests
-        self.ctas, self.fused_fb = ctas, fused_fb
+        self.ctas, self.fused_fb, self.smem_bytes = ctas, fused_fb, smem_bytes
         # Pages issued before the PDL wait: the state was written by this layer's
         # previous step, never by the kernels just before it. The fused F_B rows
         # stage in the last page slot, so that mode prefetches one page fewer.
@@ -236,7 +236,10 @@ class KdaFlow:
 
     @cute.jit
     def __call__(self, *args):
-        launch(self.kernel, args, self.ctas, THREADS, min_blocks_per_mp=1)
+        # Explicit size: the inferred one left the last mbarriers 16 B past the CTA's
+        # window, where a co-resident CTA (PDL successor, side stream) overwrote them.
+        launch(self.kernel, args, self.ctas, THREADS, min_blocks_per_mp=1,
+               smem=self.smem_bytes)  # fmt: skip
 
     # ---------------------------------------------------------------- helpers
     @cute.jit
