@@ -214,6 +214,7 @@ class DcpTopKMerge:
 
     cand_k = _DCP_MERGE_CAND_K
     merge_warps = 0
+    owner_merge = False
 
     def __init__(
         self,
@@ -264,6 +265,15 @@ class DcpTopKMerge:
         self.merge_warps = envs.SGLANG_DCP4_PUSH_MERGE_WARPS.get() if world == 4 and self.cand_k == topk else 0
         if self.merge_warps:
             print_info_once(f"DSA DCP4 push merge: {self.merge_warps} warps per rank (cand_k {self.cand_k} == top-k)")
+        self.owner_merge = bool(self.merge_warps) and envs.SGLANG_DCP4_PUSH_OWNER_MERGE.get()
+        # owner merge blocks one GPU holds at once (512 threads, 64 registers): with fewer rows waiting for another
+        # rank's t* than this, an owner's block always has a place, whatever order the blocks are dispatched in
+        self.owner_slots = 2 * torch.cuda.get_device_properties(group.device).multi_processor_count
+        if self.owner_merge:
+            print_info_once(
+                f"DSA DCP4 push merge: owner mode, each row's candidates only to rank row % {world} "
+                f"(up to {self.owner_slots + self.owner_slots // (world - 1)} rows; SGLANG_DCP4_PUSH_OWNER_MERGE)"
+            )
         if world not in worlds or topk != 2048:
             print_info_once(
                 "DSA DCP top-k merge off: it needs 8 or 16 ranks and top-k 2048"
@@ -401,6 +411,10 @@ class DcpTopKMerge:
         into every rank's buffer, then the merge. Fills ``out`` (as ``__call__``)
         and returns the same keys localized, as ``dcp_localize_compact(out)``."""
         rows = out.shape[0]
+        cluster_size = candidates_cluster_size(rows)
+        # owner mode needs the plain launch and, per rank, fewer rows waiting for t* than resident merge blocks;
+        # every rank decides alike (same rows), so the push and the merge always agree
+        owner = self.owner_merge and cluster_size == 0 and rows - rows // self.world < self.owner_slots
         topk_transform_candidates_dcp_push(
             logits,
             local_lens,
@@ -410,12 +424,13 @@ class DcpTopKMerge:
             rank=self.rank,
             cand_k=self.cand_k,
             slot=dcp_topk_merge_row_slot(self.world, out.shape[1], self.cand_k, push=True),
-            cluster_size=candidates_cluster_size(rows),
+            cluster_size=cluster_size,
             cluster_floor=_CANDIDATE_CLUSTER_FLOOR,
             sampled=self.sampled,
             sampled_min_len=self.sampled_min_len,
             fallback_rows=self.sampled_fallbacks,
             lpt_row_map=self.lpt_map_for(local_lens),
+            owner_peers=self.peer_ptrs if owner else None,
         )
         local = torch.empty_like(out)
         lengths = torch.empty(rows, dtype=torch.int32, device=out.device)
@@ -436,6 +451,7 @@ class DcpTopKMerge:
             cand_k=self.cand_k,
             stats=self.stats,
             warps_per_rank=self.merge_warps,
+            owner_mc=self.multicast_ptr if owner else None,
         )
         return local, lengths
 
