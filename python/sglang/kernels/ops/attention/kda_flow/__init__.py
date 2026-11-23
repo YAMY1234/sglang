@@ -184,7 +184,7 @@ def kda_flow_verify(
     import cutlass
 
     views = tuple(
-        from_dlpack(a, assumed_align=16) if isinstance(a, torch.Tensor) else cutlass.Float32(a)
+        from_dlpack(a.detach(), assumed_align=16) if isinstance(a, torch.Tensor) else cutlass.Float32(a)
         for a in args
     )
     stream = cuda.CUstream(torch.cuda.current_stream(x.device).cuda_stream)
