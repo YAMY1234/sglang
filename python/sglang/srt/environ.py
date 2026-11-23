@@ -954,6 +954,9 @@ class Envs:
     # With the diag on: log any diag span and any loop iteration this many ms over the
     # rolling median (labels, GC ms, wall time), and time GC on every rank (0 off).
     SGLANG_PP_DIAG_SLOW_MS = EnvFloat(0.0)
+    # With the diag on: count every synchronizing CUDA call by call site and diag label
+    # (sync debug mode plus timed Event / Stream / tensor host reads), one line per interval.
+    SGLANG_PP_SYNC_AUDIT = EnvBool(False)
     # PP PD prefill (Mooncake): each stage sends a request's last KV chunk when its
     # own forward of that chunk completes, not when the result returns pp_size - 1
     # micro-batches later; only the last stage, which samples the first token, sends

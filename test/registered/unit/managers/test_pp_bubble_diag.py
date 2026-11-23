@@ -358,5 +358,47 @@ class TestModuleHooks(unittest.TestCase):
             d._fwd_file.close()
 
 
+class TestSyncAudit(unittest.TestCase):
+    def _audit(self):
+        from sglang.srt.managers.pp_sync_audit import SyncAudit
+
+        return SyncAudit(lambda: "host.launch")
+
+    def test_timed_call_is_keyed_by_kind_label_and_caller(self):
+        import torch
+
+        audit = self._audit()
+        wait = audit.timed("event.synchronize", lambda: time.sleep(0.002), False)
+        wait()
+        wait()
+        audit.timed("tensor.item", torch.Tensor.item, True)(torch.ones(1))
+        snap = audit.snapshot(fwd_n=7)
+        self.assertEqual(snap["fwd_n"], 7)
+        self.assertEqual(snap["n_sites"], 1)
+        (key, (calls, ms)), = snap["sites"].items()
+        kind, label, site = key.split("|")
+        self.assertEqual((kind, label, calls), ("event.synchronize", "host.launch", 2))
+        self.assertGreaterEqual(ms, 3.5)
+        self.assertIn("test_pp_bubble_diag.py:", site)
+        self.assertEqual(audit.snapshot(fwd_n=0)["sites"], {})
+
+    def test_sync_warning_is_counted_and_others_pass_through(self):
+        audit = self._audit()
+        shown = []
+        audit._showwarning = lambda *a: shown.append(a)
+        audit.on_warning(UserWarning("called a synchronizing CUDA operation"), UserWarning, "f", 1)
+        audit.on_warning(UserWarning("unrelated"), UserWarning, "f", 1)
+        self.assertEqual(len(shown), 1)
+        (key, (calls, ms)), = audit.snapshot(fwd_n=1)["sites"].items()
+        self.assertTrue(key.startswith("implicit|host.launch|"))
+        self.assertEqual((calls, ms), (1, 0.0))
+
+    def test_off_by_default_is_inert(self):
+        from sglang.srt.managers import pp_sync_audit
+
+        self.assertIsNone(pp_sync_audit.init(_diag()[0]))
+        pp_sync_audit.log({"fwd_n": 1})
+
+
 if __name__ == "__main__":
     unittest.main()

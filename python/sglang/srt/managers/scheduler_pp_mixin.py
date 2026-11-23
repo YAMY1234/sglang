@@ -37,7 +37,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     PPProxyTensors,
 )
 from sglang.srt.observability.req_time_stats import set_time_batch
-from sglang.srt.managers import pp_bubble_diag, pp_ce_push, pp_decouple
+from sglang.srt.managers import pp_bubble_diag, pp_ce_push, pp_decouple, pp_sync_audit
 from sglang.srt.managers.pp_decouple import PPRecvInbox, PPSendWindow, PPSendWindows
 from sglang.srt.observability.scheduler_stage_metrics import (
     SCHEDULER_STAGE_BUILD_BATCH,
@@ -341,7 +341,9 @@ class SchedulerPPMixin:
                 next_batch_result = None
 
                 if diag is not None:
-                    diag.maybe_log()
+                    stats = diag.maybe_log()
+                    if stats is not None:
+                        pp_sync_audit.log(stats)
                     diag.phase("ingest")
                 if self._pp_host_lead_file is not None:
                     self._pp_reread_host_lead_max()
@@ -739,6 +741,7 @@ class SchedulerPPMixin:
             event_factory=self.device_module.Event,
             chunk_budget=self.chunked_prefill_size,
         )
+        pp_sync_audit.init(self.pp_bubble_diag)
         # Last stage, PD local result: own outputs held until the mb is processed.
         self._pp_local_outputs: Dict[int, Tuple[torch.Event, PPProxyTensors]] = {}
         self._pp_pd_local_result_enabled = (
