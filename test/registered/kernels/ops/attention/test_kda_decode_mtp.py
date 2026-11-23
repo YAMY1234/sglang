@@ -329,10 +329,10 @@ class TestKdaVerifyPendingFold(CustomTestCase):
 
 
 def _kda_flow_reference(*, x, out_gate, raw_gate, beta, conv_w, conv_state, a_log,
-                        dt_bias, state, norm_w, eps, lower_bound, tokens):  # fmt: skip
+                        dt_bias, state, norm_w, eps, lower_bound, tokens, keys=None):  # fmt: skip
     """FP64 KDA verify of n requests x H heads in the stock RecoverSSM semantics
     (BF16 conv outputs, sequential delta rule from the checkpoint). Returns the
-    gated-RMSNorm output [R, D], corrections [n, H, q, 128], conv outputs k
+    gated-RMSNorm output [R, D], corrections [n, H, q, 128], its own conv outputs k
     [n, H, q, 128] and the per-token states [q, n, H, 128, 128]."""
     f64 = torch.float64
     rows, dim3 = x.shape
@@ -343,7 +343,11 @@ def _kda_flow_reference(*, x, out_gate, raw_gate, beta, conv_w, conv_state, a_lo
         [(seq[:, t : t + 4, :] * w.t()[None]).sum(1) for t in range(tokens)], 1
     )
     act = (conv / (1 + torch.exp(-conv))).bfloat16().to(f64)  # [n, q, 3 D]
-    q, k, v = (act[..., i * d : (i + 1) * d].view(n, tokens, heads, 128) for i in range(3))
+    q, k_calc, v = (
+        act[..., i * d : (i + 1) * d].view(n, tokens, heads, 128) for i in range(3)
+    )
+    # ``keys``: the kernel's BF16 conv outputs (its FP32 SiLU rounds a few differently).
+    k = k_calc if keys is None else keys.to(f64)
     qn = q / torch.sqrt((q * q).sum(-1, keepdim=True) + 1e-6) * 128**-0.5
     kn = k / torch.sqrt((k * k).sum(-1, keepdim=True) + 1e-6)
     g = raw_gate.to(f64).view(n, tokens, heads, 128)
@@ -365,7 +369,7 @@ def _kda_flow_reference(*, x, out_gate, raw_gate, beta, conv_w, conv_state, a_lo
     rstd = torch.rsqrt((o * o).mean(-1, keepdim=True) + eps)
     gate = torch.sigmoid(out_gate.to(f64).view(n, tokens, heads, 128))
     out = (o * rstd * norm_w.to(f64) * gate).reshape(rows, heads * 128)
-    return out, torch.stack(us, 2), k.transpose(1, 2), torch.stack(states)
+    return out, torch.stack(us, 2), k_calc.transpose(1, 2), torch.stack(states)
 
 
 def _rel(got, want):
@@ -478,6 +482,7 @@ class TestKdaFlowVerify(CustomTestCase):
                     conv_w=conv_w[layer], conv_state=conv_before, a_log=a_log[layer],
                     dt_bias=dt[layer], state=committed[layer][live], norm_w=norm_w,
                     eps=1e-5, lower_bound=-5.0, tokens=tokens,
+                    keys=key_gate[layer][live][..., :128].transpose(1, 2),
                 )  # fmt: skip
                 r = dict(step=step, layer=layer)
                 r["out"] = _rel(out[: num_requests * tokens], ref_out)
