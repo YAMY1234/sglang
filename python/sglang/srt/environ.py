@@ -2124,6 +2124,9 @@ class Envs:
     # FlashInfer KDA prefill: fill its cu_seqlens contents memo from host lengths
     # so planning does not read cu_seqlens back. 0 off, 1 on, 2 on + verify (syncs).
     SGLANG_K31_KDA_SEED_CU_SEQLENS = EnvInt(0)
+    # FlashInfer KDA prefill, decomposed route (one sequence): copy a newly planned
+    # cu_chunks to the device from pinned memory without a stream sync.
+    SGLANG_K31_KDA_PLAN_ASYNC_H2D = EnvBool(False)
     # KDA prefill on FlashInfer: the causal conv writes Q, K and V as separate
     # contiguous planes instead of one token-major tensor the kernel copies three
     # times (backport of #46738).

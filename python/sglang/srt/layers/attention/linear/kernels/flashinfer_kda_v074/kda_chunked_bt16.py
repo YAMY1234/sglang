@@ -6905,6 +6905,17 @@ def host_prep(
 _PLAN_CACHE: dict = {}
 
 
+def _cu_chunks_to_device(cu_chunks: list, device) -> torch.Tensor:
+    """A pageable H2D copy syncs the current stream, which in a pipelined forward waits out the previous
+    forward. From pinned memory the copy is stream-ordered before the decomp kernels on the same stream."""
+    from sglang.srt.environ import envs
+
+    if envs.SGLANG_K31_KDA_PLAN_ASYNC_H2D.get():
+        host = torch.tensor(cu_chunks, dtype=torch.int32, pin_memory=True)
+        return host.to(device, non_blocking=True)
+    return torch.tensor(cu_chunks, dtype=torch.int32, device=device)
+
+
 def _plan(cu_seqlens: torch.Tensor) -> dict:
     """Cached cumulative chunk-prefix tensor and host metadata.
 
@@ -6927,9 +6938,7 @@ def _plan(cu_seqlens: torch.Tensor) -> dict:
         total_chunks = cu_chunks[-1]
         plan = {
             "total_chunks": total_chunks,
-            "cu_chunks": torch.tensor(
-                cu_chunks, dtype=torch.int32, device=cu_seqlens.device
-            ),
+            "cu_chunks": _cu_chunks_to_device(cu_chunks, cu_seqlens.device),
             "cu_list": cu_list,
         }
         _PLAN_CACHE[key] = plan
