@@ -458,6 +458,82 @@ def test_dcp4_topk_merge_pushed_sampled(kind: str, cand_k: int, min_len: int) ->
         assert _all_ranks_ok(not bad), bad or "failed on another rank"
 
 
+_SPLIT_MERGES: dict[tuple[int, int], DcpTopKMerge] = {}
+# local rows of `random` and `dense_top` (32768 keys) take 2 CTAs, those of `long` 3 or 4
+SPLIT_CHUNK = 16384
+
+
+def _split_merge(cand_k: int, min_len: int) -> DcpTopKMerge:
+    if (cand_k, min_len) not in _SPLIT_MERGES:
+        with (
+            envs.SGLANG_DCP4_PUSH_CAND_K.override(cand_k),
+            envs.SGLANG_DSA_DCP_TOPK_PUSH_SAMPLED.override(True),
+            envs.SGLANG_DSA_DCP_TOPK_PUSH_SAMPLED_MIN_LEN.override(min_len),
+            envs.SGLANG_DSA_DCP_TOPK_PUSH_SPLIT_CHUNK.override(SPLIT_CHUNK),
+        ):
+            _SPLIT_MERGES[cand_k, min_len] = DcpTopKMerge(
+                ps._WORLD, MAX_ROWS, TOPK, push=True
+            )
+    return _SPLIT_MERGES[cand_k, min_len]
+
+
+@pytest.mark.parametrize("min_len", [0, 32768])
+@pytest.mark.parametrize("cand_k", [768, 2048])
+@pytest.mark.parametrize(
+    "kind", ["random", "long", "dense_top", "ties", "periodic", "skew", "short"]
+)
+@torch.inference_mode()
+def test_dcp4_topk_merge_pushed_split(kind: str, cand_k: int, min_len: int) -> None:
+    """SGLANG_DSA_DCP_TOPK_PUSH_SPLIT_CHUNK: with local rows cut into 2-4 CTAs, the sampled
+    local top-k still pushes the exact local candidate sets, so the merge is exact and fails
+    its certificate on the same rows as with the exact local top-k; Gaussian rows need no
+    exact redo; the split counters are zero after every call, also under graph replay.
+    min_len 32768 keeps the 32768-key local rows of `random` on one exact CTA."""
+    _init_once()
+    world, rank = ps._WORLD.world_size, ps._WORLD.rank_in_group
+    if world != 4:
+        pytest.skip("the DCP4 push merge needs 4 ranks")
+    split, exact = _split_merge(cand_k, min_len), _push_merge(cand_k)
+    if split.buffer is None:
+        pytest.skip("multimem multicast unavailable")
+    assert split.sampled and split.split_chunk == SPLIT_CHUNK and not exact.split_chunk
+    counters = split.split_scratch[1]
+    span = PAGE_SIZE * world
+    for seed in SEEDS:
+        case = _Case(kind, seed, rank, world, span)
+        case.run_pushed(exact, span)
+        torch.cuda.synchronize()
+        exact_fell_back = exact.fallback[: case.rows].tolist()
+        redone = int(split.sampled_fallbacks)
+        case.run_pushed(split, span)
+        torch.cuda.synchronize()
+        bad = case.pushed_failures(rank, world)
+        if split.fallback[: case.rows].tolist() != exact_fell_back:
+            bad.append(
+                f"rank {rank}: certificate failures differ from the exact local top-k"
+            )
+        if kind in ("random", "long") and int(split.sampled_fallbacks) != redone:
+            bad.append(f"rank {rank}: the split local top-k redid a Gaussian row")
+        if bool(counters.any()):
+            bad.append(f"rank {rank}: split counters left nonzero")
+        assert _all_ranks_ok(not bad), bad or "failed on another rank"
+
+    if kind not in ("random", "long") or min_len:
+        return
+    case = _Case(kind, SEEDS[0], rank, world, span)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        case.run_pushed(split, span)
+    for _ in range(GRAPH_CHECKS):
+        for _ in range(REPLAYS_PER_CHECK):
+            graph.replay()
+        torch.cuda.synchronize()
+        bad = case.pushed_failures(rank, world)
+        if bool(counters.any()):
+            bad.append(f"rank {rank}: split counters left nonzero")
+        assert _all_ranks_ok(not bad), bad or "failed on another rank"
+
+
 @pytest.mark.parametrize("failing", ["stale1", "stale2"])
 @torch.inference_mode()
 def test_dcp4_topk_merge_pushed_stale_slot(failing: str) -> None:

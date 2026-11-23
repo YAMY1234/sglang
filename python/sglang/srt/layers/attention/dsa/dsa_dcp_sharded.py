@@ -47,6 +47,7 @@ from sglang.kernels.ops.attention.dsa.dcp_topk_merge import (
 )
 from sglang.kernels.ops.attention.dsv4.topk import (
     candidates_cluster_size,
+    topk_candidates_split_scratch,
     topk_transform_candidates_dcp_push,
     topk_transform_candidates_v2,
     topk_transform_packed_v2,
@@ -249,6 +250,11 @@ class DcpTopKMerge:
         self.sampled_fallbacks: Optional[torch.Tensor] = None
         self._fallbacks_host: Optional[torch.Tensor] = None
         self._fallbacks_reported = 0
+        # sampled only: rows past the chunk run on several CTAs, through split_scratch
+        self.split_chunk = (
+            envs.SGLANG_DSA_DCP_TOPK_PUSH_SPLIT_CHUNK.get() if self.sampled else 0
+        )
+        self.split_scratch: Optional[tuple[torch.Tensor, torch.Tensor]] = None
 
         world = group.world_size
         # 16 ranks only on megakernel paths; stock DCP16 keeps the all-gather.
@@ -308,6 +314,25 @@ class DcpTopKMerge:
                     f"DSA DCP top-k merge: local rows over {max(self.sampled_min_len, 16384)} "
                     "keys select their candidates in one sampled-threshold pass "
                     "(SGLANG_DSA_DCP_TOPK_PUSH_SAMPLED, SGLANG_DSA_DCP_TOPK_PUSH_SAMPLED_MIN_LEN)"
+                )
+            if self.split_chunk:
+                if self.split_chunk < 16384 or self.split_chunk % 4:
+                    raise ValueError(
+                        "SGLANG_DSA_DCP_TOPK_PUSH_SPLIT_CHUNK must be 0 or a multiple of 4 "
+                        f">= 16384, got {self.split_chunk}"
+                    )
+                self.split_scratch = topk_candidates_split_scratch(
+                    max_rows, group.device
+                )
+                print_info_once(
+                    f"DSA DCP top-k merge: local rows over {max(self.split_chunk, self.sampled_min_len)} "
+                    f"keys take one CTA per {self.split_chunk} keys on the idle SM slots "
+                    "(SGLANG_DSA_DCP_TOPK_PUSH_SPLIT_CHUNK)"
+                )
+            elif envs.SGLANG_DSA_DCP_TOPK_PUSH_SPLIT_CHUNK.get():
+                print_info_once(
+                    "DSA DCP top-k merge: SGLANG_DSA_DCP_TOPK_PUSH_SPLIT_CHUNK is off, "
+                    "it needs SGLANG_DSA_DCP_TOPK_PUSH_SAMPLED"
                 )
             return
         self.union_scratch = torch.empty(
@@ -370,6 +395,8 @@ class DcpTopKMerge:
             sampled=self.sampled,
             sampled_min_len=self.sampled_min_len,
             fallback_rows=self.sampled_fallbacks,
+            split_chunk=self.split_chunk,
+            split_scratch=self.split_scratch,
         )
         local = torch.empty_like(out)
         lengths = torch.empty(rows, dtype=torch.int32, device=out.device)

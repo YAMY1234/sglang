@@ -906,9 +906,17 @@ struct TopKSampled : TopKRadixBase<12> {
   static constexpr uint32_t kCheckEvery = 4;  // collect rounds between overflow checks
 
   struct Smem : Base::Smem {
-    uint32_t n_ge;     // scores >= theta, also past kCapacity
-    uint32_t bin;      // coarse bin of the sample's target-th largest score
-    uint32_t s_above;  // sampled scores in coarser bins above it
+    uint32_t n_ge;  // scores >= theta, also past kCapacity
+    union {
+      struct {
+        uint32_t bin;      // coarse bin of the sample's target-th largest score
+        uint32_t s_above;  // sampled scores in coarser bins above it
+      };
+      struct {                // a chunk of a split row, once theta is known
+        uint32_t chunk_base;  // its first entry in the row's buffer
+        uint32_t chunk_last;  // whether it is the row's last to arrive
+      };
+    };
     float theta;
     union {
       TieValue cand[kCapacity];
@@ -917,12 +925,33 @@ struct TopKSampled : TopKRadixBase<12> {
   };
   static_assert(sizeof(TieValue) * kCapacity >= sizeof(int32_t) * kMaxTopK);
 
+  /// One CTA's share of a row split into `chunks` CTAs: the row's full vectors [vec_begin, vec_end)
+  /// (clamped to the row), plus its scalar tail if `tail`. `cand` is the row's global buffer
+  /// [kCapacity] and `counters` its {entries appended (also past kCapacity), CTAs arrived}, both
+  /// zero between calls. The default is the whole row in one CTA.
+  struct RowChunk {
+    TieValue* cand = nullptr;
+    uint32_t* counters = nullptr;
+    uint32_t vec_begin = 0;
+    uint32_t vec_end = UINT32_MAX;
+    uint32_t chunks = 1;
+    bool tail = true;
+  };
+
   /// Emits the top-k above the threshold bin as `emit_above(slot, score, index)` and leaves
   /// the rest as indices (+ problem.bias) in smem->staged[first_staged, topk); returns false,
   /// having emitted nothing, when theta missed.
-  template <bool kUsePDL, typename EmitAbove>
-  SGL_DEVICE static bool
-  forward(const TopKProblem& problem, Smem* smem, const EmitAbove& emit_above, uint32_t& first_staged) {
+  /// kChunked: `*chunk` may be one of several CTAs of the row. Every one of them takes theta from
+  /// the whole row's sample, so they agree on it without communicating; all but the row's last
+  /// to arrive return true with first_staged = topk (nothing to emit), and the last one selects
+  /// over the row's buffer (or returns false) and resets its counters.
+  template <bool kUsePDL, bool kChunked = false, typename EmitAbove>
+  SGL_DEVICE static bool forward(
+      const TopKProblem& problem,
+      Smem* smem,
+      const EmitAbove& emit_above,
+      uint32_t& first_staged,
+      const RowChunk* chunk = nullptr) {
     const auto tx = threadIdx.x;
     init_histogram(smem->histogram, tx);
     if (tx == 0) {
@@ -937,7 +966,15 @@ struct TopKSampled : TopKRadixBase<12> {
 
     const float theta = sample_threshold(problem, smem);
     init_histogram(smem->histogram, tx);  // for the candidates; sample_threshold ends on a barrier
-    collect(problem, theta, smem);
+    if constexpr (kChunked) {
+      collect<true>(problem, theta, smem, chunk->vec_begin, chunk->vec_end, chunk->tail);
+      if (chunk->chunks > 1 && !gather_chunks(problem, smem, *chunk)) {
+        first_staged = problem.topk;
+        return true;
+      }
+    } else {
+      collect(problem, theta, smem);
+    }
     __syncthreads();
     const auto n = smem->n_ge;
     if (n < problem.topk || n > kCapacity) return false;
@@ -1025,18 +1062,28 @@ struct TopKSampled : TopKRadixBase<12> {
   }
 
   /// Appends every score >= theta to smem->cand (warp-aggregated), counting all of them in n_ge.
-  SGL_DEVICE static void collect(const TopKProblem& problem, const float theta, Smem* smem) {
+  /// kRange: only the full vectors [vec_begin, vec_end), and the scalar tail only if `tail`.
+  template <bool kRange = false>
+  SGL_DEVICE static void collect(
+      const TopKProblem& problem,
+      const float theta,
+      Smem* smem,
+      const uint32_t vec_begin = 0,
+      const uint32_t vec_end = 0,
+      const bool tail = true) {
     constexpr uint32_t kStride = kUnroll * kBlockSize;
     const auto tx = threadIdx.x;
     const auto lane_id = tx % kWarpSize;
     const auto num_full = problem.seq_len / kVecSize;
+    const auto begin = kRange ? broadcast(vec_begin) : 0u;
+    const auto end = kRange ? broadcast(min(vec_end, num_full)) : num_full;
     // warp-uniform trip count: the warp scan below needs every lane
 #pragma unroll 1
-    for (uint32_t base = 0; base < num_full; base += kStride) {
+    for (uint32_t base = begin; base < end; base += kStride) {
       vec_t v[kUnroll];
 #pragma unroll
       for (uint32_t u = 0; u < kUnroll; ++u) {
-        if (const auto vi = base + u * kBlockSize + tx; vi < num_full) {
+        if (const auto vi = base + u * kBlockSize + tx; vi < end) {
           v[u].load(problem.in, vi);
         } else {
           v[u].fill(padding_value());  // NaN is never >= theta
@@ -1067,9 +1114,10 @@ struct TopKSampled : TopKRadixBase<12> {
         }
       }
       // the row is redone on the exact path anyway
-      const bool check = base / kStride % kCheckEvery == kCheckEvery - 1;
+      const bool check = base / kStride % kCheckEvery == kCheckEvery - 1;  // every 4th round from any begin
       if (check && broadcast(*reinterpret_cast<volatile uint32_t*>(&smem->n_ge)) > kCapacity) break;
     }
+    if (kRange && !tail) return;
     if (const auto idx = num_full * kVecSize + tx; idx < problem.seq_len) {
       const auto val = problem.in[idx];
       if (val >= theta) {
@@ -1077,6 +1125,53 @@ struct TopKSampled : TopKRadixBase<12> {
         if (pos < kCapacity) smem->cand[pos] = {val, idx};
       }
     }
+  }
+
+  /// A chunk's candidates go to the row's buffer (one global atomic per CTA reserves their
+  /// slots), then the CTA arrives on the row. Returns true only in the row's last CTA to arrive:
+  /// it leaves the row's count in n_ge, the row's candidates in cand when they fit and reach
+  /// topk, and the row's counters zeroed for the next call.
+  SGL_DEVICE static bool gather_chunks(const TopKProblem& problem, Smem* smem, const RowChunk& chunk) {
+    constexpr uint32_t kItems = (kCapacity + kBlockSize - 1) / kBlockSize;
+    const auto tx = threadIdx.x;
+    __syncthreads();  // collect's appends and its n_ge
+    const auto n_local = min(smem->n_ge, kCapacity);
+    if (tx == 0) smem->chunk_base = atomicAdd(&chunk.counters[0], smem->n_ge);
+    __syncthreads();
+    const auto base = smem->chunk_base;
+    const auto n_put = base < kCapacity ? min(n_local, kCapacity - base) : 0u;
+    for (uint32_t i = tx; i < n_put; i += kBlockSize) {
+      chunk.cand[base + i] = smem->cand[i];
+    }
+    __syncthreads();  // the block's appends are issued before thread 0 arrives
+    if (tx == 0) {
+      __threadfence();  // release: the appends land before the arrival
+      const bool last = atomicAdd(&chunk.counters[1], 1u) == chunk.chunks - 1;
+      if (last) {
+        __threadfence();  // acquire the other chunks' appends
+        smem->n_ge = atomicExch(&chunk.counters[0], 0u);
+        chunk.counters[1] = 0;
+      }
+      smem->chunk_last = last;
+    }
+    __syncthreads();
+    if (!smem->chunk_last) return false;
+    const auto n = smem->n_ge;
+    if (n < problem.topk || n > kCapacity) return true;
+    // All loads in flight at once, and from L2: the entries were written by other SMs.
+    TieValue c[kItems];
+#pragma unroll
+    for (uint32_t u = 0; u < kItems; ++u) {
+      if (const auto i = tx + u * kBlockSize; i < n) {
+        const auto raw = __ldcg(reinterpret_cast<const uint2*>(chunk.cand) + i);
+        c[u] = {__uint_as_float(raw.x), raw.y};
+      }
+    }
+#pragma unroll
+    for (uint32_t u = 0; u < kItems; ++u) {
+      if (const auto i = tx + u * kBlockSize; i < n) smem->cand[i] = c[u];
+    }
+    return true;
   }
 
   /// One output slot per lane with `pred`; every lane of the warp must call it.

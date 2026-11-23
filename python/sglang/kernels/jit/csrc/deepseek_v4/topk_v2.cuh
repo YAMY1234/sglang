@@ -466,6 +466,12 @@ struct TopKCandidatesParams {
   int64_t push_slot = 0;                       // entries per row slot
   int32_t push_max_rows = 0;
   uint32_t sampled_min_len = 0;  // sampled variant only: rows up to this length stay on the exact path
+  // Split variant only (topk_candidates_split_kernel): the rows' candidate buffers and
+  // {entries, CTAs arrived} counters, zero between calls; the chunk length and the CTAs past the rows.
+  impl::TieValue* split_cand = nullptr;  // [rows, TopKSampled::kCapacity]
+  uint32_t* split_counters = nullptr;    // [rows, 2]
+  uint32_t split_chunk = 0;
+  uint32_t split_extra = 0;
 
   SGL_DEVICE int32_t global_position(int32_t local) const {
     const auto b = cand_page_bits;
@@ -567,9 +573,13 @@ static_assert(sizeof(SampledCandidatesSmem) <= 48 * 1024, "static shared memory 
 /// `candidates_one_block`, except that rows longer than `sampled_min_len` and past the
 /// register paths take the sampled single pass (impl::TopKSampled), falling back to the
 /// exact path when it misses, counted in `overflow_rows`. Same selected set; slot order differs.
-template <bool kPDL, bool kPush>
-SGL_DEVICE void
-candidates_sampled_one_block(const TopKCandidatesParams& params, const uint32_t bx, SampledCandidatesSmem* smem) {
+/// kChunked: this CTA may be one `*chunk` of a split row (see TopKSampled::forward).
+template <bool kPDL, bool kPush, bool kChunked = false>
+SGL_DEVICE void candidates_sampled_one_block(
+    const TopKCandidatesParams& params,
+    const uint32_t bx,
+    SampledCandidatesSmem* smem,
+    const Sampled::RowChunk* chunk = nullptr) {
   constexpr uint32_t kVecSize = impl::TopKStreaming::kVecSize;
   const auto seq_len = static_cast<uint32_t>(params.seq_lens[bx]);
   const auto row_start = params.row_starts == nullptr ? 0u : static_cast<uint32_t>(params.row_starts[bx]);
@@ -596,7 +606,7 @@ candidates_sampled_one_block(const TopKCandidatesParams& params, const uint32_t 
   const auto emit_above = [&](uint32_t slot, float val, uint32_t idx) {
     sink.put(slot, __float_as_int(val), params.global_position(static_cast<int32_t>(idx - rem)));
   };
-  if (Sampled::forward<kPDL>(problem, &smem->sampled, emit_above, first_staged)) {
+  if (Sampled::forward<kPDL, kChunked>(problem, &smem->sampled, emit_above, first_staged, chunk)) {
     __syncthreads();
     for (uint32_t slot = first_staged + threadIdx.x; slot < topk; slot += kBlockSize) {
       const auto idx = smem->sampled.staged[slot];
@@ -614,6 +624,97 @@ TOPK_KERNEL void topk_candidates_sampled_kernel(const __grid_constant__ TopKCand
   device::enable_smem_spilling();
   __shared__ SampledCandidatesSmem smem;
   candidates_sampled_one_block<kPDL, kPush>(params, blockIdx.x, &smem);
+}
+
+constexpr uint32_t kSplitMaxRows = 512;   // one plan thread per row, and the grid stays near one wave
+constexpr uint32_t kSplitMaxExtra = 256;  // CTAs past the rows
+static_assert(kSplitMaxRows <= kBlockSize);
+
+struct ChunkPlanSmem {
+  uint32_t warp_sums[impl::TopKConfig::kNumWarps];
+  uint32_t row;
+  uint32_t chunk;
+};
+
+/// The split plan, the same in every CTA since it reads only seq_lens: a row longer than
+/// max(chunk_len, sampled_min_len) takes ceil(len / chunk_len) chunks, and chunk_len starts at
+/// split_chunk and doubles until the chunks past the first fit the split_extra CTAs after the rows.
+/// Returns chunk_len and this CTA's (row, chunk): (blockIdx.x, 0) for a row's own CTA; for extra
+/// CTA j = blockIdx.x - rows the j-th chunk past the first in row order, or row = rows if none.
+SGL_DEVICE uint32_t chunk_plan(
+    const TopKCandidatesParams& params, const uint32_t rows, uint32_t& row, uint32_t& chunk, ChunkPlanSmem* smem) {
+  const auto tx = threadIdx.x;
+  const auto lane = tx % device::kWarpSize;
+  const auto warp_id = tx / device::kWarpSize;
+  const auto j = blockIdx.x - rows;  // wraps for the rows' own CTAs, so it matches no chunk
+  const auto len = tx < rows ? static_cast<uint32_t>(params.seq_lens[tx]) : 0u;
+  if (tx == 0) {
+    smem->row = blockIdx.x < rows ? blockIdx.x : rows;
+    smem->chunk = 0;
+  }
+  auto chunk_len = params.split_chunk;
+  while (true) {
+    const auto extra = len > max(chunk_len, params.sampled_min_len) ? device::div_ceil(len, chunk_len) - 1 : 0u;
+    const auto inc = device::warp::inclusive_sum(extra, lane);
+    if (lane == device::kWarpSize - 1) smem->warp_sums[warp_id] = inc;
+    __syncthreads();
+    const auto w = smem->warp_sums[lane];
+    if (device::warp::reduce_sum(w) <= params.split_extra) {
+      const auto first = device::warp::reduce_sum(lane < warp_id ? w : 0u) + inc - extra;
+      if (j - first < extra) {
+        smem->row = tx;
+        smem->chunk = j - first + 1;
+      }
+      break;
+    }
+    __syncthreads();  // the warp sums are rewritten
+    chunk_len *= 2;   // ends by 2^31 at the latest: no row is split there
+  }
+  __syncthreads();
+  row = smem->row;
+  chunk = smem->chunk;
+  __syncthreads();  // the plan's storage is the sampled path's shared memory
+  return chunk_len;
+}
+
+/**
+ * \brief `topk_candidates_sampled_kernel` on rows + split_extra CTAs: rows longer than
+ * max(split_chunk, sampled_min_len) local keys are cut into chunks of whole vectors, one CTA each
+ * (`chunk_plan`), so the longest row no longer sets the kernel time alone. Every chunk computes the
+ * row's theta from the whole row's sample, masks the row head as the one-block path does (same
+ * value), collects its own vectors into the row's `split_cand` buffer and arrives; the row's last
+ * CTA selects and emits as the sampled path does, or redoes the row exactly. Same selected set.
+ */
+template <bool kPDL, bool kPush>
+TOPK_KERNEL void topk_candidates_split_kernel(const __grid_constant__ TopKCandidatesParams params) {
+  device::enable_smem_spilling();
+  __shared__ union {
+    SampledCandidatesSmem sampled;
+    ChunkPlanSmem plan;
+  } smem;
+  constexpr uint32_t kVecSize = impl::TopKStreaming::kVecSize;
+  const auto rows = gridDim.x - params.split_extra;
+  auto row = blockIdx.x;
+  uint32_t chunk = 0, chunks = 1, chunk_vecs = UINT32_MAX;  // by default the whole row
+  if (row >= rows || static_cast<uint32_t>(params.seq_lens[row]) > max(params.split_chunk, params.sampled_min_len)) {
+    const auto chunk_len = chunk_plan(params, rows, row, chunk, &smem.plan);
+    if (row >= rows) return;
+    const auto len = static_cast<uint32_t>(params.seq_lens[row]);
+    if (len > max(chunk_len, params.sampled_min_len)) {
+      const auto rem = params.row_starts == nullptr ? 0u : static_cast<uint32_t>(params.row_starts[row]) % kVecSize;
+      chunks = device::div_ceil(len, chunk_len);
+      chunk_vecs = device::div_ceil(device::div_ceil(len + rem, kVecSize), chunks);
+    }
+  }
+  const Sampled::RowChunk part = {
+      .cand = params.split_cand + static_cast<int64_t>(row) * Sampled::kCapacity,
+      .counters = params.split_counters + 2 * static_cast<int64_t>(row),
+      .vec_begin = chunk * chunk_vecs,
+      .vec_end = (chunk + 1) * chunk_vecs,
+      .chunks = chunks,
+      .tail = chunk == chunks - 1,
+  };
+  candidates_sampled_one_block<kPDL, kPush, true>(params, row, &smem.sampled, &part);
 }
 #endif  // !USE_ROCM
 
@@ -2141,12 +2242,67 @@ struct TopKKernel {
         .launch(topk_candidates_kernel<kUsePDL>, params);
   }
 
+#ifndef USE_ROCM
+  /**
+   * \brief The sampled DCP candidates launch: `topk_candidates_split_kernel` on rows + extra CTAs
+   * when `split_chunk` is set and the rows fit its plan, else one CTA per row.
+   * \param split_chunk 0 (off), or the chunk length in local keys (a multiple of 4, >= 16384)
+   * \param split_extra CTAs past the rows; < 0: the slots a 2-per-SM wave leaves, at most 256
+   * \param split_cand int64 [M, TopKSampled::kCapacity], the split rows' candidates (M >= rows)
+   * \param split_counters int32 [M, 2], zero; the kernel leaves them zero
+   */
+  template <bool kPush>
+  static void launch_sampled(
+      TopKCandidatesParams params,
+      const uint32_t rows,
+      const int64_t split_chunk,
+      const int64_t split_extra,
+      const tvm::ffi::Optional<tvm::ffi::TensorView>& split_cand,
+      const tvm::ffi::Optional<tvm::ffi::TensorView>& split_counters,
+      host::SymbolicDevice& device_) {
+    using namespace host;
+    const auto device = device_.unwrap();
+    RuntimeCheck(
+        split_chunk == 0 || (split_chunk >= kReg4MaxSeqLen && split_chunk % 4 == 0 && split_chunk <= INT32_MAX),
+        "split_chunk must be 0 or a multiple of 4 in [16384, 2^31)");
+    int64_t extra = 0;
+    if (split_chunk != 0 && rows > 0 && rows <= kSplitMaxRows) {
+      const int64_t slots = int64_t{kOccupancy} * runtime::get_sm_count(device.device_id);
+      extra = std::clamp<int64_t>(split_extra >= 0 ? split_extra : slots - rows, 0, kSplitMaxExtra);
+    }
+    if (extra != 0) {
+      RuntimeCheck(
+          split_cand.has_value() && split_counters.has_value(), "split_chunk needs split_cand and split_counters");
+      auto M = SymbolicSize{"split_rows"};
+      TensorMatcher({M, static_cast<int64_t>(Sampled::kCapacity)})  // split_cand
+          .with_dtype<int64_t>()
+          .with_device(device_)
+          .verify(split_cand.value());
+      TensorMatcher({M, 2})  // split_counters
+          .with_dtype<int32_t>()
+          .with_device(device_)
+          .verify(split_counters.value());
+      RuntimeCheck(M.unwrap() >= rows, "more rows than split buffer rows");
+      params.split_cand = static_cast<impl::TieValue*>(split_cand.value().data_ptr());
+      params.split_counters = static_cast<uint32_t*>(split_counters.value().data_ptr());
+      params.split_chunk = static_cast<uint32_t>(split_chunk);
+      params.split_extra = static_cast<uint32_t>(extra);
+      return LaunchKernel(rows + params.split_extra, kBlockSize, device)
+          .config({.use_pdl = kUsePDL})
+          .launch(topk_candidates_split_kernel<kUsePDL, kPush>, params);
+    }
+    LaunchKernel(rows, kBlockSize, device)
+        .config({.use_pdl = kUsePDL})
+        .launch(topk_candidates_sampled_kernel<kUsePDL, kPush>, params);
+  }
+#endif
+
   /**
    * \brief DCP decode variant of `transform_candidates` (token interleave): `cluster_size` 2 / 4
    * runs rows longer than `cluster_floor` on that many blocks, 0 one block. With `cluster_size` 0,
    * `sampled` takes rows longer than `sampled_min_len` and past the register paths through the
    * sampled single pass, counting the rows it redoes on the exact path in `fallback_rows`
-   * (int32 [1], optional).
+   * (int32 [1], optional), and `split_*` splits the longest of them over more CTAs (`launch_sampled`).
    */
   static void transform_candidates_dcp(
       const tvm::ffi::TensorView scores,
@@ -2159,7 +2315,11 @@ struct TopKKernel {
       const int64_t cluster_floor,
       const bool sampled,
       const int64_t sampled_min_len,
-      const tvm::ffi::Optional<tvm::ffi::TensorView> fallback_rows) {
+      const tvm::ffi::Optional<tvm::ffi::TensorView> fallback_rows,
+      const int64_t split_chunk,
+      const int64_t split_extra,
+      const tvm::ffi::Optional<tvm::ffi::TensorView> split_cand,
+      const tvm::ffi::Optional<tvm::ffi::TensorView> split_counters) {
     using namespace host;
     auto B = SymbolicSize{"batch_size"};
     auto L = SymbolicSize{"max_seq_len"};
@@ -2241,9 +2401,7 @@ struct TopKKernel {
 #ifdef USE_ROCM
       RuntimeCheck(false, "the sampled candidate top-k needs CUDA");
 #else
-      return LaunchKernel(rows, kBlockSize, device_.unwrap())
-          .config({.use_pdl = kUsePDL})
-          .launch(topk_candidates_sampled_kernel<kUsePDL, false>, params);
+      return launch_sampled<false>(params, rows, split_chunk, split_extra, split_cand, split_counters, device_);
 #endif
     }
     LaunchKernel(rows, kBlockSize, device_.unwrap())
@@ -2257,7 +2415,7 @@ struct TopKKernel {
    * every rank's DCP merge buffer (multicast address `push_mc`; the int64 layout
    * of dsa/dcp_topk_merge.cuh, `slot` entries per row slot, `max_rows` slots per
    * parity), tagged with the call of `counters[i]`. The merge kernel that reads
-   * them advances the counters. `sampled` / `sampled_min_len` / `fallback_rows`: as in
+   * them advances the counters. `sampled` / `sampled_min_len` / `fallback_rows` / `split_*`: as in
    * `transform_candidates_dcp`.
    */
   static void transform_candidates_dcp_push(
@@ -2273,7 +2431,11 @@ struct TopKKernel {
       const int64_t cluster_floor,
       const bool sampled,
       const int64_t sampled_min_len,
-      const tvm::ffi::Optional<tvm::ffi::TensorView> fallback_rows) {
+      const tvm::ffi::Optional<tvm::ffi::TensorView> fallback_rows,
+      const int64_t split_chunk,
+      const int64_t split_extra,
+      const tvm::ffi::Optional<tvm::ffi::TensorView> split_cand,
+      const tvm::ffi::Optional<tvm::ffi::TensorView> split_counters) {
     using namespace host;
     auto B = SymbolicSize{"batch_size"};
     auto L = SymbolicSize{"max_seq_len"};
@@ -2352,9 +2514,7 @@ struct TopKKernel {
 #ifdef USE_ROCM
       RuntimeCheck(false, "the sampled candidate top-k needs CUDA");
 #else
-      return LaunchKernel(rows, kBlockSize, device_.unwrap())
-          .config({.use_pdl = kUsePDL})
-          .launch(topk_candidates_sampled_kernel<kUsePDL, true>, params);
+      return launch_sampled<true>(params, rows, split_chunk, split_extra, split_cand, split_counters, device_);
 #endif
     }
     LaunchKernel(rows, kBlockSize, device_.unwrap())

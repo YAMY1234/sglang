@@ -234,6 +234,22 @@ def topk_transform_ragged_v2(
     module.topk_transform_ragged(scores, seq_lens, row_starts, out_offsets, out_indices)
 
 
+# Candidates a split row's buffer holds (TopKSampled::kCapacity in topk_impl.cuh).
+SPLIT_CAND_CAPACITY = 3584
+
+
+def topk_candidates_split_scratch(
+    max_rows: int, device: torch.device
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Scratch of the split sampled candidates top-k (``split_chunk``): the split rows'
+    candidates, int64 [max_rows, SPLIT_CAND_CAPACITY], and their counters, int32
+    [max_rows, 2], zero; every call leaves them zero again."""
+    return (
+        torch.empty((max_rows, SPLIT_CAND_CAPACITY), dtype=torch.int64, device=device),
+        torch.zeros((max_rows, 2), dtype=torch.int32, device=device),
+    )
+
+
 def topk_transform_candidates_v2(
     scores: torch.Tensor,
     seq_lens: torch.Tensor,
@@ -250,6 +266,9 @@ def topk_transform_candidates_v2(
     cluster_size: Optional[int] = None,
     sampled: bool = False,
     sampled_min_len: int = 0,
+    split_chunk: int = 0,
+    split_scratch: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
+    split_extra: int = -1,
 ) -> None:
     """Ragged top-k emitting candidates for a distributed top-k merge.
 
@@ -269,7 +288,11 @@ def topk_transform_candidates_v2(
     do not apply. There, with ``cluster_size`` 0, ``sampled`` runs rows longer than both
     16384 and ``sampled_min_len`` through a sampled-threshold single pass that selects the
     same set (slot order aside) and redoes on the exact path the rows it cannot certify;
-    ``overflow_rows`` counts those.
+    ``overflow_rows`` counts those. With ``sampled``, ``split_chunk`` (0: off; a multiple of 4,
+    >= 16384) runs rows longer than it and ``sampled_min_len`` on ``ceil(len / split_chunk)``
+    CTAs each, past the rows' own (``split_extra`` of them, -1: the slots of a two-CTA-per-SM
+    wave the rows leave, up to 256; the chunk doubles while they are too few), through
+    ``split_scratch`` (:func:`topk_candidates_split_scratch`). Same set again.
 
     NOTE: ``scores`` is written in place as for the ragged entry point.
     """
@@ -287,6 +310,7 @@ def topk_transform_candidates_v2(
             bool(sampled),
             int(sampled_min_len),
             overflow_rows,
+            *_split_args(split_chunk, split_scratch, split_extra),
         )
         return
     module.topk_transform_candidates(
@@ -318,6 +342,9 @@ def topk_transform_candidates_dcp_push(
     sampled: bool = False,
     sampled_min_len: int = 0,
     fallback_rows: Optional[torch.Tensor] = None,
+    split_chunk: int = 0,
+    split_scratch: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
+    split_extra: int = -1,
 ) -> None:
     """DCP decode top-k that pushes its candidates to the merge.
 
@@ -330,7 +357,7 @@ def topk_transform_candidates_dcp_push(
     parity; see ``jit/csrc/dsa/dcp_topk_merge.cuh``). ``counters``: [max_rows]
     int64 merge calls per row slot; the merge advances them. ``sampled``,
     ``sampled_min_len`` and ``fallback_rows``: as ``sampled``, ``sampled_min_len`` and
-    ``overflow_rows`` of :func:`topk_transform_candidates_v2`.
+    ``overflow_rows`` of :func:`topk_transform_candidates_v2`, and ``split_*`` as there.
     """
     _jit_topk_v2_push_module().topk_transform_candidates_dcp_push(
         scores,
@@ -346,7 +373,13 @@ def topk_transform_candidates_dcp_push(
         bool(sampled),
         int(sampled_min_len),
         fallback_rows,
+        *_split_args(split_chunk, split_scratch, split_extra),
     )
+
+
+def _split_args(split_chunk, split_scratch, split_extra):
+    cand, counters = split_scratch or (None, None)
+    return int(split_chunk), int(split_extra), cand, counters
 
 
 def candidates_cluster_size(rows: int) -> int:

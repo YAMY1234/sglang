@@ -35,7 +35,9 @@ import pytest
 import torch
 
 from sglang.kernels.ops.attention.dsv4.topk import (
+    SPLIT_CAND_CAPACITY,
     plan_topk_v2,
+    topk_candidates_split_scratch,
     topk_transform_candidates_v2,
     topk_transform_packed_v2,
     topk_transform_paged_v2,
@@ -1064,6 +1066,266 @@ def test_topk_v2_candidates_sampled_min_len(dist: str, min_len: int) -> None:
     sampled_rows = sum(n > min_len and n + s % 4 > 16384 for n, s in rows)
     assert int(redone) == (sampled_rows if dist == "all_equal" else 0), int(redone)
     _assert_sampled_rows(scores, rows, got, ref, k, True, (dist, min_len))
+
+
+# --- split sampled DCP candidates (CUDA) ----------------------------------------
+# At chunk 16384 and sampled_min_len 0: rows of 13, 5, 4, 3, 2 and 2 chunks, with tails
+# past the last full vector (length + row_start % 4 not a multiple of 4) when the rows
+# have starts, then the one-CTA paths: sampled, Register4, Register2, trivial.
+SPLIT_CHUNK = 16384
+SPLIT_ROWS = [
+    (200000, 0),
+    (65537, 2),
+    (49153, 1),
+    (40000, 3),
+    (16385, 3),
+    (16386, 1),
+    (16384, 2),
+    (16384, 0),
+    (9000, 5),
+    (2049, 6),
+    (2048, 7),
+    (100, 9),
+]
+# every chunk of a split row holds candidates, so the plan's chunk count shows
+SPLIT_ALL_CHUNKS = {"randn", "skewed", "dense_top", "ties"}
+
+
+def _ceil_div(a, b):
+    return -(-a // b)
+
+
+def _split_plan(lens, chunk, min_len, extra):
+    """topk_candidates_split_kernel's plan: the chunk length and each row's chunk count."""
+    while True:
+        chunks = [_ceil_div(n, chunk) if n > max(chunk, min_len) else 1 for n in lens]
+        if sum(chunks) - len(chunks) <= extra:
+            return chunk, chunks
+        chunk *= 2
+
+
+def _split_candidates(scores, seq_lens, k, scratch, **kwargs):
+    scratch[0].fill_(-1)  # unwritten entries stay -1
+    return _dcp_candidates(
+        scores, seq_lens, k, sampled=True, split_scratch=scratch, **kwargs
+    )
+
+
+def _assert_split_buffers(scores, rows, scratch, chunks, all_chunks, tag):
+    """The rows cut into several chunks left their candidates in the scratch buffer as one
+    block per chunk, together every score >= one theta; the other rows left it untouched,
+    and every counter is zero again."""
+    cand, counters = scratch
+    assert not bool(counters.any()), (tag, counters.nonzero().tolist())
+    for row, ((n, start), c) in enumerate(zip(rows, chunks)):
+        msg = (tag, row, n, start, c)
+        written = cand[row] != -1
+        if c == 1:
+            assert not bool(written.any()), msg
+            continue
+        m = int(written.sum())
+        assert bool(written[:m].all()), msg
+        if m == SPLIT_CAND_CAPACITY:  # overflowed, so the row was redone
+            continue
+        rem = start % 4
+        window = scores[row, start : start + n]
+        pairs = cand[row, :m].view(torch.int32).view(m, 2)  # (score bits, index + rem)
+        local = pairs[:, 1].long() - rem
+        assert bool((local >= 0).all() and (local < n).all()), msg
+        assert local.unique().numel() == m, msg
+        assert torch.equal(pairs[:, 0], window[local].view(torch.int32)), msg
+        theta = pairs[:, 0].view(torch.float32).min()
+        assert torch.equal(local.sort().values, (window >= theta).nonzero()[:, 0]), msg
+        # chunk c-1 also takes the scalar tail past the last full vector
+        idx = pairs[:, 1].long()
+        chunk_vecs = _ceil_div(_ceil_div(n + rem, 4), c)
+        tail = idx >= (n + rem) // 4 * 4
+        ids = torch.where(tail, c - 1, idx // 4 // chunk_vecs)
+        runs = int((ids[1:] != ids[:-1]).sum()) + 1
+        assert int(ids.max()) < c and runs == ids.unique().numel(), msg
+        if all_chunks:
+            assert runs == c, msg
+
+
+@pytest.mark.skipif(is_hip(), reason="CUDA sampled candidate top-k")
+@pytest.mark.parametrize("k", [768, 2048])
+@pytest.mark.parametrize("with_row_starts", [False, True])
+@pytest.mark.parametrize("dist", SAMPLED_DISTRIBUTIONS)
+@torch.inference_mode()
+def test_topk_v2_candidates_split(dist: str, with_row_starts: bool, k: int) -> None:
+    """split_chunk: rows cut into 2-13 chunks select the exact path's set, redo exactly
+    the rows the sampled pass redoes (once each), and leave every chunk's candidates in
+    the row's buffer above one common theta, the counters back at zero."""
+    rows = [(n, s if with_row_starts else 0) for n, s in SPLIT_ROWS]
+    width = (max(n + s for n, s in rows) + 3) // 4 * 4
+    seed = SAMPLED_DISTRIBUTIONS.index(dist) * 10007 + k
+    torch.manual_seed(seed)
+    scores = _sampled_scores(
+        dist, k, rows, width, torch.Generator(device="cuda").manual_seed(seed)
+    )
+    seq_lens = torch.tensor([n for n, _ in rows], dtype=torch.int32, device="cuda")
+    starts = (
+        torch.tensor([s for _, s in rows], dtype=torch.int32, device="cuda")
+        if with_row_starts
+        else None
+    )
+    scratch = topk_candidates_split_scratch(len(rows), "cuda")
+    redone = torch.zeros(1, dtype=torch.int32, device="cuda")
+    ref = _dcp_candidates(scores, seq_lens, k, row_starts=starts, stable_ties=True)
+    got = _split_candidates(
+        scores,
+        seq_lens,
+        k,
+        scratch,
+        row_starts=starts,
+        stable_ties=True,
+        split_chunk=SPLIT_CHUNK,
+        overflow_rows=redone,
+    )
+
+    _, chunks = _split_plan([n for n, _ in rows], SPLIT_CHUNK, 0, 256)
+    assert chunks[:6] == [13, 5, 4, 3, 2, 2] and set(chunks[6:]) == {1}
+    sampled_rows = sum(n > k and n + s % 4 > 16384 for n, s in rows)
+    if dist in SAMPLED_ALL_REDONE:
+        assert int(redone) == sampled_rows, (int(redone), sampled_rows)
+    elif dist in SAMPLED_NONE_REDONE:
+        assert int(redone) == 0, int(redone)
+    _assert_sampled_rows(scores, rows, got, ref, k, True, dist)
+    _assert_split_buffers(
+        scores, rows, scratch, chunks, dist in SPLIT_ALL_CHUNKS, (dist, k)
+    )
+
+
+@pytest.mark.skipif(is_hip(), reason="CUDA sampled candidate top-k")
+@pytest.mark.parametrize("stable_ties", [True, False])
+@pytest.mark.parametrize(
+    "extra,chunk", [(18, 16384), (9, 32768), (6, 65536), (1, 131072)]
+)
+@torch.inference_mode()
+def test_topk_v2_candidates_split_doubling(
+    extra: int, chunk: int, stable_ties: bool
+) -> None:
+    """With too few CTAs past the rows for the chunks, the chunk doubles until they fit
+    (13 + 5 + 3 chunks at 16384, 7 + 3 + 2 at 32768, 4 + 2 at 65536, 2 at 131072);
+    the set stays exact."""
+    k = 2048
+    rows = [(200000, 1), (65537, 2), (40000, 3), (9000, 0)]
+    lens = [n for n, _ in rows]
+    plan_chunk, chunks = _split_plan(lens, SPLIT_CHUNK, 0, extra)
+    assert plan_chunk == chunk, (plan_chunk, chunk)
+    width = (max(n + s for n, s in rows) + 3) // 4 * 4
+    torch.manual_seed(extra)
+    scores = torch.randn(len(rows), width, device="cuda")
+    seq_lens = torch.tensor(lens, dtype=torch.int32, device="cuda")
+    starts = torch.tensor([s for _, s in rows], dtype=torch.int32, device="cuda")
+    scratch = topk_candidates_split_scratch(len(rows), "cuda")
+    redone = torch.zeros(1, dtype=torch.int32, device="cuda")
+    kwargs = dict(row_starts=starts, stable_ties=stable_ties)
+    ref = _dcp_candidates(scores, seq_lens, k, **kwargs)
+    got = _split_candidates(
+        scores,
+        seq_lens,
+        k,
+        scratch,
+        split_chunk=SPLIT_CHUNK,
+        split_extra=extra,
+        overflow_rows=redone,
+        **kwargs,
+    )
+    assert int(redone) == 0, int(redone)
+    _assert_sampled_rows(scores, rows, got, ref, k, stable_ties, extra)
+    _assert_split_buffers(scores, rows, scratch, chunks, True, extra)
+
+
+@pytest.mark.skipif(is_hip(), reason="CUDA sampled candidate top-k")
+@torch.inference_mode()
+def test_topk_v2_candidates_split_graph_replay() -> None:
+    """One captured split top-k replayed on two inputs in a row: each replay finds its
+    counters at zero, so each split row is selected by its last CTA, and leaves them zero."""
+    k = 2048
+    rows = SPLIT_ROWS
+    width = (max(n + s for n, s in rows) + 3) // 4 * 4
+    g = torch.Generator(device="cuda").manual_seed(4242)
+    inputs = [
+        torch.randn(len(rows), width, generator=g, device="cuda") for _ in range(2)
+    ]
+    seq_lens = torch.tensor([n for n, _ in rows], dtype=torch.int32, device="cuda")
+    starts = torch.tensor([s for _, s in rows], dtype=torch.int32, device="cuda")
+    _, chunks = _split_plan([n for n, _ in rows], SPLIT_CHUNK, 0, 256)
+    refs = [
+        _dcp_candidates(x, seq_lens, k, row_starts=starts, stable_ties=True)
+        for x in inputs
+    ]
+    scores = inputs[0].clone()
+    cand = torch.full((len(rows), k, 2), -7, dtype=torch.int32, device="cuda")
+    scratch = topk_candidates_split_scratch(len(rows), "cuda")
+    redone = torch.zeros(1, dtype=torch.int32, device="cuda")
+
+    def run():
+        topk_transform_candidates_v2(
+            scores,
+            seq_lens,
+            out_candidates=cand,
+            world=4,
+            rank=1,
+            row_starts=starts,
+            stable_ties=True,
+            cluster_size=0,
+            sampled=True,
+            overflow_rows=redone,
+            split_chunk=SPLIT_CHUNK,
+            split_scratch=scratch,
+        )
+
+    run()  # compile outside the capture
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    for i in (0, 1, 0, 1):
+        scores.copy_(inputs[i])
+        cand.fill_(-7)
+        scratch[0].fill_(-1)
+        graph.replay()
+        torch.cuda.synchronize()
+        _assert_sampled_rows(inputs[i], rows, cand, refs[i], k, True, ("graph", i))
+        _assert_split_buffers(inputs[i], rows, scratch, chunks, True, ("graph", i))
+    assert int(redone) == 0, int(redone)
+
+
+@pytest.mark.skipif(is_hip(), reason="CUDA sampled candidate top-k")
+@torch.inference_mode()
+def test_topk_v2_candidates_split_off() -> None:
+    """split_chunk 0, or more than 512 rows: every row on one CTA as the sampled pass
+    alone runs it (same sets), the scratch untouched."""
+    k = 2048
+    for tag, rows, split_chunk in (
+        ("chunk 0", SPLIT_ROWS, 0),
+        ("513 rows", [(20000, i % 4) for i in range(513)], SPLIT_CHUNK),
+    ):
+        width = (max(n + s for n, s in rows) + 3) // 4 * 4
+        torch.manual_seed(len(rows))
+        scores = torch.randn(len(rows), width, device="cuda")
+        seq_lens = torch.tensor([n for n, _ in rows], dtype=torch.int32, device="cuda")
+        starts = torch.tensor([s for _, s in rows], dtype=torch.int32, device="cuda")
+        scratch = topk_candidates_split_scratch(len(rows), "cuda")
+        ref = _dcp_candidates(
+            scores, seq_lens, k, row_starts=starts, stable_ties=True, sampled=True
+        )
+        got = _split_candidates(
+            scores,
+            seq_lens,
+            k,
+            scratch,
+            row_starts=starts,
+            stable_ties=True,
+            split_chunk=split_chunk,
+        )
+        # stable ties: the very sets of the sampled pass, whatever the slot order
+        assert torch.equal(
+            got[..., 1].sort(dim=1).values, ref[..., 1].sort(dim=1).values
+        )
+        assert bool((scratch[0] == -1).all()) and not bool(scratch[1].any()), tag
 
 
 @pytest.mark.skipif(not is_hip(), reason="ROCm split path")
