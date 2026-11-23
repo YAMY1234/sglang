@@ -65,6 +65,9 @@ ENABLED = _env_flag("SGLANG_QSA_FP8_POOL_VERIFY_WS")
 SPLITS = _env_num("SGLANG_QSA_FP8_POOL_VERIFY_WS_SPLITS", None, int)
 # PDL into this kernel (gdc_wait after its setup); off by default until measured in the engine.
 PDL = _env_flag("SGLANG_QSA_FP8_POOL_VERIFY_WS_PDL")
+# "ns,nbv": the FP8 K+V ring and BF16 V ring stages; None: the most of (2, 2), (1, 1) that fit the device's
+# shared memory (2 + 2 is 328 KB, over SM103's 227 KB).
+STAGES = _env_num("SGLANG_QSA_FP8_POOL_VERIFY_WS_STAGES", None, lambda v: tuple(int(x) for x in v.split(",")))
 RESCALE_LOG2 = 8.0
 _LOGGED_ROWS: set = set()
 
@@ -110,6 +113,18 @@ def choose_ws_splits(requests, kv_heads, sms):
     return max(1, min(4, sms // pairs))
 
 
+def ws_smem_bytes(ns, nbv, bn=128, dim=256, qp=64, lm=64):
+    """The kernel's shared memory: FP8 K and V rings, the BF16 V ring, P^T, Q, the ones operand, alpha, barriers."""
+    return 2 * ns * bn * dim + 2 * nbv * bn * dim + 2 * bn * qp + 2 * qp * dim + 2 * lm * bn + 4 * qp + 1024
+
+
+def ws_stages(device):
+    if STAGES is not None:
+        return STAGES
+    smem = triton.runtime.driver.active.utils.get_device_properties(device.index or 0)["max_shared_mem"]
+    return next((s for s in ((2, 2), (1, 1)) if ws_smem_bytes(*s) <= smem), (1, 1))
+
+
 def _log_engaged(rows: int, width: int, kv_heads: int, device, served: bool) -> None:
     """One line per verify row count, printed at graph capture (the runner's engagement check)."""
     if rows in _LOGGED_ROWS:
@@ -118,12 +133,13 @@ def _log_engaged(rows: int, width: int, kv_heads: int, device, served: bool) -> 
     requests = rows // width
     if served:
         logger.info(
-            "SGLANG_QSA_FP8_POOL_VERIFY_WS engaged rows=%d width=%d requests=%d splits=%d pdl=%d",
+            "SGLANG_QSA_FP8_POOL_VERIFY_WS engaged rows=%d width=%d requests=%d splits=%d pdl=%d stages=%s",
             rows,
             width,
             requests,
             SPLITS or choose_ws_splits(requests, kv_heads, _num_sms(device)),
             int(PDL),
+            ws_stages(device),
         )
     else:
         logger.info(
@@ -346,10 +362,10 @@ if _GLUON:
         NT: gl.constexpr,
         RESCALE: gl.constexpr,
         USE_PDL: gl.constexpr,
+        NS: gl.constexpr,  # FP8 K+V ring stages (64 KB each)
+        NBV: gl.constexpr,  # BF16 V stages (64 KB each)
     ):
         BN: gl.constexpr = 128  # tokens per tile: the MMA's M
-        NS: gl.constexpr = 2  # FP8 K+V ring stages (64 KB each)
-        NBV: gl.constexpr = 2  # BF16 V stages (64 KB each)
         LM: gl.constexpr = 64  # rows of the row-sum MMA
         KC: gl.constexpr = 128  # columns converted per step
         OC: gl.constexpr = 16  # O^T columns per TMEM load in the rescale and epilogue
@@ -490,6 +506,7 @@ def union_ws_attend(q3, k_cache, v_cache, tok_slots, tok_masks, ntok, ninv, out,
         nt,
         RESCALE_LOG2,
         bool(pdl),
+        *ws_stages(dev),
         num_warps=4,
         maxnreg=128,
         **({"launch_pdl": True} if pdl else {}),
