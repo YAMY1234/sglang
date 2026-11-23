@@ -2634,8 +2634,8 @@ class Envs:
     # input is all-gathered. Works with NCCL or SGLANG_K3_SP_COLLECTIVE.
     SGLANG_K3_SP_ATTN_RES = EnvBool(False)
     # K3 attention-residual bank on a later pipeline stage: copy the inherited rows into the stage's bank with a
-    # pitched row copy (16-byte vectors) instead of a strided elementwise copy_; bitwise identical.
-    SGLANG_ATTN_RES_FAST_INHERIT = EnvBool(False)
+    # pitched row copy (16-byte vectors) instead of a strided elementwise copy_; bitwise identical. On by default.
+    SGLANG_ATTN_RES_FAST_INHERIT = EnvBool(True)
     # SP-MoE prefill: compute o_proj's TP-partial output in N column chunks
     # and reduce-scatter each chunk over attention TP on a side stream while
     # the next chunk's GEMM runs (0: off). Taken only for eager batches of at
