@@ -1966,6 +1966,8 @@ class ModelRunner:
                 reinit_attn_backend,
                 split_forward_count,
             )
+            if isinstance(self.req_to_token_pool, HybridReqToTokenPool):
+                self.req_to_token_pool.flush_pending_cow()
             if self.enable_elastic_ep:
                 output = self._maybe_rebalance_after_rank_fault(
                     output,

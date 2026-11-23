@@ -1272,6 +1272,25 @@ class MambaPool:
         for sibling in self._slot_siblings:
             sibling.copy_slots(src_indices, dst_indices)
 
+    def copy_slot_side_state(
+        self, src_indices: torch.Tensor, dst_indices: torch.Tensor
+    ) -> None:
+        """The layer-independent part of copy_from: ReplaySSM cursor and slot siblings."""
+        if self.replayssm_write_pos is not None:
+            self.replayssm_write_pos[dst_indices] = 0
+        for sibling in self._slot_siblings:
+            sibling.copy_slots(src_indices, dst_indices)
+
+    def copy_layer_slots(
+        self, layer: int, src_indices: torch.Tensor, dst_indices: torch.Tensor
+    ) -> None:
+        """copy_from's conv + temporal copy for one pool layer."""
+        for conv in self.mamba_cache.conv:
+            conv[layer, dst_indices] = conv[layer, src_indices]
+        temporal = self.mamba_cache.temporal
+        if temporal.numel() > 0:
+            temporal[layer, dst_indices] = temporal[layer, src_indices]
+
     def get_cpu_copy(self, indices):
         if self.kda_fold_pending is not None:
             self.flush_kda_pending(indices)
@@ -1472,6 +1491,8 @@ class HybridReqToTokenPool(ReqToTokenPool):
         self.enable_memory_saver = enable_memory_saver
         self.start_layer = start_layer if start_layer is not None else 0
         self.layer_transfer_counter = None
+        # (src, dst, mamba layer ids not yet copied) of a per-layer COW in flight.
+        self._pending_cow = None
         self.ple_window_cache = None
         self._init_mamba_pool(
             mamba_size=mamba_size,
@@ -1746,6 +1767,14 @@ class HybridReqToTokenPool(ReqToTokenPool):
         assert layer_id in self.mamba_map
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
+        if self._pending_cow is not None and layer_id in self._pending_cow[2]:
+            src_index, dst_index, pending = self._pending_cow
+            self.mamba_pool.copy_layer_slots(
+                self.mamba_map[layer_id], src_index, dst_index
+            )
+            pending.discard(layer_id)
+            if not pending:
+                self._pending_cow = None
         return self.mamba_map[layer_id]
 
     def mamba2_layer_cache(self, layer_id: int):
@@ -1794,9 +1823,32 @@ class HybridReqToTokenPool(ReqToTokenPool):
             self.layer_transfer_counter is not None
             and self.layer_transfer_counter.consumer_index >= 0
         ):
+            if (
+                envs.SGLANG_HICACHE_COW_PER_LAYER.get()
+                and type(self.mamba_pool).copy_from is MambaPool.copy_from
+                and self.mamba_pool.kda_fold_pending is None
+            ):
+                # Side state rides the first Mamba layer's transfer; each layer's
+                # conv / temporal is copied by mamba2_layer_index after its own
+                # load event, so the forward never waits for the whole load-back.
+                assert self._pending_cow is None, "a per-layer COW was not flushed"
+                first_mamba_layer = min(self.mamba_map)
+                self.layer_transfer_counter.wait_until(
+                    first_mamba_layer - self.start_layer
+                )
+                self.mamba_pool.copy_slot_side_state(src_index, dst_index)
+                self._pending_cow = (src_index, dst_index, set(self.mamba_map))
+                return
             last_mamba_layer = max(self.mamba_map)
             self.layer_transfer_counter.wait_until(last_mamba_layer - self.start_layer)
         self.mamba_pool.copy_from(src_index, dst_index)
+
+    def flush_pending_cow(self) -> None:
+        """Copy the layers of a per-layer COW that the forward did not read."""
+        if self._pending_cow is None:
+            return
+        for layer_id in sorted(self._pending_cow[2]):
+            self.mamba2_layer_index(layer_id)
 
     def get_speculative_mamba2_params_all_layers(self) -> MambaPool.SpeculativeState:
         return self.mamba_pool.get_speculative_mamba2_params_all_layers()
