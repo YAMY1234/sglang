@@ -8,7 +8,6 @@ import triton
 import triton.language as tl
 
 import sglang.kernels.ops.attention.triton_block_ptr_compat  # noqa: F401
-from sglang.kernels import launch_fastpath
 from sglang.kernels.jit.utils import get_jit_cuda_arch, is_arch_support_pdl
 from sglang.srt.utils import (
     cdiv,
@@ -253,9 +252,7 @@ def layer_norm_gated_fwd(
                 # Other norm modes retain their T=64 selection.
                 BT = 8
         pdl_kwargs = {"USE_GDC": True, "launch_pdl": True} if use_pdl else {}
-        launch_fastpath.triton_launch(
-            layer_norm_gated_fwd_kernel,
-            (cdiv(T, BT),),
+        layer_norm_gated_fwd_kernel[(cdiv(T, BT),)](
             x=x,
             g=g,
             y=y,

@@ -961,9 +961,6 @@ class Envs:
     # >= MIN_RANK, so those hosts can queue more than ~1.7 forwards ahead of their GPU.
     SGLANG_PP_LAUNCH_QUEUE_SCALE = EnvStr("")
     SGLANG_PP_LAUNCH_QUEUE_SCALE_MIN_RANK = EnvInt(1)
-    # Cached host launch paths for hot Triton and CuTe DSL kernels (sglang/kernels/launch_fastpath.py);
-    # a PP stage's host-lead file can switch it at run time (field 7).
-    SGLANG_LAUNCH_FASTPATH = EnvBool(False)
     # PP PD prefill (Mooncake): each stage sends a request's last KV chunk when its
     # own forward of that chunk completes, not when the result returns pp_size - 1
     # micro-batches later; only the last stage, which samples the first token, sends

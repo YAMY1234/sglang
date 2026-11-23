@@ -10,7 +10,6 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.kernels import launch_fastpath
 from sglang.kernels.jit.utils import is_arch_support_pdl
 from sglang.srt.environ import envs
 
@@ -649,9 +648,7 @@ def causal_conv1d_fn(
             triton.cdiv(dim, META["BLOCK_N"]),
         )
 
-    launch_fastpath.triton_launch(
-        _causal_conv1d_fwd_kernel,
-        grid,
+    _causal_conv1d_fwd_kernel[grid](
         # Pointers to matrices
         x,
         weight,
