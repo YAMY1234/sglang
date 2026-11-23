@@ -573,9 +573,10 @@ def _check_gdn_replayssm_ucache_model(server_args: Any, *, flag: str) -> None:
         raise ValueError(f"{flag} requires a GDN hybrid linear-attention model.")
     if not get_platform().is_cuda or torch.cuda.get_device_capability() not in (
         (10, 0),
+        (10, 3),
         (10, 7),
     ):
-        raise ValueError(f"{flag} requires an SM100 or SM107 CUDA GPU.")
+        raise ValueError(f"{flag} requires an SM100, SM103 or SM107 CUDA GPU.")
 
 
 def _check_gdn_replayssm_ucache_spec(cfg: Any, *, flag: str) -> None:
