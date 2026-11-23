@@ -15,6 +15,7 @@ the stages already exchange; a message larger than a slot falls back to NCCL.
 
 from __future__ import annotations
 
+import ctypes
 import json
 import logging
 import os
@@ -85,6 +86,19 @@ class _Drv:
         drv = self.drv
         self._ok(drv.cuMemcpyDtoHAsync(host, drv.CUdeviceptr(addr), 4, drv.CUstream(stream)), "cuMemcpyDtoHAsync")
         self._ok(drv.cuStreamSynchronize(drv.CUstream(stream)), "cuStreamSynchronize")
+
+    def reader(self, stream: int, host: int, addr: int) -> Callable[[], None]:
+        """read() with its driver handles built once: a polling thread then holds the GIL for a few bytecodes per
+        poll (the driver calls release it), which the main thread's launches share."""
+        drv, ok = self.drv, self.drv.CUresult.CUDA_SUCCESS
+        copy, sync = drv.cuMemcpyDtoHAsync, drv.cuStreamSynchronize
+        s, a = drv.CUstream(stream), drv.CUdeviceptr(addr)
+
+        def read() -> None:
+            if copy(host, a, 4, s)[0] != ok or sync(s)[0] != ok:
+                self.read(stream, host, addr)  # raises with the failing call's name
+
+        return read
 
     def wait_geq(self, stream: torch.cuda.Stream, addr: int, value: int) -> None:
         drv = self.drv
@@ -454,7 +468,7 @@ class PPCEPush:
         # Once anything waits at the gate, later push-stream work goes through it too, in order.
         return self.gated >= 2 or (self.gated == 1 and not self.has_prev) or self._gate_pending > 0
 
-    _GATE_POLL_S = 5e-4
+    _GATE_POLL_S = 1e-3
 
     def _copy_out_of_input_slot(self, tensors, ready_event):
         """Gate-every-stage: the release goes right after the forward, so a pushed tensor still in this stage's
@@ -496,10 +510,12 @@ class PPCEPush:
         if self._poll_stream is None:
             self._poll_stream = self.drv.stream_create()
             self._poll_host = torch.zeros(1, dtype=torch.int32, pin_memory=True)
-        host, addr = self._poll_host.data_ptr(), self.free_va + 4 * slot
+        host = self._poll_host.data_ptr()
+        read = self.drv.reader(self._poll_stream, host, self.free_va + 4 * slot)
+        flag = ctypes.c_int32.from_address(host)
         while True:
-            self.drv.read(self._poll_stream, host, addr)
-            if int(self._poll_host[0]) >= target:
+            read()
+            if flag.value >= target:
                 return
             time.sleep(self._GATE_POLL_S)
 

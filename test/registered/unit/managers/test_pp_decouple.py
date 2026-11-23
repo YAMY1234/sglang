@@ -421,6 +421,72 @@ class TestPPCEPush(CustomTestCase):
             self.assertEqual(w.work.event, "done2")
             self.assertIsNone(ce._gate_thread)
 
+    def _polling_ce(self, flag_after_s):
+        """A PPCEPush reading the next stage's free flag, which turns 1 flag_after_s after the first read."""
+        import ctypes
+
+        from sglang.srt.managers.pp_ce_push import PPCEPush
+
+        ce = PPCEPush.__new__(PPCEPush)
+        ce.free_va, ce._poll_stream = 0, 7
+        ce._poll_host = torch.zeros(1, dtype=torch.int32)
+        reads = []
+
+        def reader(stream, host, addr):
+            word = ctypes.c_int32.from_address(host)
+
+            def read():
+                reads.append(time.perf_counter())
+                if reads[-1] - reads[0] >= flag_after_s:
+                    word.value = 1
+
+            return read
+
+        ce.drv = SimpleNamespace(reader=reader)
+        return ce, reads
+
+    def test_the_gate_polls_the_free_flag_until_the_slot_is_free(self):
+        ce, reads = self._polling_ce(flag_after_s=0.05)
+        t0 = time.perf_counter()
+        ce._gate_wait(0, 1, None)
+        elapsed = time.perf_counter() - t0
+        self.assertGreaterEqual(elapsed, 0.05)
+        self.assertLess(elapsed, 1.0)
+        self.assertEqual(int(ce._poll_host[0]), 1)
+        # one read per poll interval, not a spin
+        self.assertGreaterEqual(len(reads), 2)
+        self.assertLessEqual(len(reads), elapsed / ce._GATE_POLL_S + 2)
+        # a slot that is free already: one read
+        ce, reads = self._polling_ce(flag_after_s=0.0)
+        ce._gate_wait(0, 1, None)
+        self.assertEqual(len(reads), 1)
+
+    def test_a_polling_gate_leaves_the_main_thread_its_rate(self):
+        """The gate thread polls while the next stage holds the slot. Each poll holds the GIL for a few bytecodes
+        only, so a main thread that gives the GIL up between steps (as launches do around C calls) keeps its rate."""
+
+        def rate(with_gate):
+            th = None
+            if with_gate:
+                ce, _ = self._polling_ce(flag_after_s=0.4)
+                th = threading.Thread(target=ce._gate_wait, args=(0, 1, None))
+                th.start()
+                time.sleep(0.02)
+            n, t0 = 0, time.perf_counter()
+            while time.perf_counter() - t0 < 0.3:
+                for _ in range(100):
+                    n += 1
+                time.sleep(0)
+            r = n / (time.perf_counter() - t0)
+            if th is not None:
+                th.join(5)
+                self.assertFalse(th.is_alive())
+            return r
+
+        base = sorted(rate(False) for _ in range(3))[1]
+        gated = sorted(rate(True) for _ in range(3))[1]
+        self.assertGreater(gated, 0.8 * base, (gated, base))
+
     def _scheduler(self, last, log, gated=0):
         from sglang.srt.managers.pp_ce_push import CEWait
 
