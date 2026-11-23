@@ -1,3 +1,5 @@
+import json
+import os
 import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -17,6 +19,7 @@ from sglang.srt.layers.quantization.fp8_utils import (
     block_fp8_scale_to_mxfp8_e8m0,
     can_serve_block_fp8_as_mxfp8,
     inverse_transform_scale_ue8m0,
+    mxfp8_quantize_modelopt,
     quant_weight_ue8m0,
     resolve_block_fp8_mxfp8_backend,
     transform_scale_ue8m0,
@@ -107,6 +110,65 @@ class TestInverseTransformScaleUe8m0(CustomTestCase):
             )
             assert torch.all(sf_fp32_original == sf_fp32_recreated), (
                 f"{sf_fp32_original=} {sf_fp32_recreated}"
+            )
+
+
+def _modelopt_mxfp8_reference(w: torch.Tensor):
+    """modelopt/torch/quantization/qtensor/mxfp8_tensor.py (nvidia-modelopt 0.48.0)."""
+    blocks = w.view(*w.shape[:-1], w.shape[-1] // 32, 32)
+    descale = blocks.abs().amax(dim=-1).float() / 448.0
+    log2 = torch.where(descale > 0, torch.log2(descale), descale.new_tensor(-127.0))
+    scale = (torch.clamp(torch.ceil(log2), min=-127, max=127) + 127).to(torch.uint8)
+    scaled = blocks * torch.exp2(127 - scale.float()).unsqueeze(-1)
+    q = torch.clamp(scaled, min=-448.0, max=448.0).to(torch.float8_e4m3fn)
+    return q.view(w.shape), scale
+
+
+class TestMxfp8QuantizeModelopt(CustomTestCase):
+    def _assert_bitwise(self, w: torch.Tensor, rows_per_chunk: int = 4096):
+        q, s = mxfp8_quantize_modelopt(w, rows_per_chunk=rows_per_chunk)
+        q_ref, s_ref = _modelopt_mxfp8_reference(w)
+        self.assertTrue(torch.equal(s, s_ref))
+        self.assertTrue(torch.equal(q.view(torch.uint8), q_ref.view(torch.uint8)))
+
+    def test_matches_modelopt_on_random_and_edge_blocks(self):
+        gen = torch.Generator().manual_seed(0)
+        n, k = 96, 7168
+        mag = torch.exp2(
+            torch.randint(-30, 4, (n, k // 32, 1), generator=gen, device="cpu").float()
+        )
+        w = torch.randn(n, k // 32, 32, generator=gen, device="cpu") * mag
+        w = w.to(torch.bfloat16)
+        w[0, 0] = 0  # all-zero block
+        w[1, 0] = 1e-38  # descale below 2^-127, clamped exponent
+        w[2, 0, 0] = 1.75 * 2.0**-3  # amax exactly on the power-of-two boundary
+        w[2, 0, 1:] = 0.01
+        w[3, 0, 0] = -448.0
+        self._assert_bitwise(w.view(n, k), rows_per_chunk=40)
+        self.assertEqual(
+            mxfp8_quantize_modelopt(w.view(n, k))[1][2, 0].item(), 127 - 11
+        )
+
+    @unittest.skipUnless(
+        os.environ.get("SGLANG_TEST_K31_MXFP8_SLICES"),
+        "set to a directory of matching BF16 / TRT-LLM MXFP8 checkpoint row slices",
+    )
+    def test_matches_trtllm_checkpoint_bytes(self):
+        root = os.environ["SGLANG_TEST_K31_MXFP8_SLICES"]
+        dtypes = {"BF16": torch.bfloat16, "F8_E4M3": torch.uint8, "U8": torch.uint8}
+
+        def load(entry):
+            raw = bytearray(open(os.path.join(root, entry["file"]), "rb").read())
+            return torch.frombuffer(raw, dtype=dtypes[entry["dtype"]]).view(
+                *entry["shape"]
+            )
+
+        for entry in json.load(open(os.path.join(root, "manifest.json"))):
+            q, s = mxfp8_quantize_modelopt(load(entry["ours.weight"]))
+            self.assertTrue(torch.equal(s, load(entry["trt.weight_scale"])))
+            self.assertTrue(
+                torch.equal(q.view(torch.uint8), load(entry["trt.weight"])),
+                entry["name"],
             )
 
 

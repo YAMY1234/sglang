@@ -1867,6 +1867,33 @@ def mxfp8_group_quantize(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     return q_input.contiguous(), scale_u8.contiguous()
 
 
+def mxfp8_quantize_modelopt(
+    x: torch.Tensor, rows_per_chunk: int = 4096
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """MXFP8 weight cast bit-identical to ModelOpt's MXFP8QTensor.quantize:
+    scale = 2^clamp(ceil(log2(amax / 448)), -127, 127) per 32 along K, RNE to E4M3.
+    Returns ([N, K] float8_e4m3fn, [N, K // 32] uint8 biased exponents)."""
+    n, k = x.shape
+    assert k % 32 == 0, f"{k=} must be divisible by 32"
+    qweight = torch.empty((n, k), dtype=torch.float8_e4m3fn, device=x.device)
+    scale_u8 = torch.empty((n, k // 32), dtype=torch.uint8, device=x.device)
+    # Chunked over rows to bound the fp32 temporaries of wide TP1 weights.
+    for r0 in range(0, n, rows_per_chunk):
+        blocks = x[r0 : r0 + rows_per_chunk].reshape(-1, k // 32, 32)
+        descale = blocks.abs().amax(dim=-1).float() / 448.0
+        # The torch log2 is exact on the power-of-two boundary (amax mantissa
+        # 1.75, ~0.7% of blocks); Triton's approximate divide is not.
+        exponent = torch.ceil(
+            torch.where(descale > 0, torch.log2(descale), descale.new_tensor(-127.0))
+        ).clamp(-127, 127)
+        q = torch.clamp(
+            blocks * torch.exp2(-exponent).unsqueeze(-1), min=-448.0, max=448.0
+        )
+        qweight[r0 : r0 + rows_per_chunk] = q.to(torch.float8_e4m3fn).view(-1, k)
+        scale_u8[r0 : r0 + rows_per_chunk] = (exponent + 127).to(torch.uint8)
+    return qweight, scale_u8
+
+
 def flashinfer_mxfp8_blockscaled_linear(
     input: torch.Tensor,
     weight: torch.Tensor,
