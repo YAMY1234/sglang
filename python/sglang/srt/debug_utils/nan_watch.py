@@ -27,8 +27,11 @@ logger = logging.getLogger(__name__)
 _IN, _STATE, _OUT, _SLOT, _KV_MIN, _KV_MAX, _IN_BANK, _OUT_BANK = range(8)
 # Counter row, past the counters: up to 4 values the Mamba free list holds twice, up to 2 batch slots on it.
 _FREE_DUP_VALS, _SLOTS_ON_FREE = slice(6, 10), slice(10, 12)
-_NUM_COLS = 12
 _NONE = torch.iinfo(torch.int64).max
+# Per watched point (a layer's attention output, a layer's output): non-finite tokens, offset of the first one.
+_POINT_BASE, _MAX_POINTS = 12, 32
+_NUM_COLS = _POINT_BASE + 2 * _MAX_POINTS
+_POINT_NAMES = ("attn", "out")
 _COUNTERS = (
     "dup_mamba_slot",
     "mamba_slot_free",
@@ -41,10 +44,14 @@ _SUMMARY_EVERY_S = 60.0
 
 
 class _Forward:
-    def __init__(self, *, stage, rids, prefix_lens, extend_lens, dev):
+    def __init__(
+        self, *, stage, rids, prefix_lens, extend_lens, dev, token_row, token_offset
+    ):
         self.stage, self.rids = stage, rids
         self.prefix_lens, self.extend_lens = prefix_lens, extend_lens
         self.dev = dev
+        self.token_row, self.token_offset = token_row, token_offset
+        self.points = {}  # (layer, point) -> column, in first-seen order
         self.t = time.time()
 
 
@@ -133,6 +140,12 @@ def begin(
         forward_batch.extend_seq_lens[:bs].long(),
         output_size=num_tokens,
     )
+    lens = forward_batch.extend_seq_lens[:bs].long()
+    token_offset = (
+        torch.arange(num_tokens, device=device)
+        - (torch.cumsum(lens, 0) - lens)[token_row]
+    )
+    dev[:bs, _POINT_BASE + 1 :: 2] = _NONE
     if pp_proxy_tensors is not None:
         _add_proxy_flags(dev, (_IN, _IN_BANK), pp_proxy_tensors, token_row, num_tokens)
 
@@ -186,6 +199,8 @@ def begin(
         prefix_lens=prefix_lens,
         extend_lens=extend_lens,
         dev=dev,
+        token_row=token_row,
+        token_offset=token_offset,
     )
 
 
@@ -202,6 +217,28 @@ def check_state(
     bad = ~torch.isfinite(ssm[safe]).reshape(bs, -1).all(-1)
     bad |= ~torch.isfinite(conv[safe]).reshape(bs, -1).all(-1)
     dev[:bs, _STATE] += (bad & (idx >= 0)).long()
+
+
+def check_point(layer_idx: int, point: int, hidden) -> None:
+    """Per row: non-finite tokens of a layer's attention output (point 0) or layer output (point 1), first offset."""
+    watch = _active
+    if watch is None or not isinstance(hidden, torch.Tensor):
+        return
+    num_tokens = watch.token_row.numel()
+    if hidden.shape[0] < num_tokens:
+        return  # rows sharded across ranks: not mapped to requests here
+    col = watch.points.get((layer_idx, point))
+    if col is None:
+        if len(watch.points) == _MAX_POINTS:
+            return
+        col = _POINT_BASE + 2 * len(watch.points)
+        watch.points[(layer_idx, point)] = col
+    dev = watch.dev
+    bs = dev.shape[0] - 1
+    bad = _bad_tokens(hidden, num_tokens)
+    dev[:bs, col].index_add_(0, watch.token_row, bad)
+    first = torch.where(bad.bool(), watch.token_offset, _NONE)
+    dev[:bs, col + 1].scatter_reduce_(0, watch.token_row, first, "amin")
 
 
 def end(
@@ -264,7 +301,12 @@ def _report(watch: _Forward, rows) -> None:
     for k, v in counters.items():
         _totals[k] += int(v > 0)
     # Bank-only rows are counted, not logged: rows of blocks a stage has not written may not be initialized.
-    hits = [i for i, r in enumerate(rows) if r[_IN] or r[_STATE] or r[_OUT]]
+    point_cols = list(watch.points.items())
+    hits = [
+        i
+        for i, r in enumerate(rows)
+        if r[_IN] or r[_STATE] or r[_OUT] or any(r[c] for _, c in point_cols)
+    ]
     for col, key in (
         (_IN, "in"),
         (_STATE, "state"),
@@ -288,9 +330,15 @@ def _report(watch: _Forward, rows) -> None:
     ]
     for i in hits:
         r = rows[i]
+        # (layer, point, non-finite tokens, offset of the first) for each watched point with any.
+        points = [
+            (layer, _POINT_NAMES[point], r[c], r[c + 1])
+            for (layer, point), c in point_cols
+            if r[c]
+        ]
         logger.warning(
             "NaN watch hit PP%d rid=%s in_bad_tokens=%d state_bad_layers=%d out_bad=%d in_bank_bad=%d out_bank_bad=%d "
-            "prefix=%d extend=%d mamba_slot=%d kv_slots=[%d,%d] counters=%s batch=%s t=%.3f",
+            "prefix=%d extend=%d mamba_slot=%d kv_slots=[%d,%d] counters=%s batch=%s t=%.3f points=%s",
             watch.stage,
             batch[i][0],
             r[_IN],
@@ -306,6 +354,7 @@ def _report(watch: _Forward, rows) -> None:
             counters,
             batch,
             watch.t,
+            points,
         )
     if anomaly and not hits:
         logger.warning(

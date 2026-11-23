@@ -67,6 +67,7 @@ class TestNanWatch(unittest.TestCase):
         hidden=None,
         state=None,
         logits=None,
+        layer_outputs=(),
     ):
         pool = _Pool(list(slots), list(free_slots), self.rtt)
         proxy = PPProxyTensors(
@@ -82,6 +83,8 @@ class TestNanWatch(unittest.TestCase):
             )
         ssm = state if state is not None else torch.zeros(10, 2, 2)
         nan_watch.check_state(torch.tensor(list(slots)), ssm, torch.zeros(10, 3))
+        for layer, point, h in layer_outputs:
+            nan_watch.check_point(layer, point, h)
         nan_watch.end(
             logits=logits if logits is not None else torch.zeros(2, 8),
             forward_batch=self.batch,
@@ -109,6 +112,18 @@ class TestNanWatch(unittest.TestCase):
         self.assertIn("in_bad_tokens=0 state_bad_layers=1 out_bad=0", row0)
         self.assertIn("in_bad_tokens=1 state_bad_layers=0 out_bad=1", row1)
         self.assertIn("mamba_slot=6 kv_slots=[44,46]", row1)
+
+    def test_first_bad_layer_point_and_token_offset(self):
+        # Row 1 (tokens 2-4) turns non-finite at its second token in layer 39's attention output.
+        clean = torch.zeros(5, 3)
+        attn = torch.zeros(5, 3)
+        attn[3:, 0] = float("nan")
+        out = torch.zeros(5, 3)
+        out[3:, 1] = float("nan")
+        lines = self._run(layer_outputs=[(38, 1, clean), (39, 0, attn), (39, 1, out)])
+        self.assertEqual(len(lines), 1)
+        self.assertIn("rid=b ", lines[0])
+        self.assertIn("points=[(39, 'attn', 2, 1), (39, 'out', 2, 1)]", lines[0])
 
     def test_shared_slots_are_counted(self):
         # Both rows on Mamba slot 5, which is also free; new KV token 41 sits on free page 10.

@@ -23,6 +23,7 @@ from sglang.kernels.ops.attention.fla.fused_norm_gate import FusedRMSNormGated
 from sglang.srt.configs.kimi_k3 import KimiK3Config
 from sglang.srt.configs.kimi_linear import KimiLinearConfig
 from sglang.srt.configs.model_config import is_kimi_k31
+from sglang.srt.debug_utils import nan_watch
 from sglang.srt.distributed import (
     divide,
     tensor_model_parallel_all_reduce,
@@ -3484,6 +3485,7 @@ class KimiK3DecoderLayer(nn.Module):
         hidden_states = self._run_self_attn(
             hidden_states, positions, forward_batch, zero_allocator
         )
+        nan_watch.check_point(self.layer_idx, 0, hidden_states)
         hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
         hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)
         if isinstance(self.mlp, KimiK3MoE) and self.mlp._use_mega_moe:
@@ -3519,7 +3521,9 @@ class KimiK3DecoderLayer(nn.Module):
             hidden_states = self.mlp(hidden_states, cp_shard_rows=True)
         else:
             hidden_states = self.mlp(hidden_states)
-        return self.ffn_boundary.finish(hidden_states, forward_batch)
+        hidden_states = self.ffn_boundary.finish(hidden_states, forward_batch)
+        nan_watch.check_point(self.layer_idx, 1, hidden_states)
+        return hidden_states
 
 
 class KimiK3LinearModel(nn.Module):
