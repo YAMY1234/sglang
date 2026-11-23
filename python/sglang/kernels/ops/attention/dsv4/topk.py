@@ -29,6 +29,17 @@ def _jit_topk_v1_module():
     )
 
 
+def _one_cta_per_sm_flag() -> str:
+    # an SM that holds one 1024-thread block: the sampled top-k then runs (1024, 1) with an 8-deep collect
+    one = not is_hip_runtime() and (
+        torch.cuda.get_device_properties(
+            torch.cuda.current_device()
+        ).max_threads_per_multi_processor
+        <= 1024
+    )
+    return f"-DSGL_TOPK_ONE_CTA_PER_SM={int(one)}"
+
+
 @cache_once
 def _jit_topk_v2_module(stable_ties: bool = False):
     from sglang.kernels.jit.utils.occupancy import (
@@ -37,7 +48,10 @@ def _jit_topk_v2_module(stable_ties: bool = False):
     )
 
     args = make_cpp_args(is_arch_support_pdl(), stable_ties)
-    extra_cuda_cflags = [f"-DSGL_TOPK_STABLE_TIES={int(stable_ties)}"]
+    extra_cuda_cflags = [
+        f"-DSGL_TOPK_STABLE_TIES={int(stable_ties)}",
+        _one_cta_per_sm_flag(),
+    ]
     # Enable each cluster path only when its occupancy probe reports capacity.
     if is_arch_support_pdl():  # set the persistent cluster size after hopper
         for cluster_size, occupancy in ((8, 2), (16, 1)):
@@ -79,7 +93,7 @@ def _jit_topk_v2_push_module():
     return load_jit(
         make_name("topk_v2_push"),
         *args,
-        extra_cuda_cflags=["-DSGL_TOPK_STABLE_TIES=1"],
+        extra_cuda_cflags=["-DSGL_TOPK_STABLE_TIES=1", _one_cta_per_sm_flag()],
         cuda_files=["deepseek_v4/topk_v2.cuh"],
         cuda_wrappers=[
             (

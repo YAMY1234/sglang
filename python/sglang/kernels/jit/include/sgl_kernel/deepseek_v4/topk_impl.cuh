@@ -43,6 +43,10 @@
 
 // 1: the large-tie radix select resolves equal scores to the smallest indices
 // (built only into the module the DSA decode context-parallel merge uses)
+#ifndef SGL_TOPK_ONE_CTA_PER_SM  // 1 when an SM holds one 1024-thread block (set at JIT time from the device)
+#define SGL_TOPK_ONE_CTA_PER_SM 0
+#endif
+
 #ifndef SGL_TOPK_STABLE_TIES
 #define SGL_TOPK_STABLE_TIES 0
 #endif
@@ -895,7 +899,9 @@ struct TopKSampled : TopKRadixBase<12> {
   // A 1/8 sample: 2 adjacent vectors (one 32-byte sector) of every 16.
   static constexpr uint32_t kSampleShift = 3;
   static constexpr uint32_t kSampleGroup = 2u << kSampleShift;
-  static constexpr uint32_t kUnroll = 4;  // vectors in flight per thread
+  static constexpr uint32_t kUnroll = 4;  // vectors in flight per thread (sample pass)
+  // collect: 8 in flight when the block has the SM to itself (the kernel then runs (1024, 1), up to 64 registers)
+  static constexpr uint32_t kCollectUnroll = SGL_TOPK_ONE_CTA_PER_SM ? 8 : 4;
   // Sampled scores >= theta: topk * 9/64 + kSlack, >= 4.8 sigma over topk / 8 for topk <= 2048.
   static constexpr uint32_t kSlack = 40;
   // Sampled scores the threshold bin may add past the target before it is cut finer; keeps
@@ -1042,47 +1048,51 @@ struct TopKSampled : TopKRadixBase<12> {
     return smem->theta;
   }
 
-  /// Appends every score >= theta to smem->cand (warp-aggregated), counting all of them in n_ge.
+  /// Appends every score >= theta to smem->cand (warp-aggregated), counting all of them in n_ge. The compares pack
+  /// into a bit mask and only the set bits are written, each value re-read from L1: per-element write blocks made
+  /// this loop issue-bound, and a register array indexed by a runtime bit would go to local memory.
   SGL_DEVICE static void collect(const TopKProblem& problem, const float theta, Smem* smem) {
-    constexpr uint32_t kStride = kUnroll * kBlockSize;
+    constexpr uint32_t kU = kCollectUnroll;
+    constexpr uint32_t kStride = kU * kBlockSize;
+    static_assert(kU * kVecSize <= 32, "one mask bit per score of a round");
     const auto tx = threadIdx.x;
     const auto lane_id = tx % kWarpSize;
     const auto num_full = problem.seq_len / kVecSize;
     // warp-uniform trip count: the warp scan below needs every lane
 #pragma unroll 1
     for (uint32_t base = 0; base < num_full; base += kStride) {
-      vec_t v[kUnroll];
+      vec_t v[kU];
+      if (base + kStride <= num_full) {  // block-uniform: a full round needs no bounds
 #pragma unroll
-      for (uint32_t u = 0; u < kUnroll; ++u) {
-        if (const auto vi = base + u * kBlockSize + tx; vi < num_full) {
-          v[u].load(problem.in, vi);
-        } else {
-          v[u].fill(padding_value());  // NaN is never >= theta
+        for (uint32_t u = 0; u < kU; ++u) v[u].load(problem.in, base + u * kBlockSize + tx);
+      } else {
+#pragma unroll
+        for (uint32_t u = 0; u < kU; ++u) {
+          if (const auto vi = base + u * kBlockSize + tx; vi < num_full) {
+            v[u].load(problem.in, vi);
+          } else {
+            v[u].fill(padding_value());  // NaN is never >= theta
+          }
         }
       }
-      uint32_t count = 0;
+      uint32_t mask = 0;
 #pragma unroll
-      for (uint32_t u = 0; u < kUnroll; ++u) {
+      for (uint32_t u = 0; u < kU; ++u) {
 #pragma unroll
         for (uint32_t j = 0; j < kVecSize; ++j) {
-          count += v[u][j] >= theta ? 1u : 0u;
+          mask |= (v[u][j] >= theta ? 1u : 0u) << (u * kVecSize + j);
         }
       }
+      const uint32_t count = __popc(mask);
       const auto inc = warp::inclusive_sum(count, lane_id);
       uint32_t pos = 0;
       if (lane_id == kWarpSize - 1 && inc != 0) pos = atomicAdd(&smem->n_ge, inc);
       pos = __shfl_sync(0xFFFFFFFFu, pos, kWarpSize - 1) + inc - count;
-      if (count != 0) {
-#pragma unroll
-        for (uint32_t u = 0; u < kUnroll; ++u) {
-#pragma unroll
-          for (uint32_t j = 0; j < kVecSize; ++j) {
-            if (v[u][j] >= theta) {
-              if (pos < kCapacity) smem->cand[pos] = {v[u][j], (base + u * kBlockSize + tx) * kVecSize + j};
-              ++pos;
-            }
-          }
-        }
+#pragma unroll 1
+      for (; mask != 0; mask &= mask - 1, ++pos) {
+        const auto k = static_cast<uint32_t>(__ffs(mask)) - 1u;
+        const auto idx = (base + k / kVecSize * kBlockSize + tx) * kVecSize + k % kVecSize;
+        if (pos < kCapacity) smem->cand[pos] = {problem.in[idx], idx};
       }
       // the row is redone on the exact path anyway
       const bool check = base / kStride % kCheckEvery == kCheckEvery - 1;
