@@ -37,6 +37,7 @@ kernels/ops/attention/qsa_tcgen05_v1.py, and the rescale threshold of FlashAtten
 
 from __future__ import annotations
 
+import functools
 import logging
 import os
 
@@ -108,9 +109,14 @@ def supported(q, k_cache, width) -> bool:
 
 def choose_ws_splits(requests, kv_heads, sms):
     """Splits of a request's token list: the most that keep the grid within one wave (one CTA per SM),
-    at most 4. Measured fastest on VR200 (212 SMs) at 44-64 requests: 2 at 44-48, 1 at 57-64."""
+    at most 4. Measured fastest on VR200 (212 SMs) at 44-64 requests: 2 at 44-48, 1 at 57-64.
+    Past one wave, the split count with the least wave-quantized work per CTA, each split charged 10%
+    (choose_union_splits' cost): GB300 (152 SMs) 3 at 84 requests, 2 at 104, 1 at 128."""
     pairs = max(1, requests * kv_heads)
-    return max(1, min(4, sms // pairs))
+    if pairs <= sms:
+        return max(1, min(4, sms // pairs))
+    cost = lambda s: -(-pairs * s // sms) / s * (1.0 + 0.1 * s)
+    return min(range(1, 5), key=lambda s: (cost(s), s))
 
 
 def ws_smem_bytes(ns, nbv, bn=128, dim=256, qp=64, lm=64):
@@ -118,10 +124,15 @@ def ws_smem_bytes(ns, nbv, bn=128, dim=256, qp=64, lm=64):
     return 2 * ns * bn * dim + 2 * nbv * bn * dim + 2 * bn * qp + 2 * qp * dim + 2 * lm * bn + 4 * qp + 1024
 
 
+@functools.lru_cache(maxsize=None)
+def _max_smem(device_index):
+    return triton.runtime.driver.active.utils.get_device_properties(device_index)["max_shared_mem"]
+
+
 def ws_stages(device):
     if STAGES is not None:
         return STAGES
-    smem = triton.runtime.driver.active.utils.get_device_properties(device.index or 0)["max_shared_mem"]
+    smem = _max_smem(device.index or 0)
     return next((s for s in ((2, 2), (1, 1)) if ws_smem_bytes(*s) <= smem), (1, 1))
 
 
