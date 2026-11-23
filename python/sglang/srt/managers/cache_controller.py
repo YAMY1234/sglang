@@ -82,12 +82,30 @@ class LayerLoadingEvent:
         return self.load_events[-1]
 
 
+def layer_load_ring_size(pp_size: int, pp_async_batch_depth: int, override: int) -> int:
+    """Slots of the layer-wise load-back event ring. A PP stage holds up to pp_size + pp_async_batch_depth
+    micro-batches in flight, each with at most one load, and a slot is reused only once its load finished."""
+    if override > 0:
+        return override
+    if pp_size > 1:
+        return max(3, pp_size + pp_async_batch_depth + 1)
+    return 3
+
+
+def scheduler_layer_load_ring_size() -> int:
+    parallel = get_parallel()
+    return layer_load_ring_size(
+        pp_size=parallel.pp_size,
+        pp_async_batch_depth=parallel.pp_async_batch_depth,
+        override=envs.SGLANG_HICACHE_LAYER_LOAD_RING.get(),
+    )
+
+
 class LayerDoneCounter:
-    def __init__(self, num_layers: int):
+    def __init__(self, num_layers: int, num_counters: int = 3):
         self.num_layers = num_layers
-        # extra producer and consumer counters for overlap mode; a PP stage whose host runs
-        # further ahead of its GPU has as many loads in flight and needs as many slots
-        self.num_counters = envs.SGLANG_HICACHE_LAYER_LOAD_RING.get()
+        # extra producer and consumer counters for overlap mode (and one per PP micro-batch in flight)
+        self.num_counters = num_counters
         self.events = [LayerLoadingEvent(num_layers) for _ in range(self.num_counters)]
         self.producer_index = -1
         self.consumer_index = -1
@@ -430,7 +448,9 @@ class HiCacheController:
 
         self.device = self.mem_pool_device.device
         self.transfer_layer_id_max = self.mem_pool_device.layer_num
-        self.layer_done_counter = LayerDoneCounter(self.transfer_layer_id_max)
+        self.layer_done_counter = LayerDoneCounter(
+            self.transfer_layer_id_max, num_counters=scheduler_layer_load_ring_size()
+        )
         self.mem_pool_device.register_layer_transfer_counter(self.layer_done_counter)
 
         if write_policy not in [
