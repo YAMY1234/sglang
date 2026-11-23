@@ -160,6 +160,19 @@ def _jit_dcp_topk_merge_pushed_module(num_ranks: int, topk: int, cand_k: int) ->
     )
 
 
+@cache_once
+def _jit_dcp_topk_merge_pushed_wide_module(num_ranks: int, topk: int, warps_per_rank: int) -> Module:
+    args = make_cpp_args(num_ranks, topk, warps_per_rank, is_arch_support_pdl())
+    return load_jit(
+        "dcp_topk_merge_pushed_wide",
+        *args,
+        cuda_files=["dsa/dcp_topk_merge.cuh"],
+        cuda_wrappers=[
+            ("dcp_topk_merge_pushed_wide", f"DcpTopKMergePushedWideKernel<{args}>::run")
+        ],
+    )
+
+
 def dcp_topk_merge_pushed(
     logits: torch.Tensor,
     local_lens: torch.Tensor,
@@ -177,6 +190,7 @@ def dcp_topk_merge_pushed(
     span: int,
     cand_k: int,
     stats: Optional[torch.Tensor] = None,
+    warps_per_rank: int = 0,
 ) -> None:
     """``dcp_topk_merge`` for candidates the local top-k already pushed
     (``topk_transform_candidates_dcp_push`` with the same ``buffer``,
@@ -188,11 +202,20 @@ def dcp_topk_merge_pushed(
     ``dcp_topk_merge``; ``out_local``: [rows, topk] the same keys as this rank's
     local KV rows (slot // num_ranks), -1 after them, and ``out_lengths``: [rows]
     their count (what ``dcp_localize_compact`` returns for ``out_slots``).
-    ``stats`` as ``dcp_topk_merge``.
+    ``stats`` as ``dcp_topk_merge``. ``warps_per_rank`` > 0 (``cand_k`` == topk
+    only): the merge with that many warps per rank instead of one, same outputs.
     """
     num_ranks = peer_ptrs.shape[0]
-    module = _jit_dcp_topk_merge_pushed_module(num_ranks, out_slots.shape[1], cand_k)
-    module.dcp_topk_merge_pushed(
+    topk = out_slots.shape[1]
+    if warps_per_rank > 0:
+        if cand_k != topk:
+            raise ValueError(f"warps_per_rank needs cand_k == topk, got {cand_k} != {topk}")
+        module = _jit_dcp_topk_merge_pushed_wide_module(num_ranks, topk, warps_per_rank)
+        run = module.dcp_topk_merge_pushed_wide
+    else:
+        module = _jit_dcp_topk_merge_pushed_module(num_ranks, topk, cand_k)
+        run = module.dcp_topk_merge_pushed
+    run(
         logits,
         local_lens,
         buffer,

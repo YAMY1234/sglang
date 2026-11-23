@@ -212,6 +212,7 @@ class DcpTopKMerge:
     local top-k selects only the candidates and pushes them (``merge_pushed``)."""
 
     cand_k = _DCP_MERGE_CAND_K
+    merge_warps = 0
 
     def __init__(
         self,
@@ -249,6 +250,9 @@ class DcpTopKMerge:
         if self.push:
             worlds += (4,)
         self.cand_k = _merge_cand_k(world, topk)
+        self.merge_warps = envs.SGLANG_DCP4_PUSH_MERGE_WARPS.get() if world == 4 and self.cand_k == topk else 0
+        if self.merge_warps:
+            print_info_once(f"DSA DCP4 push merge: {self.merge_warps} warps per rank (cand_k {self.cand_k} == top-k)")
         if world not in worlds or topk != 2048:
             print_info_once(
                 "DSA DCP top-k merge off: it needs 8 or 16 ranks and top-k 2048"
@@ -368,6 +372,7 @@ class DcpTopKMerge:
             span=span,
             cand_k=self.cand_k,
             stats=self.stats,
+            warps_per_rank=self.merge_warps,
         )
         return local, lengths
 

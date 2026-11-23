@@ -917,6 +917,107 @@ __global__ void __launch_bounds__(32 * kNumRanks, kNumRanks == 8 ? 4 : 1)
   if (tid == 0) p.counters[row] = c + 1;
 }
 
+
+// merge_pushed_kernel for kCandK == kTopK (every rank pushes its whole local top-k, so the
+// certificate never fails) with kWarpsPerRank warps per rank instead of one: rank q's
+// candidate j sits in thread j % (32 * kWarpsPerRank) of group q, so each thread holds
+// kTopK / (32 * kWarpsPerRank) keys and the select's rounds have that many more warps in
+// flight. Same buffer protocol, same t*, and this rank's keys >= t* in candidate order, so
+// out / out_local / out_lengths equal merge_pushed_kernel's.
+template <int kNumRanks, int kTopK, int kWarpsPerRank, bool kUsePDL>
+__global__ void __launch_bounds__(32 * kNumRanks * kWarpsPerRank)
+    merge_pushed_wide_kernel(const __grid_constant__ PushedParams p) {
+  constexpr int kRankThreads = 32 * kWarpsPerRank;
+  constexpr int kPer = kTopK / kRankThreads;
+  constexpr int kWords = kTopK / 32;
+  static_assert(kTopK % kRankThreads == 0 && kPer >= 1 && kPer <= 64);
+  constexpr int64_t kSlot = static_cast<int64_t>(kNumRanks) * kTopK + kTopK + kPushExtra;
+  __shared__ PushSmem s;
+  __shared__ uint32_t sel_bits[kWords];
+  __shared__ int sel_before[kWords];
+  __shared__ int n_cand_smem, n_sel_smem;
+
+  const int row = blockIdx.x, tid = threadIdx.x;
+  const int q = tid / kRankThreads, t = tid % kRankThreads;
+  const uint32_t lane = device::get_lane_id();
+  if (tid == 0) n_cand_smem = 0;
+  device::PDLWaitPrimary<kUsePDL>();
+  const int64_t c = p.counters[row];
+  const uint64_t tag = static_cast<uint64_t>(c % 255) + 1;
+  const int64_t base = ((c & 1) * p.max_rows + row) * kSlot;
+
+  uint64_t cand[kPer];
+  poll_tagged<kPer>(p.buffer + base + q * kTopK + t, kRankThreads, tag, cand);
+  int mine = 0;
+#pragma unroll
+  for (int i = 0; i < kPer; ++i) {
+    cand[i] = entry_key(cand[i]);
+    mine += cand[i] != 0;
+  }
+  mine = device::warp::reduce_sum(mine);
+  __syncthreads();  // n_cand_smem zeroed
+  if (lane == 0) atomicAdd(&n_cand_smem, mine);
+  __syncthreads();
+  const int want = min(n_cand_smem, kTopK);
+  const uint64_t ts = select_kth_adaptive(visit_keys(cand), want, s);
+  if (tid == 0) {
+    p.fallback[row] = 0;
+    if (row == 0) atomicAdd(&p.stats[kStatRows], static_cast<unsigned long long>(gridDim.x));
+  }
+
+  // ---- this rank's keys >= t*, in candidate order: word w of the bitmap is warp w % kWarpsPerRank's ballot at i = w / kWarpsPerRank ----
+  const bool own = q == p.rank;
+  uint32_t m[kPer];
+  if (own) {
+#pragma unroll
+    for (int i = 0; i < kPer; ++i) {
+      m[i] = __ballot_sync(0xffffffff, ts != 0 && cand[i] != 0 && cand[i] >= ts);
+      if (lane == 0) sel_bits[i * kWarpsPerRank + t / 32] = m[i];
+    }
+  }
+  __syncthreads();
+  if (tid < 32) {
+    int cnt[(kWords + 31) / 32], tot = 0;
+#pragma unroll
+    for (int j = 0; j < (kWords + 31) / 32; ++j) {
+      const int w = lane * ((kWords + 31) / 32) + j;
+      cnt[j] = w < kWords ? __popc(sel_bits[w]) : 0;
+      tot += cnt[j];
+    }
+    int run = device::warp::inclusive_sum(tot, lane) - tot;
+#pragma unroll
+    for (int j = 0; j < (kWords + 31) / 32; ++j) {
+      const int w = lane * ((kWords + 31) / 32) + j;
+      if (w < kWords) sel_before[w] = run;
+      run += cnt[j];
+    }
+    if (lane == 31) n_sel_smem = run;
+  }
+  __syncthreads();
+  int32_t* const out = p.out + static_cast<int64_t>(row) * kTopK;
+  int32_t* const out_local = p.out_local + static_cast<int64_t>(row) * kTopK;
+  if (own) {
+#pragma unroll
+    for (int i = 0; i < kPer; ++i) {
+      if (m[i] >> lane & 1) {
+        const int e = sel_before[i * kWarpsPerRank + t / 32] + __popc(m[i] & ((1u << lane) - 1));
+        const int pos = static_cast<int>(0xFFFFFFFFu - static_cast<uint32_t>(cand[i]));
+        const int slot = p.page_table[row * p.page_table_stride + pos / p.span] * p.span + pos % p.span;
+        out[e] = slot;
+        out_local[e] = slot / kNumRanks;
+      }
+    }
+  }
+  const int n = n_sel_smem;
+  for (int e = n + tid; e < kTopK; e += kNumRanks * kRankThreads) {
+    out[e] = -1;
+    out_local[e] = -1;
+  }
+  if (tid == 0) p.out_lengths[row] = n;
+  __syncthreads();
+  if (tid == 0) p.counters[row] = c + 1;
+}
+
 }  // namespace dcp_topk_merge
 
 template <int64_t kNumRanks, int64_t kTopK, int64_t kCandK, int64_t kSplit, int64_t kStaged = 0, int64_t kMinBlocks = 1>
@@ -1066,6 +1167,83 @@ struct DcpTopKMergePushedKernel {
         .max_rows = max_rows,
     };
     LaunchKernel(rows, static_cast<int>(32 * kNumRanks), device_.unwrap()).enable_pdl(kUsePDL)(kernel, params);
+  }
+};
+
+
+template <int64_t kNumRanks, int64_t kTopK, int64_t kWarpsPerRank, bool kUsePDL>
+struct DcpTopKMergePushedWideKernel {
+  static constexpr auto kernel = dcp_topk_merge::merge_pushed_wide_kernel<kNumRanks, kTopK, kWarpsPerRank, kUsePDL>;
+
+  /**
+   * \brief DcpTopKMergePushedKernel with cand_k == topk and kWarpsPerRank warps per rank;
+   * same arguments and outputs. See dcp_topk_merge.py.
+   */
+  static void
+  run(tvm::ffi::TensorView logits,
+      tvm::ffi::TensorView local_lens,
+      tvm::ffi::TensorView buffer,
+      tvm::ffi::TensorView peer_ptrs,
+      tvm::ffi::TensorView counters,
+      tvm::ffi::TensorView global_lens,
+      tvm::ffi::TensorView page_table,
+      tvm::ffi::TensorView out_slots,
+      tvm::ffi::TensorView out_local,
+      tvm::ffi::TensorView out_lengths,
+      tvm::ffi::TensorView out_fallback,
+      tvm::ffi::TensorView stats,
+      int64_t rank,
+      int64_t span) {
+    using namespace host;
+
+    auto R = SymbolicSize{"rows"};
+    auto M = SymbolicSize{"max_rows"};
+    auto device_ = SymbolicDevice{};
+    device_.set_options<kDLCUDA>();
+    TensorMatcher({R, -1}).with_strides({-1, 1}).with_dtype<float>().with_device(device_).verify(logits);
+    TensorMatcher({R}).with_dtype<int32_t>().with_device(device_).verify(local_lens);
+    TensorMatcher({-1}).with_dtype<int64_t>().with_device(device_).verify(buffer);
+    TensorMatcher({kNumRanks}).with_dtype<int64_t>().with_device(device_).verify(peer_ptrs);
+    TensorMatcher({M}).with_dtype<int64_t>().with_device(device_).verify(counters);
+    TensorMatcher({R}).with_dtype<int32_t>().with_device(device_).verify(global_lens);
+    TensorMatcher({-1, -1}).with_strides({-1, 1}).with_dtype<int32_t>().with_device(device_).verify(page_table);
+    TensorMatcher({R, kTopK}).with_strides({kTopK, 1}).with_dtype<int32_t>().with_device(device_).verify(out_slots);
+    TensorMatcher({R, kTopK}).with_strides({kTopK, 1}).with_dtype<int32_t>().with_device(device_).verify(out_local);
+    TensorMatcher({R}).with_dtype<int32_t>().with_device(device_).verify(out_lengths);
+    TensorMatcher({R}).with_dtype<int32_t>().with_device(device_).verify(out_fallback);
+    TensorMatcher({static_cast<int64_t>(dcp_topk_merge::kNumStats)}).with_dtype<int64_t>().with_device(device_).verify(stats);
+
+    const auto rows = static_cast<int32_t>(R.unwrap());
+    const auto max_rows = static_cast<int32_t>(M.unwrap());
+    RuntimeCheck(rows <= max_rows, "dcp_topk_merge_pushed_wide: rows ", rows, " > max_rows ", max_rows);
+    RuntimeCheck(page_table.size(0) >= rows, "dcp_topk_merge_pushed_wide: page_table has fewer rows than ", rows);
+    const int64_t need = 2LL * max_rows * (kNumRanks * kTopK + kTopK + dcp_topk_merge::kPushExtra);
+    RuntimeCheck(buffer.size(0) >= need, "dcp_topk_merge_pushed_wide: buffer numel ", buffer.size(0), " < ", need);
+    const int64_t max_pos = page_table.size(1) * span;
+    RuntimeCheck(max_pos <= dcp_topk_merge::kEmptyPos, "dcp_topk_merge_pushed_wide: positions exceed 24 bits");
+    if (rows == 0) return;
+
+    const auto params = dcp_topk_merge::PushedParams{
+        .buffer = static_cast<uint64_t*>(buffer.data_ptr()),
+        .peer_ptrs = static_cast<const int64_t*>(peer_ptrs.data_ptr()),
+        .counters = static_cast<int64_t*>(counters.data_ptr()),
+        .logits = static_cast<const float*>(logits.data_ptr()),
+        .logits_stride = logits.stride(0),
+        .local_lens = static_cast<const int32_t*>(local_lens.data_ptr()),
+        .global_lens = static_cast<const int32_t*>(global_lens.data_ptr()),
+        .page_table = static_cast<const int32_t*>(page_table.data_ptr()),
+        .page_table_stride = page_table.stride(0),
+        .out = static_cast<int32_t*>(out_slots.data_ptr()),
+        .out_local = static_cast<int32_t*>(out_local.data_ptr()),
+        .out_lengths = static_cast<int32_t*>(out_lengths.data_ptr()),
+        .fallback = static_cast<int32_t*>(out_fallback.data_ptr()),
+        .stats = static_cast<unsigned long long*>(stats.data_ptr()),
+        .rank = static_cast<int32_t>(rank),
+        .span = static_cast<int32_t>(span),
+        .max_rows = max_rows,
+    };
+    LaunchKernel(rows, static_cast<int>(32 * kNumRanks * kWarpsPerRank), device_.unwrap())
+        .enable_pdl(kUsePDL)(kernel, params);
   }
 };
 
