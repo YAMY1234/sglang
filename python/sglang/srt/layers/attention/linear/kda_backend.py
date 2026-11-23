@@ -8,6 +8,7 @@ from sglang.kernels.ops.mamba.causal_conv1d_triton import (
     causal_conv1d_fn,
     causal_conv1d_update,
 )
+from sglang.srt.debug_utils import nan_watch
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import MambaAttnBackendBase
 from sglang.srt.layers.attention.linear.kda_prefill_graph import (
@@ -1174,6 +1175,10 @@ class KDAAttnBackend(MambaAttnBackendBase):
         cache_indices = self.forward_metadata.mamba_cache_indices
 
         mamba_cache_params = self.req_to_token_pool.mamba2_layer_cache(layer.layer_id)
+        # After the layer's HiCache load wait above, before anything reads or tracks the slots.
+        nan_watch.check_state(
+            cache_indices, mamba_cache_params.temporal, mamba_cache_params.conv[0]
+        )
         conv_states = mamba_cache_params.conv[0].transpose(-1, -2)
 
         ssm_states = mamba_cache_params.temporal

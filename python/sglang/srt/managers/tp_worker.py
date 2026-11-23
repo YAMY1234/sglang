@@ -24,6 +24,7 @@ import torch
 from sglang.srt.beam_search.logits_capture import capture_pre_sample_logits
 from sglang.srt.configs.draft_parallel import DraftParallelLayout
 from sglang.srt.configs.load_config import _DEFAULT_LOAD_GROUP, LoadGroup
+from sglang.srt.debug_utils import nan_watch
 from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import (
     DestroyWeightsUpdateGroupReqInput,
@@ -311,6 +312,8 @@ class TpModelWorker(BaseTpWorker):
         self.context_length = context_length
         # Draft worker: the attention backend the algorithm resolved for it.
         self.draft_attention_backend = draft_attention_backend
+        # SGLANG_ENABLE_NAN_WATCH covers the target model's extend forwards only.
+        self._nan_watch = nan_watch.enabled() and not is_draft_worker
 
         # MTP model runners
         self.model_runner_list: List[ModelRunner] = []
@@ -671,12 +674,26 @@ class TpModelWorker(BaseTpWorker):
         if self.is_dllm():
             return self._forward_batch_generation_dllm(forward_batch, batch)
 
+        nan_watch_on = self._nan_watch and batch is not None
+        if nan_watch_on:
+            nan_watch.begin(
+                forward_batch,
+                pp_proxy_tensors,
+                model_runner=self.model_runner,
+                rids=[r.rid for r in batch.reqs],
+                stage=self.pp_group.rank_in_group,
+            )
+
         if self.pp_group.is_last_rank:
             out = self.model_runner.forward(
                 forward_batch,
                 pp_proxy_tensors=pp_proxy_tensors,
             )
             logits_output, can_run_cuda_graph = out.logits_output, out.can_run_graph
+            if nan_watch_on:
+                nan_watch.end(
+                    logits=logits_output.next_token_logits, forward_batch=forward_batch
+                )
             if folded is not None:
                 from sglang.srt.model_executor.encoder_swa_replay import (
                     drop_folded_rows,
@@ -779,6 +796,10 @@ class TpModelWorker(BaseTpWorker):
                 pp_proxy_tensors=pp_proxy_tensors,
             )
             pp_proxy_tensors, can_run_cuda_graph = out.logits_output, out.can_run_graph
+            if nan_watch_on:
+                nan_watch.end(
+                    pp_proxy_tensors=pp_proxy_tensors, forward_batch=forward_batch
+                )
             return GenerationBatchResult(
                 pp_hidden_states_proxy_tensors=pp_proxy_tensors,
                 can_run_cuda_graph=can_run_cuda_graph,
