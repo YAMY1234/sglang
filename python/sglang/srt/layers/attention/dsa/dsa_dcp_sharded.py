@@ -215,6 +215,7 @@ class DcpTopKMerge:
     cand_k = _DCP_MERGE_CAND_K
     merge_warps = 0
     owner_merge = False
+    _owner_fallback_logged = False
 
     def __init__(
         self,
@@ -415,6 +416,12 @@ class DcpTopKMerge:
         # owner mode needs the plain launch and, per rank, fewer rows waiting for t* than resident merge blocks;
         # every rank decides alike (same rows), so the push and the merge always agree
         owner = self.owner_merge and cluster_size == 0 and rows - rows // self.world < self.owner_slots
+        if self.owner_merge and not owner and not self._owner_fallback_logged:
+            self._owner_fallback_logged = True
+            print_info_once(
+                f"DSA DCP4 push merge: a call of {rows} rows takes the multicast push "
+                f"({'cluster launch' if cluster_size else f'over {self.owner_slots} rows wait for t*'}); logged once"
+            )
         topk_transform_candidates_dcp_push(
             logits,
             local_lens,
