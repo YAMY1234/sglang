@@ -19,9 +19,11 @@ Selection checks do not mutate cache state. Shared-pool load preparation
 realizes the selected reservation before a host transfer pins device rows.
 """
 
+import logging
 from contextlib import nullcontext
 from typing import Dict, Mapping, Optional, Sequence, Tuple
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.cp.base import get_cp_strategy, is_cp_sharded_padded
 from sglang.srt.layers.cp.utils import (
     from_cp_sharded,
@@ -40,6 +42,9 @@ from sglang.srt.mem_cache.kv.alloc.demand import (
     largest_fitting_chunk,
     window_retirement,
 )
+
+logger = logging.getLogger(__name__)
+_logged_parked_chunk = False
 
 
 def estimate_swa_kv_tokens(
@@ -84,6 +89,15 @@ def _single_window_hit(
     return max((window_host_hit_lengths or {}).values(), default=0)
 
 
+def _log_parked_chunk_once() -> None:
+    global _logged_parked_chunk
+    if not _logged_parked_chunk:
+        _logged_parked_chunk = True
+        logger.info(
+            "Chunked prefill backpressure: a continuing chunk waits for free KV"
+        )
+
+
 class PrefillBudget:
     """Fixed token pool. Offsets include pending allocations and decode headroom."""
 
@@ -114,6 +128,7 @@ class PrefillBudget:
         self.total_offset = num_mixed_decode_tokens
         self.current_offset = num_mixed_decode_tokens
         self.swa_offset = 0
+        self.chunk_backpressure = envs.SGLANG_CHUNKED_PREFILL_BACKPRESSURE.get()
 
     def ceil_paged_tokens(self, tokens: int) -> int:
         return -(-tokens // self.page_size) * self.page_size
@@ -247,8 +262,21 @@ class PrefillBudget:
             chunk_limit,
             available_tokens,
         )
-        # Single-pool continuation must make progress to release its KV.
-        return available if available > 0 else chunk_limit
+        if available > 0:
+            return available
+        if not self.chunk_backpressure:
+            # Single-pool continuation must make progress to release its KV.
+            return chunk_limit
+        # The chunk may borrow decode headroom counted in total_offset, never tokens
+        # the pool does not hold; with less than a page left it waits (None).
+        physical = int(self._available_and_evictable())
+        if is_cp_sharded_padded():
+            physical = get_cp_sharded_padded_available_tokens(physical)
+        physical -= self.page_size
+        if physical < self.page_size:
+            _log_parked_chunk_once()
+            return None
+        return min(chunk_limit, physical)
 
     def fit_chunk(
         self,
@@ -289,6 +317,11 @@ class PrefillBudget:
         )
         self.total_offset += immediate + max_new_tokens
         self.current_offset += immediate
+        if self.chunk_backpressure:
+            # Later passes allocate the rest, so only the total carries it.
+            self.total_offset += (
+                self.ceil_paged_tokens(unfinished_input_len) + deferred_max_new_tokens
+            )
 
 
 class SWAPrefillBudget(PrefillBudget):

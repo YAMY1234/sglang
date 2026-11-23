@@ -2994,6 +2994,11 @@ class UnifiedRadixCache(BasePrefixCache):
         if self.linker is not None and self.linker.load_mode == "prefetch":
             self.linker.release_hold(request, admitted=True, prefix_len=prefix_len)
 
+    @rank_consensus(same_params=True)
+    def set_admission_reserve(self, tokens: int) -> None:
+        if self.linker is not None and self.linker.load_mode == "prefetch":
+            self.linker.set_admission_reserve(tokens)
+
     # Locks tree nodes and may queue lookups: every rank walks the same queue.
     @rank_consensus
     def protect_queued_prefixes(

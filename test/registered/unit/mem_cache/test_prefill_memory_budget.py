@@ -8,6 +8,7 @@ from unittest.mock import patch
 import torch
 
 from sglang.srt.disaggregation.mode import DisaggregationMode
+from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
 from sglang.srt.managers.scheduler import Scheduler
@@ -752,6 +753,50 @@ class TestFixedPrefillMemoryBudget(unittest.TestCase):
         self.assertTrue(evict_from_tree_cache(cache, 8))
         self.assertIsNotNone(allocator.alloc(8))
         self.assertFalse(allocator.verify_byte_accounting())
+
+
+class TestChunkedPrefillBackpressure(CustomTestCase):
+    """A continuing chunk on a pool with no free page waits instead of raising
+    "Prefill out of memory", and the chunk's unfinished rest stays held."""
+
+    def _budget(self, *, used):
+        allocator = TokenToKVPoolAllocator(2048, torch.bfloat16, "cpu", None, False)
+        self.assertIsNotNone(allocator.alloc(used))
+        cache = RadixCache.create_simulated(mock_allocator=allocator)
+        return allocator, allocator.create_prefill_budget(cache)
+
+    def test_continuing_chunk_waits_on_a_full_pool(self):
+        for backpressure, expected in ((False, 8192), (True, None)):
+            with (
+                self.subTest(backpressure=backpressure),
+                published_topology(),
+                envs.SGLANG_CHUNKED_PREFILL_BACKPRESSURE.override(backpressure),
+            ):
+                _, budget = self._budget(used=2048)
+                self.assertEqual(budget.available_chunk_tokens(8192), expected)
+
+    def test_continuing_chunk_is_capped_by_physical_tokens(self):
+        with (
+            published_topology(),
+            envs.SGLANG_CHUNKED_PREFILL_BACKPRESSURE.override(True),
+        ):
+            _, budget = self._budget(used=2048 - 100)
+            self.assertEqual(budget.available_chunk_tokens(8192), 100)
+            budget.total_offset += 500  # decode headroom of running requests
+            self.assertLess(budget.remaining_total, 0)
+            self.assertEqual(budget.available_chunk_tokens(8192), 99)
+
+    def test_reserve_commits_the_unfinished_rest(self):
+        for backpressure, rest in ((False, 0), (True, 40 + 2)):
+            with (
+                self.subTest(backpressure=backpressure),
+                published_topology(),
+                envs.SGLANG_CHUNKED_PREFILL_BACKPRESSURE.override(backpressure),
+            ):
+                _, budget = self._budget(used=0)
+                budget.reserve(8, 0, unfinished_input_len=40, deferred_max_new_tokens=2)
+                self.assertEqual(budget.current_offset, 8 + 1)
+                self.assertEqual(budget.total_offset, 8 + 1 + rest)
 
 
 if __name__ == "__main__":

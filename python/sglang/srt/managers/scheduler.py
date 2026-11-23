@@ -4225,11 +4225,21 @@ class Scheduler(
             or self.enable_unified_cache_external_linker
             or self.enable_lmcache
         ):
+            if self.enable_unified_cache_external_linker:
+                self.tree_cache.set_admission_reserve(self._chunked_prefill_rest())
             self.tree_cache.check_hicache_events()
             if self.enable_unified_cache_external_linker:
                 self.tree_cache.protect_queued_prefixes(self.waiting_queue)
             if self.enable_hicache_storage and should_retry_storage_prefetch:
                 self._process_storage_prefetch_retries()
+
+    def _chunked_prefill_rest(self) -> int:
+        """Page-ceiled tokens the chunked request's later chunks still allocate."""
+        req = self.chunked_req
+        if req is None or req.extend_end is None:
+            return 0
+        rest = max(len(req.full_untruncated_fill_ids) - req.extend_end, 0)
+        return -(-rest // self.page_size) * self.page_size
 
     @scheduler_stage_method(SCHEDULER_STAGE_GET_NEXT_BATCH)
     def get_next_batch_to_run(

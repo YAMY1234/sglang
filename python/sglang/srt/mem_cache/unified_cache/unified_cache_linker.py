@@ -386,6 +386,18 @@ class UnifiedCacheLinkerWrapper:
             else 0
         )
         self.qlock_seconds = envs.SGLANG_EXTERNAL_LINKER_QUEUE_LOCK_SECONDS.get()
+        # Full tokens an admitted chunked prefill still needs (`set_admission_reserve`):
+        # loads, holds and queue locks leave them free.
+        self.admission_reserve = 0
+        self.reserve_backpressure = (
+            self.load_mode == "prefetch"
+            and envs.SGLANG_CHUNKED_PREFILL_BACKPRESSURE.get()
+        )
+        if self.reserve_backpressure:
+            logger.info(
+                "External linker prefetch: loads, holds and queue locks leave a "
+                "chunked prefill's unfinished rest free"
+            )
         self.qlocks: dict[CacheRequestHandle, _PrefetchHold] = {}
         self.qlocked_tokens = 0
         # Queued requests whose device match was empty when the walk reached them.
@@ -403,6 +415,7 @@ class UnifiedCacheLinkerWrapper:
                 "lookahead_deferred",
                 "released_admitted",
                 "released_other",
+                "released_reserve",
             ),
             0,
         )
@@ -470,6 +483,7 @@ class UnifiedCacheLinkerWrapper:
                 "requeried",
                 "load_capped",
                 "deferred_far",
+                "reserve_deferred",
             ),
             0,
         )
@@ -752,6 +766,11 @@ class UnifiedCacheLinkerWrapper:
                 self.cache.dec_lock_ref(anchor_node_id, anchor_lock)
                 return
             self._occupied_peak = max(self._occupied_peak, occupied + pages * page)
+        if self.admission_reserve and pages * page > self._free_beyond_reserve():
+            # As a capped load: the target stays, so a later re-query retries it.
+            self._lookup_stats["reserve_deferred"] += 1
+            self.cache.dec_lock_ref(anchor_node_id, anchor_lock)
+            return
         state = _ExternalCachePrefetch(
             key[:end],
             anchor_node_id,
@@ -1087,7 +1106,9 @@ class UnifiedCacheLinkerWrapper:
         if resident.device_prefix_len < end:
             stats["not_resident"] += 1
             self.unheld[request] = end
-        elif self.held_tokens + tokens > self.hold_cap_tokens:
+        elif self.held_tokens + tokens > self.hold_cap_tokens or (
+            self.admission_reserve and tokens > self._free_beyond_reserve()
+        ):
             stats["over_cap"] += 1
             self.unheld[request] = end
         else:
@@ -1129,6 +1150,8 @@ class UnifiedCacheLinkerWrapper:
         in the window (those admitted within qlock_seconds at the observed prefill
         rate) while their tokens fit the cap; queue a re-query for a request that
         reaches the window with part of its prefix already lost."""
+        if self.admission_reserve and self._free_beyond_reserve() < 0:
+            self._relieve_for_reserve()
         if not self.qlock_cap_tokens:
             return
         window = self._window_requests(reqs, depth_override)
@@ -1168,7 +1191,12 @@ class UnifiedCacheLinkerWrapper:
                 qlock, room = self._lock_queued(req, room)
                 if qlock is None:
                     continue
-            if tokens + qlock.tokens > self.qlock_cap_tokens:
+            over_reserve = (
+                self.admission_reserve
+                and request not in self.qlocks
+                and self._free_beyond_reserve() < 0
+            )
+            if over_reserve or tokens + qlock.tokens > self.qlock_cap_tokens:
                 if request not in self.qlocks:
                     self.cache.dec_lock_ref(qlock.node_id, qlock.lock)
                 break
@@ -1181,6 +1209,36 @@ class UnifiedCacheLinkerWrapper:
             self._release_qlock(request, admitted=False)
         self.qlocked_tokens = tokens
         self._qlock_peak = [max(self._qlock_peak[0], depth), max(self._qlock_peak[1], tokens)]
+
+    def set_admission_reserve(self, tokens: int) -> None:
+        if self.reserve_backpressure:
+            self.admission_reserve = max(tokens, 0)
+
+    def _free_beyond_reserve(self) -> int:
+        """Free plus evictable Full tokens left after the admission reserve."""
+        free = (
+            self.cache.token_to_kv_pool_allocator.available_size()
+            + self.cache.evictable_size()
+        )
+        return free - self.admission_reserve
+
+    def _relieve_for_reserve(self) -> None:
+        """Unlock queue locks, then holds, newest first, until the reserve fits;
+        their requests keep their targets, so a lost prefix is looked up again."""
+        for request in reversed(list(self.qlocks)):
+            if self._free_beyond_reserve() >= 0:
+                return
+            qlock = self.qlocks.pop(request)
+            self.cache.dec_lock_ref(qlock.node_id, qlock.lock)
+            self.qlocked_tokens -= qlock.tokens
+            self._qlock_stats["released_reserve"] += 1
+        for request in reversed(list(self.holds)):
+            if self._free_beyond_reserve() >= 0:
+                return
+            hold = self.holds.pop(request)
+            self.cache.dec_lock_ref(hold.node_id, hold.lock)
+            self.held_tokens -= hold.tokens
+            self._hold_stats["released"] += 1
 
     def _window_requests(
         self, reqs: Sequence[Req], depth_override: Optional[int]
