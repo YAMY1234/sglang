@@ -1068,13 +1068,15 @@ def test_topk_v2_candidates_sampled_min_len(dist: str, min_len: int) -> None:
 
 
 def _lpt_map(seq_lens):
-    row_map = torch.full((seq_lens.shape[0] + 3,), -5, dtype=torch.int32, device="cuda")
+    rows = seq_lens.shape[0]
+    row_map = torch.full((1 + rows + 3,), -5, dtype=torch.int32, device="cuda")
     topk_lpt_row_map(seq_lens, row_map)
     torch.cuda.synchronize()
     lens = seq_lens.tolist()
-    want = sorted(range(len(lens)), key=lambda r: (-lens[r], r))
-    assert row_map[: len(lens)].tolist() == want, "row map is not longest-first"
-    assert row_map[len(lens) :].tolist() == [-5] * 3, "row map wrote past its rows"
+    want = sorted(range(rows), key=lambda r: (-lens[r], r))
+    assert int(row_map[0]) == rows, "row map does not carry its row count"
+    assert row_map[1 : 1 + rows].tolist() == want, "row map is not longest-first"
+    assert row_map[1 + rows :].tolist() == [-5] * 3, "row map wrote past its rows"
     return row_map
 
 
@@ -1154,7 +1156,7 @@ def test_topk_v2_candidates_sampled_lpt_graph_replay() -> None:
     width = 140000 + 4
     scores = torch.empty((rows, width), device="cuda")
     seq_lens = torch.empty(rows, dtype=torch.int32, device="cuda")
-    row_map = torch.empty(rows, dtype=torch.int32, device="cuda")
+    row_map = torch.zeros(1 + rows, dtype=torch.int32, device="cuda")
     cand = torch.empty((rows, k, 2), dtype=torch.int32, device="cuda")
 
     def fill(seed):
@@ -1198,11 +1200,43 @@ def test_topk_v2_candidates_sampled_lpt_graph_replay() -> None:
         graph.replay()
         torch.cuda.synchronize()
         want = sorted(range(rows), key=lambda r: (-lens_rows[r][0], r))
-        assert row_map.tolist() == want, seed
+        assert row_map.tolist() == [rows] + want, seed
         ref = _dcp_candidates(snap, seq_lens, k, stable_ties=True)
         _assert_sampled_rows(
             snap, lens_rows[:40], cand, ref, k, True, ("lpt-graph", seed)
         )
+
+
+@pytest.mark.skipif(is_hip(), reason="CUDA sampled candidate top-k")
+@pytest.mark.parametrize("case", ["other_rows", "never_built", "out_of_range"])
+@torch.inference_mode()
+def test_topk_v2_candidates_sampled_lpt_foreign_map(case: str) -> None:
+    """A map built for another row count (a forward that skipped the step's map), one never
+    built (zero), or one whose only out-of-range entry sits on the block of that very row:
+    every launch keeps the exact sets."""
+    k = 2048
+    g = torch.Generator().manual_seed(11)
+    lens = torch.randint(100, 120000, (288,), generator=g).tolist()
+    rows = [(n, 0) for n in lens]
+    scores, ref, off, _ = _lpt_case(rows, "randn", k, 288)
+    seq_lens = torch.tensor(lens, dtype=torch.int32, device="cuda")
+    if case == "other_rows":  # built for 250 rows
+        row_map = torch.zeros(1 + len(rows), dtype=torch.int32, device="cuda")
+        topk_lpt_row_map(seq_lens[:250].flip(0).contiguous(), row_map)
+    elif case == "never_built":
+        row_map = torch.zeros(1 + len(rows), dtype=torch.int32, device="cuda")
+    else:  # the identity map with block 7's entry out of range: block 7 runs row 7 anyway
+        row_map = torch.arange(-1, len(rows), dtype=torch.int32, device="cuda")
+        row_map[0] = len(rows)
+        row_map[1 + 7] = len(rows) + 5
+    got = _dcp_candidates(
+        scores, seq_lens, k, stable_ties=True, sampled=True, lpt_row_map=row_map
+    )
+    for row in range(len(rows)):
+        assert torch.equal(
+            got[row, :, 1].sort().values, off[row, :, 1].sort().values
+        ), (case, row)
+    _assert_sampled_rows(scores, rows[:40], got, ref, k, True, ("lpt-foreign", case))
 
 
 @pytest.mark.skipif(not is_hip(), reason="ROCm split path")
