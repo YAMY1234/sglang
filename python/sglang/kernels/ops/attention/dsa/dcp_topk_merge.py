@@ -168,7 +168,9 @@ def _jit_dcp_topk_merge_pushed_wide_module(num_ranks: int, topk: int, warps_per_
         *args,
         cuda_files=["dsa/dcp_topk_merge.cuh"],
         cuda_wrappers=[
-            ("dcp_topk_merge_pushed_wide", f"DcpTopKMergePushedWideKernel<{args}>::run")
+            ("dcp_topk_merge_pushed_wide", f"DcpTopKMergePushedWideKernel<{args}>::run"),
+            # bench only: the same merge with a per-CTA globaltimer trace
+            ("dcp_topk_merge_pushed_wide_traced", f"DcpTopKMergePushedWideKernel<{args}>::run_traced"),
         ],
     )
 
