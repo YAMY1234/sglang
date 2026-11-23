@@ -1248,6 +1248,15 @@ class HybridLinearAttnBackend(AttentionBackend):
         linear_attn_backend: MambaAttnBackendBase,
         full_attn_layers: list[int],
     ):
+        if (
+            envs.SGLANG_MAMBA_BRANCH_TRACK_DUAL.get()
+            and not linear_attn_backend.supports_mamba_fork_tracks()
+        ):
+            raise ValueError(
+                "SGLANG_MAMBA_BRANCH_TRACK_DUAL needs a linear-attention prefill kernel "
+                "with state checkpoints (FlashInfer KDA); "
+                f"{type(linear_attn_backend).__name__} tracks one state per row"
+            )
         self.full_attn_layers = full_attn_layers
         self.full_attn_backend = full_attn_backend
         self.linear_attn_backend = linear_attn_backend

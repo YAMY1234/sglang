@@ -51,6 +51,8 @@ def _prepare_extend(
     branching: int | None = None,
     input_len: int | None = None,
     free_mamba_slot=None,
+    evicted_mamba_slot=None,
+    tree_cache=None,
 ) -> tuple[_MambaRadixCacheV2TrackEntry, Req]:
     """Run one extend through the tracker; return its track entry and the request."""
     server_args = ServerArgs(model_path="dummy", page_size=CHUNK)
@@ -76,10 +78,14 @@ def _prepare_extend(
     batch.model_config = SimpleNamespace(
         hf_text_config=SimpleNamespace(mamba_chunk_size=CHUNK)
     )
-    batch.tree_cache = SimpleNamespace(page_size=tree_page)
+    batch.tree_cache = tree_cache or MagicMock(page_size=tree_page)
     batch.req_to_token_pool = MagicMock()
     batch.req_to_token_pool.get_mamba_ping_pong_other_idx.return_value = 1 - next_idx
-    batch.req_to_token_pool.mamba_allocator.alloc.return_value = free_mamba_slot
+    # The second alloc follows the eviction an empty pool triggers.
+    batch.req_to_token_pool.mamba_allocator.alloc.side_effect = [
+        free_mamba_slot,
+        evicted_mamba_slot,
+    ]
 
     with patch(
         "sglang.srt.managers.schedule_batch.get_parallel",
@@ -476,7 +482,15 @@ class TestMambaBranchTrackDual(unittest.TestCase):
     """With PREFER_END the forward that ends the input tracks the input end; DUAL
     also tracks the branching-point state, in an extra Mamba slot."""
 
-    def _prepare(self, *, branching_seqlen=512, dual=True, free_mamba_slot="slot"):
+    def _prepare(
+        self,
+        *,
+        branching_seqlen=512,
+        dual=True,
+        free_mamba_slot="slot",
+        evicted_mamba_slot=None,
+        tree_cache=None,
+    ):
         with (
             envs.SGLANG_MAMBA_BRANCH_TRACK_PREFER_END.override(True),
             envs.SGLANG_MAMBA_BRANCH_TRACK_DUAL.override(dual),
@@ -487,6 +501,8 @@ class TestMambaBranchTrackDual(unittest.TestCase):
                 extend_len=1000,
                 branching=branching_seqlen,
                 free_mamba_slot=free_mamba_slot,
+                evicted_mamba_slot=evicted_mamba_slot,
+                tree_cache=tree_cache,
             )
 
     def test_the_fork_is_tracked_beside_the_input_end(self):
@@ -510,6 +526,29 @@ class TestMambaBranchTrackDual(unittest.TestCase):
                 self.assertEqual(entry.fork_seqlen, -1)
                 self.assertIsNone(req.kv.mamba_fork_track_idx)
                 self.assertEqual(req.kv.mamba_last_track_seqlen, 960)
+
+    def test_an_empty_pool_evicts_one_tree_state_for_the_fork(self):
+        tree = MagicMock(page_size=CHUNK)
+        entry, req = self._prepare(
+            free_mamba_slot=None, evicted_mamba_slot="evicted", tree_cache=tree
+        )
+        params = tree.evict_for_alloc.call_args.args[0]
+        self.assertEqual((params.num_tokens, params.mamba_num), (0, 1))
+        self.assertEqual(entry.fork_seqlen, 512)
+        self.assertEqual(req.kv.mamba_fork_track_idx, "evicted")
+        tree.count_mamba_retention.assert_called_once_with("dual_tracked")
+
+    def test_no_slot_even_after_eviction_tracks_the_end_only(self):
+        tree = MagicMock(page_size=CHUNK)
+        entry, req = self._prepare(free_mamba_slot=None, tree_cache=tree)
+        self.assertEqual(entry.fork_seqlen, -1)
+        self.assertIsNone(req.kv.mamba_fork_track_idx)
+        tree.count_mamba_retention.assert_called_once_with("dual_no_slot")
+
+    def test_a_free_slot_needs_no_eviction(self):
+        tree = MagicMock(page_size=CHUNK)
+        self._prepare(tree_cache=tree)
+        tree.evict_for_alloc.assert_not_called()
 
 
 class TestMambaTrackGrid(unittest.TestCase):

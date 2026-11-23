@@ -284,6 +284,18 @@ class TestFlashInferKDAPrefillPolicy(CustomTestCase):
                     prefill_cuda_graph_backend="breakable",
                 )
 
+    def test_fork_tracks_need_a_checkpoint_kernel_at_startup(self):
+        from sglang.srt.environ import envs
+        from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
+            HybridLinearAttnBackend,
+        )
+
+        # The Triton KDA path snapshots one chunk per row: no fork rows.
+        linear = SimpleNamespace(supports_mamba_fork_tracks=lambda: False)
+        with envs.SGLANG_MAMBA_BRANCH_TRACK_DUAL.override(True):
+            with self.assertRaisesRegex(ValueError, "state checkpoints"):
+                HybridLinearAttnBackend(SimpleNamespace(), linear, [])
+
     def test_fork_states_take_the_snapshot_rows_after_the_batch(self):
         import torch
 

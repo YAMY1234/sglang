@@ -720,6 +720,7 @@ class UnifiedRadixCacheCoreSuite(UnifiedRadixCacheCoreFixtures):
         # The request's own end state still follows, past the fork.
         self.assertEqual(match_prefix(cache, tokens).device_prefix_len, len(tokens))
         self.assertEqual(req.kv.cache_protected_len, len(tokens))
+        self.assertEqual(cache.mamba_retention_counts["fork_states_inserted"], 1)
         cache.unlock(req.lock)
         cache.sanity_check()
 
@@ -771,6 +772,8 @@ class UnifiedRadixCacheCoreSuite(UnifiedRadixCacheCoreFixtures):
                     self._insert(cache, allocator, req_to_token_pool, tokens[:depth])
                     cache.checkpoint(req, up_to=req.extend_end)
                     cache.unlock(req.lock)
+                    counts = cache.mamba_retention_counts
+                    self.assertEqual(counts["fork_states_present"], 1)
                 else:
                     release_kv_cache(req, cache, checkpoint=False)
                 self.assertIsNone(req.kv.mamba_fork_track_idx)

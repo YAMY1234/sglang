@@ -99,7 +99,11 @@ def _batch(reqs, pool, **fields):
             is_encoder_decoder=False,
             hf_text_config=SimpleNamespace(mamba_chunk_size=STATE_CHUNK),
         ),
-        tree_cache=SimpleNamespace(page_size=GRID),
+        tree_cache=SimpleNamespace(
+            page_size=GRID,
+            evict_for_alloc=lambda params: None,
+            count_mamba_retention=lambda name: None,
+        ),
         sampling_info=MagicMock(),
         spec_algorithm=SpeculativeAlgorithm.NONE,
         req_pool_indices=torch.arange(bs),

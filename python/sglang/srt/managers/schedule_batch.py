@@ -109,6 +109,7 @@ from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
     CacheRequestHandle,
+    EvictParams,
     TreeLock,
 )
 from sglang.srt.mem_cache.common import (
@@ -3329,10 +3330,18 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     def _alloc_mamba_fork_track(self, req: Req) -> int:
         """SGLANG_MAMBA_BRANCH_TRACK_DUAL: an extra Mamba slot for the branching-point
-        state; -1 (track the end only, as without it) when the pool has none free."""
+        state, evicting one tree state when none is free (as a split cut's checkpoint
+        does); -1 (track the end only, as without it) when none can be had."""
         if req.kv.mamba_fork_track_idx is not None or req.skip_radix_cache_insert:
             return -1
-        slot = self.req_to_token_pool.mamba_allocator.alloc(1)
+        allocator = self.req_to_token_pool.mamba_allocator
+        slot = allocator.alloc(1)
+        if slot is None:
+            self.tree_cache.evict_for_alloc(EvictParams(num_tokens=0, mamba_num=1))
+            slot = allocator.alloc(1)
+        self.tree_cache.count_mamba_retention(
+            "dual_no_slot" if slot is None else "dual_tracked"
+        )
         if slot is None:
             return -1
         req.kv.mamba_fork_track_idx = slot

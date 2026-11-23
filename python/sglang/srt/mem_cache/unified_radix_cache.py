@@ -1598,8 +1598,12 @@ class UnifiedRadixCache(BasePrefixCache):
         if req.kv.mamba_fork_track_idx is not None:
             # SGLANG_MAMBA_BRANCH_TRACK_DUAL: the branching-point state the last
             # extend tracked goes in first, as a split forward would have put it.
-            self._checkpoint_into_tree(
+            result = self._checkpoint_into_tree(
                 req, up_to=req.kv.mamba_fork_track_seqlen, mamba_fork=True
+            )
+            inserted = result is not None and not result.mamba_exist
+            self.count_mamba_retention(
+                "fork_states_inserted" if inserted else "fork_states_present"
             )
         self._checkpoint_into_tree(req, up_to=up_to, **kwargs)
         if is_finished:
@@ -1607,7 +1611,7 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def _checkpoint_into_tree(
         self, req: Req, *, up_to: int, mamba_fork: bool = False, **kwargs
-    ) -> None:
+    ) -> Optional[InsertResult]:
         # A finished request hands its component state (mamba) to the tree
         # instead of forking it, and the tree frees what the request still held.
         is_finished = req.finished() and not mamba_fork
@@ -1785,6 +1789,14 @@ class UnifiedRadixCache(BasePrefixCache):
                 self.session_refs.register_session_ref(
                     req, leaf=result.last_device_node
                 )
+        return result
+
+    def count_mamba_retention(self, name: str) -> None:
+        """Bump a Mamba retention counter (logged in the "HiCache host usage" line)."""
+        if self.mamba_retention_counts is None:
+            self.mamba_retention_counts = {}
+        counts = self.mamba_retention_counts
+        counts[name] = counts.get(name, 0) + 1
 
     @rank_consensus(same_params=["req.rid"])
     def advance_unpublished_req(self, req: Req) -> None:
