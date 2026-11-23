@@ -149,6 +149,9 @@ class FlashInferKDAPrefillKernel(LinearAttnKernelBase):
     wants_int64_query_start_loc = True
     supports_track_state_snapshot = True
     supports_safe_gate = True
+    # Set by __init__ under SGLANG_K31_KDA_PLAN_ASYNC_H2D; extend() records the head count.
+    _plan_module = None
+    _kda_heads = None
 
     def __init__(self):
         from sglang.srt.environ import envs
@@ -176,9 +179,6 @@ class FlashInferKDAPrefillKernel(LinearAttnKernelBase):
         # a stream sync inside the forward; its contents memo can be filled from host.
         self._seed_mode = envs.SGLANG_K31_KDA_SEED_CU_SEQLENS.get()
         self._cu_contents_memo = None
-        # The vendored module (seeded plan cache), and the KDA head count once a forward has run.
-        self._plan_module = None
-        self._kda_heads = None
         if self._seed_mode:
             module = importlib.import_module(_BT16)
             self._cu_contents_memo = getattr(module, "_CU_CONTENTS_MEMO", None)
