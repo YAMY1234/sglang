@@ -28,10 +28,10 @@ _IN, _STATE, _OUT, _SLOT, _KV_MIN, _KV_MAX, _IN_BANK, _OUT_BANK = range(8)
 # Counter row, past the counters: up to 4 values the Mamba free list holds twice, up to 2 batch slots on it.
 _FREE_DUP_VALS, _SLOTS_ON_FREE = slice(6, 10), slice(10, 12)
 _NONE = torch.iinfo(torch.int64).max
-# Per watched point (a layer's attention output, a layer's output): non-finite tokens, offset of the first one.
-_POINT_BASE, _MAX_POINTS = 12, 32
+# Per watched point (see _POINT_NAMES; layer and point id): non-finite tokens, offset of the first one.
+_POINT_BASE, _MAX_POINTS = 12, 96
 _NUM_COLS = _POINT_BASE + 2 * _MAX_POINTS
-_POINT_NAMES = ("attn", "out")
+_POINT_NAMES = ("attn", "out", "in", "kda_qkv", "kda_gate", "kda_core", "kda_onorm")
 _COUNTERS = (
     "dup_mamba_slot",
     "mamba_slot_free",
@@ -220,7 +220,7 @@ def check_state(
 
 
 def check_point(layer_idx: int, point: int, hidden) -> None:
-    """Per row: non-finite tokens of a layer's attention output (point 0) or layer output (point 1), first offset."""
+    """Per row: non-finite tokens at one point of a layer (an index into _POINT_NAMES) and the first one's offset."""
     watch = _active
     if watch is None or not isinstance(hidden, torch.Tensor):
         return

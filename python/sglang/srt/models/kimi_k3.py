@@ -2849,6 +2849,8 @@ class KimiK3DeltaAttention(nn.Module):
             mixed_qkv, beta, forget_gate, g_proj_states = self.forward_qkvbfg(
                 hidden_states
             )
+        nan_watch.check_point(self.layer_idx, 3, mixed_qkv)
+        nan_watch.check_point(self.layer_idx, 4, forget_gate)
 
         if not forward_batch.logical_forward_mode.is_decode():
             forget_gate = forget_gate.unflatten(-1, (-1, self.head_dim))
@@ -2880,6 +2882,7 @@ class KimiK3DeltaAttention(nn.Module):
             b=beta,
         )
 
+        nan_watch.check_point(self.layer_idx, 5, core_attn_out[0])
         if fused_onorm:
             self.attn._k3_onorm_gate = None
             fused_onorm = self.attn._k3_onorm_consumed
@@ -2888,6 +2891,7 @@ class KimiK3DeltaAttention(nn.Module):
         if not fused_onorm:
             norm_gate = g_proj_states.unflatten(-1, (-1, self.head_dim))
             core_attn_out = self.o_norm(core_attn_out, norm_gate)
+        nan_watch.check_point(self.layer_idx, 6, core_attn_out[0])
         core_attn_out = core_attn_out.squeeze(0).flatten(-2)
         # Back to the boundary's interleave rows before o_proj, whose input is
         # narrower than its output; o_proj is row-wise.
@@ -3482,6 +3486,7 @@ class KimiK3DecoderLayer(nn.Module):
         hidden_states = self.attn_boundary.prepare(
             hidden_states, forward_batch, capture_gathered=capture_gathered
         )
+        nan_watch.check_point(self.layer_idx, 2, hidden_states)
         hidden_states = self._run_self_attn(
             hidden_states, positions, forward_batch, zero_allocator
         )
