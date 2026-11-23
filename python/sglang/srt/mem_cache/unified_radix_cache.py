@@ -5606,8 +5606,8 @@ class UnifiedRadixCache(BasePrefixCache):
         self,
         params: InitLoadBackParams,
     ) -> Optional[tuple[int, NodeId]]:
-        """Only buffer mode returns None: its admission retries without
-        committing a load."""
+        """None means admission retries without committing a load: buffer mode,
+        or a refused load-back whose device anchor has no state to extend from."""
         if self.buffer_pipeline is not None:
             return self.buffer_pipeline.init_load_back(params)
         best_match_node_id = params.best_match_node
@@ -5639,8 +5639,21 @@ class UnifiedRadixCache(BasePrefixCache):
                     best_match_node_id,
                 )
                 return len(new_indices), best_match_node_id
+            # A refused load-back falls back to the device anchor and extends from
+            # its device Mamba state. A non-root anchor without one would extend
+            # from zeros, so admission retries instead.
+            if self._anchor_lacks_mamba_state(last_best_match_device_node_id):
+                return None
 
         return 0, last_best_match_device_node_id
+
+    def _anchor_lacks_mamba_state(self, node_id: NodeId) -> bool:
+        return (
+            self.is_mamba_enabled
+            and not self.tree_core.is_root(node_id)
+            and self.tree_core.get_component_device_value(node_id, ComponentType.MAMBA)
+            is None
+        )
 
     def load_back_is_cache_owned(self) -> bool:
         # Linker-loaded slots stay request-owned until the load succeeds.
