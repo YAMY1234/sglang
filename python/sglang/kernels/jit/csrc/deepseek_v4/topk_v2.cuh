@@ -639,28 +639,32 @@ SGL_DEVICE uint32_t lpt_row(const TopKCandidatesParams& params, const uint32_t r
   return row;
 }
 
-template <bool kPDL, bool kPush, bool kLpt = false>
+/// kTrace (bench only, with kLpt): thread 0 stamps {start, row chosen, end, row} in params.lpt_trace.
+/// The production launch uses kTrace = false and carries no timestamp code.
+template <bool kPDL, bool kPush, bool kLpt = false, bool kTrace = false>
 TOPK_KERNEL void topk_candidates_sampled_kernel(const __grid_constant__ TopKCandidatesParams params) {
   device::enable_smem_spilling();
   __shared__ SampledCandidatesSmem smem;
   static_assert(sizeof(LptRankSmem) <= sizeof(SampledCandidatesSmem));
-  if constexpr (kLpt) {
-    uint64_t t0 = 0, t1 = 0, t2 = 0;
-    if (params.lpt_trace != nullptr) asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t0));
+  static_assert(kLpt || !kTrace);
+  if constexpr (kTrace) {
+    uint64_t t0, t1, t2;
+    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t0));
     const auto row = lpt_row(params, gridDim.x, reinterpret_cast<LptRankSmem*>(&smem));
-    if (params.lpt_trace != nullptr) asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t1));
+    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t1));
     candidates_sampled_one_block<kPDL, kPush>(params, row, &smem);
-    if (params.lpt_trace != nullptr) {  // bench only: when this block started, chose its row, ended
-      __syncthreads();
-      if (threadIdx.x == 0) {
-        asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t2));
-        auto* r = params.lpt_trace + 4 * static_cast<int64_t>(blockIdx.x);
-        r[0] = static_cast<int64_t>(t0);
-        r[1] = static_cast<int64_t>(t1);
-        r[2] = static_cast<int64_t>(t2);
-        r[3] = row;
-      }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+      asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t2));
+      auto* r = params.lpt_trace + 4 * static_cast<int64_t>(blockIdx.x);
+      r[0] = static_cast<int64_t>(t0);
+      r[1] = static_cast<int64_t>(t1);
+      r[2] = static_cast<int64_t>(t2);
+      r[3] = row;
     }
+  } else if constexpr (kLpt) {
+    const auto row = lpt_row(params, gridDim.x, reinterpret_cast<LptRankSmem*>(&smem));
+    candidates_sampled_one_block<kPDL, kPush>(params, row, &smem);
   } else {
     candidates_sampled_one_block<kPDL, kPush>(params, blockIdx.x, &smem);
   }
@@ -2296,16 +2300,19 @@ struct TopKKernel {
       RuntimeCheck(false, "the sampled candidate top-k needs CUDA");
 #else
       if (lpt && rows <= kBlockSize) {  // longest rows first (topk_candidates_sampled_kernel)
-        auto lpt_params = params;
-        if (lpt_trace.has_value()) {  // bench only: int64 [>= rows, 4]
+        if (lpt_trace.has_value()) {  // bench only: int64 [>= rows, 4], the timestamped instantiation
           auto G = SymbolicSize{"lpt_trace_blocks"};
           TensorMatcher({G, 4}).with_dtype<int64_t>().with_device(device_).verify(lpt_trace.value());
           RuntimeCheck(G.unwrap() >= rows, "lpt_trace has fewer rows than the grid");
-          lpt_params.lpt_trace = static_cast<int64_t*>(lpt_trace.value().data_ptr());
+          auto traced = params;
+          traced.lpt_trace = static_cast<int64_t*>(lpt_trace.value().data_ptr());
+          return LaunchKernel(rows, kBlockSize, device_.unwrap())
+              .config({.use_pdl = kUsePDL})
+              .launch(topk_candidates_sampled_kernel<kUsePDL, false, true, true>, traced);
         }
         return LaunchKernel(rows, kBlockSize, device_.unwrap())
             .config({.use_pdl = kUsePDL})
-            .launch(topk_candidates_sampled_kernel<kUsePDL, false, true>, lpt_params);
+            .launch(topk_candidates_sampled_kernel<kUsePDL, false, true>, params);
       }
       return LaunchKernel(rows, kBlockSize, device_.unwrap())
           .config({.use_pdl = kUsePDL})
