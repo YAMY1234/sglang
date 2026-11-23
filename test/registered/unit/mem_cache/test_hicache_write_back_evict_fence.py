@@ -164,8 +164,8 @@ class TestEvictionCallSites(CustomTestCase):
         cache.writing_check.assert_not_called()
 
     def _demote_walk(self, *, backup, backed=True, mamba=True):
-        """Evict one leaf under the Mamba demote watch; returns the counts and
-        the order of the backup and leaf-eviction calls."""
+        """Evict one leaf under the Mamba demote watch; returns the counts, the
+        order of the backup and leaf-eviction calls, and the nodes it copied."""
         cache = _cache()
         cache.tree_components = (ComponentType.FULL,)
         cache.tree_core.full_evictable_size.return_value = 0
@@ -179,6 +179,7 @@ class TestEvictionCallSites(CustomTestCase):
         )
         cache._mamba_demote_watch = True
         cache._mamba_backup_before_demote = backup
+        cache._demote_copied_nodes = set()
         cache.mamba_retention_counts = {
             "demote_state_drops": 0,
             "demote_state_copies": 0,
@@ -192,22 +193,64 @@ class TestEvictionCallSites(CustomTestCase):
             side_effect=[(5, True), (None, False)]
         )
         cache._evict_components({ComponentType.FULL: 1}, {ComponentType.FULL: 0})
-        return cache.mamba_retention_counts, [name for name, _, _ in order.mock_calls]
+        calls = [name for name, _, _ in order.mock_calls]
+        return cache.mamba_retention_counts, calls, cache._demote_copied_nodes
 
     def test_backed_leaf_state_is_copied_before_the_demote(self):
-        counts, calls = self._demote_walk(backup=True)
+        counts, calls, copied = self._demote_walk(backup=True)
         self.assertEqual(calls, ["backup", "evict_leaf"])
         self.assertEqual(counts, {"demote_state_drops": 0, "demote_state_copies": 1})
+        self.assertEqual(copied, {5})
 
     def test_watch_only_counts_the_dropped_state(self):
-        counts, calls = self._demote_walk(backup=False)
+        counts, calls, copied = self._demote_walk(backup=False)
         self.assertEqual(calls, ["evict_leaf"])
         self.assertEqual(counts, {"demote_state_drops": 1, "demote_state_copies": 0})
+        self.assertEqual(copied, set())
         # an unbacked leaf's backup carries its state; a stateless one has none
         for kwargs in (dict(backed=False), dict(mamba=False)):
-            counts, calls = self._demote_walk(backup=True, **kwargs)
+            counts, calls, copied = self._demote_walk(backup=True, **kwargs)
             self.assertEqual(calls, ["evict_leaf"])
             self.assertEqual(set(counts.values()), {0})
+            self.assertEqual(copied, set())
+
+    def test_load_back_counts_a_restored_copy_once(self):
+        # Only a load-back that brings back the Mamba state of a node copied before
+        # its demote counts, once; a KV-only load leaves the node pending.
+        cache = _cache()
+        cache._demote_copied_nodes = {7, 8}
+        cache.mamba_retention_counts = {"demote_copy_restores": 0}
+        kv = SimpleNamespace(host_indices=torch.arange(64))
+        cache._build_sidecar_transfers = MagicMock(return_value=[])
+        cache.load_back_threshold = 1
+        cache.token_to_kv_pool_allocator = SimpleNamespace()
+        cache._component_available_size = MagicMock(return_value=1 << 20)
+        cache.cache_controller.load = MagicMock(return_value=torch.arange(64))
+        for name in (
+            "dec_lock_ref",
+            "dec_host_lock_ref",
+            "inc_lock_ref",
+            "_apply_cache_actions",
+        ):
+            setattr(cache, name, MagicMock())
+        cache.ongoing_load_back = {}
+        kwargs = dict(
+            mem_quota=None,
+            req=None,
+            result=SimpleNamespace(delta=0),
+            ancestor_lock_params=None,
+            host_anchor_params=None,
+        )
+
+        def load(node_id, comp_xfers):
+            cache.tree_core.build_load_back_spec.return_value = (kv, comp_xfers)
+            self.assertTrue(cache._load_back_transfers(node_id=node_id, **kwargs))
+
+        load(8, {})
+        load(7, {ComponentType.MAMBA: ["state"]})
+        load(7, {ComponentType.MAMBA: ["state"]})
+        self.assertEqual(cache.mamba_retention_counts["demote_copy_restores"], 1)
+        self.assertEqual(cache._demote_copied_nodes, {8})
 
     def test_full_leaf_victim_opts_in(self):
         cache = _cache()

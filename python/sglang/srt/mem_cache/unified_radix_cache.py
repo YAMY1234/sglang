@@ -227,6 +227,9 @@ class UnifiedRadixCache(BasePrefixCache):
     # set by _init_mamba_demote_watch.
     _mamba_demote_watch = False
     _mamba_backup_before_demote = False
+    # Nodes whose device-only Mamba state was copied to host before their demote;
+    # a later load-back of one counts in demote_copy_restores.
+    _demote_copied_nodes: Optional[set[NodeId]] = None
     mamba_retention_counts: Optional[dict[str, int]] = None
     # L2->L3 write-back (SGLANG_OPT_HICACHE_STORAGE_WRITE_BACK); set in init_hicache.
     _storage_write_back: Optional[StorageWriteBack] = None
@@ -969,6 +972,7 @@ class UnifiedRadixCache(BasePrefixCache):
             **(self.mamba_retention_counts or {}),
             "demote_state_drops": 0,
             "demote_state_copies": 0,
+            "demote_copy_restores": 0,
             # Load-backs of a host-only Mamba state refused, by reason; and those
             # where the request then continues from a device anchor past the root.
             "lb_refused_held": 0,
@@ -977,6 +981,7 @@ class UnifiedRadixCache(BasePrefixCache):
             "lb_refused_alloc": 0,
             "lb_refused_nonzero_prefix": 0,
         }
+        self._demote_copied_nodes = set()
         logger.info("Mamba demote watch on, back up before demote %s", backup)
 
     def _count_mamba_load_back_refusal(self, req, reason: str) -> None:
@@ -1003,6 +1008,7 @@ class UnifiedRadixCache(BasePrefixCache):
                 self.evict_host(1, ComponentType.MAMBA)
             if self.backup_node_for_write_back(node_id):
                 counts["demote_state_copies"] += 1
+                self._demote_copied_nodes.add(node_id)
                 return
         counts["demote_state_drops"] += 1
 
@@ -2748,6 +2754,10 @@ class UnifiedRadixCache(BasePrefixCache):
             self._count_mamba_load_back_refusal(req, "alloc")
             self.dec_host_lock_ref(node_id, host_anchor_params)
             return False
+        if self._demote_copied_nodes and comp_xfers.get(ComponentType.MAMBA):
+            if node_id in self._demote_copied_nodes:
+                self._demote_copied_nodes.discard(node_id)
+                self.mamba_retention_counts["demote_copy_restores"] += 1
 
         # Commit the loaded KV back onto the node + apply its emitted actions.
         self._apply_cache_actions(
