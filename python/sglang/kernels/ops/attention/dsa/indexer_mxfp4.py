@@ -207,7 +207,8 @@ def mxfp4_quant_ref(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     idx = torch.where(cand[..., ::2].any(-1),
                       (cand.float() * torch.tensor([1.0, 0, 1, 0, 1, 0, 1, 0], device=x.device)).argmax(-1),
                       cand.float().argmax(-1))
-    code = (idx | ((scaled < 0) & (idx != 0)).long() << 3).to(torch.uint8)
+    # cvt.rn.satfinite keeps the sign of values that round to zero (-0 is code 0x8)
+    code = (idx | torch.signbit(scaled).long() << 3).to(torch.uint8)
     code = code.reshape(*shp[:-1], shp[-1])
     packed = (code[..., 0::2] | (code[..., 1::2] << 4)).to(torch.uint8)
     return packed, (s + 127).to(torch.uint8)

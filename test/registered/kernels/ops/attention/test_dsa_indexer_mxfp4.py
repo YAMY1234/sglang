@@ -82,7 +82,7 @@ def test_store_skips_other_dcp_ranks_and_negative_slots():
         store_index_k_mxfp4(key, cache, loc, page_size=PAGE, dcp_size=dcp, dcp_rank=rank)
         torch.cuda.synchronize()
         packed, _ = mxfp4_quant_ref(key.float())
-        vals = cache[:, : PAGE * D // 2].view(-1, D // 2)
+        vals = cache[:, : PAGE * D // 2].reshape(-1, D // 2)
         owned = (loc >= 0) & (loc % dcp == rank)
         rows = loc[owned] // dcp
         assert torch.equal(vals[rows], packed[owned])
