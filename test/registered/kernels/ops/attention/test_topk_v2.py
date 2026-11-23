@@ -36,6 +36,7 @@ import torch
 
 from sglang.kernels.ops.attention.dsv4.topk import (
     plan_topk_v2,
+    topk_lpt_row_map,
     topk_transform_candidates_v2,
     topk_transform_packed_v2,
     topk_transform_paged_v2,
@@ -1066,6 +1067,17 @@ def test_topk_v2_candidates_sampled_min_len(dist: str, min_len: int) -> None:
     _assert_sampled_rows(scores, rows, got, ref, k, True, (dist, min_len))
 
 
+def _lpt_map(seq_lens):
+    row_map = torch.full((seq_lens.shape[0] + 3,), -5, dtype=torch.int32, device="cuda")
+    topk_lpt_row_map(seq_lens, row_map)
+    torch.cuda.synchronize()
+    lens = seq_lens.tolist()
+    want = sorted(range(len(lens)), key=lambda r: (-lens[r], r))
+    assert row_map[: len(lens)].tolist() == want, "row map is not longest-first"
+    assert row_map[len(lens) :].tolist() == [-5] * 3, "row map wrote past its rows"
+    return row_map
+
+
 def _lpt_case(rows, dist, k, seed):
     width = (max(n + s for n, s in rows) + 3) // 4 * 4
     torch.manual_seed(seed)
@@ -1075,6 +1087,7 @@ def _lpt_case(rows, dist, k, seed):
     seq_lens = torch.tensor([n for n, _ in rows], dtype=torch.int32, device="cuda")
     starts = torch.tensor([s for _, s in rows], dtype=torch.int32, device="cuda")
     ref = _dcp_candidates(scores, seq_lens, k, row_starts=starts, stable_ties=True)
+    row_map = _lpt_map(seq_lens) if len(rows) <= 1024 else None
     redone = [torch.zeros(1, dtype=torch.int32, device="cuda") for _ in range(2)]
     off, on = (
         _dcp_candidates(
@@ -1085,7 +1098,7 @@ def _lpt_case(rows, dist, k, seed):
             stable_ties=True,
             sampled=True,
             overflow_rows=redone[lpt],
-            lpt=bool(lpt),
+            lpt_row_map=row_map if lpt else None,
         )
         for lpt in (0, 1)
     )
@@ -1098,33 +1111,98 @@ def _lpt_case(rows, dist, k, seed):
 @pytest.mark.parametrize("dist", ["randn", "ties", "planted", "all_equal"])
 @torch.inference_mode()
 def test_topk_v2_candidates_sampled_lpt(dist: str, with_row_starts: bool) -> None:
-    """lpt launches the blocks longest row first: on shuffled rows with repeated lengths
-    (ranks tie by row index), every row keeps the exact set and the same rows are redone."""
+    """lpt_row_map launches the blocks longest row first: on shuffled rows with repeated
+    lengths (the map ranks ties by row index), every row keeps the exact set and the same
+    rows are redone."""
     k = 2048
     base = SAMPLED_ROWS + [(65537, 1), (16385, 0), (200000, 3), (100, 0)]
-    perm = torch.randperm(len(base), generator=torch.Generator().manual_seed(7)).tolist()
+    perm = torch.randperm(
+        len(base), generator=torch.Generator().manual_seed(7)
+    ).tolist()
     rows = [(base[i][0], base[i][1] if with_row_starts else 0) for i in perm]
     scores, ref, _, on = _lpt_case(rows, dist, k, 31 + len(dist))
     _assert_sampled_rows(scores, rows, on, ref, k, True, (dist, "lpt"))
 
 
 @pytest.mark.skipif(is_hip(), reason="CUDA sampled candidate top-k")
-@pytest.mark.parametrize("num_rows", [300, 1025])
+@pytest.mark.parametrize("num_rows", [300, 1024, 1025])
 @torch.inference_mode()
 def test_topk_v2_candidates_sampled_lpt_rows(num_rows: int) -> None:
-    """Every row ranked once at 300 rows (two waves on a 212-SM part), and past 1024 rows
-    (more than one rank per thread) lpt keeps the launch order: same sets either way."""
+    """Every row mapped once at 300 and 1024 rows, and past 1024 rows (no map) the launch
+    keeps its order: same sets either way."""
     k = 2048
     g = torch.Generator().manual_seed(num_rows)
-    hi = 140000 if num_rows <= 1024 else 20000
+    hi = 140000 if num_rows <= 300 else 20000
     lens = torch.randint(100, hi, (num_rows,), generator=g).tolist()
     rows = [(n, i % 4) for i, n in enumerate(lens)]
     scores, ref, off, on = _lpt_case(rows, "randn", k, num_rows)
     for row in range(num_rows):
-        assert torch.equal(
-            on[row, :, 1].sort().values, off[row, :, 1].sort().values
-        ), (num_rows, row)
+        assert torch.equal(on[row, :, 1].sort().values, off[row, :, 1].sort().values), (
+            num_rows,
+            row,
+        )
     _assert_sampled_rows(scores, rows[:40], on, ref, k, True, ("lpt", num_rows))
+
+
+@pytest.mark.skipif(is_hip(), reason="CUDA sampled candidate top-k")
+@torch.inference_mode()
+def test_topk_v2_candidates_sampled_lpt_graph_replay() -> None:
+    """The row map kernel and the LPT top-k captured in one CUDA graph: each replay maps the
+    lengths in the device buffer at replay time (changed in place between replays, the longest
+    row moving), so every replay selects that replay's exact sets."""
+    k, rows = 2048, 300
+    width = 140000 + 4
+    scores = torch.empty((rows, width), device="cuda")
+    seq_lens = torch.empty(rows, dtype=torch.int32, device="cuda")
+    row_map = torch.empty(rows, dtype=torch.int32, device="cuda")
+    cand = torch.empty((rows, k, 2), dtype=torch.int32, device="cuda")
+
+    def fill(seed):
+        g = torch.Generator().manual_seed(seed)
+        lens = torch.randint(100, 140000, (rows,), generator=g)
+        lens[seed % rows] = 140000  # the longest row moves between inputs
+        seq_lens.copy_(lens.to(torch.int32))
+        scores.copy_(
+            torch.randn(
+                rows,
+                width,
+                generator=torch.Generator(device="cuda").manual_seed(seed),
+                device="cuda",
+            )
+        )
+        return [(int(n), 0) for n in lens]
+
+    def call():
+        topk_lpt_row_map(seq_lens, row_map)
+        topk_transform_candidates_v2(
+            scores,
+            seq_lens,
+            out_candidates=cand,
+            world=4,
+            rank=1,
+            cluster_size=0,
+            stable_ties=True,
+            sampled=True,
+            lpt_row_map=row_map,
+        )
+
+    fill(1)
+    call()  # compile outside the capture
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        call()
+    for seed in (2, 3, 4):
+        lens_rows = fill(seed)
+        snap = scores.clone()
+        graph.replay()
+        torch.cuda.synchronize()
+        want = sorted(range(rows), key=lambda r: (-lens_rows[r][0], r))
+        assert row_map.tolist() == want, seed
+        ref = _dcp_candidates(snap, seq_lens, k, stable_ties=True)
+        _assert_sampled_rows(
+            snap, lens_rows[:40], cand, ref, k, True, ("lpt-graph", seed)
+        )
 
 
 @pytest.mark.skipif(not is_hip(), reason="ROCm split path")

@@ -210,6 +210,7 @@ class _Case:
         merge(self.candidates, self.global_lens, self.page_table, self.out, span)
 
     def run_pushed(self, merge: DcpTopKMerge, span: int) -> None:
+        merge.prepare_step(self.local_lens, layer_id=0)  # the step's LPT row map, if any
         self.local, self.lengths = merge.merge_pushed(
             self.logits.clone(), self.local_lens, self.global_lens, self.page_table, self.out, span
         )
@@ -444,7 +445,7 @@ def test_dcp4_topk_merge_pushed_sampled(kind: str, cand_k: int, min_len: int, lp
     if sampled.buffer is None:
         pytest.skip("multimem multicast unavailable")
     assert sampled.sampled and not exact.sampled and sampled.sampled_min_len == min_len
-    assert sampled.lpt == lpt
+    assert sampled.lpt == lpt and (sampled.lpt_row_map is not None) == lpt
     span = PAGE_SIZE * world
     for seed in SEEDS:
         case = _Case(kind, seed, rank, world, span)

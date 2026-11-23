@@ -60,6 +60,7 @@ def _jit_topk_v2_module(stable_ties: bool = False):
         ("topk_plan", f"{kernel}::plan"),
         ("topk_transform_kpool", f"{kernel}::transform_kpool"),
         ("topk_transform_kpool_ragged", f"{kernel}::transform_kpool_ragged"),
+        ("topk_lpt_row_map", f"{kernel}::lpt_row_map"),
     ]
     return load_jit(
         make_name("topk_v2"),
@@ -84,7 +85,8 @@ def _jit_topk_v2_push_module():
             (
                 "topk_transform_candidates_dcp_push",
                 f"TopKKernel<{args}>::transform_candidates_dcp_push",
-            )
+            ),
+            ("topk_lpt_row_map", f"TopKKernel<{args}>::lpt_row_map"),
         ],
     )
 
@@ -250,7 +252,7 @@ def topk_transform_candidates_v2(
     cluster_size: Optional[int] = None,
     sampled: bool = False,
     sampled_min_len: int = 0,
-    lpt: bool = False,
+    lpt_row_map: Optional[torch.Tensor] = None,
     lpt_trace: Optional[torch.Tensor] = None,
 ) -> None:
     """Ragged top-k emitting candidates for a distributed top-k merge.
@@ -271,9 +273,10 @@ def topk_transform_candidates_v2(
     do not apply. There, with ``cluster_size`` 0, ``sampled`` runs rows longer than both
     16384 and ``sampled_min_len`` through a sampled-threshold single pass that selects the
     same set (slot order aside) and redoes on the exact path the rows it cannot certify;
-    ``overflow_rows`` counts those. ``lpt`` (with ``sampled``, rows <= 1024) launches the blocks
-    longest row first, so a launch of more rows than resident blocks queues the shortest.
-    ``lpt_trace`` (bench only): int64 [rows, 4], each block's {start, row chosen, end} in
+    ``overflow_rows`` counts those. ``lpt_row_map`` (with ``sampled``, rows <= 1024; from
+    :func:`topk_lpt_row_map`) launches the blocks longest row first, so a launch of more rows
+    than resident blocks queues the shortest; each block reads its row after the PDL wait.
+    ``lpt_trace`` (bench only): int64 [rows, 4], each block's {start, row read, end} in
     globaltimer ns and its row.
 
     NOTE: ``scores`` is written in place as for the ragged entry point.
@@ -292,7 +295,7 @@ def topk_transform_candidates_v2(
             bool(sampled),
             int(sampled_min_len),
             overflow_rows,
-            bool(lpt),
+            lpt_row_map,
             lpt_trace,
         )
         return
@@ -325,7 +328,7 @@ def topk_transform_candidates_dcp_push(
     sampled: bool = False,
     sampled_min_len: int = 0,
     fallback_rows: Optional[torch.Tensor] = None,
-    lpt: bool = False,
+    lpt_row_map: Optional[torch.Tensor] = None,
 ) -> None:
     """DCP decode top-k that pushes its candidates to the merge.
 
@@ -338,7 +341,7 @@ def topk_transform_candidates_dcp_push(
     parity; see ``jit/csrc/dsa/dcp_topk_merge.cuh``). ``counters``: [max_rows]
     int64 merge calls per row slot; the merge advances them. ``sampled``,
     ``sampled_min_len`` and ``fallback_rows``: as ``sampled``, ``sampled_min_len`` and
-    ``overflow_rows`` of :func:`topk_transform_candidates_v2`, and ``lpt`` as there.
+    ``overflow_rows`` of :func:`topk_transform_candidates_v2`, and ``lpt_row_map`` as there.
     """
     _jit_topk_v2_push_module().topk_transform_candidates_dcp_push(
         scores,
@@ -354,8 +357,16 @@ def topk_transform_candidates_dcp_push(
         bool(sampled),
         int(sampled_min_len),
         fallback_rows,
-        bool(lpt),
+        lpt_row_map,
     )
+
+
+def topk_lpt_row_map(seq_lens: torch.Tensor, row_map: torch.Tensor) -> None:
+    """The LPT row map of a decode step: ``row_map[r]`` = the r-th longest of the ``seq_lens``
+    rows (int32, ties by row index; rows <= 1024), one block, for the ``lpt_row_map`` argument of
+    the sampled DCP candidates launches of the step. They read it after their PDL wait, so it may
+    be launched any time before them on the stream."""
+    _jit_topk_v2_push_module().topk_lpt_row_map(seq_lens, row_map)
 
 
 def candidates_cluster_size(rows: int) -> int:
