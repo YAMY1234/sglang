@@ -37,6 +37,7 @@ from typing import (
     Union,
 )
 
+from sglang.srt.debug_utils import nan_probe
 from sglang.srt.runtime_context import (
     SpawnRanks,
     attention_backends,
@@ -5760,6 +5761,8 @@ class Scheduler(
         )
 
         if batch.forward_mode.is_decode():
+            if nan_probe.enabled():
+                nan_probe.check(self, batch, result)
             self.batch_result_processor.process_batch_result_decode(batch, result)
         elif batch.forward_mode.is_extend():
             if batch.is_dllm():

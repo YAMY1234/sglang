@@ -12,6 +12,7 @@ from torch import nn
 
 from sglang.kernels.ops.attention.dsv4 import fused_q_norm_rope, fused_rope_inplace
 from sglang.kernels.ops.speculative.dspark.dspark_draft_model import CommitKvProj
+from sglang.srt.debug_utils import nan_probe
 from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
 from sglang.srt.configs.draft_parallel import DraftParallelSpec, DraftTPExecution
 from sglang.srt.distributed.device_communicators.vocab_gather import make_vocab_gather
@@ -751,9 +752,17 @@ class DSparkV4CudaStage(DSparkV4StageMixin, DeepseekV4CudaDecoderLayer):
     def _run_boundary_attention(
         self, hidden_states, positions, forward_batch, quantized
     ):
-        return self.self_attn(
+        probe = nan_probe.enabled()
+        if probe:
+            nan_probe.record(
+                f"dspark.s{self.stage_id}.attn_in", hidden_states, forward_batch
+            )
+        out = self.self_attn(
             positions, hidden_states, forward_batch, defer_all_reduce=True
         )
+        if probe:
+            nan_probe.record(f"dspark.s{self.stage_id}.attn_out", out, forward_batch)
+        return out
 
     def forward(self, positions, hidden_states, forward_batch):
         return super().forward(
@@ -953,8 +962,14 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
 
     def project_target_hidden(self, main_hidden: torch.Tensor) -> torch.Tensor:
         stage0 = self.stages[0]
+        probe = nan_probe.enabled()
+        if probe:
+            nan_probe.record("dspark.target_hidden", main_hidden)
         projected, _ = stage0.main_proj(main_hidden)
-        return stage0.main_norm(projected)
+        out = stage0.main_norm(projected)
+        if probe:
+            nan_probe.record("dspark.main_norm_out", out)
+        return out
 
     def write_target_hidden_kv(
         self,
@@ -1051,6 +1066,8 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
             input_embeds = self.forward_embed(input_ids)
         elif input_embeds.dim() == 2:
             input_embeds = self._expand_hc(input_embeds)
+        if nan_probe.enabled():
+            nan_probe.record("dspark.input_embeds", input_embeds, forward_batch)
         x = input_embeds
         pre = None
         if _is_cuda:

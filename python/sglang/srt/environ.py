@@ -2273,6 +2273,9 @@ class Envs:
     SGLANG_DECODE_DP_ADMIT_BALANCE = EnvBool(False)
     SGLANG_DECODE_DP_ADMIT_SLACK = EnvInt(2)
     SGLANG_DECODE_DP_ADMIT_MAX_HOLD_MS = EnvInt(500)
+    # Debug only: mark non-finite rows at the mega-gate and DSpark draft inputs, log
+    # every PD decode admission, and raise after the first forward that saw one.
+    SGLANG_DEBUG_NAN_PROBE = EnvBool(False)
     # PD with --dsv41-encoder-only-prefill, set alike on prefill, decode and the tail
     # server: a shared tail server runs every late-fed request's last window through
     # the late layers and sends their SWA and DSpark captures to decode as PP rank 1;

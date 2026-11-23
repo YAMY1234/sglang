@@ -46,6 +46,7 @@ import numpy as np
 import torch
 import torch.distributed as dist
 
+from sglang.srt.debug_utils import nan_probe
 from sglang.srt.configs.mamba_utils import Mamba2CacheParams
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.disaggregation.base import KVPoll
@@ -3549,6 +3550,9 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         # Keep the checksum before the metadata slot is freed; it is verified
         # when the request enters a batch.
         idx = decode_req.metadata_buffer_index
+        if nan_probe.enabled():
+            decode_req.req.nan_probe_slot = idx
+            decode_req.req.nan_probe_transfer_t = time.monotonic()
         if self.scheduler.kv_checksum_computer is not None:
             digest, signature = self.metadata_buffers.get_kv_checksum(idx)
             decode_req.req.expected_kv_checksum = (
@@ -5063,6 +5067,15 @@ class SchedulerDisaggregationDecodeMixin:
         ):
             self._log_dp_admit(can_run_list, now, max_hold_s, curr_batch_size)
 
+        if nan_probe.enabled() and can_run_list:
+            nan_probe.note_admit(
+                self,
+                can_run_list,
+                time.monotonic(),
+                self.dp_admit_held_since
+                if envs.SGLANG_DECODE_DP_ADMIT_BALANCE.get()
+                else None,
+            )
         if len(can_run_list) == 0:
             return None
         # They run from here on; one the checksum or the prebuilt result ends

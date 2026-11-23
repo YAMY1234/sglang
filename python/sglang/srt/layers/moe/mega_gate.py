@@ -7,6 +7,7 @@ from typing import NamedTuple, Optional
 import torch
 
 from sglang.kernels.ops.moe.mega_gate import bf16_mega_gate
+from sglang.srt.debug_utils import nan_probe
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers.moe.topk import (
@@ -226,6 +227,10 @@ def run_mega_gate(
         # NOTE(kpham-sgl): MegaMoE reads physical expert slots from this buffer, so
         # under EPLB the gate must map logical ids in-kernel to stay on this path.
         to_physical_map, logical_count = _physical_dispatch_maps(dispatch_info)
+    if nan_probe.enabled():
+        nan_probe.record(
+            f"gate.L{moe.layer_id}", hidden_states, forward_batch, sanitize=True
+        )
     weights, ids = bf16_mega_gate(
         hidden_states,
         moe.gate.weight,
