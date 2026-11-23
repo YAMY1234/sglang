@@ -845,5 +845,21 @@ class TestPPLaunchQueueScale(CustomTestCase):
                 self.assertNotIn("CUDA_SCALE_LAUNCH_QUEUES", os.environ)
 
 
+class TestHiCacheLoadRing(CustomTestCase):
+    """The layer-wise load-back event ring is sized by SGLANG_HICACHE_LAYER_LOAD_RING: a PP stage whose host runs
+    further ahead of its GPU has that many loads in flight, and a reused slot must hold a finished load."""
+
+    @unittest.skipUnless(torch.cuda.is_available(), "LayerLoadingEvent holds CUDA events")
+    def test_ring_size_follows_the_env_and_wraps(self):
+        from sglang.srt.environ import envs
+        from sglang.srt.managers.cache_controller import LayerDoneCounter
+
+        self.assertEqual(LayerDoneCounter(num_layers=2).num_counters, 3)
+        with envs.SGLANG_HICACHE_LAYER_LOAD_RING.override(8):
+            counter = LayerDoneCounter(num_layers=2)
+        self.assertEqual((counter.num_counters, len(counter.events)), (8, 8))
+        self.assertEqual([counter.update_producer() for _ in range(9)], [0, 1, 2, 3, 4, 5, 6, 7, 0])
+
+
 if __name__ == "__main__":
     unittest.main()
