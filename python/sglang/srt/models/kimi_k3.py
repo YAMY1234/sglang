@@ -1128,7 +1128,13 @@ class KimiK3MoE(nn.Module):
         # control of weight layout.
         if not (get_platform().is_cuda or get_platform().is_hip):
             return
-        if self.shared_experts is not None and get_moe_a2a_backend().is_none():
+        # Basis-B shared experts are cast to MXFP8 after this merge runs; a BF16
+        # view taken here would keep the BF16 copy and feed a BF16 front.
+        if (
+            self.shared_experts is not None
+            and get_moe_a2a_backend().is_none()
+            and not k31_basisb_enabled()
+        ):
             mods = [
                 self.shared_experts.gate_up_proj,
                 self.gate,
