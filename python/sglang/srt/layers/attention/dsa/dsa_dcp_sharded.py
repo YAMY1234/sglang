@@ -245,6 +245,7 @@ class DcpTopKMerge:
         self.union_scratch: Optional[torch.Tensor] = None
         # push only: the local top-k's sampled single pass, and the rows it redid exactly
         self.sampled = self.push and envs.SGLANG_DSA_DCP_TOPK_PUSH_SAMPLED.get()
+        self.sampled_min_len = envs.SGLANG_DSA_DCP_TOPK_PUSH_SAMPLED_MIN_LEN.get()
         self.sampled_fallbacks: Optional[torch.Tensor] = None
         self._fallbacks_host: Optional[torch.Tensor] = None
         self._fallbacks_reported = 0
@@ -304,8 +305,9 @@ class DcpTopKMerge:
                 self.sampled_fallbacks = torch.zeros(1, dtype=torch.int32, device=group.device)
                 self._fallbacks_host = torch.zeros(1, dtype=torch.int32).pin_memory()
                 print_info_once(
-                    "DSA DCP top-k merge: local rows over 16384 keys select their "
-                    "candidates in one sampled-threshold pass (SGLANG_DSA_DCP_TOPK_PUSH_SAMPLED)"
+                    f"DSA DCP top-k merge: local rows over {max(self.sampled_min_len, 16384)} "
+                    "keys select their candidates in one sampled-threshold pass "
+                    "(SGLANG_DSA_DCP_TOPK_PUSH_SAMPLED, SGLANG_DSA_DCP_TOPK_PUSH_SAMPLED_MIN_LEN)"
                 )
             return
         self.union_scratch = torch.empty(
@@ -366,6 +368,7 @@ class DcpTopKMerge:
             cluster_size=candidates_cluster_size(rows),
             cluster_floor=_CANDIDATE_CLUSTER_FLOOR,
             sampled=self.sampled,
+            sampled_min_len=self.sampled_min_len,
             fallback_rows=self.sampled_fallbacks,
         )
         local = torch.empty_like(out)
