@@ -520,6 +520,10 @@ class MambaPool:
     # Stream of the commits that write kda_fold_pending (the scheduler's forward
     # stream under overlap); None = the caller's stream.
     kda_flush_stream = None
+    # SGLANG_OPT_KDA_FLOW: (A_log [L, H], dt_bias [L, H * 128], lower_bound, verify
+    # rows) of the KDA layers in pool order, filled by the KDA backend's first verify
+    # of each layer; the ring buffers then hold RecoverSSM records, folded with these.
+    kda_flow_gate: Optional[Tuple[torch.Tensor, torch.Tensor, float, int]] = None
 
     def _on_kda_flush_stream(self, fn, slots: torch.Tensor, *, wait_back: bool):
         cur = torch.cuda.current_stream()
@@ -558,7 +562,10 @@ class MambaPool:
 
         self._on_kda_flush_stream(
             lambda idx: fold_kda_pending(
-                spec_state=self.mamba_cache, pending=self.kda_fold_pending, slots=idx
+                spec_state=self.mamba_cache,
+                pending=self.kda_fold_pending,
+                slots=idx,
+                flow_gate=self.kda_flow_gate,
             ),
             slots.reshape(-1),
             wait_back=True,

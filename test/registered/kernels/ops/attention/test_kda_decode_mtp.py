@@ -328,5 +328,246 @@ class TestKdaVerifyPendingFold(CustomTestCase):
                         )
 
 
+def _kda_flow_reference(*, x, out_gate, raw_gate, beta, conv_w, conv_state, a_log,
+                        dt_bias, state, norm_w, eps, lower_bound, tokens):  # fmt: skip
+    """FP64 KDA verify of n requests x H heads in the stock RecoverSSM semantics
+    (BF16 conv outputs, sequential delta rule from the checkpoint). Returns the
+    gated-RMSNorm output [R, D], corrections [n, H, q, 128], conv outputs k
+    [n, H, q, 128] and the per-token states [q, n, H, 128, 128]."""
+    f64 = torch.float64
+    rows, dim3 = x.shape
+    n, d, heads = rows // tokens, dim3 // 3, a_log.shape[0]
+    seq = torch.cat([conv_state.to(f64), x.view(n, tokens, dim3).to(f64)], 1)
+    w = conv_w.to(f64).transpose(1, 2).reshape(dim3, 4)  # [3 D, 4]
+    conv = torch.stack(
+        [(seq[:, t : t + 4, :] * w.t()[None]).sum(1) for t in range(tokens)], 1
+    )
+    act = (conv / (1 + torch.exp(-conv))).bfloat16().to(f64)  # [n, q, 3 D]
+    q, k, v = (act[..., i * d : (i + 1) * d].view(n, tokens, heads, 128) for i in range(3))
+    qn = q / torch.sqrt((q * q).sum(-1, keepdim=True) + 1e-6) * 128**-0.5
+    kn = k / torch.sqrt((k * k).sum(-1, keepdim=True) + 1e-6)
+    g = raw_gate.to(f64).view(n, tokens, heads, 128)
+    decay = torch.exp(
+        lower_bound
+        * torch.sigmoid(torch.exp(a_log.to(f64))[:, None] * (g + dt_bias.to(f64).view(heads, 128)))
+    )
+    b = torch.sigmoid(beta.to(f64).view(n, tokens, heads))
+    s = state.to(f64).clone()  # [n, H, V, K]
+    outs, us, states = [], [], []
+    for t in range(tokens):
+        s = s * decay[:, t, :, None, :]
+        u = b[:, t, :, None] * (v[:, t] - (s @ kn[:, t, :, :, None]).squeeze(-1))
+        s = s + u[..., :, None] * kn[:, t, :, None, :]
+        outs.append((s @ qn[:, t, :, :, None]).squeeze(-1).bfloat16().to(f64))
+        us.append(u)
+        states.append(s.clone())
+    o = torch.stack(outs, 1)  # [n, q, H, V]
+    rstd = torch.rsqrt((o * o).mean(-1, keepdim=True) + eps)
+    gate = torch.sigmoid(out_gate.to(f64).view(n, tokens, heads, 128))
+    out = (o * rstd * norm_w.to(f64) * gate).reshape(rows, heads * 128)
+    return out, torch.stack(us, 2), k.transpose(1, 2), torch.stack(states)
+
+
+def _rel(got, want):
+    return float((got.double() - want.double()).norm() / want.double().norm())
+
+
+class TestKdaFlowVerify(CustomTestCase):
+    """SGLANG_OPT_KDA_FLOW: the persistent verify folds the previous step's accepted
+    rows from its RecoverSSM records and verifies q = 5 rows; over steps with partial
+    acceptance, a padding row and a slot changing owner it must match an FP64
+    sequential reference (outputs within BF16, states and corrections within FP32
+    reduction order) and the reader flush must commit the same state."""
+
+    @classmethod
+    def setUpClass(cls):
+        if not torch.cuda.is_available():
+            raise unittest.SkipTest("CUDA is not available")
+        if torch.cuda.get_device_capability() != (10, 7):
+            raise unittest.SkipTest("KdaFlow needs Rubin's 320 KiB shared memory")
+
+    def _run(self, *, num_requests, fused_fb, steps=4, heads=24, tokens=5, layers=2):
+        from types import SimpleNamespace
+
+        from sglang.kernels.ops.attention.kda_flow import (
+            fold_kda_flow_pending,
+            kda_flow_records,
+            kda_flow_verify,
+            prepare_conv_weight,
+        )
+        from sglang.kernels.ops.attention.linear.kda_replayssm_spec_decode import (
+            commit_kda_replayssm_after_verify,
+            reset_kda_pending,
+        )
+        from sglang.srt.environ import envs
+
+        gen = torch.Generator(device="cuda").manual_seed(11)
+        dev, bf16, f32 = "cuda", torch.bfloat16, torch.float32
+        d, ring, rows_n = heads * 128, 16, num_requests + 1  # + one padding row
+        rows, num_slots = rows_n * tokens, 2 * num_requests + 3
+
+        def randn(*shape, scale=1.0, dtype=f32):
+            return (torch.randn(*shape, device=dev, generator=gen) * scale).to(dtype)
+
+        conv_w = [prepare_conv_weight(randn(3 * d, 4, scale=0.5)) for _ in range(layers)]
+        a_log = [randn(heads, scale=0.5) for _ in range(layers)]
+        dt = [randn(d, scale=0.5) for _ in range(layers)]
+        f_b = [randn(d, 128, scale=128**-0.5, dtype=bf16) for _ in range(layers)]
+        norm_w = randn(128, scale=0.1) + 1
+        spec = SimpleNamespace(
+            temporal=randn(layers, num_slots, heads, 128, 128, scale=0.1),
+            replayssm_rawv=torch.zeros(layers, num_slots, heads, ring, 128, device=dev, dtype=bf16),
+            replayssm_rawk=torch.zeros(layers, num_slots, heads, ring, 128, device=dev, dtype=bf16),
+            replayssm_g=torch.zeros(layers, num_slots, heads, ring, 128, device=dev),
+            replayssm_beta=torch.zeros(layers, num_slots, heads, ring, device=dev),
+            conv=[randn(layers, num_slots, 3, 3 * d, dtype=bf16)],
+            intermediate_conv_window=[
+                torch.zeros(layers, rows_n, tokens, 3, 3 * d, device=dev, dtype=bf16)
+            ],
+        )  # fmt: skip
+        corrections, key_gate = kda_flow_records(
+            g_ring=spec.replayssm_g, rawk_ring=spec.replayssm_rawk, tokens=tokens
+        )
+        pending = torch.zeros(num_slots + 1, device=dev, dtype=torch.int32)
+        slots = torch.randperm(num_slots - 1, device=dev, generator=gen)[:rows_n] + 1
+        slots[-1] = -1
+        free = sorted(set(range(1, num_slots)) - set(slots.tolist()))
+        scratch = torch.arange(rows_n, device=dev, dtype=torch.int32)
+        committed = spec.temporal.clone().double()  # the reference checkpoints
+        report = []
+        for step in range(steps):
+            if step == 2:  # request 0 finishes; new owners of its slot and of a free one
+                old = int(slots[0])
+                slots[0], slots[1] = old, free[0]
+                for s in (old, free[0]):
+                    fresh = randn(layers, heads, 128, 128, scale=0.1)
+                    spec.temporal[:, s] = fresh
+                    committed[:, s] = fresh.double()
+                reset_kda_pending(pending=pending, slots=slots[:2])
+            fused = randn(rows, 4 * d, dtype=bf16)
+            bfa = randn(rows, 152, dtype=bf16)
+            accept = torch.randint(1, tokens + 1, (rows_n,), device=dev, generator=gen)
+            live = slots[:num_requests].long()
+            for layer in range(layers):
+                f_a = bfa[:, :128]
+                raw = (f_a.float() @ f_b[layer].float().t()).to(bf16)
+                conv_before = spec.conv[0][layer][live].clone()
+                out = kda_flow_verify(
+                    x=fused[:, : 3 * d], conv_weight=conv_w[layer],
+                    conv_state=spec.conv[0][layer], gate_in=f_a if fused_fb else raw,
+                    beta=bfa[:, 128:152], a_log=a_log[layer], dt_bias=dt[layer],
+                    slots=slots.to(torch.int32), state=spec.temporal[layer],
+                    out_gate=fused[:, 3 * d :], norm_weight=norm_w,
+                    f_b=f_b[layer] if fused_fb else None,
+                    conv_windows=spec.intermediate_conv_window[0][layer],
+                    scratch_rows=scratch, corrections=corrections[layer],
+                    key_gate=key_gate[layer], pending=pending, lower_bound=-5.0, eps=1e-5,
+                )  # fmt: skip
+                torch.cuda.synchronize()
+                # The kernel's own BF16 raw gates (F_B MMA: within one ulp of cuBLAS).
+                rec_gate = key_gate[layer][live][..., 128:].transpose(1, 2)
+                gate = rec_gate.reshape(num_requests * tokens, d)
+                if fused_fb:
+                    torch.testing.assert_close(
+                        gate.float(), raw[: num_requests * tokens].float(), rtol=2**-7, atol=1e-6
+                    )
+                ref_out, ref_u, ref_k, ref_states = _kda_flow_reference(
+                    x=fused[: num_requests * tokens, : 3 * d],
+                    out_gate=fused[: num_requests * tokens, 3 * d :],
+                    raw_gate=gate, beta=bfa[: num_requests * tokens, 128:152],
+                    conv_w=conv_w[layer], conv_state=conv_before, a_log=a_log[layer],
+                    dt_bias=dt[layer], state=committed[layer][live], norm_w=norm_w,
+                    eps=1e-5, lower_bound=-5.0, tokens=tokens,
+                )  # fmt: skip
+                r = dict(step=step, layer=layer)
+                r["out"] = _rel(out[: num_requests * tokens], ref_out)
+                r["state"] = _rel(spec.temporal[layer][live], committed[layer][live])
+                r["corr"] = _rel(corrections[layer][live], ref_u)
+                # Conv outputs rounded to BF16 from FP32 (kernel) vs FP64: one ulp.
+                torch.testing.assert_close(
+                    key_gate[layer][live][..., :128].float(), ref_k.float(),
+                    rtol=2**-7, atol=1e-6,
+                )  # fmt: skip
+                if layer == 0:
+                    r["v2_vs_ref"], r["flow_vs_v2"] = self._against_v2(
+                        out=out, ref_out=ref_out, fused=fused, raw=raw, bfa=bfa,
+                        conv_w=conv_w[0], conv_state=spec.conv[0][0], a_log=a_log[0],
+                        dt=dt[0], state=committed[0], slots=slots, scratch=scratch,
+                        norm_w=norm_w, tokens=tokens, num_requests=num_requests,
+                    )  # fmt: skip
+                windows = spec.intermediate_conv_window[0][layer][: num_requests]
+                full = torch.cat([conv_before, fused[: num_requests * tokens, : 3 * d].view(num_requests, tokens, 3 * d)], 1)  # fmt: skip
+                for t in range(tokens):
+                    self.assertTrue(torch.equal(windows[:, t], full[:, t + 1 : t + 4]))
+                self.assertTrue(torch.equal(out[num_requests * tokens :], torch.zeros_like(out[num_requests * tokens :])))
+                torch.testing.assert_close(out[: num_requests * tokens].float(), ref_out.float(), rtol=2e-2, atol=2e-2)  # fmt: skip
+                self.assertLess(r["state"], 1e-5, r)
+                self.assertLess(r["corr"], 1e-4, r)
+                self.assertLess(r["out"], 1e-2, r)
+                report.append(r)
+                # The reference commit: the state after each request's accepted rows.
+                index = (accept[:num_requests] - 1).long()
+                committed[layer][live] = ref_states[index, torch.arange(num_requests, device=dev)]
+            with envs.SGLANG_OPT_KDA_FLOW.override(True):
+                commit_kda_replayssm_after_verify(
+                    spec_state=spec, state_batch_indices=slots, accept_lens=accept,
+                    last_correct_step_indices=accept - 1, src_indices_raw=scratch,
+                    pending=pending,
+                )  # fmt: skip
+        # The reader flush (retract / copy) commits the last step's accepted rows.
+        a_all, dt_all = torch.stack(a_log), torch.stack(dt)
+        fold_kda_flow_pending(
+            state=spec.temporal, corrections=corrections, key_gate=key_gate,
+            a_log=a_all, dt_bias=dt_all, lower_bound=-5.0, slots=slots, pending=pending,
+        )  # fmt: skip
+        live = slots[:num_requests].long()
+        flushed = _rel(spec.temporal[:, live], committed[:, live])
+        self.assertLess(flushed, 1e-5)
+        return report, flushed
+
+    def _against_v2(self, *, out, ref_out, fused, raw, bfa, conv_w, conv_state, a_log,
+                    dt, state, slots, scratch, norm_w, tokens, num_requests):  # fmt: skip
+        """Our recurrent v2 verify from the same checkpoint and inputs (rings to
+        scratch): its error against the FP64 reference and its distance to KdaFlow."""
+        from sglang.kernels.ops.attention.kda_decode_mtp_v2 import (
+            fused_kda_decode_mtp_dspark as verify_v2,
+        )
+
+        rows, d = fused.shape[0], conv_w.shape[-1]
+        heads, num_slots = a_log.shape[0], state.shape[0]
+        as4 = lambda t: t.reshape(1, rows, heads, 128).contiguous()  # noqa: E731
+        w = conv_w.transpose(1, 2).reshape(3 * d, 4)
+        cs = conv_state.split([d, d, d], dim=-1)
+        windows = torch.zeros(scratch.numel(), tokens, 3, 3 * d, device="cuda", dtype=torch.bfloat16)
+        ic = windows.transpose(-1, -2).split([d, d, d], dim=-2)
+        ring = lambda dtype: torch.zeros(num_slots, heads, 16, 128, device="cuda", dtype=dtype)  # noqa: E731
+        got = verify_v2(
+            x_q=as4(fused[:, :d]), x_k=as4(fused[:, d : 2 * d]), x_v=as4(fused[:, 2 * d : 3 * d]),
+            w_q=w[:d], w_k=w[d : 2 * d], w_v=w[2 * d :],
+            cs_q=cs[0].transpose(-1, -2), cs_k=cs[1].transpose(-1, -2), cs_v=cs[2].transpose(-1, -2),
+            g=as4(raw), beta=bfa[:, 128:152].reshape(1, rows, heads).contiguous(),
+            A_log=a_log, dt_bias=dt, recurrent_state=state.float().clone(),
+            intermediate_ssm=None, intermediate_state_indices=scratch,
+            intermediate_conv_q=ic[0], intermediate_conv_k=ic[1], intermediate_conv_v=ic[2],
+            ssm_state_indices=slots.to(torch.int32),
+            cu_seqlens=torch.arange(0, rows + 1, tokens, device="cuda", dtype=torch.int32),
+            lower_bound=-5.0, replayssm_rawv=ring(torch.bfloat16),
+            replayssm_rawk=ring(torch.bfloat16), replayssm_g=ring(torch.float32),
+            replayssm_beta=torch.zeros(num_slots, heads, 16, device="cuda"),
+            onorm_gate=as4(fused[:, 3 * d :]), onorm_weight=norm_w, onorm_eps=1e-5,
+        ).reshape(rows, heads * 128)  # fmt: skip
+        live = num_requests * tokens
+        return _rel(got[:live], ref_out), _rel(out[:live], got[:live])
+
+    def test_matches_fp64_reference(self):
+        for num_requests, fused_fb in ((33, False), (58, False), (58, True), (112, True)):
+            with self.subTest(num_requests=num_requests, fused_fb=fused_fb):
+                report, flushed = self._run(num_requests=num_requests, fused_fb=fused_fb)
+                keys = ("out", "state", "corr", "v2_vs_ref", "flow_vs_v2")
+                worst = {k: max(r.get(k, 0.0) for r in report) for k in keys}
+                self.assertLess(worst["flow_vs_v2"], 1e-2, worst)
+                print(f"KdaFlow n{num_requests} fused_fb={fused_fb}: worst rel {worst}, flush {flushed:.2e}")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -571,6 +571,10 @@ class KDAAttnBackend(MambaAttnBackendBase):
             )
         if self.req_to_token_pool.mamba_pool.kda_fold_pending is not None:
             self._check_pending_fold_contract(verify_backend)
+        self.kda_flow = envs.SGLANG_OPT_KDA_FLOW.get()
+        self._kda_flow_layers = {}
+        if self.kda_flow:
+            self._check_kda_flow_contract()
 
     @staticmethod
     def _check_pending_fold_contract(verify_backend) -> None:
@@ -597,6 +601,122 @@ class KDAAttnBackend(MambaAttnBackendBase):
             raise ValueError(
                 "SGLANG_OPT_KDA_PENDING_FOLD needs " + "; ".join(problems) + "."
             )
+
+    def _check_kda_flow_contract(self) -> None:
+        """KdaFlow writes RecoverSSM records into the ring buffers and folds them
+        in the next verify; every verify must run it and every eager fold must
+        read the records (MambaPool.kda_flow_gate)."""
+        pool = self.req_to_token_pool.mamba_pool
+        problems = []
+        if pool.kda_fold_pending is None:
+            problems.append("SGLANG_OPT_KDA_PENDING_FOLD")
+        if (
+            pool.mamba_cache.replayssm_g is None
+            or pool.mamba_cache.replayssm_rawk is None
+        ):
+            problems.append("--enable-linear-replayssm-spec (the record rings)")
+        if envs.SGLANG_OPT_KDA_FLOW_FB.get() and not envs.SGLANG_OPT_KDA_FLOW.get():
+            problems.append("SGLANG_OPT_KDA_FLOW for SGLANG_OPT_KDA_FLOW_FB")
+        if problems:
+            raise ValueError("SGLANG_OPT_KDA_FLOW needs " + "; ".join(problems) + ".")
+        rank0_log("KDA verify: KdaFlow persistent kernel (SGLANG_OPT_KDA_FLOW)")
+
+    def _kda_flow_layer(self, layer: RadixLinearAttention, tokens: int):
+        """The layer's prepared conv weight; on its first call (eager warmup) also
+        its gate parameters into MambaPool.kda_flow_gate for the reader flush."""
+        prepared = self._kda_flow_layers.get(layer.layer_id)
+        if prepared is not None:
+            return prepared
+        from sglang.kernels.ops.attention.kda_flow import prepare_conv_weight
+
+        pool = self.req_to_token_pool.mamba_pool
+        heads = layer.num_v_heads
+        if pool.kda_flow_gate is None:
+            num_layers, device = pool.mamba_cache.temporal.shape[0], layer.A_log.device
+            pool.kda_flow_gate = (
+                torch.zeros(num_layers, heads, dtype=torch.float32, device=device),
+                torch.zeros(num_layers, heads * layer.head_k_dim, dtype=torch.float32, device=device),
+                float(layer.lower_bound),
+                tokens,
+            )  # fmt: skip
+        a_log, dt_bias, _, _ = pool.kda_flow_gate
+        index = self.req_to_token_pool.mamba2_layer_index(layer.layer_id)
+        a_log[index].copy_(layer.A_log.reshape(-1))
+        dt_bias[index].copy_(layer.dt_bias.reshape(-1))
+        prepared = prepare_conv_weight(layer.conv_weights)
+        self._kda_flow_layers[layer.layer_id] = prepared
+        return prepared
+
+    def _run_kda_flow(
+        self,
+        *,
+        layer: RadixLinearAttention,
+        mixed_qkv: torch.Tensor,
+        a: torch.Tensor,
+        b: torch.Tensor,
+        conv_states: torch.Tensor,
+        ssm_states: torch.Tensor,
+        mamba_cache_params,
+        intermediate_state_indices: torch.Tensor,
+        cache_indices: torch.Tensor,
+        draft_token_num: int,
+        dense_chain: bool,
+    ) -> torch.Tensor:
+        from sglang.kernels.ops.attention.kda_flow import (
+            kda_flow_records,
+            kda_flow_verify,
+        )
+
+        onorm_gate = getattr(layer, "_k3_onorm_gate", None)
+        fused_static = getattr(layer, "_k3_fused_decode_args", None)
+        onorm_args = (
+            fused_static[5:7]
+            if fused_static is not None
+            else getattr(layer, "_k3_onorm_fold_args", None)
+        )
+        if not dense_chain or onorm_gate is None or onorm_args is None:
+            raise RuntimeError(
+                "SGLANG_OPT_KDA_FLOW needs a dense chain verify with the output norm "
+                "folded in (SGLANG_K31_KDA_ONORM_FOLD_ANY_HEADS); no other verify may "
+                "run on its records"
+            )
+        seq_len, heads = mixed_qkv.shape[0], layer.num_v_heads
+        requests = seq_len // draft_token_num
+        conv_weight = self._kda_flow_layer(layer, draft_token_num)
+        corrections, key_gate = kda_flow_records(
+            g_ring=mamba_cache_params.replayssm_g,
+            rawk_ring=mamba_cache_params.replayssm_rawk,
+            tokens=draft_token_num,
+        )
+        # SGLANG_OPT_KDA_FLOW_FB: the model skipped f_b, ``a`` is F_A [R, 128].
+        f_b = (
+            getattr(layer, "_k3_flow_f_b", None)
+            if getattr(layer, "_k3_deferred_f_b", False)
+            else None
+        )
+        out = kda_flow_verify(
+            x=mixed_qkv,
+            conv_weight=conv_weight,
+            conv_state=conv_states,
+            gate_in=a.reshape(seq_len, -1),
+            beta=b.reshape(seq_len, heads),
+            a_log=layer.A_log.reshape(-1),
+            dt_bias=layer.dt_bias.reshape(-1),
+            slots=cache_indices[:requests].to(torch.int32),
+            state=ssm_states,
+            out_gate=onorm_gate.reshape(seq_len, -1),
+            norm_weight=onorm_args[0],
+            f_b=f_b,
+            conv_windows=mamba_cache_params.intermediate_conv_window[0],
+            scratch_rows=intermediate_state_indices[:requests].to(torch.int32),
+            corrections=corrections,
+            key_gate=key_gate,
+            pending=self.req_to_token_pool.mamba_pool.kda_fold_pending,
+            lower_bound=float(layer.lower_bound),
+            eps=float(onorm_args[1]),
+        )
+        layer._k3_onorm_consumed = True
+        return out.view(1, seq_len, heads, layer.head_v_dim)
 
     @staticmethod
     def _can_fuse_accept_state(verify_backend) -> bool:
@@ -1383,6 +1503,20 @@ class KDAAttnBackend(MambaAttnBackendBase):
 
         draft_token_num = forward_batch.spec_info.draft_token_num
         ragged_layout = forward_batch.spec_info.ragged_verify_layout
+        if self.kda_flow:
+            return self._run_kda_flow(
+                layer=layer,
+                mixed_qkv=mixed_qkv,
+                a=a,
+                b=b,
+                conv_states=conv_states,
+                ssm_states=ssm_states,
+                mamba_cache_params=mamba_cache_params,
+                intermediate_state_indices=intermediate_state_indices,
+                cache_indices=cache_indices,
+                draft_token_num=draft_token_num,
+                dense_chain=ragged_layout is None and retrieve_parent_token is None,
+            )
         if self._can_run_dspark_cutedsl_mtp(
             layer=layer,
             mixed_qkv=mixed_qkv,

@@ -2017,6 +2017,13 @@ class Envs:
     # KDA ReplaySSM spec commit: record the accepted ring rows per slot and fold
     # them inside the next P1_HOIST verify (bit-identical); off by default.
     SGLANG_OPT_KDA_PENDING_FOLD = EnvBool(False)
+    # KDA verify: the persistent KdaFlow kernel (adapted from vLLM) with RecoverSSM
+    # records and the pending fold in the same state pass; needs
+    # SGLANG_OPT_KDA_PENDING_FOLD. Not bit-identical (FP32 reduction order).
+    SGLANG_OPT_KDA_FLOW = EnvBool(False)
+    # KdaFlow applies f_b itself (F_A in, F_B MMA in the prologue) instead of
+    # reading the side stream's f_b GEMM output.
+    SGLANG_OPT_KDA_FLOW_FB = EnvBool(False)
     SGLANG_ENABLE_LILICORR_SAMPLING = EnvBool(False)
     SGLANG_LILICORR_REQUIRE_SAMPLING = EnvBool(False)
     SGLANG_RAGGED_VERIFY_MODE = EnvStr("static")
