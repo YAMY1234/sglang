@@ -2501,6 +2501,7 @@ class KimiK3DeltaAttention(nn.Module):
         self._kda_fused_decode_ready = False
         self._kda_onorm_fold_ready = False
         self._kda_hip_fused_decode_ready = False
+        self._kda_flow_fb_ready = False
         if _overlaps_sp_o_proj_rs(config, sp_moe):
             k3_sp_rs_overlap.wrap_o_proj(self.o_proj)
         if sp_moe:
@@ -2747,6 +2748,16 @@ class KimiK3DeltaAttention(nn.Module):
         )
         self._kda_fused_decode_ready = True
 
+    def _prepare_kda_flow_fb(self) -> None:
+        """SGLANG_OPT_KDA_FLOW_FB: target verify skips the side stream's f_b GEMM and
+        hands KdaFlow F_A plus the dense F_B weight [heads * 128, 128] BF16."""
+        if not (envs.SGLANG_OPT_KDA_FLOW.get() and envs.SGLANG_OPT_KDA_FLOW_FB.get()):
+            return
+        if self._bfa_w is None:
+            raise ValueError("SGLANG_OPT_KDA_FLOW_FB needs the merged f_a | b GEMM")
+        self.attn._k3_flow_f_b = self._bfa_f_b_w.to(torch.bfloat16).contiguous()
+        self._kda_flow_fb_ready = True
+
     def forward_qkvbfg_fused(
         self, hidden_states: torch.Tensor, defer_f_b: bool = False
     ):
@@ -2839,7 +2850,7 @@ class KimiK3DeltaAttention(nn.Module):
         hidden_states = cp_interleave_to_sequence_order(hidden_states, forward_batch)
         defer_f_b = (
             self._kda_hip_fused_decode_ready and forward_batch.forward_mode.is_decode()
-        )
+        ) or (self._kda_flow_fb_ready and forward_batch.forward_mode.is_target_verify())
         if self.do_fuse_qkvbfg or self.use_full_rank_gate:
             mixed_qkv, beta, forget_gate, g_proj_states = self.forward_qkvbfg_fused(
                 hidden_states, defer_f_b=defer_f_b
@@ -4313,6 +4324,7 @@ class KimiK3LinearForCausalLM(nn.Module):
             if isinstance(layer.self_attn, KimiK3DeltaAttention):
                 layer.self_attn._merge_bfa_weights()
                 layer.self_attn._prepare_fused_decode()
+                layer.self_attn._prepare_kda_flow_fb()
             if (
                 isinstance(layer.self_attn, KimiK3MLAAttention)
                 and layer.self_attn.indexer is not None

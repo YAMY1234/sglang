@@ -510,6 +510,15 @@ def commit_kda_replayssm_after_verify(
 
     L = spec_state.replayssm_rawv.shape[-2]
     num_k_heads = spec_state.replayssm_rawk.shape[2]
+    from sglang.srt.environ import envs
+
+    if envs.SGLANG_OPT_KDA_FLOW.get() and (
+        pending is None or mamba_track_indices is not None
+    ):
+        raise RuntimeError(
+            "SGLANG_OPT_KDA_FLOW: the rings hold RecoverSSM records; an eager or "
+            "track commit would replay them as raw inputs"
+        )
     if pending is not None and mamba_track_indices is None:
         record_kda_pending(
             pending=pending, slots=state_batch_indices, accept_lens=accept_lens
@@ -569,9 +578,17 @@ def reset_kda_pending(*, pending: torch.Tensor, slots: torch.Tensor) -> None:
     pending.index_fill_(0, rows.reshape(-1), 0)
 
 
-def fold_kda_pending(*, spec_state, pending: torch.Tensor, slots: torch.Tensor) -> None:
+def fold_kda_pending(
+    *, spec_state, pending: torch.Tensor, slots: torch.Tensor, flow_gate=None
+) -> None:
     """Fold the pending rows of ``slots`` into ``temporal`` (the eager commit fold) and
-    clear them, so a reader of those slots sees the committed state."""
+    clear them, so a reader of those slots sees the committed state. ``flow_gate``
+    (SGLANG_OPT_KDA_FLOW): the rings hold RecoverSSM records, folded rank-n."""
+    from sglang.srt.environ import envs
+
+    if envs.SGLANG_OPT_KDA_FLOW.get():
+        _fold_kda_flow_pending(spec_state, pending, slots, flow_gate)
+        return
     slots = slots.reshape(-1).to(torch.int64)
     commit_kda_replayssm_spec_all_layers(
         checkpoint_state=spec_state.temporal,
@@ -586,5 +603,35 @@ def fold_kda_pending(*, spec_state, pending: torch.Tensor, slots: torch.Tensor) 
         max_cache_len=spec_state.replayssm_rawv.shape[-2],
         num_k_heads=spec_state.replayssm_rawk.shape[2],
         null_block_id=-1,
+    )
+    reset_kda_pending(pending=pending, slots=slots)
+
+
+def _fold_kda_flow_pending(spec_state, pending, slots, flow_gate) -> None:
+    from sglang.kernels.ops.attention.kda_flow import (
+        fold_kda_flow_pending,
+        kda_flow_records,
+    )
+
+    if flow_gate is None:
+        raise RuntimeError(
+            "SGLANG_OPT_KDA_FLOW: pending records to fold before the KDA backend "
+            "registered the layers' gate parameters"
+        )
+    a_log, dt_bias, lower_bound, tokens = flow_gate
+    corrections, key_gate = kda_flow_records(
+        g_ring=spec_state.replayssm_g,
+        rawk_ring=spec_state.replayssm_rawk,
+        tokens=tokens,
+    )
+    fold_kda_flow_pending(
+        state=spec_state.temporal,
+        corrections=corrections,
+        key_gate=key_gate,
+        a_log=a_log,
+        dt_bias=dt_bias,
+        lower_bound=lower_bound,
+        slots=slots,
+        pending=pending,
     )
     reset_kda_pending(pending=pending, slots=slots)
