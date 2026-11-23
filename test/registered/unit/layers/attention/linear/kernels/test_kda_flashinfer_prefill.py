@@ -219,5 +219,43 @@ class TestFlashInferKDADecompPlanSeed(CustomTestCase):
         )
 
 
+class TestFlashInferKDAPlanSeedSwitch(CustomTestCase):
+    """The plan seed follows the run-time switch (set_plan_seed, PP host-lead file field 6) per call."""
+
+    def _kernel(self):
+        kernel = FlashInferKDAPrefillKernel.__new__(FlashInferKDAPrefillKernel)
+        kernel._seed_mode = 1
+        kernel._cu_contents_memo = {}
+        kernel._plan_module = _PlanModule(decomp_max_seqs=1)
+        kernel._kda_heads = 96
+        return kernel
+
+    def tearDown(self):
+        from sglang.srt.layers.attention.linear.kernels import kda_flashinfer_prefill
+
+        kda_flashinfer_prefill.set_plan_seed(False)
+
+    def test_switched_off_seeds_only_the_contents_memo(self):
+        from sglang.srt.layers.attention.linear.kernels import kda_flashinfer_prefill
+
+        kda_flashinfer_prefill.set_plan_seed(False)
+        kernel = self._kernel()
+        kernel.seed_query_start_loc(torch.tensor([0, 100], dtype=torch.int64), [100])
+        self.assertEqual(len(kernel._cu_contents_memo), 1)
+        self.assertEqual(kernel._plan_module._PLAN_CACHE, {})
+
+    @unittest.skipUnless(torch.cuda.is_available(), "pinned host memory needs CUDA")
+    def test_switched_on_seeds_the_plan(self):
+        from sglang.srt.layers.attention.linear.kernels import kda_flashinfer_prefill
+
+        kda_flashinfer_prefill.set_plan_seed(True)
+        kernel = self._kernel()
+        loc = torch.tensor([0, 100], dtype=torch.int64, device="cuda")
+        kernel.seed_query_start_loc(loc, [100])
+        plan = kernel._plan_module._PLAN_CACHE[((0, 100), str(loc.device))]
+        torch.cuda.synchronize()
+        self.assertEqual(plan["cu_chunks"].tolist(), [0, 7])
+
+
 if __name__ == "__main__":
     unittest.main()
