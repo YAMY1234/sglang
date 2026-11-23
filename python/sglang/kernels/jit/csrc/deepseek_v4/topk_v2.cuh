@@ -616,25 +616,19 @@ candidates_sampled_one_block(const TopKCandidatesParams& params, const uint32_t 
 /// Every DSA layer's candidates top-k of the step reads it.
 __global__ __launch_bounds__(kBlockSize, 1) void lpt_row_map_kernel(
     const int32_t* __restrict__ seq_lens, int32_t* __restrict__ row_map, const uint32_t rows) {
-  __shared__ alignas(16) uint32_t len[kBlockSize];
+  __shared__ uint32_t len[kBlockSize];
   const auto tx = threadIdx.x;
   const auto mine = tx < rows ? static_cast<uint32_t>(seq_lens[tx]) : 0u;
-  len[tx] = mine;  // every entry is written: past the rows a 0 never ranks before a row (j >= rows > tx)
+  len[tx] = mine;
   __syncthreads();
   if (tx < rows) {
-    // 4 lengths per 16-byte broadcast read, 4 independent counts: the rank of row tx among all rows
-    const auto* q = reinterpret_cast<const uint4*>(len);
-    const auto above = [mine, tx](const uint32_t l, const uint32_t j) { return (l > mine || (l == mine && j < tx)) ? 1u : 0u; };
-    uint32_t r0 = 0, r1 = 0, r2 = 0, r3 = 0;
+    uint32_t rank = 0;
 #pragma unroll 4
-    for (uint32_t i = 0; i < (rows + 3) / 4; ++i) {
-      const auto v = q[i];
-      r0 += above(v.x, 4 * i);
-      r1 += above(v.y, 4 * i + 1);
-      r2 += above(v.z, 4 * i + 2);
-      r3 += above(v.w, 4 * i + 3);
+    for (uint32_t j = 0; j < rows; ++j) {  // every lane reads the same len[j]: a broadcast
+      const auto l = len[j];
+      rank += (l > mine || (l == mine && j < tx)) ? 1u : 0u;
     }
-    row_map[1 + r0 + r1 + r2 + r3] = static_cast<int32_t>(tx);
+    row_map[1 + rank] = static_cast<int32_t>(tx);
   }
   if (tx == 0) row_map[0] = static_cast<int32_t>(rows);
 }
