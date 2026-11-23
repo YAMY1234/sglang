@@ -522,6 +522,39 @@ def _owner_merge(warps: int, sampled: bool = False, lpt: bool = False, owner: bo
     return _VARIANT_MERGES[key]
 
 
+def _merge_same_push(merge: DcpTopKMerge, case: "_Case", rank: int, span: int) -> list:
+    """One multicast push of the case's local top-k, then the multicast merge and the owner merge over it
+    (row counters stepped back in between): both merges read identical candidates."""
+    from sglang.kernels.ops.attention.dsa.dcp_topk_merge import dcp_topk_merge_pushed, dcp_topk_merge_row_slot
+    from sglang.kernels.ops.attention.dsv4.topk import topk_transform_candidates_dcp_push
+
+    rows = case.rows
+    merge.prepare_step(case.local_lens, 0)
+    topk_transform_candidates_dcp_push(
+        case.logits.clone(), case.local_lens, push_mc=merge.multicast_ptr, counters=merge.counters,
+        world=merge.world, rank=rank, cand_k=TOPK, slot=dcp_topk_merge_row_slot(merge.world, TOPK, TOPK, push=True),
+        sampled=merge.sampled, sampled_min_len=merge.sampled_min_len, fallback_rows=merge.sampled_fallbacks,
+        lpt_row_map=merge.lpt_map_for(case.local_lens),
+    )
+    outs = []
+    for owner_mc in (None, merge.multicast_ptr):
+        out, local = torch.empty_like(case.out), torch.empty_like(case.out)
+        lengths = torch.empty(rows, dtype=torch.int32, device=out.device)
+        dcp_topk_merge_pushed(
+            case.logits.clone(), case.local_lens, case.global_lens, case.page_table,
+            buffer=merge.buffer, peer_ptrs=merge.peer_ptrs, counters=merge.counters,
+            out_slots=out, out_local=local, out_lengths=lengths,
+            out_fallback=torch.empty(rows, dtype=torch.int32, device=out.device),
+            rank=rank, span=span, cand_k=TOPK, warps_per_rank=merge.merge_warps, owner_mc=owner_mc,
+        )
+        torch.cuda.synchronize()
+        outs.append((out, local, lengths))
+        if owner_mc is None:
+            dist.barrier()
+            merge.counters[:rows] -= 1
+    return outs
+
+
 @pytest.mark.parametrize("variant", ["exact", "sampled", "sampled_lpt"])
 @pytest.mark.parametrize(
     "kind", ["random", "dense_top", "ties", "periodic", "skew", "skew2", "short", "long"]
@@ -531,7 +564,8 @@ def test_dcp4_topk_merge_pushed_owner(kind: str, variant: str) -> None:
     """SGLANG_DCP4_PUSH_OWNER_MERGE: each row's candidates go only to its owner (row % 4), which
     sends t* to the others. Every rank's slots, localized rows and lengths equal the multicast
     merge's on the same inputs, as sets per row (the local top-k's slot order varies from run to
-    run, and the merge keeps it), and are exact. Then three
+    run, and the merge keeps it), and are exact; over identical candidates (one push) the two merges
+    agree element for element. Then three
     inputs, one CUDA graph each, replayed in turn for 300 calls per row slot (past the 255 tags):
     a non-owner reading a stale t* would write another input's keys."""
     _init_once()
@@ -559,6 +593,9 @@ def test_dcp4_topk_merge_pushed_owner(kind: str, variant: str) -> None:
             for i in range(case.rows)
         )
         assert _all_ranks_ok(not bad and same), bad or ("outputs differ from the multicast merge" if not same else "failed on another rank")
+        mc, own = _merge_same_push(owner, case, rank, span)
+        same = all(torch.equal(x, y) for x, y in zip(mc, own))
+        assert _all_ranks_ok(same), "on identical candidates, the owner merge differs from the multicast merge" if not same else "failed on another rank"
 
     graphs = []
     for case in cases:
