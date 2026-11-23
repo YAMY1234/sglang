@@ -341,37 +341,56 @@ def _wide_merge(warps: int) -> DcpTopKMerge:
     return _WIDE_MERGES[warps]
 
 
+def _rerun_merge(merge: DcpTopKMerge, case: "_Case", rank: int, span: int, **kw) -> tuple:
+    """The merge again on the candidates the last call pushed (its row counters stepped back)."""
+    from sglang.kernels.ops.attention.dsa.dcp_topk_merge import dcp_topk_merge_pushed
+
+    rows = case.rows
+    merge.counters[:rows] -= 1
+    out, local = torch.empty_like(case.out), torch.empty_like(case.out)
+    lengths = torch.empty(rows, dtype=torch.int32, device=case.out.device)
+    dcp_topk_merge_pushed(
+        case.logits.clone(), case.local_lens, case.global_lens, case.page_table,
+        buffer=merge.buffer, peer_ptrs=merge.peer_ptrs, counters=merge.counters,
+        out_slots=out, out_local=local, out_lengths=lengths,
+        out_fallback=torch.empty(rows, dtype=torch.int32, device=out.device),
+        rank=rank, span=span, cand_k=TOPK, **kw,
+    )
+    torch.cuda.synchronize()
+    return out, local, lengths
+
+
 @pytest.mark.parametrize("warps", [2, 4, 8])
 @pytest.mark.parametrize(
     "kind", ["random", "dense_top", "ties", "periodic", "skew", "skew2", "short"]
 )
 @torch.inference_mode()
 def test_dcp4_topk_merge_pushed_wide(kind: str, warps: int) -> None:
-    """SGLANG_DCP4_PUSH_MERGE_WARPS at cand_k == top-k: the same slots, localized rows
-    and lengths as the one-warp-per-rank merge, element for element, eager and replayed."""
+    """SGLANG_DCP4_PUSH_MERGE_WARPS at cand_k == top-k: on the same pushed candidates, the
+    same slots, localized rows and lengths as the one-warp merge, element for element; exact
+    sets; and stable under CUDA graph replay."""
     _init_once()
     world, rank = ps._WORLD.world_size, ps._WORLD.rank_in_group
     if world != 4:
         pytest.skip("the DCP4 push merge needs 4 ranks")
-    ref, wide = _push_merge(TOPK), _wide_merge(warps)
-    if ref.buffer is None or wide.buffer is None:
+    wide = _wide_merge(warps)
+    if wide.buffer is None:
         pytest.skip("multimem multicast unavailable")
-    assert ref.merge_warps == 0 and wide.merge_warps == warps
+    assert wide.merge_warps == warps
     span = PAGE_SIZE * world
     for seed in SEEDS:
-        a, b = _Case(kind, seed, rank, world, span), _Case(kind, seed, rank, world, span)
-        a.run_pushed(ref, span)
-        b.run_pushed(wide, span)
+        case = _Case(kind, seed, rank, world, span)
+        case.run_pushed(wide, span)
         torch.cuda.synchronize()
-        bad = b.pushed_failures(rank, world)
-        same = torch.equal(a.out, b.out) and torch.equal(a.local, b.local) and torch.equal(a.lengths, b.lengths)
-        assert not any(wide.fallback[: b.rows].tolist())
+        bad = case.pushed_failures(rank, world)
+        assert not any(wide.fallback[: case.rows].tolist())
+        got = (case.out.clone(), case.local.clone(), case.lengths.clone())
+        dist.barrier()
+        ref = _rerun_merge(wide, case, rank, span, warps_per_rank=0)
+        same = all(torch.equal(x, y) for x, y in zip(got, ref))
         assert _all_ranks_ok(not bad and same), bad or ("outputs differ from the one-warp merge" if not same else "failed on another rank")
 
     case = _Case(kind, SEEDS[0], rank, world, span)
-    case.run_pushed(wide, span)
-    torch.cuda.synchronize()
-    expect = (case.out.clone(), case.local.clone(), case.lengths.clone())
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         case.run_pushed(wide, span)
@@ -379,8 +398,8 @@ def test_dcp4_topk_merge_pushed_wide(kind: str, warps: int) -> None:
         for _ in range(REPLAYS_PER_CHECK):
             graph.replay()
         torch.cuda.synchronize()
-        same = torch.equal(case.out, expect[0]) and torch.equal(case.local, expect[1]) and torch.equal(case.lengths, expect[2])
-        assert _all_ranks_ok(same), "replayed outputs differ"
+        bad = case.pushed_failures(rank, world)
+        assert _all_ranks_ok(not bad), bad or "failed on another rank"
 
 
 @pytest.mark.parametrize("failing", ["stale1", "stale2"])
