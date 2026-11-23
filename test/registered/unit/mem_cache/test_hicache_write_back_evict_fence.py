@@ -143,6 +143,72 @@ class TestEvictionCallSites(CustomTestCase):
         cache._wb_evict_overlap_stream.assert_not_called()
         cache._flush_queued_writes_fenced.assert_not_called()
 
+    def test_state_only_backup_lands_before_it_returns(self):
+        # A node whose Full KV is on host writes no KV tokens, only its Mamba
+        # state; that copy must be drained before the caller frees the source.
+        cache = _cache()
+        cache.writing_check = MagicMock()
+
+        def commit(action, write_back):
+            cache.ongoing_write_through[action.node_ids[0]] = object()
+            return 0
+
+        cache._execute_and_commit_kv_backup = MagicMock(side_effect=commit)
+        self.assertTrue(cache.backup_node_for_write_back(7))
+        cache.writing_check.assert_called_once_with(write_back=True)
+        # Nothing issued (host allocation failed): no commit to wait for.
+        cache.ongoing_write_through.clear()
+        cache.writing_check.reset_mock()
+        cache._execute_and_commit_kv_backup = MagicMock(return_value=0)
+        self.assertFalse(cache.backup_node_for_write_back(7))
+        cache.writing_check.assert_not_called()
+
+    def _demote_walk(self, *, backup, backed=True, mamba=True):
+        """Evict one leaf under the Mamba demote watch; returns the counts and
+        the order of the backup and leaf-eviction calls."""
+        cache = _cache()
+        cache.tree_components = (ComponentType.FULL,)
+        cache.tree_core.full_evictable_size.return_value = 0
+        cache.tree_core.is_backuped.return_value = backed
+        cache.tree_core.build_backup_spec.return_value = (
+            None,
+            {ComponentType.MAMBA: ["state"]} if mamba else {},
+        )
+        cache.host_pool_group = SimpleNamespace(
+            get_pool=lambda name: SimpleNamespace(available_size=lambda: 1)
+        )
+        cache._mamba_demote_watch = True
+        cache._mamba_backup_before_demote = backup
+        cache.mamba_retention_counts = {
+            "demote_state_drops": 0,
+            "demote_state_copies": 0,
+        }
+        order = MagicMock()
+        order.backup.return_value = True
+        order.evict_leaf.return_value = None  # a backed leaf demotes in the tree core
+        cache.backup_node_for_write_back = order.backup
+        cache._evict_device_leaf = order.evict_leaf
+        cache._evict_device_next_node = MagicMock(
+            side_effect=[(5, True), (None, False)]
+        )
+        cache._evict_components({ComponentType.FULL: 1}, {ComponentType.FULL: 0})
+        return cache.mamba_retention_counts, [name for name, _, _ in order.mock_calls]
+
+    def test_backed_leaf_state_is_copied_before_the_demote(self):
+        counts, calls = self._demote_walk(backup=True)
+        self.assertEqual(calls, ["backup", "evict_leaf"])
+        self.assertEqual(counts, {"demote_state_drops": 0, "demote_state_copies": 1})
+
+    def test_watch_only_counts_the_dropped_state(self):
+        counts, calls = self._demote_walk(backup=False)
+        self.assertEqual(calls, ["evict_leaf"])
+        self.assertEqual(counts, {"demote_state_drops": 1, "demote_state_copies": 0})
+        # an unbacked leaf's backup carries its state; a stateless one has none
+        for kwargs in (dict(backed=False), dict(mamba=False)):
+            counts, calls = self._demote_walk(backup=True, **kwargs)
+            self.assertEqual(calls, ["evict_leaf"])
+            self.assertEqual(set(counts.values()), {0})
+
     def test_full_leaf_victim_opts_in(self):
         cache = _cache()
         cache.tree_components = (ComponentType.FULL,)

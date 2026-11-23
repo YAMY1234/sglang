@@ -223,6 +223,10 @@ class UnifiedRadixCache(BasePrefixCache):
     _wb_evict_batch = False
     # SGLANG_MAMBA_PATH_CAP_COUNTS_HOST, set by _init_mamba_path_cap_counts_host.
     _mamba_path_cap_counts_host = False
+    # SGLANG_HICACHE_MAMBA_BACKUP_BEFORE_DEMOTE / SGLANG_LOG_MAMBA_DEMOTE_DROPS,
+    # set by _init_mamba_demote_watch.
+    _mamba_demote_watch = False
+    _mamba_backup_before_demote = False
     mamba_retention_counts: Optional[dict[str, int]] = None
     # L2->L3 write-back (SGLANG_OPT_HICACHE_STORAGE_WRITE_BACK); set in init_hicache.
     _storage_write_back: Optional[StorageWriteBack] = None
@@ -881,6 +885,7 @@ class UnifiedRadixCache(BasePrefixCache):
                 envs.SGLANG_HICACHE_DEVICE_WRITE_AHEAD_MAX_TOKENS.get(),
             )
         self._init_mamba_path_cap_counts_host()
+        self._init_mamba_demote_watch()
         self._storage_write_back = StorageWriteBack.create(self)
         # Pre-seed the logical dropped-tokens series.
         if self.metrics_collector is not None and self.cache_controller is not None:
@@ -939,6 +944,51 @@ class UnifiedRadixCache(BasePrefixCache):
             cap,
             type(self.tree_core).__name__,
         )
+
+    def _init_mamba_demote_watch(self) -> None:
+        """A write_back demote of a leaf whose Full KV is already on host drops a
+        device-only Mamba state: count those (SGLANG_LOG_MAMBA_DEMOTE_DROPS), or
+        copy the state to host first (SGLANG_HICACHE_MAMBA_BACKUP_BEFORE_DEMOTE)."""
+        backup = envs.SGLANG_HICACHE_MAMBA_BACKUP_BEFORE_DEMOTE.get()
+        if not (backup or envs.SGLANG_LOG_MAMBA_DEMOTE_DROPS.get()):
+            return
+        if (
+            not self.is_mamba_enabled
+            or self.cache_controller is None
+            or self.host_memory_mode == "buffer_only"
+            or not self.is_write_back
+        ):
+            logger.info(
+                "Mamba demote watch ignored: it needs a Mamba tree with a "
+                "write_back HiCache host tier in cache mode"
+            )
+            return
+        self._mamba_demote_watch = True
+        self._mamba_backup_before_demote = backup
+        self.mamba_retention_counts = {
+            **(self.mamba_retention_counts or {}),
+            "demote_state_drops": 0,
+            "demote_state_copies": 0,
+        }
+        logger.info("Mamba demote watch on, back up before demote %s", backup)
+
+    def _watch_backed_leaf_state(self, node_id: NodeId) -> None:
+        """Before a backed leaf's demote: copy its device-only Mamba state to host
+        and land the copy, or count the state the demote drops."""
+        if not self.tree_core.is_backuped(node_id):
+            return
+        _, comp_xfers = self.tree_core.build_backup_spec(node_id)
+        if ComponentType.MAMBA not in comp_xfers:
+            return
+        counts = self.mamba_retention_counts
+        if self._mamba_backup_before_demote:
+            mamba_host_pool = self.host_pool_group.get_pool(PoolName.MAMBA)
+            if mamba_host_pool is not None and mamba_host_pool.available_size() < 1:
+                self.evict_host(1, ComponentType.MAMBA)
+            if self.backup_node_for_write_back(node_id):
+                counts["demote_state_copies"] += 1
+                return
+        counts["demote_state_drops"] += 1
 
     def register_sidecar_pool(
         self, spec: SidecarPoolSpec, entry: Optional[PoolEntry] = None
@@ -1440,6 +1490,8 @@ class UnifiedRadixCache(BasePrefixCache):
                         if not made_progress:
                             break
                     else:
+                        if self._mamba_demote_watch:
+                            self._watch_backed_leaf_state(node_id)
                         backup_kv = self._evict_device_leaf(node_id, tracker)
                     if node_id is not None and backup_kv is not None:
                         # Deferred demote: run the D->H backup, demote only on success.
@@ -2376,7 +2428,9 @@ class UnifiedRadixCache(BasePrefixCache):
         written = self._execute_and_commit_kv_backup(
             BackupKV(node_ids=[node_id]), write_back=True
         )
-        if written == 0:
+        # A node whose Full KV is already on host copies component state only
+        # (written == 0); that copy must land before the device source is freed.
+        if written == 0 and node_id not in self.ongoing_write_through:
             return False
         self.writing_check(write_back=True)
         return True
