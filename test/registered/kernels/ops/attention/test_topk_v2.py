@@ -885,6 +885,147 @@ def test_topk_v2_candidates_cluster_matches_one_block(
                 assert torch.equal(got_pos, want_pos), msg
 
 
+# --- sampled-threshold DCP candidates (CUDA) ----------------------------------
+# (length, row_start): rows past 16384 + row_start % 4 take the sampled pass, the
+# rest the one-block paths of the same kernel.
+SAMPLED_ROWS = [
+    (200000, 0),
+    (131075, 1),
+    (65537, 2),
+    (16385, 3),
+    (16384, 0),
+    (16384, 2),
+    (9000, 5),
+    (2049, 6),
+    (2048, 7),
+    (100, 9),
+]
+SAMPLED_DISTRIBUTIONS = [
+    "randn",
+    "skewed",
+    "late_block",
+    "neg_inf_tail",
+    "ties",
+    "dense_top",
+    "neg_inf",
+    "planted",
+] + NARROW_DISTRIBUTIONS
+# every sampled row is redone: too few scores reach theta (planted), or the row has
+# one value (all_equal, or tiny: one fp32 slice), or theta is -inf (neg_inf)
+SAMPLED_ALL_REDONE = {"neg_inf", "planted", "tiny", "all_equal"}
+SAMPLED_NONE_REDONE = {"randn", "skewed", "late_block", "neg_inf_tail"}
+
+
+def _sampled_scores(dist, k, rows, width, g):
+    if dist in NARROW_DISTRIBUTIONS:
+        return _single_bin_scores(dist, len(rows), width, "cuda")
+    x = torch.randn(len(rows), width, generator=g, device="cuda")
+    if dist == "skewed":
+        return torch.exp(2 * x)
+    if dist == "ties":
+        return torch.randint(0, 200, x.shape, generator=g, device="cuda").float() / 8
+    if dist == "dense_top":
+        return 10 + 0.3 * x
+    for i, (n, start) in enumerate(rows):
+        window = x[i, start : start + n]
+        if dist == "late_block":  # the whole top-k in one contiguous block
+            window[-3000:] += 3
+        elif dist == "neg_inf_tail":
+            window[n // 2 :] = float("-inf")
+        elif dist == "neg_inf":  # fewer finite scores than k: the cut is among -inf
+            window[k // 2 :] = float("-inf")
+        elif dist == "planted":  # k // 4 top scores, all on the sampled vectors
+            pos = torch.arange(n, device="cuda")
+            on = pos[((pos + start % 4) // 4) % 16 < 2]
+            pick = on[torch.randperm(on.numel(), generator=g, device="cuda")[: k // 4]]
+            window[pick] = 100 + torch.rand(pick.numel(), generator=g, device="cuda")
+    return x
+
+
+def _dcp_candidates(scores, seq_lens, k, **kwargs):
+    cand = torch.full(
+        (scores.shape[0], k, 2), -7, dtype=torch.int32, device=scores.device
+    )
+    topk_transform_candidates_v2(
+        scores.clone(),
+        seq_lens,
+        out_candidates=cand,
+        world=4,
+        rank=1,
+        cluster_size=0,
+        **kwargs,
+    )
+    torch.cuda.synchronize()
+    return cand
+
+
+@pytest.mark.skipif(is_hip(), reason="CUDA sampled candidate top-k")
+@pytest.mark.parametrize("stable_ties", [True, False])
+@pytest.mark.parametrize("k", [768, 2048])
+@pytest.mark.parametrize("with_row_starts", [False, True])
+@pytest.mark.parametrize("dist", SAMPLED_DISTRIBUTIONS)
+@torch.inference_mode()
+def test_topk_v2_candidates_sampled(
+    dist: str, with_row_starts: bool, k: int, stable_ties: bool
+) -> None:
+    """The sampled single pass of the DCP candidates selects the exact top-k on every
+    row (with stable ties, the exact path's very set), and redoes on the exact path
+    exactly the rows whose sampled threshold misses: top scores planted on the
+    sampled vectors only, fewer finite scores than k, a row of one value."""
+    rows = [(n, s if with_row_starts else 0) for n, s in SAMPLED_ROWS]
+    width = (max(n + s for n, s in rows) + 3) // 4 * 4
+    seed = SAMPLED_DISTRIBUTIONS.index(dist) * 10007 + k
+    torch.manual_seed(seed)
+    scores = _sampled_scores(
+        dist, k, rows, width, torch.Generator(device="cuda").manual_seed(seed)
+    )
+    seq_lens = torch.tensor([n for n, _ in rows], dtype=torch.int32, device="cuda")
+    starts = (
+        torch.tensor([s for _, s in rows], dtype=torch.int32, device="cuda")
+        if with_row_starts
+        else None
+    )
+    redone = torch.zeros(1, dtype=torch.int32, device="cuda")
+    ref = _dcp_candidates(
+        scores, seq_lens, k, row_starts=starts, stable_ties=stable_ties
+    )
+    got = _dcp_candidates(
+        scores,
+        seq_lens,
+        k,
+        row_starts=starts,
+        stable_ties=stable_ties,
+        sampled=True,
+        overflow_rows=redone,
+    )
+
+    sampled_rows = sum(n > k and n + s % 4 > 16384 for n, s in rows)
+    if dist in SAMPLED_ALL_REDONE:
+        assert int(redone) == sampled_rows, (int(redone), sampled_rows)
+    elif dist in SAMPLED_NONE_REDONE:
+        assert int(redone) == 0, int(redone)
+    for row, (n, start) in enumerate(rows):
+        msg = (dist, k, row, n, start)
+        window = scores[row, start : start + n]
+        pos, order = got[row, :, 1].long().sort()
+        valid = pos >= 0
+        assert int(valid.sum()) == min(n, k), msg
+        local = (pos[valid] - 1) // 4
+        assert bool((local >= 0).all() and (local < n).all()), msg
+        assert local.unique().numel() == local.numel(), msg
+        assert torch.equal(
+            got[row, order[valid], 0], window[local].view(torch.int32)
+        ), msg
+        assert bool((got[row, order[~valid], 0] == 0).all()), msg
+        want = window.topk(min(n, k)).values
+        assert torch.equal(window[local].sort(descending=True).values, want), msg
+        # past the 2048-entry tie buffer, which equal scores the exact path keeps is not defined
+        if stable_ties and int((window == want[-1]).sum()) <= 2048:
+            stable = torch.sort(-window, stable=True).indices[: min(n, k)].sort().values
+            assert torch.equal(local, stable), msg
+            assert torch.equal(pos, ref[row, :, 1].long().sort().values), msg
+
+
 @pytest.mark.skipif(not is_hip(), reason="ROCm split path")
 @pytest.mark.parametrize("nvals", [64, 1024, 16384])
 @pytest.mark.parametrize("batch,seq", [(1, 131072), (8, 131072)])
