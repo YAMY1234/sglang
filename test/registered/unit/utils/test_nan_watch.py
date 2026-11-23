@@ -4,14 +4,17 @@ from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
+import os
 import re
+import tempfile
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
 
-from sglang.srt.debug_utils import nan_watch
+from sglang.srt.debug_utils import nan_capture, nan_watch
+from sglang.srt.environ import envs
 from sglang.srt.model_executor.forward_batch_info import ForwardMode, PPProxyTensors
 
 
@@ -150,6 +153,35 @@ class TestNanWatch(unittest.TestCase):
         got_in, got_out = got_in.split(", "), got_out.split(", ")
         self.assertEqual(got_in[0], got_out[0])
         self.assertNotEqual(got_in[1], got_out[1])
+
+    def test_capture_saves_the_first_layer_bundle_of_a_produced_row(self):
+        # Row 0 (prefix 4, tokens 0-1) turns non-finite in layer 39's attention output with a clean input and state.
+        attn = torch.zeros(5, 3)
+        attn[1, 0] = float("nan")
+        later = torch.full((5, 3), float("nan"))  # a later layer: not captured
+        with (
+            tempfile.TemporaryDirectory() as d,
+            envs.SGLANG_NAN_WATCH_CAPTURE_DIR.override(d),
+            patch.object(nan_capture, "_MIN_PREFIX", 1),
+            patch.object(nan_capture, "_dumps", [0]),
+        ):
+            self._run(
+                layer_outputs=[
+                    (39, 2, torch.zeros(5, 3)),
+                    (39, 0, attn),
+                    (40, 0, later),
+                ]
+            )
+            saved = os.listdir(d)
+            self.assertEqual(saved, ["pp3-a-p4-e2.pt"])
+            bundle = torch.load(os.path.join(d, saved[0]))
+        self.assertEqual(bundle["meta"]["capture_layer"], 39)
+        tensors = bundle["tensors"]
+        self.assertEqual(
+            sorted(tensors), ["attn", "conv", "in", "recv.hidden_states", "ssm"]
+        )
+        self.assertTrue(torch.isnan(tensors["attn"][1, 0]))
+        self.assertEqual(tuple(tensors["ssm"].shape), (1, 2, 2))
 
     def test_shared_slots_are_counted(self):
         # Both rows on Mamba slot 5, which is also free; new KV token 41 sits on free page 10.

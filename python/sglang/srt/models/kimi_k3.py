@@ -2851,6 +2851,7 @@ class KimiK3DeltaAttention(nn.Module):
             )
         nan_watch.check_point(self.layer_idx, 3, mixed_qkv)
         nan_watch.check_point(self.layer_idx, 4, forget_gate)
+        nan_watch.check_point(self.layer_idx, 7, beta)
 
         if not forward_batch.logical_forward_mode.is_decode():
             forget_gate = forget_gate.unflatten(-1, (-1, self.head_dim))

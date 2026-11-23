@@ -524,6 +524,8 @@ class Envs:
     # Per request, where a non-finite value first appears in an extend forward (incoming hidden, Mamba state slot,
     # outgoing hidden / logits), plus shared-slot checks; flags reach the host by async copy (debug_utils/nan_watch.py).
     SGLANG_ENABLE_NAN_WATCH = EnvBool(False)
+    # With the NaN watch on: a directory for replay bundles of rows a stage turned non-finite (debug_utils/nan_capture.py).
+    SGLANG_NAN_WATCH_CAPTURE_DIR = EnvStr("")
     SGLANG_TBO_DEBUG = EnvBool(False)
     # Timing probe: run the swap-in fully but skip the host->device KV bytes,
     # measuring the "IO is free" floor. GARBAGE OUTPUT -- benchmarking only.

@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
+from sglang.srt.debug_utils import nan_capture
 from sglang.srt.environ import envs
 
 if TYPE_CHECKING:
@@ -36,7 +37,16 @@ _NONE = torch.iinfo(torch.int64).max
 # Per watched point (see _POINT_NAMES; layer and point id): non-finite tokens, offset of the first one.
 _POINT_BASE, _MAX_POINTS = 12, 96
 _NUM_COLS = _POINT_BASE + 2 * _MAX_POINTS
-_POINT_NAMES = ("attn", "out", "in", "kda_qkv", "kda_gate", "kda_core", "kda_onorm")
+_POINT_NAMES = (
+    "attn",
+    "out",
+    "in",
+    "kda_qkv",
+    "kda_gate",
+    "kda_core",
+    "kda_onorm",
+    "kda_beta",
+)
 _COUNTERS = (
     "dup_mamba_slot",
     "mamba_slot_free",
@@ -58,6 +68,7 @@ class _Forward:
         self.token_row, self.token_offset = token_row, token_offset
         self.points = {}  # (layer, point) -> column, in first-seen order
         self.received = self.sent = False
+        self.capture: Optional[nan_capture.Capture] = None
         self.t = time.time()
 
 
@@ -224,6 +235,13 @@ def begin(
         token_offset=token_offset,
     )
     _active.received = received
+    if nan_capture.enabled():
+        _active.capture = nan_capture.select(prefix_lens, extend_lens)
+    if _active.capture is not None and pp_proxy_tensors is not None:
+        for key in _XFER_KEYS:
+            t = pp_proxy_tensors.tensors.get(key)
+            if t is not None and t.shape[0] >= num_tokens:
+                nan_capture.rows_of(_active.capture, f"recv.{key}", t)
 
 
 def check_state(
@@ -239,6 +257,8 @@ def check_state(
     bad = ~torch.isfinite(ssm[safe]).reshape(bs, -1).all(-1)
     bad |= ~torch.isfinite(conv[safe]).reshape(bs, -1).all(-1)
     dev[:bs, _STATE] += (bad & (idx >= 0)).long()
+    if _active.capture is not None:
+        nan_capture.state(_active.capture, cache_indices, ssm, conv)
 
 
 def check_point(layer_idx: int, point: int, hidden) -> None:
@@ -261,6 +281,10 @@ def check_point(layer_idx: int, point: int, hidden) -> None:
     dev[:bs, col].index_add_(0, watch.token_row, bad)
     first = torch.where(bad.bool(), watch.token_offset, _NONE)
     dev[:bs, col + 1].scatter_reduce_(0, watch.token_row, first, "amin")
+    if watch.capture is not None:
+        nan_capture.point(
+            watch.capture, layer_idx, _POINT_NAMES[point], hidden, num_tokens
+        )
 
 
 def end(
@@ -296,6 +320,8 @@ def end(
             num_tokens,
         )
         watch.sent = True
+    if watch.capture is not None:
+        nan_capture.finish(watch.capture)
     # Power-of-two pinned buffers, so the caching host allocator reuses blocks instead of a new cudaHostAlloc.
     rows = dev.shape[0]
     host = torch.empty(
@@ -398,6 +424,23 @@ def _report(watch: _Forward, rows) -> None:
             watch.t,
             points,
         )
+        if watch.capture is not None and not r[_IN] and not r[_STATE]:
+            meta = {
+                "stage": watch.stage,
+                "rid": batch[i][0] or "",
+                "prefix": watch.prefix_lens[i],
+                "extend": watch.extend_lens[i],
+                "mamba_slot": r[_SLOT],
+                "kv_slots": (r[_KV_MIN], r[_KV_MAX]),
+                "points": points,
+                "counters": counters,
+                "capture_layer": watch.capture.layer,
+                "batch": batch,
+                "t": watch.t,
+            }
+            path = nan_capture.dump(watch.capture, i, meta)
+            if path is not None:
+                logger.warning("NaN watch capture saved %s", path)
     if anomaly and not hits:
         logger.warning(
             "NaN watch slot anomaly PP%d counters=%s free_dup_vals=%s slots_on_free=%s batch=%s t=%.3f",
