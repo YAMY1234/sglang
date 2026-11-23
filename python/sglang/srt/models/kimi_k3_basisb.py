@@ -18,6 +18,8 @@ cast it to MXFP8 after loading, with ModelOpt MXFP8QTensor numerics, so the
 served weights equal the TRT-LLM mixed checkpoint byte for byte.
 """
 
+import logging
+from functools import lru_cache
 from typing import Optional
 
 import torch
@@ -28,7 +30,13 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizeMethodBase,
 )
 from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8LinearMethod
-from sglang.srt.layers.quantization.fp8_utils import mxfp8_quantize_modelopt
+from sglang.srt.layers.quantization.fp8_utils import (
+    mxfp8_quantize_modelopt,
+    resolve_mxfp8_dense_gemm_backend,
+)
+from sglang.srt.utils.common import log_info_on_rank0
+
+logger = logging.getLogger(__name__)
 
 
 class _BasisBMxfp8LinearMethod(Fp8LinearMethod):
@@ -61,7 +69,18 @@ def k31_basisb_linear_config(
     """The config for a linear in the basis-B set: online MXFP8 when the switch is on."""
     if not envs.SGLANG_K31_BASISB_MXFP8.get():
         return quant_config
+    _log_engaged()
     return _BasisBMxfp8Config()
+
+
+@lru_cache(maxsize=1)
+def _log_engaged() -> None:
+    log_info_on_rank0(
+        logger,
+        "K3.1 basis B ENGAGED: shared experts and KDA q/k/v/g/b/f_a/o load BF16 and "
+        "cast to MXFP8 (ModelOpt MXFP8QTensor numerics), dense backend "
+        f"{resolve_mxfp8_dense_gemm_backend().name}",
+    )
 
 
 def k31_basisb_enabled() -> bool:
