@@ -1008,6 +1008,10 @@ class Envs:
     # With the queue lock and device-loss re-query on: an enqueue-time load for a
     # request queued beyond that window starts when the window reaches it.
     SGLANG_EXTERNAL_LINKER_QUEUE_LOCK_DEFER_FAR_LOADS = EnvBool(False)
+    # A chunked prefill keeps the KV its unfinished rest needs: the prefill budget
+    # holds the rest, the external linker's loads and locks leave it free, and a
+    # continuing chunk waits instead of raising when the pool holds no free page.
+    SGLANG_CHUNKED_PREFILL_BACKPRESSURE = EnvBool(False)
     # External linker prefetch mode: log lookup counters (issued, skipped for a
     # device anchor with no storage hash, zero restorable, re-queried) every 60 s.
     SGLANG_EXTERNAL_LINKER_LOOKUP_STATS = EnvBool(False)

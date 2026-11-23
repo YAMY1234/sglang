@@ -2497,5 +2497,95 @@ class TestTransferReadyEvents(CustomTestCase):
         self.assertEqual(linker.broadcast_loads, {})
 
 
+class TestPrefetchReserveBackpressure(CustomTestCase):
+    """Prefetch loads, holds and queue locks leave an admitted chunked prefill's
+    unfinished rest free, so its next chunk is not starved into an OOM."""
+
+    def _wrapper(self, *, available, evictable, reserve):
+        pool = {"available": available, "evictable": evictable}
+        node_tokens = {}
+
+        def dec_lock_ref(node, lock):
+            pool["evictable"] += node_tokens.pop(node)
+
+        def inc_lock_ref(node):
+            pool["evictable"] -= node_tokens[node]
+            return SimpleNamespace(to_dec_params=lambda: None)
+
+        w = object.__new__(UnifiedCacheLinkerWrapper)
+        w.cache = SimpleNamespace(
+            token_to_kv_pool_allocator=SimpleNamespace(
+                available_size=lambda: pool["available"]
+            ),
+            evictable_size=lambda: pool["evictable"],
+            dec_lock_ref=dec_lock_ref,
+            inc_lock_ref=inc_lock_ref,
+            page_size=4,
+        )
+        w.reserve_backpressure = True
+        w.set_admission_reserve(reserve)
+        w.qlocks, w.holds, w.prefetches, w.match_targets, w.unheld = {}, {}, {}, {}, {}
+        w.qlocked_tokens = w.held_tokens = 0
+        w._qlock_stats = defaultdict(int)
+        w._hold_stats = defaultdict(int)
+        w._lookup_stats = defaultdict(int)
+        w._hold_next_log = float("inf")
+        w.hold_cap_tokens = 10**9
+        w.load_cap_tokens = 0
+        w.qlock_defer_far = False
+        w._occupied_peak = 0
+        return w, pool, node_tokens
+
+    def _lock(self, w, node_tokens, table, name, tokens):
+        node_tokens[name] = tokens
+        table[name] = SimpleNamespace(node_id=name, lock=None, tokens=tokens)
+
+    def test_relief_unlocks_queue_locks_then_holds_newest_first(self):
+        w, pool, node_tokens = self._wrapper(available=0, evictable=0, reserve=40)
+        self._lock(w, node_tokens, w.qlocks, "a", 30)
+        self._lock(w, node_tokens, w.qlocks, "b", 20)
+        self._lock(w, node_tokens, w.holds, "c", 50)
+        w.qlocked_tokens, w.held_tokens = 50, 50
+        w._relieve_for_reserve()
+        self.assertEqual(list(w.qlocks), [])
+        self.assertEqual(list(w.holds), ["c"])
+        w.set_admission_reserve(90)
+        w._relieve_for_reserve()
+        self.assertEqual(list(w.holds), [])
+        self.assertEqual(w._free_beyond_reserve(), 10)
+
+    def test_load_and_hold_leave_the_reserve_free(self):
+        w, pool, node_tokens = self._wrapper(available=16, evictable=0, reserve=8)
+        node_tokens["anchor"] = 0
+        w._sync_restorable_prefix = lambda restorable, **_: 4  # 16 tokens
+        w._start_prefetch_load(
+            "r",
+            list(range(16)),
+            ["h"] * 4,
+            0,
+            "anchor",
+            None,
+            [1] * 4,
+            1.0,
+            kind="rq",
+        )
+        self.assertEqual(w._lookup_stats["reserve_deferred"], 1)
+        self.assertEqual(w.prefetches, {})
+        # Holding a just-published, evictable 16-token prefix would leave 0 < 8 free.
+        pool["available"], pool["evictable"] = 0, 16
+        w.cache.match_prefix = lambda params: SimpleNamespace(
+            device_prefix_len=16, last_device_node="p"
+        )
+        w._hold("r", None, 16, 16)
+        self.assertEqual(w.holds, {})
+        self.assertEqual(w.unheld, {"r": 16})
+
+    def test_no_reserve_without_backpressure(self):
+        w, _, _ = self._wrapper(available=0, evictable=0, reserve=0)
+        w.reserve_backpressure = False
+        w.set_admission_reserve(100)
+        self.assertEqual(w.admission_reserve, 0)
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))
