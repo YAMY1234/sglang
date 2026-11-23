@@ -879,16 +879,32 @@ class MambaComponent(TreeComponent):
     def finalize_load_back(
         self, req: Optional[Req], prep: PrepareLoadBackResult, success: bool
     ) -> None:
-        if not success and req is not None and req.mamba_host_hit_length > 0:
-            anchor_state = self.tree_core.get_component_device_value(
+        if success or req is None:
+            return
+        # A refused load-back leaves req at its device anchor (req.last_node), which
+        # holds a device state unless it is the root: extend from that state.
+        anchor_state = (
+            None
+            if req.last_node is None
+            else self.tree_core.get_component_device_value(
                 req.last_node, self.component_type
             )
-            if self.cache._mamba_demote_watch and anchor_state is not None:
+        )
+        if anchor_state is not None:
+            if self.cache._mamba_demote_watch and req.mamba_host_hit_length > 0:
                 self.cache.mamba_retention_counts["lb_refused_nonzero_prefix"] += 1
-        # A called-off load-back returns the slot prepare allocated and clears req (the H->D copy never ran).
-        if not success and prep.allocated_mamba_slot is not None:
+            # The deferred CoW fills prepare's slot, or the one allocated at admission.
+            req.kv.mamba_cow_src_index = anchor_state
+            req.kv.mamba_needs_clear = False
+            return
+        req.kv.mamba_cow_src_index = None
+        # The H->D copy never ran: return the slot prepare allocated; a slot the
+        # request already held starts cleared, as a prefix at the root does.
+        if prep.allocated_mamba_slot is not None:
             self.cache.req_to_token_pool.mamba_allocator.free(prep.allocated_mamba_slot)
             req.kv.mamba_pool_idx = None
+        elif req.kv.holds_mamba:
+            req.kv.mamba_needs_clear = True
 
     def prepare_buffer_load_back(
         self, req: Req, staged: list[PoolTransfer]
