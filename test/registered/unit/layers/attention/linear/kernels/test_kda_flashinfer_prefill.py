@@ -171,5 +171,51 @@ class TestFlashInferKDAPrefillDispatch(CustomTestCase):
         self.assertEqual(triton_kernel.calls, 0)
 
 
+class _PlanModule:
+    """The vendored kernel module's planning surface: BT, the route rule and the plan cache."""
+
+    BT = 16
+
+    def __init__(self, decomp_max_seqs):
+        self._PLAN_CACHE = {}
+        self._decomp_max_seqs = decomp_max_seqs
+
+    def _route_for_workspace(self, num_sequences, heads, device, mode):
+        return "decomp" if num_sequences <= self._decomp_max_seqs else "engine"
+
+
+class TestFlashInferKDADecompPlanSeed(CustomTestCase):
+    """A decomposed-route plan seeded from host lengths must equal the vendored `_plan` (cu_chunks in BT
+    chunks, total) under its contents key, and engine-route or already-planned batches stay untouched."""
+
+    def test_engine_route_and_cached_plans_are_left_alone(self):
+        from sglang.srt.layers.attention.linear.kernels.kda_flashinfer_prefill import (
+            seed_decomp_plan,
+        )
+
+        module = _PlanModule(decomp_max_seqs=1)
+        seed_decomp_plan(module, (0, 100, 300), 96, torch.device("cpu"))
+        self.assertEqual(module._PLAN_CACHE, {})
+        cached = object()
+        module._PLAN_CACHE[((0, 100), "cpu")] = cached
+        seed_decomp_plan(module, (0, 100), 96, torch.device("cpu"))
+        self.assertIs(module._PLAN_CACHE[((0, 100), "cpu")], cached)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "pinned host memory needs CUDA")
+    def test_seeded_plan_matches_the_kernel_plan(self):
+        from sglang.srt.layers.attention.linear.kernels.kda_flashinfer_prefill import (
+            seed_decomp_plan,
+        )
+
+        module = _PlanModule(decomp_max_seqs=2)
+        device = torch.device("cuda")
+        seed_decomp_plan(module, (0, 6001, 6033), 96, device)
+        plan = module._PLAN_CACHE[((0, 6001, 6033), str(device))]
+        torch.cuda.synchronize()
+        self.assertEqual(plan["cu_chunks"].tolist(), [0, 376, 378])
+        self.assertEqual(plan["cu_chunks"].dtype, torch.int32)
+        self.assertEqual((plan["total_chunks"], plan["cu_list"]), (378, [0, 6001, 6033]))
+
+
 if __name__ == "__main__":
     unittest.main()
