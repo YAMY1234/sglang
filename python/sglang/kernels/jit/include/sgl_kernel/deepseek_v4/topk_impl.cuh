@@ -880,6 +880,323 @@ struct TopKStreaming : TopKRadixBase<12> {
   }
 };
 
+#if !defined(USE_ROCM)
+
+// ---------------------------------------------------------------------------
+// Sampled-threshold path (CUDA only): a 1/8 sample of the row picks a threshold
+// theta, one pass collects every score >= theta into shared memory, and an exact
+// radix select over that buffer keeps the top-k. Exact whenever
+// topk <= #{score >= theta} <= kCapacity: the k-th largest score is then >= theta.
+// ---------------------------------------------------------------------------
+
+struct TopKSampled : TopKRadixBase<12> {
+  // A 1/8 sample: 2 adjacent vectors (one 32-byte sector) of every 16.
+  static constexpr uint32_t kSampleShift = 3;
+  static constexpr uint32_t kSampleGroup = 2u << kSampleShift;
+  static constexpr uint32_t kUnroll = 4;  // vectors in flight per thread
+  // Sampled scores >= theta: topk * 9/64 + kSlack, >= 4.8 sigma over topk / 8 for topk <= 2048.
+  static constexpr uint32_t kSlack = 40;
+  // Fits the 48 KiB static shared memory next to the fallback path's; see SampledCandidatesSmem.
+  static constexpr uint32_t kCapacity = 5120;
+  // Estimated scores >= the threshold bin's lower edge past which the bin is cut finer.
+  static constexpr uint32_t kRefineFrom = kCapacity * 3 / 4;
+  static constexpr uint32_t kDigitBits = 8;
+  static constexpr uint32_t kDigits = 1u << kDigitBits;
+  static_assert(kDigits <= kBlockSize && kDigits % kWarpSize == 0);
+
+  struct Match {
+    uint32_t digit;
+    uint32_t above;
+    uint32_t equal;
+  };
+
+  struct Smem {
+    uint32_t n_ge;      // scores >= theta, also past kCapacity
+    uint32_t n_gt_out;  // output slots taken above the threshold group
+    uint32_t n_eq_out;  // output slots taken inside it
+    uint32_t bin;       // coarse bin of the sample's target-th largest score
+    uint32_t s_above;   // sampled scores in coarser bins above it
+    float theta;
+    Match match;
+    uint32_t warp_sum[kNumWarps];
+    uint32_t select_hist[2][kDigits];
+    // The sample histogram is dead once theta is published.
+    union {
+      alignas(16) uint32_t histogram[kHistSize];
+      TieValue cand[kCapacity];
+    };
+  };
+
+  /// Takes each of the top-k as `emit(slot, score, index)`, slots in [0, topk), and
+  /// returns true; returns false having emitted nothing when theta missed.
+  template <bool kUsePDL, typename Emit>
+  SGL_DEVICE static bool forward(const TopKProblem& problem, Smem* smem, const Emit& emit) {
+    const auto tx = threadIdx.x;
+    init_histogram(smem->histogram, tx);
+    if (tx == 0) {
+      smem->n_ge = 0;
+      smem->n_gt_out = 0;
+      smem->n_eq_out = 0;
+      smem->bin = 0;  // kept when the sample is too small: theta -inf, every score qualifies
+      smem->s_above = 0;
+    }
+    __syncthreads();
+    PDLWaitPrimary<kUsePDL>();
+
+    collect(problem, sample_threshold(problem, smem), smem);
+    __syncthreads();
+    const auto n = smem->n_ge;
+    if (n < problem.topk || n > kCapacity) return false;
+    select_candidates<kUsePDL>(problem.topk, n, smem, emit);
+    return true;
+  }
+
+ private:
+  /// Full vectors sampled, and the vector of sample m.
+  SGL_DEVICE static uint32_t num_sampled_vectors(const uint32_t seq_len) {
+    const auto num_full = seq_len / kVecSize;
+    return num_full / kSampleGroup * 2 + min(num_full % kSampleGroup, 2u);
+  }
+  SGL_DEVICE static uint32_t sampled_vector(const uint32_t m) {
+    return m / 2 * kSampleGroup + m % 2;
+  }
+
+  /// `fn(score)` on the sampled vectors, without the input_start head.
+  template <typename F>
+  SGL_DEVICE static void for_each_sample(const TopKProblem& problem, const uint32_t num_sampled, F&& fn) {
+#pragma unroll 1
+    for (uint32_t m0 = threadIdx.x; m0 < num_sampled; m0 += kUnroll * kBlockSize) {
+      vec_t v[kUnroll];
+#pragma unroll
+      for (uint32_t u = 0; u < kUnroll; ++u) {
+        if (const auto m = m0 + u * kBlockSize; m < num_sampled) v[u].load(problem.in, sampled_vector(m));
+      }
+#pragma unroll
+      for (uint32_t u = 0; u < kUnroll; ++u) {
+        const auto m = m0 + u * kBlockSize;
+        if (m >= num_sampled) break;
+#pragma unroll
+        for (uint32_t j = 0; j < kVecSize; ++j) {
+          if (sampled_vector(m) * kVecSize + j >= problem.input_start) fn(v[u][j]);
+        }
+      }
+    }
+  }
+
+  /// The lower edge of the coarse bin holding the sample's target-th largest score; when
+  /// that bin would overfill the buffer, a second look at the sample cuts it into
+  /// kHistSize equal slices and theta is the edge of the slice holding that score.
+  SGL_DEVICE static float sample_threshold(const TopKProblem& problem, Smem* smem) {
+    constexpr uint32_t kHistItems = kHistSize / kBlockSize;
+    const auto tx = threadIdx.x;
+    const auto num_sampled = num_sampled_vectors(problem.seq_len);
+    const auto num_samples = num_sampled * kVecSize - problem.input_start;  // vector 0 holds the head
+    const uint32_t target = ((problem.topk + (problem.topk >> 3)) >> kSampleShift) + kSlack;
+    for_each_sample(
+        problem, num_sampled, [&](float val) { atomicAdd(&smem->histogram[extract_coarse_bin<kHistBits>(val)], 1); });
+    __syncthreads();
+    find_threshold(target, num_samples, smem, [&](uint32_t bin) { smem->bin = bin; });
+
+    const auto bin = smem->bin;
+    const auto s_bin = smem->histogram[bin];
+    const float2 bounds = coarse_bin_bounds<kHistBits>(bin);
+    const float lo = bounds.x;
+    const float hi = bounds.y;
+    uint32_t above = 0;
+#pragma unroll
+    for (uint32_t i = 0; i < kHistItems; ++i) {
+      if (const auto b = tx * kHistItems + i; b > bin) above += smem->histogram[b];
+    }
+    above = warp::reduce_sum(above);
+    if (tx % kWarpSize == 0 && above != 0) atomicAdd(&smem->s_above, above);
+    __syncthreads();  // also ends the histogram reads: the buffer overwrites it next
+    const auto s_above = smem->s_above;
+    const bool unbounded = lo == -infinity_value() || hi == infinity_value();
+    if (((s_above + s_bin) << kSampleShift) <= kRefineFrom || unbounded) return lo;
+
+    init_histogram(smem->histogram, tx);
+    if (tx == 0) smem->theta = lo;
+    __syncthreads();
+    const float scale = kHistSize / (hi - lo);
+    for_each_sample(problem, num_sampled, [&](float val) {
+      if (val >= lo && val < hi) {
+        atomicAdd(&smem->histogram[min(static_cast<uint32_t>((val - lo) * scale), kHistSize - 1)], 1);
+      }
+    });
+    __syncthreads();
+    // s_above < target <= s_above + s_bin, so the slice exists
+    find_threshold(
+        target - s_above, s_bin, smem, [&](uint32_t slice) { smem->theta = lo + static_cast<float>(slice) / scale; });
+    return smem->theta;
+  }
+
+  /// Appends every score >= theta to smem->cand (warp-aggregated), counting all of them in n_ge.
+  SGL_DEVICE static void collect(const TopKProblem& problem, const float theta, Smem* smem) {
+    constexpr uint32_t kStride = kUnroll * kBlockSize;
+    const auto tx = threadIdx.x;
+    const auto lane_id = tx % kWarpSize;
+    const auto num_full = problem.seq_len / kVecSize;
+    // warp-uniform trip count: the warp scan below needs every lane
+#pragma unroll 1
+    for (uint32_t base = 0; base < num_full; base += kStride) {
+      vec_t v[kUnroll];
+#pragma unroll
+      for (uint32_t u = 0; u < kUnroll; ++u) {
+        if (const auto vi = base + u * kBlockSize + tx; vi < num_full) {
+          v[u].load(problem.in, vi);
+        } else {
+          v[u].fill(padding_value());  // NaN is never >= theta
+        }
+      }
+      uint32_t count = 0;
+#pragma unroll
+      for (uint32_t u = 0; u < kUnroll; ++u) {
+#pragma unroll
+        for (uint32_t j = 0; j < kVecSize; ++j) {
+          count += v[u][j] >= theta ? 1u : 0u;
+        }
+      }
+      const auto inc = warp::inclusive_sum(count, lane_id);
+      uint32_t pos = 0;
+      if (lane_id == kWarpSize - 1 && inc != 0) pos = atomicAdd(&smem->n_ge, inc);
+      pos = __shfl_sync(0xFFFFFFFFu, pos, kWarpSize - 1) + inc - count;
+      if (count != 0) {
+#pragma unroll
+        for (uint32_t u = 0; u < kUnroll; ++u) {
+#pragma unroll
+          for (uint32_t j = 0; j < kVecSize; ++j) {
+            if (v[u][j] >= theta) {
+              if (pos < kCapacity) smem->cand[pos] = {v[u][j], (base + u * kBlockSize + tx) * kVecSize + j};
+              ++pos;
+            }
+          }
+        }
+      }
+      // the row is redone on the exact path anyway
+      if (broadcast(*reinterpret_cast<volatile uint32_t*>(&smem->n_ge)) > kCapacity) break;
+    }
+    if (const auto idx = num_full * kVecSize + tx; idx < problem.seq_len) {
+      const auto val = problem.in[idx];
+      if (val >= theta) {
+        const auto pos = atomicAdd(&smem->n_ge, 1);
+        if (pos < kCapacity) smem->cand[pos] = {val, idx};
+      }
+    }
+  }
+
+  /// Order of the composite key (k0: exact score key, k1: inverted index) against the
+  /// prefix (p0, p1) on the leading `bits` bits: 1 above, 0 equal, -1 below.
+  SGL_DEVICE static int
+  compare_prefix(const uint32_t k0, const uint32_t k1, const uint32_t p0, const uint32_t p1, const uint32_t bits) {
+    if (bits == 0) return 0;
+    const auto s0 = 32 - min(bits, 32u);
+    if ((k0 >> s0) != (p0 >> s0)) return (k0 >> s0) > (p0 >> s0) ? 1 : -1;
+    if (bits <= 32) return 0;
+    const auto s1 = 64 - bits;
+    if ((k1 >> s1) != (p1 >> s1)) return (k1 >> s1) > (p1 >> s1) ? 1 : -1;
+    return 0;
+  }
+
+  /// One output slot per lane with `pred`; every lane of the warp must call it.
+  SGL_DEVICE static uint32_t warp_append(const bool pred, uint32_t* counter) {
+    const auto lane_id = threadIdx.x % kWarpSize;
+    const auto mask = __ballot_sync(0xFFFFFFFFu, pred);
+    uint32_t base = 0;
+    if (lane_id == 0 && mask != 0) base = atomicAdd(counter, __popc(mask));
+    return __shfl_sync(0xFFFFFFFFu, base, 0) + __popc(mask & ((1u << lane_id) - 1u));
+  }
+
+  /// Exact top-k of the n buffered candidates by 8-bit radix rounds over the composite
+  /// key; the tie order of radix_tie_select (kStableTies: smallest indices).
+  template <bool kUsePDL, typename Emit>
+  SGL_DEVICE static void select_candidates(const uint32_t topk, const uint32_t n, Smem* smem, const Emit& emit) {
+    const auto tx = threadIdx.x;
+    const auto lane_id = tx % kWarpSize;
+    const auto warp_id = broadcast(tx / kWarpSize);
+    constexpr uint32_t kRounds = kStableTies ? 8 : 4;
+    uint32_t p0 = 0, p1 = 0;  // composite-key prefix fixed so far
+    uint32_t bits = 0;        // its length
+    uint32_t remain = topk;
+    uint32_t active = n;
+    if (n > topk) {
+      if (tx < kDigits) smem->select_hist[0][tx] = 0;
+      __syncthreads();
+#pragma unroll 1
+      for (uint32_t round = 0; round < kRounds; ++round) {
+        const auto hist = smem->select_hist[round % 2];
+        const auto shift = 24 - (round % 4) * kDigitBits;
+#pragma unroll 1
+        for (uint32_t i0 = 0; i0 < n; i0 += kBlockSize) {
+          uint32_t digit = kDigits;  // none
+          if (const auto i = i0 + tx; i < n) {
+            const auto c = smem->cand[i];
+            const auto k0 = extract_exact_bin(c.value);
+            const auto k1 = ~c.idx;
+            if (compare_prefix(k0, k1, p0, p1, bits) == 0) digit = ((round < 4 ? k0 : k1) >> shift) & (kDigits - 1);
+          }
+          // candidates share their leading digits: one atomic per distinct digit per warp
+          const auto peers = __match_any_sync(0xFFFFFFFFu, digit);
+          if (digit < kDigits && lane_id == static_cast<uint32_t>(__ffs(peers) - 1)) {
+            atomicAdd(&hist[digit], __popc(peers));
+          }
+        }
+        if (round + 1 < kRounds && tx < kDigits) smem->select_hist[(round + 1) % 2][tx] = 0;
+        __syncthreads();
+
+        uint32_t count = 0;
+        uint32_t warp_inc = 0;
+        if (tx < kDigits) {
+          count = hist[tx];
+          warp_inc = warp::inclusive_sum(count, lane_id);
+          if (lane_id == kWarpSize - 1) smem->warp_sum[warp_id] = warp_inc;
+        }
+        __syncthreads();
+        if (tx < kDigits) {
+          const auto prefix_sum = warp::reduce_sum(lane_id < warp_id ? smem->warp_sum[lane_id] : 0) + warp_inc;
+          const auto above = active - prefix_sum;  // active candidates in digits above this one
+          if (above < remain && above + count >= remain) smem->match = {tx, above, count};
+        }
+        __syncthreads();
+
+        const auto match = smem->match;
+        if (round < 4) {
+          p0 |= match.digit << shift;
+        } else {
+          p1 |= match.digit << shift;
+        }
+        bits += kDigitBits;
+        remain -= match.above;
+        active = match.equal;
+        // The whole group fits (always by round 7, the indices being unique); without
+        // kStableTies round 3 leaves `remain` of `equal` equal scores to take in any order.
+        if (match.equal == remain) break;
+      }
+    }
+
+    PDLTriggerSecondary<kUsePDL>();
+    const auto num_gt = topk - remain;
+#pragma unroll 1
+    for (uint32_t i0 = 0; i0 < n; i0 += kBlockSize) {
+      const auto i = i0 + tx;
+      TieValue c = TieValue::invalid();
+      int order = -1;
+      if (i < n) {
+        c = smem->cand[i];
+        order = compare_prefix(extract_exact_bin(c.value), ~c.idx, p0, p1, bits);
+      }
+      const auto gt = warp_append(order > 0, &smem->n_gt_out);
+      const auto eq = warp_append(order == 0, &smem->n_eq_out);
+      if (order > 0) {
+        emit(gt, c.value, c.idx);
+      } else if (order == 0 && eq < remain) {
+        emit(num_gt + eq, c.value, c.idx);
+      }
+    }
+  }
+};
+
+#endif  // !USE_ROCM
+
 // ---------------------------------------------------------------------------
 // Cluster path: very long seq_len, small batch. `kClusterSize` blocks cooperate
 // on one batch element via distributed shared memory (one cluster per element).

@@ -124,6 +124,12 @@ def _rows(kind: str, seed: int) -> list[torch.Tensor]:
     if kind == "short":
         lengths = [1, 3, 7, 9, 300, 2047, 2048, 2049, 2055, 3000, 5000]
         return [torch.randn(n, generator=g) for n in lengths]
+    if kind == "long":  # local rows past the register paths of the local top-k
+        return [
+            torch.randn(200000, generator=g),
+            1 + 2 * torch.randn(160000, generator=g),
+            torch.randn(140001, generator=g),
+        ]
     raise ValueError(kind)
 
 
@@ -399,6 +405,50 @@ def test_dcp4_topk_merge_pushed_wide(kind: str, warps: int) -> None:
             graph.replay()
         torch.cuda.synchronize()
         bad = case.pushed_failures(rank, world)
+        assert _all_ranks_ok(not bad), bad or "failed on another rank"
+
+
+_SAMPLED_MERGES: dict[int, DcpTopKMerge] = {}
+
+
+def _sampled_merge(cand_k: int) -> DcpTopKMerge:
+    if cand_k not in _SAMPLED_MERGES:
+        with envs.SGLANG_DCP4_PUSH_CAND_K.override(cand_k), envs.SGLANG_DSA_DCP_TOPK_PUSH_SAMPLED.override(True):
+            _SAMPLED_MERGES[cand_k] = DcpTopKMerge(ps._WORLD, MAX_ROWS, TOPK, push=True)
+    return _SAMPLED_MERGES[cand_k]
+
+
+@pytest.mark.parametrize("cand_k", [768, 2048])
+@pytest.mark.parametrize(
+    "kind", ["random", "long", "dense_top", "ties", "periodic", "skew", "short"]
+)
+@torch.inference_mode()
+def test_dcp4_topk_merge_pushed_sampled(kind: str, cand_k: int) -> None:
+    """SGLANG_DSA_DCP_TOPK_PUSH_SAMPLED: the sampled local top-k pushes the exact local
+    candidate sets, so the merge is exact and fails its certificate on the same rows as
+    with the exact local top-k; Gaussian rows need no exact redo of the local top-k."""
+    _init_once()
+    world, rank = ps._WORLD.world_size, ps._WORLD.rank_in_group
+    if world != 4:
+        pytest.skip("the DCP4 push merge needs 4 ranks")
+    sampled, exact = _sampled_merge(cand_k), _push_merge(cand_k)
+    if sampled.buffer is None:
+        pytest.skip("multimem multicast unavailable")
+    assert sampled.sampled and not exact.sampled
+    span = PAGE_SIZE * world
+    for seed in SEEDS:
+        case = _Case(kind, seed, rank, world, span)
+        case.run_pushed(exact, span)
+        torch.cuda.synchronize()
+        exact_fell_back = exact.fallback[: case.rows].tolist()
+        redone = int(sampled.sampled_fallbacks)
+        case.run_pushed(sampled, span)
+        torch.cuda.synchronize()
+        bad = case.pushed_failures(rank, world)
+        if sampled.fallback[: case.rows].tolist() != exact_fell_back:
+            bad.append(f"rank {rank}: certificate failures differ from the exact local top-k")
+        if kind in ("random", "long") and int(sampled.sampled_fallbacks) != redone:
+            bad.append(f"rank {rank}: the sampled local top-k redid a Gaussian row")
         assert _all_ranks_ok(not bad), bad or "failed on another rank"
 
 
