@@ -1211,6 +1211,15 @@ class KDAAttnBackend(MambaAttnBackendBase):
         q, k, v = self._convolve_prefill(
             layer, forward_batch, mixed_qkv, conv_states, cache_indices
         )
+        for point, t in ((8, q), (9, k), (10, v)):
+            nan_watch.check_point(layer.layer_id, point, t)
+        nan_watch.capture_params(
+            layer.layer_id,
+            A_log=layer.A_log,
+            dt_bias=layer.dt_bias,
+            conv_weights=layer.conv_weights,
+            conv_bias=layer.bias,
+        )
 
         q = q.unflatten(-1, (-1, layer.head_q_dim)).unsqueeze(0)  # n (h d) -> 1 n h d
         k = k.unflatten(-1, (-1, layer.head_k_dim)).unsqueeze(0)  # n (h d) -> 1 n h d

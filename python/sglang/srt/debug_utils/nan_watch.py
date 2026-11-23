@@ -46,6 +46,9 @@ _POINT_NAMES = (
     "kda_core",
     "kda_onorm",
     "kda_beta",
+    "kda_q",
+    "kda_k",
+    "kda_v",
 )
 _COUNTERS = (
     "dup_mamba_slot",
@@ -285,6 +288,12 @@ def check_point(layer_idx: int, point: int, hidden) -> None:
         nan_capture.point(
             watch.capture, layer_idx, _POINT_NAMES[point], hidden, num_tokens
         )
+
+
+def capture_params(layer_idx: int, **tensors) -> None:
+    """A layer's static parameters, for a replay bundle (no-op unless the capture has rows)."""
+    if _active is not None and _active.capture is not None:
+        nan_capture.params(_active.capture, layer_idx, tensors)
 
 
 def end(

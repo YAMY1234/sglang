@@ -72,6 +72,7 @@ class TestNanWatch(unittest.TestCase):
         state=None,
         logits=None,
         layer_outputs=(),
+        params=None,
     ):
         pool = _Pool(list(slots), list(free_slots), self.rtt)
         proxy = PPProxyTensors(
@@ -89,6 +90,8 @@ class TestNanWatch(unittest.TestCase):
         nan_watch.check_state(torch.tensor(list(slots)), ssm, torch.zeros(10, 3))
         for layer, point, h in layer_outputs:
             nan_watch.check_point(layer, point, h)
+        if params is not None:
+            nan_watch.capture_params(params[0], **params[1])
         nan_watch.end(
             logits=logits if logits is not None else torch.zeros(2, 8),
             forward_batch=self.batch,
@@ -170,7 +173,8 @@ class TestNanWatch(unittest.TestCase):
                     (39, 2, torch.zeros(5, 3)),
                     (39, 0, attn),
                     (40, 0, later),
-                ]
+                ],
+                params=(39, {"A_log": torch.ones(4), "conv_bias": None}),
             )
             saved = os.listdir(d)
             self.assertEqual(saved, ["pp3-a-p4-e2.pt"])
@@ -178,7 +182,8 @@ class TestNanWatch(unittest.TestCase):
         self.assertEqual(bundle["meta"]["capture_layer"], 39)
         tensors = bundle["tensors"]
         self.assertEqual(
-            sorted(tensors), ["attn", "conv", "in", "recv.hidden_states", "ssm"]
+            sorted(tensors),
+            ["attn", "conv", "in", "param.A_log", "recv.hidden_states", "ssm"],
         )
         self.assertTrue(torch.isnan(tensors["attn"][1, 0]))
         self.assertEqual(tuple(tensors["ssm"].shape), (1, 2, 2))

@@ -30,7 +30,7 @@ class Capture:
     def __init__(self, rows: List[Tuple[int, int, int]]):
         self.rows = rows  # (batch row, first token, extend tokens)
         self.layer: Optional[int] = None
-        self.state_done = False
+        self.state_done = self.params_done = False
         self.tensors: Dict[str, torch.Tensor] = {}
         self.event = None
 
@@ -88,6 +88,16 @@ def state(cap: Capture, cache_indices: torch.Tensor, ssm, conv) -> None:
         _copy(cap, f"r{i}.conv", conv.index_select(0, slot))
 
 
+def params(cap: Capture, layer_idx: int, tensors) -> None:
+    """The captured layer's parameters (None entries skipped), once per forward."""
+    if cap.params_done or layer_idx != cap.layer:
+        return
+    cap.params_done = True
+    for name, t in tensors.items():
+        if isinstance(t, torch.Tensor):
+            _copy(cap, f"param.{name}", t)
+
+
 def finish(cap: Capture) -> None:
     if _stream is not None:
         cap.event = _stream.record_event()
@@ -102,7 +112,9 @@ def dump(cap: Capture, row: int, meta: dict) -> Optional[str]:
         cap.event.synchronize()  # the side stream's copies; only on a dump
     prefix = f"r{row}."
     tensors = {
-        k[len(prefix) :]: v for k, v in cap.tensors.items() if k.startswith(prefix)
+        k[len(prefix) :] if k.startswith(prefix) else k: v
+        for k, v in cap.tensors.items()
+        if k.startswith((prefix, "param."))
     }
     out_dir = envs.SGLANG_NAN_WATCH_CAPTURE_DIR.get()
     os.makedirs(out_dir, exist_ok=True)
