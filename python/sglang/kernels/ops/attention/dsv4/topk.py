@@ -343,6 +343,7 @@ def topk_transform_candidates_dcp_push(
     sampled_min_len: int = 0,
     fallback_rows: Optional[torch.Tensor] = None,
     lpt_row_map: Optional[torch.Tensor] = None,
+    lpt_trace: Optional[torch.Tensor] = None,
 ) -> None:
     """DCP decode top-k that pushes its candidates to the merge.
 
@@ -355,7 +356,8 @@ def topk_transform_candidates_dcp_push(
     parity; see ``jit/csrc/dsa/dcp_topk_merge.cuh``). ``counters``: [max_rows]
     int64 merge calls per row slot; the merge advances them. ``sampled``,
     ``sampled_min_len`` and ``fallback_rows``: as ``sampled``, ``sampled_min_len`` and
-    ``overflow_rows`` of :func:`topk_transform_candidates_v2`, and ``lpt_row_map`` as there.
+    ``overflow_rows`` of :func:`topk_transform_candidates_v2`, and ``lpt_row_map`` and
+    ``lpt_trace`` (bench only) as there.
     """
     _jit_topk_v2_push_module().topk_transform_candidates_dcp_push(
         scores,
@@ -372,6 +374,7 @@ def topk_transform_candidates_dcp_push(
         int(sampled_min_len),
         fallback_rows,
         lpt_row_map,
+        lpt_trace,
     )
 
 
