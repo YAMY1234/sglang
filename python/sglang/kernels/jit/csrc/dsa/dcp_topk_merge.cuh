@@ -926,7 +926,7 @@ __global__ void __launch_bounds__(32 * kNumRanks, kNumRanks == 8 ? 4 : 1)
 // kTopK / (32 * kWarpsPerRank) keys and the select's rounds have that many more warps in
 // flight. Same buffer protocol, same t*, and this rank's keys >= t* in candidate order, so
 // out / out_local / out_lengths equal merge_pushed_kernel's.
-#ifndef SGL_DCP_MERGE_WATCHDOG  // 1 (env SGLANG_DCP_MERGE_WATCHDOG, debug builds): owner-mode spins trap after ~1 s
+#ifndef SGL_DCP_MERGE_WATCHDOG  // 1 (env SGLANG_DCP_MERGE_WATCHDOG, debug builds): the wide merge's spins trap after ~1 s
 #define SGL_DCP_MERGE_WATCHDOG 0
 #endif
 
@@ -944,27 +944,33 @@ SGL_DEVICE uint64_t unpack_tstar(uint64_t v) {
   return (v & 0xFFFFFF) == 0 ? 0 : (v | uint64_t{0xFF000000});
 }
 
-/// SGL_DCP_MERGE_WATCHDOG: trap once a spin has lasted ~1 s, naming what it waited for.
-SGL_DEVICE void spin_watchdog(uint64_t& t0, uint32_t& n, int rank, int row, int64_t c, const char* what) {
+/// SGL_DCP_MERGE_WATCHDOG: trap once a spin has lasted ~1 s, naming what it waited for, from which rank, and the tag it
+/// expected against the one it saw (one call less: that rank is behind or skipped a call; 0: never written).
+SGL_DEVICE void spin_watchdog(
+    uint64_t& t0, uint32_t& n, int rank, int row, int64_t c, const char* what, int from, uint64_t tag, uint64_t seen) {
   if constexpr (SGL_DCP_MERGE_WATCHDOG) {
     if (++n % 1024 != 0) return;
     uint64_t now;
     asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(now));
     if (t0 == 0) t0 = now;
     if (now - t0 > 1000000000ull) {
-      printf("DCP owner merge watchdog: rank %d row %d call %lld parity %lld waited >1 s for %s\n", rank, row,
-             static_cast<long long>(c), static_cast<long long>(c & 1), what);
+      printf("DCP merge watchdog: rank %d row %d call %lld parity %lld waited >1 s for %s from rank %d: tag %llu "
+             "expected, %llu seen (word 0x%016llx)\n", rank, row, static_cast<long long>(c), static_cast<long long>(c & 1),
+             what, from, static_cast<unsigned long long>(tag), static_cast<unsigned long long>(seen & 255),
+             static_cast<unsigned long long>(seen));
       __trap();
     }
   } else {
     static_cast<void>(t0), static_cast<void>(n), static_cast<void>(rank), static_cast<void>(row),
-        static_cast<void>(c), static_cast<void>(what);
+        static_cast<void>(c), static_cast<void>(what), static_cast<void>(from), static_cast<void>(tag),
+        static_cast<void>(seen);
   }
 }
 
 /// poll_tagged, with the debug watchdog.
 template <int kPer>
-SGL_DEVICE void poll_tagged_wd(const uint64_t* src, int step, uint64_t tag, uint64_t (&v)[kPer], int rank, int row, int64_t c) {
+SGL_DEVICE void poll_tagged_wd(
+    const uint64_t* src, int step, uint64_t tag, uint64_t (&v)[kPer], int rank, int row, int64_t c, int from) {
   static_assert(kPer >= 1 && kPer <= 64);
   uint64_t pending = kPer == 64 ? ~uint64_t{0} : (uint64_t{1} << kPer) - 1;
   uint64_t t0 = 0;
@@ -976,7 +982,13 @@ SGL_DEVICE void poll_tagged_wd(const uint64_t* src, int step, uint64_t tag, uint
 #pragma unroll
     for (int j = 0; j < kPer; ++j)
       if ((v[j] & 255) == tag) pending &= ~(uint64_t{1} << j);
-    if (pending) spin_watchdog(t0, n, rank, row, c, "candidates");
+    if (pending) {
+      uint64_t seen = 0;
+#pragma unroll
+      for (int j = kPer - 1; j >= 0; --j)
+        if (pending >> j & 1) seen = v[j];
+      spin_watchdog(t0, n, rank, row, c, "candidates", from, tag, seen);
+    }
   }
 }
 
@@ -987,7 +999,7 @@ SGL_DEVICE uint64_t poll_tstar(const uint64_t* slot, uint64_t tag, int rank, int
   while (((v = device::ptx::load_relaxed_sys(slot)) >> 24 & 255) != tag) {
     __nanosleep(ns);
     ns = ns < 256 ? ns * 2 : ns;
-    spin_watchdog(t0, n, rank, row, c, "t*");
+    spin_watchdog(t0, n, rank, row, c, "t*", -1, tag, v >> 24 & 255);
   }
   return unpack_tstar(v);
 }
@@ -1050,8 +1062,8 @@ SGL_DEVICE void merge_pushed_wide_body(const PushedParams& p) {
   uint64_t cand[kPer];
   uint64_t ts;
   if (owner) {
-    if constexpr (kOwner) {
-      poll_tagged_wd<kPer>(p.buffer + base + q * kTopK + t, kRankThreads, tag, cand, p.rank, row, c);
+    if constexpr (kOwner || SGL_DCP_MERGE_WATCHDOG) {  // the debug build watches the multicast merge's spin too
+      poll_tagged_wd<kPer>(p.buffer + base + q * kTopK + t, kRankThreads, tag, cand, p.rank, row, c, q);
     } else {
       poll_tagged<kPer>(p.buffer + base + q * kTopK + t, kRankThreads, tag, cand);
     }
@@ -1078,7 +1090,7 @@ SGL_DEVICE void merge_pushed_wide_body(const PushedParams& p) {
     }
   } else {  // kOwner, another rank's row: this rank's own block (its top-k wrote it before the PDL wait), then t*
     if (q == p.rank) {
-      poll_tagged_wd<kPer>(p.buffer + base + q * kTopK + t, kRankThreads, tag, cand, p.rank, row, c);
+      poll_tagged_wd<kPer>(p.buffer + base + q * kTopK + t, kRankThreads, tag, cand, p.rank, row, c, q);
 #pragma unroll
       for (int i = 0; i < kPer; ++i) cand[i] = entry_key(cand[i]);
     }
