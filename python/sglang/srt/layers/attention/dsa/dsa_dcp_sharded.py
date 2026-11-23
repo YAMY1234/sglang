@@ -243,6 +243,11 @@ class DcpTopKMerge:
         self._stats_reported = [0] * DCP_TOPK_MERGE_NUM_STATS
         self._report_index = 0
         self.union_scratch: Optional[torch.Tensor] = None
+        # push only: the local top-k's sampled single pass, and the rows it redid exactly
+        self.sampled = self.push and envs.SGLANG_DSA_DCP_TOPK_PUSH_SAMPLED.get()
+        self.sampled_fallbacks: Optional[torch.Tensor] = None
+        self._fallbacks_host: Optional[torch.Tensor] = None
+        self._fallbacks_reported = 0
 
         world = group.world_size
         # 16 ranks only on megakernel paths; stock DCP16 keeps the all-gather.
@@ -295,6 +300,13 @@ class DcpTopKMerge:
                 f"{self.cand_k} keys per row to the merge, no local "
                 f"top-{topk} (SGLANG_DSA_DCP_TOPK_PUSH)"
             )
+            if self.sampled:
+                self.sampled_fallbacks = torch.zeros(1, dtype=torch.int32, device=group.device)
+                self._fallbacks_host = torch.zeros(1, dtype=torch.int32).pin_memory()
+                print_info_once(
+                    "DSA DCP top-k merge: local rows over 16384 keys select their "
+                    "candidates in one sampled-threshold pass (SGLANG_DSA_DCP_TOPK_PUSH_SAMPLED)"
+                )
             return
         self.union_scratch = torch.empty(
             (max_rows, world * topk), dtype=torch.int64, device=group.device
@@ -353,6 +365,8 @@ class DcpTopKMerge:
             slot=dcp_topk_merge_row_slot(self.world, out.shape[1], self.cand_k, push=True),
             cluster_size=candidates_cluster_size(rows),
             cluster_floor=_CANDIDATE_CLUSTER_FLOOR,
+            sampled=self.sampled,
+            fallback_rows=self.sampled_fallbacks,
         )
         local = torch.empty_like(out)
         lengths = torch.empty(rows, dtype=torch.int32, device=out.device)
@@ -396,7 +410,13 @@ class DcpTopKMerge:
                 f"({100 * fallback / max(rows, 1):.4f}%); this rank published "
                 f"{published} of them, {selected} needing a top-k select"
             )
+            if self._fallbacks_host is not None:
+                redone = int(self._fallbacks_host[0]) - self._fallbacks_reported
+                self._fallbacks_reported += redone
+                line += f"; its sampled local top-k redid {redone} rows exactly"
         self._stats_host.copy_(self.stats, non_blocking=True)
+        if self._fallbacks_host is not None:
+            self._fallbacks_host.copy_(self.sampled_fallbacks, non_blocking=True)
         self._stats_copied = torch.cuda.Event()
         self._stats_copied.record()
         return line

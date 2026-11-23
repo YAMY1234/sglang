@@ -248,6 +248,7 @@ def topk_transform_candidates_v2(
     overflow_rows: Optional[torch.Tensor] = None,
     coarse_bits: int = 10,
     cluster_size: Optional[int] = None,
+    sampled: bool = False,
 ) -> None:
     """Ragged top-k emitting candidates for a distributed top-k merge.
 
@@ -263,8 +264,10 @@ def topk_transform_candidates_v2(
     ``cluster_floor`` (no ``row_starts``) splits rows longer than it across a cluster;
     the selection stays exact. ``overflow_rows`` (int32 [1]) counts rows redone past the
     tie buffer; ``coarse_bits`` (10 / 11 / 12) is the cluster pass's coarse bin width.
-    ``cluster_size`` selects the DCP decode path, where ``page_bits``, ``overflow_rows``
-    and ``coarse_bits`` do not apply.
+    ``cluster_size`` selects the DCP decode path, where ``page_bits`` and ``coarse_bits``
+    do not apply. There, with ``cluster_size`` 0, ``sampled`` runs rows longer than 16384
+    through a sampled-threshold single pass that selects the same set (slot order aside)
+    and redoes on the exact path the rows it cannot certify; ``overflow_rows`` counts those.
 
     NOTE: ``scores`` is written in place as for the ragged entry point.
     """
@@ -279,6 +282,8 @@ def topk_transform_candidates_v2(
             rank,
             int(cluster_size),
             0 if cluster_floor is None else int(cluster_floor),
+            bool(sampled),
+            overflow_rows,
         )
         return
     module.topk_transform_candidates(
@@ -307,6 +312,8 @@ def topk_transform_candidates_dcp_push(
     slot: int,
     cluster_size: int = 0,
     cluster_floor: int = 0,
+    sampled: bool = False,
+    fallback_rows: Optional[torch.Tensor] = None,
 ) -> None:
     """DCP decode top-k that pushes its candidates to the merge.
 
@@ -317,7 +324,9 @@ def topk_transform_candidates_dcp_push(
     of row slot ``i`` in every rank's merge buffer (``push_mc``: its multicast
     address; ``slot`` entries per row slot, ``counters.shape[0]`` row slots per
     parity; see ``jit/csrc/dsa/dcp_topk_merge.cuh``). ``counters``: [max_rows]
-    int64 merge calls per row slot; the merge advances them.
+    int64 merge calls per row slot; the merge advances them. ``sampled`` /
+    ``fallback_rows``: as ``sampled`` / ``overflow_rows`` of
+    :func:`topk_transform_candidates_v2`.
     """
     _jit_topk_v2_push_module().topk_transform_candidates_dcp_push(
         scores,
@@ -330,6 +339,8 @@ def topk_transform_candidates_dcp_push(
         slot,
         int(cluster_size),
         int(cluster_floor),
+        bool(sampled),
+        fallback_rows,
     )
 
 
