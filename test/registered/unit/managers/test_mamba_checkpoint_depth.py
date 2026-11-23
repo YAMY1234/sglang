@@ -341,7 +341,7 @@ class TestBranchHeadMessageBoundary(unittest.TestCase):
             envs.SGLANG_MAMBA_BRANCH_HEAD_MIN_GAP.override(2000),
         ):
             self.assertEqual(self._matched(), 1984)
-            self.assertIsNone(self._matched(n=2100))
+            self.assertIsNone(self._matched(closes=(2000,), n=2100))
 
     def test_the_boundary_cuts_the_last_forward_like_a_branching_point(self):
         with envs.SGLANG_MAMBA_BRANCH_HEAD_TOKEN_IDS.override(str(self.CLOSE)):
