@@ -2490,6 +2490,8 @@ class Envs:
     # With the sampled pass: launch the local top-k blocks longest row first (where an SM holds one 1024-thread block
     # per SM, so ~290 rows run as two waves and the second should hold the shortest rows).
     SGLANG_DSA_DCP_TOPK_PUSH_LPT = EnvBool(False)
+    # Tests: check every LPT launch's row map against its lengths (syncs; raises on a mismatch).
+    SGLANG_DSA_DCP_TOPK_LPT_CHECK = EnvBool(False)
     # merge_kernel (push off): stage the candidate push in smem, register fallback
     # for <= 2 failed ranks (sgl-project/sglang#49922); same output. MIN_BLOCKS: its
     # launch bounds' minimum blocks per SM.

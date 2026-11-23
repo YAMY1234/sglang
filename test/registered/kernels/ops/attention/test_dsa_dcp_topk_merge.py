@@ -211,6 +211,9 @@ class _Case:
 
     def run_pushed(self, merge: DcpTopKMerge, span: int) -> None:
         merge.prepare_step(self.local_lens, layer_id=0)  # the step's LPT row map, if any
+        self.run_pushed_only(merge, span)
+
+    def run_pushed_only(self, merge: DcpTopKMerge, span: int) -> None:
         self.local, self.lengths = merge.merge_pushed(
             self.logits.clone(), self.local_lens, self.global_lens, self.page_table, self.out, span
         )
@@ -461,6 +464,40 @@ def test_dcp4_topk_merge_pushed_sampled(kind: str, cand_k: int, min_len: int, lp
         if kind in ("random", "long") and int(sampled.sampled_fallbacks) != redone:
             bad.append(f"rank {rank}: the sampled local top-k redid a Gaussian row")
         assert _all_ranks_ok(not bad), bad or "failed on another rank"
+
+
+@torch.inference_mode()
+def test_dcp4_topk_merge_pushed_lpt_forwards() -> None:
+    """LPT across forwards as the indexer drives it (prepare_step in every DSA layer, the map built
+    at the lowest layer id): forwards of 2, 11, 3 and 1 rows, each over three layers, with
+    an idle forward between; with SGLANG_DSA_DCP_TOPK_LPT_CHECK every launch's map must be its own
+    lengths' order, and every merge is exact. A forward that skips the map's layer launches on a
+    map built for other rows: plain order, still exact."""
+    _init_once()
+    world, rank = ps._WORLD.world_size, ps._WORLD.rank_in_group
+    if world != 4:
+        pytest.skip("the DCP4 push merge needs 4 ranks")
+    merge = _sampled_merge(2048, 0, True)
+    if merge.buffer is None:
+        pytest.skip("multimem multicast unavailable")
+    span = PAGE_SIZE * world
+    bad = []
+    with envs.SGLANG_DSA_DCP_TOPK_LPT_CHECK.override(True):
+        for kind, seed in (("random2", 1234), ("short", 1235), ("long", 1236), ("random", 1237)):
+            case = _Case(kind, seed, rank, world, span)
+            for layer in (3, 7, 11):  # one forward: the map is built at layer 3 only
+                merge.prepare_step(case.local_lens, layer)
+                case.run_pushed_only(merge, span)
+                torch.cuda.synchronize()
+                bad += [f"{kind} layer {layer}: {b}" for b in case.pushed_failures(rank, world)]
+            merge.prepare_step(case.local_lens[:0], 3)  # an idle forward: nothing to map
+    # a forward that skips layer 3 after a 1-row forward: its map is for 1 row, so plain order
+    case = _Case("random2", 1238, rank, world, span)
+    merge.prepare_step(case.local_lens, 7)
+    case.run_pushed_only(merge, span)
+    torch.cuda.synchronize()
+    bad += [f"skipped map: {b}" for b in case.pushed_failures(rank, world)]
+    assert _all_ranks_ok(not bad), bad or "failed on another rank"
 
 
 @pytest.mark.parametrize("failing", ["stale1", "stale2"])

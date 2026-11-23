@@ -316,7 +316,8 @@ class DcpTopKMerge:
                 )
                 if self.lpt:
                     # this step's row map, written at its first DSA layer (prepare_step)
-                    self.lpt_row_map = torch.empty(max_rows, dtype=torch.int32, device=group.device)
+                    # [0] = the row count it was built for (0: none yet, so no launch trusts it)
+                    self.lpt_row_map = torch.zeros(1 + max_rows, dtype=torch.int32, device=group.device)
                     print_info_once(
                         "DSA DCP top-k merge: local top-k blocks launch longest row first, from a "
                         "row map built once per step (SGLANG_DSA_DCP_TOPK_PUSH_LPT)"
@@ -329,6 +330,22 @@ class DcpTopKMerge:
     def usable(self, rows: int) -> bool:
         return self.buffer is not None and rows <= self.max_rows
 
+    def lpt_map_for(self, local_lens: torch.Tensor) -> Optional[torch.Tensor]:
+        """The row map this call launches by (None: plain order). With
+        SGLANG_DSA_DCP_TOPK_LPT_CHECK (tests; syncs) it must be the LPT order of these lengths."""
+        rows = local_lens.shape[0]
+        if self.lpt_row_map is None or rows > 1024:
+            return None
+        if envs.SGLANG_DSA_DCP_TOPK_LPT_CHECK.get() and not torch.cuda.is_current_stream_capturing():
+            want = torch.sort(-local_lens.long(), stable=True).indices.to(torch.int32)
+            got = self.lpt_row_map[: 1 + rows]
+            if int(got[0]) != rows or not torch.equal(got[1:], want):
+                raise RuntimeError(
+                    f"DSA DCP top-k LPT: the row map (built for {int(got[0])} rows) is not this "
+                    f"call's longest-first order of {rows} rows"
+                )
+        return self.lpt_row_map
+
     def prepare_step(self, local_lens: torch.Tensor, layer_id: int) -> None:
         """LPT (SGLANG_DSA_DCP_TOPK_PUSH_LPT): at the first DSA layer of each step, before its
         indexer logits, the row map every layer's local top-k of the step launches by (the
@@ -337,10 +354,13 @@ class DcpTopKMerge:
         rows = local_lens.shape[0]
         if self.lpt_row_map is None or not 1 <= rows <= min(1024, self.max_rows):
             return
-        if self._lpt_layer is None:
+        # the lowest DSA layer id seen is every forward's first; a forward that skipped it
+        # would launch on the previous forward's map: right rows (a permutation of them,
+        # since the map carries its row count) or the plain order, never a wrong result
+        if self._lpt_layer is None or layer_id < self._lpt_layer:
             self._lpt_layer = layer_id
         if layer_id == self._lpt_layer:
-            topk_lpt_row_map(local_lens, self.lpt_row_map[:rows])
+            topk_lpt_row_map(local_lens, self.lpt_row_map)
 
     def __call__(
         self,
@@ -395,11 +415,7 @@ class DcpTopKMerge:
             sampled=self.sampled,
             sampled_min_len=self.sampled_min_len,
             fallback_rows=self.sampled_fallbacks,
-            lpt_row_map=(
-                self.lpt_row_map[:rows]
-                if self.lpt_row_map is not None and rows <= 1024
-                else None
-            ),
+            lpt_row_map=self.lpt_map_for(local_lens),
         )
         local = torch.empty_like(out)
         lengths = torch.empty(rows, dtype=torch.int32, device=out.device)

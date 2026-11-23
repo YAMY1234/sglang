@@ -466,7 +466,7 @@ struct TopKCandidatesParams {
   int64_t push_slot = 0;                       // entries per row slot
   int32_t push_max_rows = 0;
   uint32_t sampled_min_len = 0;  // sampled variant only: rows up to this length stay on the exact path
-  const int32_t* row_map = nullptr;  // kLpt: [rows] the row each block runs (lpt_row_map_kernel)
+  const int32_t* row_map = nullptr;  // kLpt: [1 + rows] {rows built for, the row each block runs} (lpt_row_map_kernel)
   int64_t* lpt_trace = nullptr;      // bench only, kTrace: per block {start, row read, end, row} (globaltimer ns)
 
   SGL_DEVICE int32_t global_position(int32_t local) const {
@@ -611,8 +611,9 @@ candidates_sampled_one_block(const TopKCandidatesParams& params, const uint32_t 
   candidates_one_block<kPDL, kPush>(params, bx, &smem->exact.ragged, smem->exact.staged);
 }
 
-/// LPT row map, once per decode step (lpt_row_map_kernel, one block): row_map[r] is the r-th longest row (ties by
-/// row index), from seq_lens alone. rows <= kBlockSize. Every DSA layer's candidates top-k of the step reads it.
+/// LPT row map, once per decode step (lpt_row_map_kernel, one block): row_map[0] = rows, the count it was built
+/// for, and row_map[1 + r] = the r-th longest row (ties by row index), from seq_lens alone. rows <= kBlockSize.
+/// Every DSA layer's candidates top-k of the step reads it.
 __global__ __launch_bounds__(kBlockSize, 1) void lpt_row_map_kernel(
     const int32_t* __restrict__ seq_lens, int32_t* __restrict__ row_map, const uint32_t rows) {
   __shared__ uint32_t len[kBlockSize];
@@ -627,13 +628,16 @@ __global__ __launch_bounds__(kBlockSize, 1) void lpt_row_map_kernel(
       const auto l = len[j];
       rank += (l > mine || (l == mine && j < tx)) ? 1u : 0u;
     }
-    row_map[rank] = static_cast<int32_t>(tx);
+    row_map[1 + rank] = static_cast<int32_t>(tx);
   }
+  if (tx == 0) row_map[0] = static_cast<int32_t>(rows);
 }
 
-/// LPT order (kLpt): block b runs row params.row_map[b], so on a two-wave launch (one 1024-thread block
-/// per SM) the longest rows start first and the second wave holds the shortest. The map is read after
-/// the PDL wait, so it may come from any earlier kernel of the stream, the one just before included.
+/// LPT order (kLpt): block b runs row params.row_map[1 + b], so on a two-wave launch (one 1024-thread
+/// block per SM) the longest rows start first and the second wave holds the shortest. The map is read
+/// after the PDL wait, so it may come from any earlier kernel of the stream, the one just before
+/// included. A map built for another row count (row_map[0] != rows), or an entry out of range, falls
+/// back to block b running row b: a map that is late or foreign costs the order, never the result.
 /// kTrace (bench only, with kLpt): thread 0 stamps {start, row read, end, row} in params.lpt_trace;
 /// the production launch uses kTrace = false and carries no timestamp code.
 template <bool kPDL, bool kPush, bool kLpt = false, bool kTrace = false>
@@ -645,7 +649,10 @@ TOPK_KERNEL void topk_candidates_sampled_kernel(const __grid_constant__ TopKCand
     uint64_t t0 = 0, t1 = 0;
     if constexpr (kTrace) asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t0));
     device::PDLWaitPrimary<kPDL>();  // the map's producer is done (candidates_sampled_one_block waits again: a no-op)
-    const auto row = static_cast<uint32_t>(params.row_map[blockIdx.x]);
+    const auto rows = gridDim.x;
+    const auto built_for = static_cast<uint32_t>(params.row_map[0]);
+    const auto mapped = static_cast<uint32_t>(params.row_map[1 + blockIdx.x]);
+    const auto row = built_for == rows && mapped < rows ? mapped : blockIdx.x;
     if constexpr (kTrace) asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t1));
     candidates_sampled_one_block<kPDL, kPush>(params, row, &smem);
     if constexpr (kTrace) {
@@ -2195,14 +2202,15 @@ struct TopKKernel {
     using namespace host;
     auto M = SymbolicSize{"row_map_rows"};
     TensorMatcher({M}).with_dtype<int32_t>().with_device(device_).verify(row_map);
-    RuntimeCheck(M.unwrap() >= rows, "row_map has fewer rows than the launch");
+    RuntimeCheck(M.unwrap() >= 1 + rows, "row_map needs 1 + rows entries");
     return static_cast<const int32_t*>(row_map.data_ptr());
   }
 #endif
 
   /**
-   * \brief The LPT row map of a decode step (`lpt_row_map_kernel`): `row_map[r]` = the r-th longest of the
-   * `seq_lens` rows (ties by row index), for the `row_map` argument of the sampled DCP candidates launches.
+   * \brief The LPT row map of a decode step (`lpt_row_map_kernel`): `row_map[0]` = rows, `row_map[1 + r]` =
+   * the r-th longest of the `seq_lens` rows (ties by row index), for the `row_map` argument of the sampled DCP
+   * candidates launches (which fall back to their own order when `row_map[0]` is not their row count).
    * One block, rows <= 1024. Launch it once per step on the stream, any time before those launches: they
    * read the map after their PDL wait.
    */

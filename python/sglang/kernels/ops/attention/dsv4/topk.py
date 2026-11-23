@@ -362,10 +362,11 @@ def topk_transform_candidates_dcp_push(
 
 
 def topk_lpt_row_map(seq_lens: torch.Tensor, row_map: torch.Tensor) -> None:
-    """The LPT row map of a decode step: ``row_map[r]`` = the r-th longest of the ``seq_lens``
-    rows (int32, ties by row index; rows <= 1024), one block, for the ``lpt_row_map`` argument of
-    the sampled DCP candidates launches of the step. They read it after their PDL wait, so it may
-    be launched any time before them on the stream."""
+    """The LPT row map of a decode step (int32 [>= 1 + rows]): ``row_map[0]`` = rows and
+    ``row_map[1 + r]`` = the r-th longest of the ``seq_lens`` rows (ties by row index; rows <=
+    1024), one block, for the ``lpt_row_map`` argument of the sampled DCP candidates launches of
+    the step. They read it after their PDL wait, so it may be launched any time before them on the
+    stream, and a launch whose row count differs from ``row_map[0]`` keeps its own order."""
     _jit_topk_v2_push_module().topk_lpt_row_map(seq_lens, row_map)
 
 
