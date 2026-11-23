@@ -1493,6 +1493,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
         self.layer_transfer_counter = None
         # (src, dst, mamba layer ids not yet copied) of a per-layer COW in flight.
         self._pending_cow = None
+        self._cow_per_layer_logged = False
         self.ple_window_cache = None
         self._init_mamba_pool(
             mamba_size=mamba_size,
@@ -1832,6 +1833,9 @@ class HybridReqToTokenPool(ReqToTokenPool):
                 # conv / temporal is copied by mamba2_layer_index after its own
                 # load event, so the forward never waits for the whole load-back.
                 assert self._pending_cow is None, "a per-layer COW was not flushed"
+                if not self._cow_per_layer_logged:
+                    self._cow_per_layer_logged = True
+                    logger.info("HiCache: Mamba COW copies per layer behind load-back")
                 first_mamba_layer = min(self.mamba_map)
                 self.layer_transfer_counter.wait_until(
                     first_mamba_layer - self.start_layer
