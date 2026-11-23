@@ -466,7 +466,8 @@ struct TopKCandidatesParams {
   int64_t push_slot = 0;                       // entries per row slot
   int32_t push_max_rows = 0;
   uint32_t sampled_min_len = 0;  // sampled variant only: rows up to this length stay on the exact path
-  int64_t* lpt_trace = nullptr;  // bench only, lpt launch: per block {start, row chosen, end, row} (globaltimer ns)
+  const int32_t* row_map = nullptr;  // kLpt: [rows] the row each block runs (lpt_row_map_kernel)
+  int64_t* lpt_trace = nullptr;      // bench only, kTrace: per block {start, row read, end, row} (globaltimer ns)
 
   SGL_DEVICE int32_t global_position(int32_t local) const {
     const auto b = cand_page_bits;
@@ -610,61 +611,55 @@ candidates_sampled_one_block(const TopKCandidatesParams& params, const uint32_t 
   candidates_one_block<kPDL, kPush>(params, bx, &smem->exact.ragged, smem->exact.staged);
 }
 
-/// LPT order (kLpt): block b takes the b-th longest row (ties by row index), so on a two-wave launch
-/// (one 1024-thread block per SM) the longest rows start first and the second wave holds the
-/// shortest. Every block ranks all rows from seq_lens alone (before the PDL wait, as the row length
-/// read already is), in the sampled path's shared memory before that is used. rows <= kBlockSize.
-struct LptRankSmem {
-  uint32_t len[kBlockSize];
-  uint32_t row;
-};
-
-SGL_DEVICE uint32_t lpt_row(const TopKCandidatesParams& params, const uint32_t rows, LptRankSmem* smem) {
+/// LPT row map, once per decode step (lpt_row_map_kernel, one block): row_map[r] is the r-th longest row (ties by
+/// row index), from seq_lens alone. rows <= kBlockSize. Every DSA layer's candidates top-k of the step reads it.
+__global__ __launch_bounds__(kBlockSize, 1) void lpt_row_map_kernel(
+    const int32_t* __restrict__ seq_lens, int32_t* __restrict__ row_map, const uint32_t rows) {
+  __shared__ uint32_t len[kBlockSize];
   const auto tx = threadIdx.x;
-  const auto mine = tx < rows ? static_cast<uint32_t>(params.seq_lens[tx]) : 0u;
-  smem->len[tx] = mine;
+  const auto mine = tx < rows ? static_cast<uint32_t>(seq_lens[tx]) : 0u;
+  len[tx] = mine;
   __syncthreads();
   if (tx < rows) {
     uint32_t rank = 0;
 #pragma unroll 4
     for (uint32_t j = 0; j < rows; ++j) {  // every lane reads the same len[j]: a broadcast
-      const auto l = smem->len[j];
+      const auto l = len[j];
       rank += (l > mine || (l == mine && j < tx)) ? 1u : 0u;
     }
-    if (rank == blockIdx.x) smem->row = tx;
+    row_map[rank] = static_cast<int32_t>(tx);
   }
-  __syncthreads();
-  const auto row = smem->row;
-  __syncthreads();  // the rank storage is the sampled path's shared memory
-  return row;
 }
 
-/// kTrace (bench only, with kLpt): thread 0 stamps {start, row chosen, end, row} in params.lpt_trace.
-/// The production launch uses kTrace = false and carries no timestamp code.
+/// LPT order (kLpt): block b runs row params.row_map[b], so on a two-wave launch (one 1024-thread block
+/// per SM) the longest rows start first and the second wave holds the shortest. The map is read after
+/// the PDL wait, so it may come from any earlier kernel of the stream, the one just before included.
+/// kTrace (bench only, with kLpt): thread 0 stamps {start, row read, end, row} in params.lpt_trace;
+/// the production launch uses kTrace = false and carries no timestamp code.
 template <bool kPDL, bool kPush, bool kLpt = false, bool kTrace = false>
 TOPK_KERNEL void topk_candidates_sampled_kernel(const __grid_constant__ TopKCandidatesParams params) {
   device::enable_smem_spilling();
   __shared__ SampledCandidatesSmem smem;
-  static_assert(sizeof(LptRankSmem) <= sizeof(SampledCandidatesSmem));
   static_assert(kLpt || !kTrace);
-  if constexpr (kTrace) {
-    uint64_t t0, t1, t2;
-    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t0));
-    const auto row = lpt_row(params, gridDim.x, reinterpret_cast<LptRankSmem*>(&smem));
-    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t1));
+  if constexpr (kLpt) {
+    uint64_t t0 = 0, t1 = 0;
+    if constexpr (kTrace) asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t0));
+    device::PDLWaitPrimary<kPDL>();  // the map's producer is done (candidates_sampled_one_block waits again: a no-op)
+    const auto row = static_cast<uint32_t>(params.row_map[blockIdx.x]);
+    if constexpr (kTrace) asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t1));
     candidates_sampled_one_block<kPDL, kPush>(params, row, &smem);
-    __syncthreads();
-    if (threadIdx.x == 0) {
-      asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t2));
-      auto* r = params.lpt_trace + 4 * static_cast<int64_t>(blockIdx.x);
-      r[0] = static_cast<int64_t>(t0);
-      r[1] = static_cast<int64_t>(t1);
-      r[2] = static_cast<int64_t>(t2);
-      r[3] = row;
+    if constexpr (kTrace) {
+      __syncthreads();
+      if (threadIdx.x == 0) {
+        uint64_t t2;
+        asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t2));
+        auto* r = params.lpt_trace + 4 * static_cast<int64_t>(blockIdx.x);
+        r[0] = static_cast<int64_t>(t0);
+        r[1] = static_cast<int64_t>(t1);
+        r[2] = static_cast<int64_t>(t2);
+        r[3] = row;
+      }
     }
-  } else if constexpr (kLpt) {
-    const auto row = lpt_row(params, gridDim.x, reinterpret_cast<LptRankSmem*>(&smem));
-    candidates_sampled_one_block<kPDL, kPush>(params, row, &smem);
   } else {
     candidates_sampled_one_block<kPDL, kPush>(params, blockIdx.x, &smem);
   }
@@ -2195,12 +2190,46 @@ struct TopKKernel {
         .launch(topk_candidates_kernel<kUsePDL>, params);
   }
 
+#ifndef USE_ROCM
+  static const int32_t* verify_row_map(const tvm::ffi::TensorView row_map, const uint32_t rows, host::SymbolicDevice& device_) {
+    using namespace host;
+    auto M = SymbolicSize{"row_map_rows"};
+    TensorMatcher({M}).with_dtype<int32_t>().with_device(device_).verify(row_map);
+    RuntimeCheck(M.unwrap() >= rows, "row_map has fewer rows than the launch");
+    return static_cast<const int32_t*>(row_map.data_ptr());
+  }
+#endif
+
+  /**
+   * \brief The LPT row map of a decode step (`lpt_row_map_kernel`): `row_map[r]` = the r-th longest of the
+   * `seq_lens` rows (ties by row index), for the `row_map` argument of the sampled DCP candidates launches.
+   * One block, rows <= 1024. Launch it once per step on the stream, any time before those launches: they
+   * read the map after their PDL wait.
+   */
+  static void lpt_row_map(const tvm::ffi::TensorView seq_lens, const tvm::ffi::TensorView row_map) {
+    using namespace host;
+    auto B = SymbolicSize{"rows"};
+    auto device_ = SymbolicDevice{};
+    device_.set_options<kDLGPU>();
+    TensorMatcher({B}).with_dtype<int32_t>().with_device(device_).verify(seq_lens);
+    const auto rows = static_cast<uint32_t>(B.unwrap());
+#ifdef USE_ROCM
+    static_cast<void>(row_map);
+    RuntimeCheck(false, "the LPT row map needs CUDA");
+#else
+    RuntimeCheck(rows >= 1 && rows <= kBlockSize, "lpt_row_map: rows must be in [1, 1024], got ", rows);
+    const auto* map = verify_row_map(row_map, rows, device_);
+    LaunchKernel(1, kBlockSize, device_.unwrap())
+        .launch(lpt_row_map_kernel, static_cast<const int32_t*>(seq_lens.data_ptr()), const_cast<int32_t*>(map), rows);
+#endif
+  }
+
   /**
    * \brief DCP decode variant of `transform_candidates` (token interleave): `cluster_size` 2 / 4
    * runs rows longer than `cluster_floor` on that many blocks, 0 one block. With `cluster_size` 0,
    * `sampled` takes rows longer than `sampled_min_len` and past the register paths through the
    * sampled single pass, counting the rows it redoes on the exact path in `fallback_rows`
-   * (int32 [1], optional); `lpt` launches its blocks longest row first (rows <= 1024).
+   * (int32 [1], optional); `row_map` (int32, `lpt_row_map`) launches its blocks longest row first (rows <= 1024).
    */
   static void transform_candidates_dcp(
       const tvm::ffi::TensorView scores,
@@ -2214,7 +2243,7 @@ struct TopKKernel {
       const bool sampled,
       const int64_t sampled_min_len,
       const tvm::ffi::Optional<tvm::ffi::TensorView> fallback_rows,
-      const bool lpt,
+      const tvm::ffi::Optional<tvm::ffi::TensorView> row_map,
       const tvm::ffi::Optional<tvm::ffi::TensorView> lpt_trace) {
     using namespace host;
     auto B = SymbolicSize{"batch_size"};
@@ -2295,24 +2324,25 @@ struct TopKKernel {
 #endif
     if (sampled) {
 #ifdef USE_ROCM
-      static_cast<void>(lpt);
+      static_cast<void>(row_map);
       static_cast<void>(lpt_trace);
       RuntimeCheck(false, "the sampled candidate top-k needs CUDA");
 #else
-      if (lpt && rows <= kBlockSize) {  // longest rows first (topk_candidates_sampled_kernel)
+      if (row_map.has_value() && rows <= kBlockSize) {  // longest rows first (topk_candidates_sampled_kernel)
+        auto lpt = params;
+        lpt.row_map = verify_row_map(row_map.value(), rows, device_);
         if (lpt_trace.has_value()) {  // bench only: int64 [>= rows, 4], the timestamped instantiation
           auto G = SymbolicSize{"lpt_trace_blocks"};
           TensorMatcher({G, 4}).with_dtype<int64_t>().with_device(device_).verify(lpt_trace.value());
           RuntimeCheck(G.unwrap() >= rows, "lpt_trace has fewer rows than the grid");
-          auto traced = params;
-          traced.lpt_trace = static_cast<int64_t*>(lpt_trace.value().data_ptr());
+          lpt.lpt_trace = static_cast<int64_t*>(lpt_trace.value().data_ptr());
           return LaunchKernel(rows, kBlockSize, device_.unwrap())
               .config({.use_pdl = kUsePDL})
-              .launch(topk_candidates_sampled_kernel<kUsePDL, false, true, true>, traced);
+              .launch(topk_candidates_sampled_kernel<kUsePDL, false, true, true>, lpt);
         }
         return LaunchKernel(rows, kBlockSize, device_.unwrap())
             .config({.use_pdl = kUsePDL})
-            .launch(topk_candidates_sampled_kernel<kUsePDL, false, true>, params);
+            .launch(topk_candidates_sampled_kernel<kUsePDL, false, true>, lpt);
       }
       return LaunchKernel(rows, kBlockSize, device_.unwrap())
           .config({.use_pdl = kUsePDL})
@@ -2347,7 +2377,7 @@ struct TopKKernel {
       const bool sampled,
       const int64_t sampled_min_len,
       const tvm::ffi::Optional<tvm::ffi::TensorView> fallback_rows,
-      const bool lpt) {
+      const tvm::ffi::Optional<tvm::ffi::TensorView> row_map) {
     using namespace host;
     auto B = SymbolicSize{"batch_size"};
     auto L = SymbolicSize{"max_seq_len"};
@@ -2424,13 +2454,15 @@ struct TopKKernel {
 #endif
     if (sampled) {
 #ifdef USE_ROCM
-      static_cast<void>(lpt);
+      static_cast<void>(row_map);
       RuntimeCheck(false, "the sampled candidate top-k needs CUDA");
 #else
-      if (lpt && rows <= kBlockSize) {  // longest rows first (topk_candidates_sampled_kernel)
+      if (row_map.has_value() && rows <= kBlockSize) {  // longest rows first (topk_candidates_sampled_kernel)
+        auto lpt = params;
+        lpt.row_map = verify_row_map(row_map.value(), rows, device_);
         return LaunchKernel(rows, kBlockSize, device_.unwrap())
             .config({.use_pdl = kUsePDL})
-            .launch(topk_candidates_sampled_kernel<kUsePDL, true, true>, params);
+            .launch(topk_candidates_sampled_kernel<kUsePDL, true, true>, lpt);
       }
       return LaunchKernel(rows, kBlockSize, device_.unwrap())
           .config({.use_pdl = kUsePDL})
