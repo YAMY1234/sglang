@@ -2686,6 +2686,10 @@ class Envs:
     # recurrence kernel for any attention-TP head count (the fully fused decode kernel
     # is built for 12 heads, which also gated this fold).
     SGLANG_K31_KDA_ONORM_FOLD_ANY_HEADS = EnvBool(False)
+    # Kimi-K3.1, default off: cast the shared experts and the KDA q/k/v/g/b/f_a/o
+    # projections BF16 -> MXFP8 at load time, bit-identical to ModelOpt's
+    # MXFP8QTensor (the TRT-LLM IBDB checkpoint's precision for these layers).
+    SGLANG_K31_BASISB_MXFP8 = EnvBool(False)
     SGLANG_K31_SM107_GEMM_TACTICS = EnvBool(False)
     # Optional path of a JSON table that replaces the built-in SM107 table.
     SGLANG_K31_SM107_GEMM_TABLE = EnvStr(None)
