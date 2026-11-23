@@ -63,6 +63,9 @@ ROWS = _env_int("SGLANG_QSA_UNION_PREFILL_ROWS", 0)
 # K and V ring stages (128 tokens x 256 BF16 each); 2 + 2 fill shared memory next to Q (1 + 3 measured slower).
 STAGES_K = _env_int("SGLANG_QSA_UNION_PREFILL_STAGES_K", 2)
 STAGES_V = _env_int("SGLANG_QSA_UNION_PREFILL_STAGES_V", 2)
+# Union tokens per attention tile (128 or 64; the masks stay per 128). 0: 128 when the K and V rings fit the
+# device's shared memory beside Q, else 64 (2 + 2 stages of 64 tokens are 192 KB, within SM103's 227 KB).
+TILE = _env_int("SGLANG_QSA_UNION_PREFILL_TILE", 0)
 # Passes with fewer query rows keep the existing path; measured faster from 1,024 rows up (VR200 engine checks).
 MIN_ROWS = _env_int("SGLANG_QSA_UNION_PREFILL_MIN_ROWS", 1024)
 # Debug: the first N served calls also run the replaced kernel and log time and error. Not for served runs.
@@ -94,6 +97,14 @@ try:
     _GLUON = True
 except Exception:  # a Triton without Gluon's Blackwell API: the existing path serves
     _GLUON = False
+
+
+def tile_for(device, nsk: int, nsv: int) -> int:
+    """TILE, or the largest tile whose Q + K/V rings (+ barriers) fit the device's shared memory."""
+    if TILE:
+        return TILE
+    smem = triton.runtime.driver.active.utils.get_device_properties(device.index or 0)["max_shared_mem"]
+    return 128 if 2 * _HEAD_DIM * (_BM + 128 * (nsk + nsv)) + 1024 <= smem else 64
 
 
 def rows_per_group(num_q_heads: int, num_kv_heads: int) -> int:
@@ -375,6 +386,78 @@ if _GLUON:
             gl.store(obase[:, None] + (c * OC + do)[None, :], o.to(gl.bfloat16), mask=ok_o[:, None])
 
     @gluon.jit
+    def _upa_softmax64(s_tmem, o_tmem, s_ready, p_ready, o_done, MASK, mask_base, OUT, row0, rows, head, n_tiles,
+                       O_STRIDE_M, O_STRIDE_H, GQ: gl.constexpr, W: gl.constexpr, D: gl.constexpr,
+                       BM: gl.constexpr, BN: gl.constexpr, RESCALE: gl.constexpr):
+        # _upa_softmax on 64-token tiles: tile i is half i % 2 of mask tile i // 2 (words 2 * (i % 2) + 0, 1)
+        SC: gl.constexpr = 32
+        OC: gl.constexpr = 64
+        gl.static_assert(BN == 2 * SC)
+        s_tl: gl.constexpr = TensorMemoryLayout((BM, BN), col_stride=1)
+        sc_layout: gl.constexpr = _reg_layout(gl.float32, [BM, SC], s_tl, [BM, BN], gl.num_warps())
+        o_tl: gl.constexpr = TensorMemoryLayout((BM, D), col_stride=1)
+        oc_layout: gl.constexpr = _reg_layout(gl.float32, [BM, OC], o_tl, [BM, D], gl.num_warps())
+        row_l: gl.constexpr = gl.SliceLayout(1, sc_layout)
+        m_idx = gl.arange(0, BM, row_l)
+        j_idx = m_idx // GQ
+        ok = (m_idx < W * GQ) & (j_idx < rows)
+        wptr = MASK + mask_base + gl.minimum(j_idx, W - 1) * 4
+        bitval = 1 << gl.arange(0, SC, gl.SliceLayout(0, sc_layout))
+        has0 = ok & (n_tiles > 0)
+        n0 = gl.load(wptr + 0, mask=has0, other=0)
+        n1 = gl.load(wptr + 1, mask=has0, other=0)
+        m_i = gl.full([BM], float("-inf"), gl.float32, row_l)
+        l_i = gl.zeros([BM], gl.float32, row_l)
+        for i in range(n_tiles):
+            b = i % 2
+            w0 = n0
+            w1 = n1
+            hasn = ok & (i + 1 < n_tiles)
+            nptr = wptr + ((i + 1) // 2) * (W * 4) + ((i + 1) % 2) * 2
+            n0 = gl.load(nptr + 0, mask=hasn, other=0)
+            n1 = gl.load(nptr + 1, mask=hasn, other=0)
+            mbarrier.wait(s_ready.index(b), (i // 2) & 1)
+            s_buf = s_tmem.index(b)
+            x0 = _upa_masked(s_buf, 0, w0, bitval, SC, sc_layout)
+            x1 = _upa_masked(s_buf, 1, w1, bitval, SC, sc_layout)
+            mx = gl.maximum(gl.max(x0, 1), gl.max(x1, 1))
+            m_new = gl.maximum(m_i, mx)
+            prior = m_i > float("-inf")
+            need = prior & (m_new > m_i + RESCALE)
+            alpha = gl.where(need, gl.exp2(m_i - m_new), 1.0)
+            m_i = gl.where(need | (m_i == float("-inf")), m_new, m_i)
+            m_use = gl.where(m_i == float("-inf"), 0.0, m_i)
+            p0 = gl.exp2(x0 - m_use[:, None])
+            p1 = gl.exp2(x1 - m_use[:, None])
+            l_i = l_i * alpha + (gl.sum(p0, 1) + gl.sum(p1, 1))
+            p_buf = _p_view(s_buf, BM, BN)
+            p_buf.slice(0 * SC, SC).store(p0.to(gl.bfloat16))
+            p_buf.slice(1 * SC, SC).store(p1.to(gl.bfloat16))
+            if i > 0:
+                mbarrier.wait(o_done.index(0), (i - 1) & 1)
+                if gl.max(need.to(gl.int32), 0) > 0:
+                    a_o = gl.convert_layout(alpha, gl.SliceLayout(1, oc_layout))
+                    for c in gl.static_range(D // OC):
+                        o_ref = o_tmem.slice(c * OC, OC)
+                        o_ref.store(o_ref.load(oc_layout) * a_o[:, None])
+            mbarrier.arrive(p_ready.index(b), count=1)
+
+        if n_tiles > 0:
+            mbarrier.wait(o_done.index(0), (n_tiles - 1) & 1)
+        mo = gl.arange(0, BM, gl.SliceLayout(1, oc_layout))
+        jo = mo // GQ
+        ok_o = (mo < W * GQ) & (jo < rows)
+        l_o = gl.convert_layout(l_i, gl.SliceLayout(1, oc_layout))
+        do = gl.arange(0, OC, gl.SliceLayout(0, oc_layout))
+        obase = OUT + (row0 + jo).to(gl.int64) * O_STRIDE_M + (head * GQ + mo % GQ) * O_STRIDE_H
+        for c in gl.static_range(D // OC):
+            o = gl.zeros([BM, OC], gl.float32, oc_layout)
+            if n_tiles > 0:
+                o = o_tmem.slice(c * OC, OC).load(oc_layout)
+            o = o / l_o[:, None]
+            gl.store(obase[:, None] + (c * OC + do)[None, :], o.to(gl.bfloat16), mask=ok_o[:, None])
+
+    @gluon.jit
     def _qsa_union_prefill(
         Q,
         k_desc,
@@ -395,9 +478,11 @@ if _GLUON:
         NSK: gl.constexpr,
         NSV: gl.constexpr,
         RESCALE: gl.constexpr,
+        BN: gl.constexpr,  # union tokens per tile: 128, or 64 (smaller K/V rings)
     ):
         BM: gl.constexpr = 128  # query rows: W group rows x GQ heads, padded
-        BN: gl.constexpr = 128  # union tokens per tile
+        MT: gl.constexpr = 128  # tokens per mask tile (the union pass's)
+        gl.static_assert(BN == 128 or BN == 64)
         QC: gl.constexpr = 64
         gl.static_assert(W * GQ <= BM)
         g = gl.program_id(0)
@@ -424,15 +509,15 @@ if _GLUON:
             mbarrier.init(s_ready.index(i), count=1)
             mbarrier.init(p_ready.index(i), count=1)
         mbarrier.init(o_done.index(0), count=1)
-        # TMEM columns: S 2 x 128 (P aliases each) + O 256
+        # TMEM columns: S 2 x BN (P aliases each) + O 256
         s_tmem = allocate_tensor_memory(gl.float32, [2, BM, BN], TensorMemoryLayout((BM, BN), col_stride=1))
         o_tmem = allocate_tensor_memory(gl.float32, [BM, D], TensorMemoryLayout((BM, D), col_stride=1))
 
         row0 = gl.load(META + g * 4)
         rows = gl.load(META + g * 4 + 1)
-        n_tiles = gl.load(META + g * 4 + 3)
+        n_tiles = (gl.load(META + g * 4 + 2) + BN - 1) // BN
         tok_base = g * NT
-        mask_base = g * (NT // BN) * (W * 4)
+        mask_base = g * (NT // MT) * (W * 4)
 
         # Q: the group's rows x this KV head's GQ heads, scaled exactly as the stock kernel
         q_ld: gl.constexpr = gl.BlockedLayout([1, 8], [4, 8], [gl.num_warps(), 1], [1, 0])
@@ -447,25 +532,39 @@ if _GLUON:
             q_smem.slice(c * QC, QC, dim=1).store(qv)
         fence_async_shared()
 
-        gl.warp_specialize(
-            [
-                (_upa_softmax, (s_tmem, o_tmem, s_ready, p_ready, o_done, MASK, mask_base, OUT, row0, rows, head,
-                                n_tiles, O_STRIDE_M, O_STRIDE_H, GQ, W, D, BM, BN, RESCALE)),
-                (_upa_mma, (q_smem, k_smem, v_smem, s_tmem, o_tmem, k_ready, v_ready, k_free, v_free, s_ready,
-                            p_ready, o_done, n_tiles, BM, BN, NSK, NSV)),
-                (_upa_load, (k_desc, v_desc, TOK, k_smem, v_smem, k_ready, v_ready, k_free, v_free, tok_base, head,
-                             n_tiles, BN, D, NSK, NSV)),
-            ],
-            [1, 4],
-            [48, 80],
-        )
+        if BN == 128:
+            gl.warp_specialize(
+                [
+                    (_upa_softmax, (s_tmem, o_tmem, s_ready, p_ready, o_done, MASK, mask_base, OUT, row0, rows, head,
+                                    n_tiles, O_STRIDE_M, O_STRIDE_H, GQ, W, D, BM, BN, RESCALE)),
+                    (_upa_mma, (q_smem, k_smem, v_smem, s_tmem, o_tmem, k_ready, v_ready, k_free, v_free, s_ready,
+                                p_ready, o_done, n_tiles, BM, BN, NSK, NSV)),
+                    (_upa_load, (k_desc, v_desc, TOK, k_smem, v_smem, k_ready, v_ready, k_free, v_free, tok_base,
+                                 head, n_tiles, BN, D, NSK, NSV)),
+                ],
+                [1, 4],
+                [48, 80],
+            )
+        else:
+            gl.warp_specialize(
+                [
+                    (_upa_softmax64, (s_tmem, o_tmem, s_ready, p_ready, o_done, MASK, mask_base, OUT, row0, rows,
+                                      head, n_tiles, O_STRIDE_M, O_STRIDE_H, GQ, W, D, BM, BN, RESCALE)),
+                    (_upa_mma, (q_smem, k_smem, v_smem, s_tmem, o_tmem, k_ready, v_ready, k_free, v_free, s_ready,
+                                p_ready, o_done, n_tiles, BM, BN, NSK, NSV)),
+                    (_upa_load, (k_desc, v_desc, TOK, k_smem, v_smem, k_ready, v_ready, k_free, v_free, tok_base,
+                                 head, n_tiles, BN, D, NSK, NSV)),
+                ],
+                [1, 4],
+                [48, 80],
+            )
 
 
 LAST_KERNEL: dict = {}
 
 
 def attend(q, packed_k, packed_v, tok, mask, meta, nt, scale, *, groups, rows, stages=None, rescale=None,
-           out=None):
+           out=None, tile=None):
     """The tcgen05 kernel over build_unions' lists; writes out [rows, q_heads, 256] (BF16)."""
     kv_heads = packed_k.shape[1]
     gq = q.shape[1] // kv_heads
@@ -473,8 +572,10 @@ def attend(q, packed_k, packed_v, tok, mask, meta, nt, scale, *, groups, rows, s
         out = torch.empty_like(q)
     if groups == 0:
         return out
+    nsk, nsv = stages or (STAGES_K, STAGES_V)
+    bn = tile or tile_for(q.device, nsk, nsv)
     # Built per call: the packed K/V are fresh tensors every pass.
-    layout = gl.NVMMASharedLayout.get_default_for([_BN, _HEAD_DIM], gl.bfloat16)
+    layout = gl.NVMMASharedLayout.get_default_for([bn, _HEAD_DIM], gl.bfloat16)
     k_desc = TensorDescriptor.from_tensor(packed_k.view(packed_k.shape[0], -1), [1, _HEAD_DIM], layout)
     v_desc = TensorDescriptor.from_tensor(packed_v.view(packed_v.shape[0], -1), [1, _HEAD_DIM], layout)
     LAST_KERNEL["union_prefill"] = _qsa_union_prefill[(groups, kv_heads)](
@@ -494,16 +595,17 @@ def attend(q, packed_k, packed_v, tok, mask, meta, nt, scale, *, groups, rows, s
         GQ=gq,
         W=rows,
         D=_HEAD_DIM,
-        NSK=(stages or (STAGES_K, STAGES_V))[0],
-        NSV=(stages or (STAGES_K, STAGES_V))[1],
+        NSK=nsk,
+        NSV=nsv,
         RESCALE=RESCALE_LOG2 if rescale is None else float(rescale),
+        BN=bn,
         num_warps=4,
     )
     return out
 
 
 def union_prefill(q, packed_k, packed_v, indices, cu_q, cu_k, kv_lens, scale, *, extend_lens, kv_max,
-                  rows=None, stages=None, rescale=None, out=None):
+                  rows=None, stages=None, rescale=None, out=None, tile=None):
     """``sparse_gqa_fwd_interface_triton_ck``'s contract (indices relative to row cu_k[b] of the packed
     K/V) with the host extend lengths; the caller checks ``applies`` first. ``out``, when given, is a
     [rows, q_heads, 256] BF16 buffer with unit last stride that receives the result in place of a new
@@ -517,7 +619,7 @@ def union_prefill(q, packed_k, packed_v, indices, cu_q, cu_k, kv_lens, scale, *,
         indices, cu_q, kv_lens, cu_k, groups=groups, rows=rows, kv_max=kv_max, oob=packed_k.shape[0]
     )
     return attend(q, packed_k, packed_v, tok, mask, meta, nt, scale, groups=groups, rows=rows, stages=stages,
-                  rescale=rescale, out=out)
+                  rescale=rescale, out=out, tile=tile)
 
 
 def log_once(q, packed_k, indices) -> None:
@@ -526,7 +628,7 @@ def log_once(q, packed_k, indices) -> None:
     _state["logged"] = True
     heads = packed_k.shape[1]
     logger.info(
-        "QSA union prefill: on (rows=%d heads=%d/%d topk=%d stages=%d,%d rescale_log2=%g "
+        "QSA union prefill: on (rows=%d heads=%d/%d topk=%d stages=%d,%d tile=%d rescale_log2=%g "
         "min_rows=%d check_calls=%d) "
         "(SGLANG_ENABLE_QSA_UNION_PREFILL)",
         rows_per_group(q.shape[1], heads),
@@ -535,6 +637,7 @@ def log_once(q, packed_k, indices) -> None:
         indices.shape[-1],
         STAGES_K,
         STAGES_V,
+        tile_for(q.device, STAGES_K, STAGES_V),
         RESCALE_LOG2,
         MIN_ROWS,
         CHECK_CALLS,
