@@ -650,7 +650,7 @@ struct PushedParams {
   int32_t rank;
   int32_t span;  // page_size * kNumRanks
   int32_t max_rows;
-  int64_t* trace = nullptr;  // bench only (merge_pushed_wide_kernel kTrace): [rows, 8] per CTA
+  int64_t* trace = nullptr;  // bench only (merge_pushed_wide_traced_kernel): [rows, 8] per CTA
 };
 
 // This rank failed the certificate: its keys >= t_lo, tagged into its full slot
@@ -925,11 +925,10 @@ __global__ void __launch_bounds__(32 * kNumRanks, kNumRanks == 8 ? 4 : 1)
 // kTopK / (32 * kWarpsPerRank) keys and the select's rounds have that many more warps in
 // flight. Same buffer protocol, same t*, and this rank's keys >= t* in candidate order, so
 // out / out_local / out_lengths equal merge_pushed_kernel's.
-/// kTrace (bench only): thread 0 writes p.trace[row] = {start, PDL wait done, every rank's candidates in, t* known,
-/// end, row} (globaltimer); the production launch uses kTrace = false.
-template <int kNumRanks, int kTopK, int kWarpsPerRank, bool kUsePDL, bool kTrace = false>
-__global__ void __launch_bounds__(32 * kNumRanks * kWarpsPerRank)
-    merge_pushed_wide_kernel(const __grid_constant__ PushedParams p) {
+/// kTrace (bench only, merge_pushed_wide_traced_kernel): thread 0 writes p.trace[row] = {start, PDL wait done, every
+/// rank's candidates in, t* known, end, row} (globaltimer).
+template <int kNumRanks, int kTopK, int kWarpsPerRank, bool kUsePDL, bool kTrace>
+SGL_DEVICE void merge_pushed_wide_body(const PushedParams& p) {
   constexpr int kRankThreads = 32 * kWarpsPerRank;
   constexpr int kPer = kTopK / kRankThreads;
   constexpr int kWords = kTopK / 32;
@@ -1036,6 +1035,19 @@ __global__ void __launch_bounds__(32 * kNumRanks * kWarpsPerRank)
     stamp(4);
     if (tid == 0) p.trace[row * 8 + 5] = row;
   }
+}
+
+template <int kNumRanks, int kTopK, int kWarpsPerRank, bool kUsePDL>
+__global__ void __launch_bounds__(32 * kNumRanks * kWarpsPerRank)
+    merge_pushed_wide_kernel(const __grid_constant__ PushedParams p) {
+  merge_pushed_wide_body<kNumRanks, kTopK, kWarpsPerRank, kUsePDL, false>(p);
+}
+
+/// Bench only: the body with its stamps, held to the production kernel's 2 CTAs per SM (64 registers).
+template <int kNumRanks, int kTopK, int kWarpsPerRank, bool kUsePDL>
+__global__ void __launch_bounds__(32 * kNumRanks * kWarpsPerRank, 2)
+    merge_pushed_wide_traced_kernel(const __grid_constant__ PushedParams p) {
+  merge_pushed_wide_body<kNumRanks, kTopK, kWarpsPerRank, kUsePDL, true>(p);
 }
 
 }  // namespace dcp_topk_merge
@@ -1308,7 +1320,7 @@ struct DcpTopKMergePushedWideKernel {
       traced.trace = static_cast<int64_t*>(trace->data_ptr());
       LaunchKernel(rows, static_cast<int>(32 * kNumRanks * kWarpsPerRank), device_.unwrap())
           .enable_pdl(kUsePDL)(
-              dcp_topk_merge::merge_pushed_wide_kernel<kNumRanks, kTopK, kWarpsPerRank, kUsePDL, true>, traced);
+              dcp_topk_merge::merge_pushed_wide_traced_kernel<kNumRanks, kTopK, kWarpsPerRank, kUsePDL>, traced);
     } else {
       LaunchKernel(rows, static_cast<int>(32 * kNumRanks * kWarpsPerRank), device_.unwrap())
           .enable_pdl(kUsePDL)(kernel, params);
