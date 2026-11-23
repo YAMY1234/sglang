@@ -1063,6 +1063,11 @@ class Envs:
     # A branching point shallower than this many tokens gets no branch-point state
     # (no split cut, no fork checkpoint); 0 (default) keeps every branching point.
     SGLANG_MAMBA_BRANCH_TRACK_MIN_TOKENS = EnvInt(0)
+    # Comma list of message-boundary token ids (K3.1 <|close|>: 163588). A request
+    # with no branching point gets one at the last boundary past its usable Mamba
+    # state, at least MIN_GAP tokens below the input end; empty (default) = off.
+    SGLANG_MAMBA_BRANCH_HEAD_TOKEN_IDS = EnvTuple(())
+    SGLANG_MAMBA_BRANCH_HEAD_MIN_GAP = EnvInt(0)
     # Scales the hierarchical Mamba host pool's share of --hicache-size (the KV
     # host pools take the rest); unset (default) splits it as the device pools are.
     SGLANG_HICACHE_MAMBA_HOST_SCALE = EnvFloat(None)

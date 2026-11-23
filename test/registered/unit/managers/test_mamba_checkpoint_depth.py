@@ -291,6 +291,73 @@ class TestBranchTrackMinTokens(unittest.TestCase):
         self.assertEqual(_track_seqlen(**args, branching=branching), 3968)
 
 
+class TestBranchHeadMessageBoundary(unittest.TestCase):
+    # SGLANG_MAMBA_BRANCH_HEAD_TOKEN_IDS: with no branching point, the last boundary
+    # token past the usable state (closes at 2000 and 4100 of 6000) becomes one.
+    CLOSE = 163588
+
+    def _matched(self, *, closes=(2000, 4100), state=0, branching=None, n=6000):
+        ids = array("q", [1] * n)
+        for pos in closes:
+            ids[pos] = self.CLOSE
+        req = Req(
+            rid="req",
+            origin_input_text="",
+            origin_input_ids=ids,
+            sampling_params=SamplingParams(max_new_tokens=1),
+            vocab_size=128,
+        )
+        tree_cache = SimpleNamespace(
+            page_size=CHUNK,
+            swa_reprefill_tail_tokens=lambda req: 0,
+            match_prefix=lambda params: MatchResult(
+                device_prefix_len=state,
+                last_device_node=None,
+                last_host_node=None,
+                best_match_node=None,
+                mamba_branching_seqlen=branching,
+            ),
+        )
+        with get_context().override_server_args(_mamba_cache_chunk_size=CHUNK):
+            match_kv_cache(req, tree_cache, req.origin_input_ids)
+        return req.mamba_branching_seqlen
+
+    def test_off_by_default(self):
+        self.assertIsNone(self._matched())
+
+    def test_the_last_boundary_past_the_state_becomes_the_branching_point(self):
+        with envs.SGLANG_MAMBA_BRANCH_HEAD_TOKEN_IDS.override(str(self.CLOSE)):
+            self.assertEqual(self._matched(), 4096)
+            # a boundary whose state would be the input end's (5952) adds nothing
+            self.assertEqual(self._matched(closes=(2000, 4100, 5960)), 4096)
+            # none past the usable state, none at all, or a KV branching point wins
+            self.assertIsNone(self._matched(state=4096))
+            self.assertIsNone(self._matched(closes=()))
+            self.assertEqual(self._matched(branching=23808, n=40000), 23808)
+
+    def test_min_gap_keeps_the_boundary_below_the_input_end(self):
+        with (
+            envs.SGLANG_MAMBA_BRANCH_HEAD_TOKEN_IDS.override(str(self.CLOSE)),
+            envs.SGLANG_MAMBA_BRANCH_HEAD_MIN_GAP.override(2000),
+        ):
+            self.assertEqual(self._matched(), 1984)
+            self.assertIsNone(self._matched(n=2100))
+
+    def test_the_boundary_cuts_the_last_forward_like_a_branching_point(self):
+        with envs.SGLANG_MAMBA_BRANCH_HEAD_TOKEN_IDS.override(str(self.CLOSE)):
+            k = self._matched()
+        adder = object.__new__(PrefillAdder)
+        adder.page_size, adder.new_chunked_req = CHUNK, None
+        req = SimpleNamespace(
+            mamba_branching_seqlen=k, full_untruncated_fill_ids=[1] * 6000
+        )
+        with (
+            envs.SGLANG_MAMBA_BRANCH_TRACK_SPLIT.override(True),
+            get_context().override_server_args(_mamba_cache_chunk_size=CHUNK),
+        ):
+            self.assertEqual(adder._branch_split_len(req, 0, 6000, False), 4096)
+
+
 class TestChunkedPrefillStaysOnTheChunkGrid(unittest.TestCase):
     """The scheduler side of the same constraint.
 

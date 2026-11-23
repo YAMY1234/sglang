@@ -50,6 +50,7 @@ from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.managers.schedule_batch import (
     Req,
     ScheduleBatch,
+    count_branch_split_cut,
     split_cached_prefix_by_tier,
 )
 from sglang.srt.mem_cache.allocator.hisparse import (
@@ -1927,6 +1928,7 @@ class PrefillAdder:
             self._reserve_chunked_tail(req, req.extend_end)
         if admission.branch_split:
             self.rem_chunk_tokens = 0  # one chunked request per batch: admit no more
+            count_branch_split_cut()
         self._account_prefill_cache_admission(req, admission.prefix_len)
 
     def preempt_to_schedule(self, req: Req) -> bool:

@@ -25,7 +25,7 @@ from sglang.srt.mem_cache.hicache_storage import PoolTransfer
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
-from sglang.srt.runtime_context import get_serving, get_spec
+from sglang.srt.runtime_context import get_serving, get_spec, mamba_checkpoint_grid
 from sglang.srt.utils.common import ceil_align
 
 if TYPE_CHECKING:
@@ -230,6 +230,24 @@ def peek_uncached_tokens(req: Req, tree_cache: BasePrefixCache) -> Optional[int]
     )
 
 
+def _message_boundary_seqlen(
+    *, token_ids: array, state_len: int, grid: int
+) -> Optional[int]:
+    """SGLANG_MAMBA_BRANCH_HEAD_TOKEN_IDS: the grid depth just past the last
+    boundary token beyond the usable state, kept MIN_GAP below the input end."""
+    end = (len(token_ids) - envs.SGLANG_MAMBA_BRANCH_HEAD_MIN_GAP.get()) // grid * grid
+    if end - grid <= state_len:
+        return None
+    # A state at depth (pos + 1) // grid * grid must stay strictly below end.
+    tail = np.asarray(token_ids[state_len : end - 1], dtype=np.int64)
+    ids = [int(t) for t in envs.SGLANG_MAMBA_BRANCH_HEAD_TOKEN_IDS.get()]
+    hits = np.flatnonzero(np.isin(tail, ids))
+    if not len(hits):
+        return None
+    depth = (state_len + int(hits[-1]) + 1) // grid * grid
+    return depth if depth > state_len else None
+
+
 def match_kv_cache(
     req: Req,
     tree_cache: BasePrefixCache,
@@ -263,6 +281,17 @@ def match_kv_cache(
         and branching_seqlen < envs.SGLANG_MAMBA_BRANCH_TRACK_MIN_TOKENS.get()
     ):
         match_result = match_result._replace(mamba_branching_seqlen=None)
+    if (
+        match_result.mamba_branching_seqlen is None
+        and envs.SGLANG_MAMBA_BRANCH_HEAD_TOKEN_IDS.get()
+    ):
+        match_result = match_result._replace(
+            mamba_branching_seqlen=_message_boundary_seqlen(
+                token_ids=token_ids,
+                state_len=match_result.device_prefix_len + match_result.host_hit_length,
+                grid=mamba_checkpoint_grid(tree_cache.page_size),
+            )
+        )
     req.prefix_len = match_result.device_prefix_len
     (
         req.last_node,

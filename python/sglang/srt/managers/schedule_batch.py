@@ -2310,7 +2310,13 @@ _BRANCH_TRACK_COUNTS = {
     "branch_tracked": 0,
     "branch_tracked_last": 0,
     "end_preferred": 0,
+    "split_cuts": 0,
 }
+
+
+def count_branch_split_cut() -> None:
+    """An extra prefill forward: an admission cut at the branching point."""
+    _BRANCH_TRACK_COUNTS["split_cuts"] += 1
 
 
 def _count_branch_track(branch_in_forward: bool, prefer_end: bool, last: bool) -> None:
