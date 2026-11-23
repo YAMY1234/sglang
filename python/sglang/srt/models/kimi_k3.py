@@ -2783,6 +2783,8 @@ class KimiK3DeltaAttention(nn.Module):
                     # first to avoid CUDA graph replay stream expansion.
                     alt = self._bfa_alt_stream
                     cur = torch.cuda.current_stream()
+                    # Stream 2 (shared with the MLA output gate): bfa / forget_gate blocks are reused only by
+                    # stream-2 allocations after the next fork; their consumers must not outlive that fork.
                     alt.wait_stream(cur)
                     fused_states, _ = self.fused_qkvg_proj(hidden_states)
                     m_ranges = self._bfa_side_tgv_m_ranges
@@ -3108,6 +3110,8 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
             and (0 < hidden_states.shape[0] <= self._gate_bs_limit)
         ):
             alt = self._gate_alt_stream
+            # Stream 2 (shared with the KDA [f_a|b] GEMMs): the gate's blocks are reused only by stream-2
+            # allocations after the next fork; its consumer (o_proj) must not outlive that fork.
             alt.wait_stream(torch.cuda.current_stream())
             self._gate_pending_stream = alt
 
