@@ -369,8 +369,8 @@ class TestSyncAudit(unittest.TestCase):
 
         audit = self._audit()
         wait = audit.timed("event.synchronize", lambda: time.sleep(0.002), False)
-        wait()
-        wait()
+        for _ in range(2):
+            wait()
         audit.timed("tensor.item", torch.Tensor.item, True)(torch.ones(1))
         snap = audit.snapshot(fwd_n=7)
         self.assertEqual(snap["fwd_n"], 7)
