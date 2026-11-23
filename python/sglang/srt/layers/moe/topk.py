@@ -2641,15 +2641,17 @@ def _post_process_topk_ids(
             else:
                 # A remap table indexed by -1 aliases its last entry, so only the
                 # identity-remap branch may drop the padded-row mask.
-                topk_ids = _biased_grouped_topk_postprocess(
-                    topk_ids,
-                    expert_location_dispatch_info,
-                    (
-                        None
-                        if padded_rows_masked and expert_location_dispatch_info is None
-                        else num_token_non_padded
-                    ),
+                pad_rows = (
+                    None
+                    if padded_rows_masked and expert_location_dispatch_info is None
+                    else num_token_non_padded
                 )
+                # With neither a remap nor rows to mask the compiled call is the identity;
+                # skipping it saves its guard evaluation on every MoE layer.
+                if expert_location_dispatch_info is not None or pad_rows is not None:
+                    topk_ids = _biased_grouped_topk_postprocess(
+                        topk_ids, expert_location_dispatch_info, pad_rows
+                    )
     elif _is_hip:
         # On AMD HIP the aiter MoE kernels do not handle topk_ids=-1 safely
         # (negative indices cause illegal memory access). Always fill the padded

@@ -1465,15 +1465,8 @@ def use_cutedsl_bf16_gemm(m: int, n: int, k: int) -> bool:
     m_range = _MUSE_SPARK_TGV_M_RANGES.get((n, k))
     if m_range is not None:
         return m_range[0] <= m <= m_range[1]
-    if (
-        get_device_sm() == 107
-        and m in _K3_FRONT_WARP_SPLITK
-        and (n, k)
-        == (
-            6016,
-            7168,
-        )
-    ):
+    # Device check last: it queries CUDA, and this runs for every bf16 GEMM.
+    if m in _K3_FRONT_WARP_SPLITK and (n, k) == (6016, 7168) and get_device_sm() == 107:
         return True
     if m <= 8 and (n, k) in _K3_TGV_WIN_SHAPES:
         return True
@@ -1539,12 +1532,12 @@ def _tgv_bf16_gemm_out_run(
     if x.shape[0] == 0:
         return None
     if (
-        get_device_sm() == 107
-        and x.shape[0] in _K3_FRONT_WARP_SPLITK
+        x.shape[0] in _K3_FRONT_WARP_SPLITK
         and x.shape[1] == 7168
         and weight.shape == (6016, 7168)
         and out.dtype == torch.float32
         and bias is None
+        and get_device_sm() == 107
     ):
         # Temporary vendored copy of FlashInfer's warp split-K kernel with an
         # FP32 output path; switch to flashinfer.gemm once it accepts FP32 out.
