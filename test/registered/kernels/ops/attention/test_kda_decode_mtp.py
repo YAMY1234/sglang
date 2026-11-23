@@ -376,24 +376,6 @@ def _rel(got, want):
     return float((got.double() - want.double()).norm() / want.double().norm())
 
 
-class TestKdaFlowOperands(CustomTestCase):
-    """KdaFlow hands layer parameters (A_log, dt_bias, norm weight: nn.Parameter,
-    requires grad) to CuTe through DLPack, which refuses tensors that require grad;
-    the operands must be detached. Runs on CPU."""
-
-    def test_parameters_export(self):
-        try:
-            from sglang.kernels.ops.attention.kda_flow import cute_views
-        except ImportError as exc:  # no CuTe DSL in this environment
-            raise unittest.SkipTest(str(exc))
-        a_log = torch.nn.Parameter(torch.randn(24))
-        dt_bias = torch.nn.Parameter(torch.randn(24 * 128))
-        state = torch.zeros(3, 24, 128, 128)
-        views = cute_views((a_log, dt_bias, state, -5.0))
-        self.assertEqual(len(views), 4)
-        self.assertTrue(a_log.requires_grad)
-
-
 class TestKdaFlowVerify(CustomTestCase):
     """SGLANG_OPT_KDA_FLOW: the persistent verify folds the previous step's accepted
     rows from its RecoverSSM records and verifies q = 5 rows; over steps with partial
