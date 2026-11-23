@@ -14,9 +14,9 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
+import sglang.srt.managers.cache_controller as cc_mod
 import sglang.srt.mem_cache.unified_radix_cache as urc_mod
 from sglang.srt.environ import envs
-import sglang.srt.managers.cache_controller as cc_mod
 from sglang.srt.managers.cache_controller import CacheOperation, HiCacheController
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.mem_cache import pmicro_hoststats as hs
@@ -164,8 +164,8 @@ class TestEvictionCallSites(CustomTestCase):
         cache.writing_check.assert_not_called()
 
     def _demote_walk(self, *, backup, backed=True, mamba=True):
-        """Evict one leaf under the Mamba demote watch; returns the counts and
-        the order of the backup and leaf-eviction calls."""
+        """Evict one leaf under the Mamba demote watch; returns the counts, the
+        order of the backup and leaf-eviction calls, and the nodes it copied."""
         cache = _cache()
         cache.tree_components = (ComponentType.FULL,)
         cache.tree_core.full_evictable_size.return_value = 0
@@ -179,6 +179,7 @@ class TestEvictionCallSites(CustomTestCase):
         )
         cache._mamba_demote_watch = True
         cache._mamba_backup_before_demote = backup
+        cache._demote_copied_nodes = set()
         cache.mamba_retention_counts = {
             "demote_state_drops": 0,
             "demote_state_copies": 0,
@@ -192,22 +193,64 @@ class TestEvictionCallSites(CustomTestCase):
             side_effect=[(5, True), (None, False)]
         )
         cache._evict_components({ComponentType.FULL: 1}, {ComponentType.FULL: 0})
-        return cache.mamba_retention_counts, [name for name, _, _ in order.mock_calls]
+        calls = [name for name, _, _ in order.mock_calls]
+        return cache.mamba_retention_counts, calls, cache._demote_copied_nodes
 
     def test_backed_leaf_state_is_copied_before_the_demote(self):
-        counts, calls = self._demote_walk(backup=True)
+        counts, calls, copied = self._demote_walk(backup=True)
         self.assertEqual(calls, ["backup", "evict_leaf"])
         self.assertEqual(counts, {"demote_state_drops": 0, "demote_state_copies": 1})
+        self.assertEqual(copied, {5})
 
     def test_watch_only_counts_the_dropped_state(self):
-        counts, calls = self._demote_walk(backup=False)
+        counts, calls, copied = self._demote_walk(backup=False)
         self.assertEqual(calls, ["evict_leaf"])
         self.assertEqual(counts, {"demote_state_drops": 1, "demote_state_copies": 0})
+        self.assertEqual(copied, set())
         # an unbacked leaf's backup carries its state; a stateless one has none
         for kwargs in (dict(backed=False), dict(mamba=False)):
-            counts, calls = self._demote_walk(backup=True, **kwargs)
+            counts, calls, copied = self._demote_walk(backup=True, **kwargs)
             self.assertEqual(calls, ["evict_leaf"])
             self.assertEqual(set(counts.values()), {0})
+            self.assertEqual(copied, set())
+
+    def test_load_back_counts_a_restored_copy_once(self):
+        # Only a load-back that brings back the Mamba state of a node copied before
+        # its demote counts, once; a KV-only load leaves the node pending.
+        cache = _cache()
+        cache._demote_copied_nodes = {7, 8}
+        cache.mamba_retention_counts = {"demote_copy_restores": 0}
+        kv = SimpleNamespace(host_indices=torch.arange(64))
+        cache._build_sidecar_transfers = MagicMock(return_value=[])
+        cache.load_back_threshold = 1
+        cache.token_to_kv_pool_allocator = SimpleNamespace()
+        cache._component_available_size = MagicMock(return_value=1 << 20)
+        cache.cache_controller.load = MagicMock(return_value=torch.arange(64))
+        for name in (
+            "dec_lock_ref",
+            "dec_host_lock_ref",
+            "inc_lock_ref",
+            "_apply_cache_actions",
+        ):
+            setattr(cache, name, MagicMock())
+        cache.ongoing_load_back = {}
+        kwargs = dict(
+            mem_quota=None,
+            req=None,
+            result=SimpleNamespace(delta=0),
+            ancestor_lock_params=None,
+            host_anchor_params=None,
+        )
+
+        def load(node_id, comp_xfers):
+            cache.tree_core.build_load_back_spec.return_value = (kv, comp_xfers)
+            self.assertTrue(cache._load_back_transfers(node_id=node_id, **kwargs))
+
+        load(8, {})
+        load(7, {ComponentType.MAMBA: ["state"]})
+        load(7, {ComponentType.MAMBA: ["state"]})
+        self.assertEqual(cache.mamba_retention_counts["demote_copy_restores"], 1)
+        self.assertEqual(cache._demote_copied_nodes, {8})
 
     def test_full_leaf_victim_opts_in(self):
         cache = _cache()
@@ -434,8 +477,8 @@ class TestBatchedEviction(CustomTestCase):
         self, *, batch, backups=(3, 3, 3), streams=None, demote_error=None, host_only=()
     ):
         cache = _cache()
-        cache.tree_core.component_has_host_value_only.side_effect = (
-            lambda n, ct: n in host_only and ct == ComponentType.MAMBA
+        cache.tree_core.component_has_host_value_only.side_effect = lambda n, ct: (
+            n in host_only and ct == ComponentType.MAMBA
         )
         cache.tree_core.full_evictable_size.return_value = 0
         cache._wb_evict_batch = batch
@@ -451,7 +494,10 @@ class TestBatchedEviction(CustomTestCase):
         )
         results = iter(backups)
         cache._execute_and_commit_kv_backup = MagicMock(
-            side_effect=lambda bkv, **k: (order.backup(bkv.node_ids[-1]), next(results))[1]
+            side_effect=lambda bkv, **k: (
+                order.backup(bkv.node_ids[-1]),
+                next(results),
+            )[1]
         )
 
         def demote(node_id, tracker):
@@ -461,7 +507,9 @@ class TestBatchedEviction(CustomTestCase):
 
         cache._demote = MagicMock(side_effect=demote)
         cache._drop_subtree_no_host = MagicMock(
-            side_effect=lambda n, t: (order.drop(n, list(cache._wb_batch_locks)), True)[1]
+            side_effect=lambda n, t: (order.drop(n, list(cache._wb_batch_locks)), True)[
+                1
+            ]
         )
         cache.writing_check = MagicMock(
             side_effect=lambda **k: order.wait(k, [n for n, _ in cache._wb_batch_locks])
@@ -491,11 +539,14 @@ class TestBatchedEviction(CustomTestCase):
         self.assertEqual(
             calls,
             [
-                call.backup(5), call.wait({"write_back": True, "relaxed_fence": True}, []),
+                call.backup(5),
+                call.wait({"write_back": True, "relaxed_fence": True}, []),
                 call.demote(5),
-                call.backup(6), call.wait({"write_back": True, "relaxed_fence": True}, []),
+                call.backup(6),
+                call.wait({"write_back": True, "relaxed_fence": True}, []),
                 call.demote(6),
-                call.backup(7), call.wait({"write_back": True, "relaxed_fence": True}, []),
+                call.backup(7),
+                call.wait({"write_back": True, "relaxed_fence": True}, []),
                 call.demote(7),
                 call.end(),
             ],
@@ -507,11 +558,20 @@ class TestBatchedEviction(CustomTestCase):
         self.assertEqual(
             calls,
             [
-                call.backup(5), call.lock(5), call.demote(5),
-                call.backup(6), call.lock(3), call.lock(6), call.demote(6),
-                call.backup(7), call.lock(7), call.demote(7),
+                call.backup(5),
+                call.lock(5),
+                call.demote(5),
+                call.backup(6),
+                call.lock(3),
+                call.lock(6),
+                call.demote(6),
+                call.backup(7),
+                call.lock(7),
+                call.demote(7),
                 wait,
-                call.unlock(5, "r5"), call.unlock(3, "r3"), call.unlock(6, "r6"),
+                call.unlock(5, "r5"),
+                call.unlock(3, "r3"),
+                call.unlock(6, "r6"),
                 call.unlock(7, "r7"),
                 call.end(),
             ],
@@ -528,10 +588,18 @@ class TestBatchedEviction(CustomTestCase):
         self.assertEqual(
             calls,
             [
-                call.backup(5), call.lock(5), call.demote(5),
-                call.backup(6), wait, call.unlock(5, "r5"), call.demote(6),
-                call.backup(7), call.lock(7), call.demote(7),
-                wait, call.unlock(7, "r7"),
+                call.backup(5),
+                call.lock(5),
+                call.demote(5),
+                call.backup(6),
+                wait,
+                call.unlock(5, "r5"),
+                call.demote(6),
+                call.backup(7),
+                call.lock(7),
+                call.demote(7),
+                wait,
+                call.unlock(7, "r7"),
                 call.end(),
             ],
         )
@@ -558,9 +626,13 @@ class TestBatchedEviction(CustomTestCase):
         cache._execute_and_commit_kv_backup = MagicMock(side_effect=backup)
         locks = []
         cache.inc_host_lock_ref = MagicMock(
-            side_effect=lambda n: (locks.append(n), SimpleNamespace(to_dec_params=str))[1]
+            side_effect=lambda n: (locks.append(n), SimpleNamespace(to_dec_params=str))[
+                1
+            ]
         )
-        self.assertEqual(cache._backup_full_leaf_batched(SimpleNamespace(node_ids=[3, 6])), 3)
+        self.assertEqual(
+            cache._backup_full_leaf_batched(SimpleNamespace(node_ids=[3, 6])), 3
+        )
         self.assertEqual(locks, [3, 6, 2])
 
     def test_same_victims_and_demotes_as_per_victim_walk(self):
@@ -591,7 +663,9 @@ class TestBatchedEviction(CustomTestCase):
 
     def test_stream_change_lands_the_queue(self):
         stream_ctx = MagicMock()
-        with patch.object(urc_mod.device_module, "stream", return_value=stream_ctx) as s:
+        with patch.object(
+            urc_mod.device_module, "stream", return_value=stream_ctx
+        ) as s:
             _, calls = self._walk(batch=True, streams=[None, "S", "S"])
         waits = [i for i, c in enumerate(calls) if c[0] == "wait"]
         self.assertEqual(len(waits), 2)
@@ -614,6 +688,7 @@ class TestBatchedEviction(CustomTestCase):
             ],
         )
         self.assertEqual(cache._wb_batch_locks, [])
+
 
 class TestPMicroHostStats(CustomTestCase):
     """SGLANG_PMICRO_HOSTSTATS (rig only): host-side counters and per-op timings."""
@@ -780,7 +855,6 @@ class TestPMicroHostStats(CustomTestCase):
         )
         self.assertTrue(msgs[2].startswith("PMICRO_HOSTSTAT iter=8 "))
         self.assertEqual(hs.OPS["evict_wait"].n, 0)
-
 
 
 class _FakeEvent:
@@ -1027,7 +1101,20 @@ class TestPMicroD2HAndPutStats(CustomTestCase):
         self.assertIsNotNone(m, line)
         self.assertEqual(
             m.groups(),
-            ("176", "512", "128", "3", "3", "0.333", "0", "64", "2", "5.0", "4.0", "1.0"),
+            (
+                "176",
+                "512",
+                "128",
+                "3",
+                "3",
+                "0.333",
+                "0",
+                "64",
+                "2",
+                "5.0",
+                "4.0",
+                "1.0",
+            ),
         )
         self.assertEqual(
             hs.take_hostfree_fields(),

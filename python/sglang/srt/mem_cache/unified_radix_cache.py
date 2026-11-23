@@ -227,6 +227,9 @@ class UnifiedRadixCache(BasePrefixCache):
     # set by _init_mamba_demote_watch.
     _mamba_demote_watch = False
     _mamba_backup_before_demote = False
+    # Nodes whose device-only Mamba state was copied to host before their demote;
+    # a later load-back of one counts in demote_copy_restores.
+    _demote_copied_nodes: Optional[set[NodeId]] = None
     mamba_retention_counts: Optional[dict[str, int]] = None
     # L2->L3 write-back (SGLANG_OPT_HICACHE_STORAGE_WRITE_BACK); set in init_hicache.
     _storage_write_back: Optional[StorageWriteBack] = None
@@ -759,7 +762,9 @@ class UnifiedRadixCache(BasePrefixCache):
             self.tree_core.begin_mamba_host_eviction(0, min_depth=8192)
             if envs.SGLANG_HICACHE_L3_TOMBSTONE_ASYNC.get():
                 self._l3_tombstone_pending = {}
-                self._l3_tombstone_reserve = max(0, envs.SGLANG_HICACHE_L3_TOMBSTONE_RESERVE.get())
+                self._l3_tombstone_reserve = max(
+                    0, envs.SGLANG_HICACHE_L3_TOMBSTONE_RESERVE.get()
+                )
                 logger.info(
                     "HiCache L3 state tombstones written asynchronously (reserve %d host states).",
                     self._l3_tombstone_reserve,
@@ -794,8 +799,14 @@ class UnifiedRadixCache(BasePrefixCache):
             )
             self._l3_tier_final = WriteOnHostEvictFinalStats.register(self)
             if envs.SGLANG_HICACHE_L3_TRACE.get() and self.pp_rank == 0:
-                self._l3_trace = dict(kv={}, state={}, writes_logged=0, absent_logged=0,
-                                      present_logged=0, queried_logged=0)
+                self._l3_trace = dict(
+                    kv={},
+                    state={},
+                    writes_logged=0,
+                    absent_logged=0,
+                    present_logged=0,
+                    queried_logged=0,
+                )
             if (
                 envs.SGLANG_HICACHE_L3_WRITE_MAMBA_HOST_LEAVES.get()
                 and self.is_mamba_enabled
@@ -969,7 +980,9 @@ class UnifiedRadixCache(BasePrefixCache):
             **(self.mamba_retention_counts or {}),
             "demote_state_drops": 0,
             "demote_state_copies": 0,
+            "demote_copy_restores": 0,
         }
+        self._demote_copied_nodes = set()
         logger.info("Mamba demote watch on, back up before demote %s", backup)
 
     def _watch_backed_leaf_state(self, node_id: NodeId) -> None:
@@ -987,6 +1000,7 @@ class UnifiedRadixCache(BasePrefixCache):
                 self.evict_host(1, ComponentType.MAMBA)
             if self.backup_node_for_write_back(node_id):
                 counts["demote_state_copies"] += 1
+                self._demote_copied_nodes.add(node_id)
                 return
         counts["demote_state_drops"] += 1
 
@@ -2042,7 +2056,9 @@ class UnifiedRadixCache(BasePrefixCache):
             raise RuntimeError("Mamba tombstone victim has no writable host state")
         return operation_id
 
-    def _finish_mamba_tombstone(self, node_id: NodeId, *, revived_ok: bool = False) -> int:
+    def _finish_mamba_tombstone(
+        self, node_id: NodeId, *, revived_ok: bool = False
+    ) -> int:
         result = self.tree_core.finish_mamba_host_eviction(node_id)
         self._apply_eviction_result(result)
         freed = result.tracker.get(ComponentType.MAMBA, 0)
@@ -2075,7 +2091,9 @@ class UnifiedRadixCache(BasePrefixCache):
         # The caller needs the slots now: finish the oldest writes synchronously,
         # as the synchronous mode would have (the same step on every rank).
         mamba_host_pool = self.host_pool_group.get_pool(PoolName.MAMBA)
-        while self._l3_tombstone_pending and mamba_host_pool.available_size() < num_states:
+        while (
+            self._l3_tombstone_pending and mamba_host_pool.available_size() < num_states
+        ):
             operation_id, node_id = next(iter(self._l3_tombstone_pending.items()))
             del self._l3_tombstone_pending[operation_id]
             self._wait_mamba_storage_backup(operation_id)
@@ -2143,7 +2161,9 @@ class UnifiedRadixCache(BasePrefixCache):
         """Keep a tombstone source pinned unless its KV and state reached storage."""
         cc = self.cache_controller
         state_written = False
-        succeeded = operation.completed_tokens >= len(operation.hash_value) * self.page_size
+        succeeded = (
+            operation.completed_tokens >= len(operation.hash_value) * self.page_size
+        )
         for transfer in operation.pool_transfers or ():
             if not cc.should_backup(transfer):
                 continue
@@ -2152,14 +2172,18 @@ class UnifiedRadixCache(BasePrefixCache):
                 transfer.name, 0
             )
             succeeded = succeeded and expected > 0 and written >= expected
-            state_written |= transfer.name == PoolName.MAMBA and expected > 0 and written >= expected
+            state_written |= (
+                transfer.name == PoolName.MAMBA and expected > 0 and written >= expected
+            )
         node_id, _ = self.ongoing_backup[operation_id]
         if not succeeded or not state_written:
             operation.l3_tombstone_quarantined = True
             self._l3_tombstone_quarantined_ops |= {operation_id}
         if self._l3_lifetime_ledger is not None:
             self._l3_lifetime_ledger.emit(
-                "state_tombstone_write_ack", op_id=operation_id, node_id=node_id,
+                "state_tombstone_write_ack",
+                op_id=operation_id,
+                node_id=node_id,
                 succeeded=bool(succeeded and state_written),
                 completed_tokens=operation.completed_tokens,
                 pool_hit_pages=dict(operation.pool_storage_result.extra_pool_hit_pages),
@@ -2726,6 +2750,10 @@ class UnifiedRadixCache(BasePrefixCache):
         if device_indices is None:
             self.dec_host_lock_ref(node_id, host_anchor_params)
             return False
+        if self._demote_copied_nodes and comp_xfers.get(ComponentType.MAMBA):
+            if node_id in self._demote_copied_nodes:
+                self._demote_copied_nodes.discard(node_id)
+                self.mamba_retention_counts["demote_copy_restores"] += 1
 
         # Commit the loaded KV back onto the node + apply its emitted actions.
         self._apply_cache_actions(
@@ -2819,7 +2847,11 @@ class UnifiedRadixCache(BasePrefixCache):
         return self._write_backup_storage(node_id)
 
     def _write_backup_storage(
-        self, node_id: NodeId, *, force: bool = False, ledger_reason: str = "write_behind"
+        self,
+        node_id: NodeId,
+        *,
+        force: bool = False,
+        ledger_reason: str = "write_behind",
     ) -> Optional[int]:
         if not self.enable_storage or self.cache_controller is None:
             return None
@@ -2867,13 +2899,17 @@ class UnifiedRadixCache(BasePrefixCache):
         self.ongoing_backup[operation_id] = (node_id, lock_params)
         if self._l3_lifetime_ledger is not None:
             self._l3_lifetime_ledger.emit(
-                "storage_write_issue", reason=ledger_reason, node_id=node_id,
-                op_id=operation_id, kv_keys=list(spec.hash_value),
+                "storage_write_issue",
+                reason=ledger_reason,
+                node_id=node_id,
+                op_id=operation_id,
+                kv_keys=list(spec.hash_value),
                 pools={x.name.value: list(x.keys or ()) for x in aux_xfers},
                 depth=(
                     len(self.tree_core.get_prefix_hash_values(node_id))
                     + len(spec.hash_value)
-                ) * self.page_size,
+                )
+                * self.page_size,
             )
         return operation_id
 
@@ -2899,7 +2935,9 @@ class UnifiedRadixCache(BasePrefixCache):
                 continue
             self._write_behind_mamba_inflight[operation_id] = node_id
             stats["wb_mamba_leaf_issued_tokens"] += num_tokens
-            stats[f"wb_mamba_ops_{'state' if self._l3_last_write_has_state else 'nostate'}"] += 1
+            stats[
+                f"wb_mamba_ops_{'state' if self._l3_last_write_has_state else 'nostate'}"
+            ] += 1
 
     def _maybe_rotate_beliefs(self) -> None:
         """Rotate the storage beliefs every half TTL, by PP0's clock agreed on all ranks
@@ -3077,7 +3115,9 @@ class UnifiedRadixCache(BasePrefixCache):
         # Refill in quarter-reserve quanta: the candidate walk heapifies every
         # host leaf, so running it per freed page would eat the scheduler thread.
         if deficit < max(1, target // 4):
-            self._l3_tier_stats["wb_walk_us"] += int((time.perf_counter() - walk_start) * 1e6)
+            self._l3_tier_stats["wb_walk_us"] += int(
+                (time.perf_counter() - walk_start) * 1e6
+            )
             return
         stats = self._l3_tier_stats
         stats["wb_walks"] += 1
@@ -3263,9 +3303,7 @@ class UnifiedRadixCache(BasePrefixCache):
                     checkpoint_key=hashes[end // self.page_size - 1] if end else None,
                     request_end_key=hashes[-1] if hashes else None,
                     local_state_keys=[
-                        key
-                        for key, hit in zip(hashes, operation.state_exists)
-                        if hit
+                        key for key, hit in zip(hashes, operation.state_exists) if hit
                     ],
                     outcome=operation.state_outcome,
                     attached=attached,
@@ -3551,7 +3589,8 @@ class UnifiedRadixCache(BasePrefixCache):
             or self.prefetch_stop_policy != "best_effort"
             or operation.host_indices is None
             or not any(
-                t.indices_from_pool != PoolName.KV for t in operation.pool_transfers or ()
+                t.indices_from_pool != PoolName.KV
+                for t in operation.pool_transfers or ()
             )
         ):
             return False
@@ -3563,7 +3602,9 @@ class UnifiedRadixCache(BasePrefixCache):
         stats = self._prefetch_outcome_stats
         stats["inflight_admission_waits"] = stats.get("inflight_admission_waits", 0) + 1
         if held == 0:
-            stats["inflight_admission_held"] = stats.get("inflight_admission_held", 0) + 1
+            stats["inflight_admission_held"] = (
+                stats.get("inflight_admission_held", 0) + 1
+            )
         return True
 
     def _mark_prefetch_deadline_expired(self, operation: PrefetchOperation) -> None:
@@ -3971,8 +4012,10 @@ class UnifiedRadixCache(BasePrefixCache):
             previous = pending.pop(request, None)
             if previous is not None:
                 self._l3_lifetime_ledger.emit(
-                    "storage_prefetch_discard", rid=request.rid,
-                    op_id=previous["op_id"], remaining_tokens=previous["remaining"],
+                    "storage_prefetch_discard",
+                    rid=request.rid,
+                    op_id=previous["op_id"],
+                    remaining_tokens=previous["remaining"],
                     reason="replaced",
                 )
             info = self.ongoing_prefetch.get(request)
@@ -4010,9 +4053,12 @@ class UnifiedRadixCache(BasePrefixCache):
                 resolved = min(num_tokens, entry["remaining"])
                 entry["remaining"] -= resolved
                 self._l3_lifetime_ledger.emit(
-                    "storage_prefetch_resolved", rid=request.rid,
-                    op_id=entry["op_id"], storage_start=entry["storage_start"],
-                    resolved_tokens=resolved, reason=reason or "tree_overlap",
+                    "storage_prefetch_resolved",
+                    rid=request.rid,
+                    op_id=entry["op_id"],
+                    storage_start=entry["storage_start"],
+                    resolved_tokens=resolved,
+                    reason=reason or "tree_overlap",
                 )
         remaining = self._storage_prefetch_hit_remaining_by_reqid.get(request)
         if remaining is None:
@@ -4045,10 +4091,13 @@ class UnifiedRadixCache(BasePrefixCache):
             if entry is not None:
                 fulfilled = min(fulfilled_tokens, entry["remaining"])
                 self._l3_lifetime_ledger.emit(
-                    "storage_prefetch_finish", rid=request.rid,
-                    op_id=entry["op_id"], storage_start=entry["storage_start"],
+                    "storage_prefetch_finish",
+                    rid=request.rid,
+                    op_id=entry["op_id"],
+                    storage_start=entry["storage_start"],
                     fulfilled_tokens=fulfilled,
-                    unfulfilled_tokens=entry["remaining"] - fulfilled, reason=reason,
+                    unfulfilled_tokens=entry["remaining"] - fulfilled,
+                    reason=reason,
                 )
         remaining = self._storage_prefetch_hit_remaining_by_reqid.pop(request, None)
         if remaining is None:
@@ -4096,8 +4145,10 @@ class UnifiedRadixCache(BasePrefixCache):
             entry = getattr(self, "_l3_ledger_prefetch", {}).pop(request, None)
             if entry is not None:
                 self._l3_lifetime_ledger.emit(
-                    "storage_prefetch_discard", rid=request.rid,
-                    op_id=entry["op_id"], remaining_tokens=entry["remaining"],
+                    "storage_prefetch_discard",
+                    rid=request.rid,
+                    op_id=entry["op_id"],
+                    remaining_tokens=entry["remaining"],
                 )
         self._storage_prefetch_hit_remaining_by_reqid.pop(request, None)
 
@@ -4253,11 +4304,15 @@ class UnifiedRadixCache(BasePrefixCache):
             chain = operation.all_hash_values or operation.hash_value
             hit_pages = hit // self.page_size
             self._l3_lifetime_ledger.emit(
-                "storage_lookup", rid=operation.request_id, op_id=operation.id,
+                "storage_lookup",
+                rid=operation.request_id,
+                op_id=operation.id,
                 M=operation.storage_start - operation.stats_tree_kv_tokens,
                 K=operation.storage_start,
                 D=operation.storage_start + hit if hit else None,
-                requested_tokens=requested, hit_tokens=hit, revoked=revoked,
+                requested_tokens=requested,
+                hit_tokens=hit,
+                revoked=revoked,
                 anchor_hash=operation.last_hash,
                 query_end_hash=chain[-1] if chain else None,
                 checkpoint_hash=chain[hit_pages - 1] if hit_pages else None,
@@ -4314,14 +4369,20 @@ class UnifiedRadixCache(BasePrefixCache):
         except Exception as e:  # diagnostics must not fail a write
             return f"<{e!r}>"
 
-    def _l3_trace_write(self, hash_value: list[str], aux_xfers: list[PoolTransfer]) -> None:
+    def _l3_trace_write(
+        self, hash_value: list[str], aux_xfers: list[PoolTransfer]
+    ) -> None:
         """Diagnostics (PP0): remember when each page and state hash was issued to L3."""
         trace, now = self._l3_trace, time.monotonic()
         kv, stats = trace["kv"], self._l3_tier_stats
         for h in hash_value:
             then = kv.get(h)
             if then is not None:
-                stats["trace_rewrite_pages_lt10m" if now - then < 600 else "trace_rewrite_pages_ge10m"] += 1
+                stats[
+                    "trace_rewrite_pages_lt10m"
+                    if now - then < 600
+                    else "trace_rewrite_pages_ge10m"
+                ] += 1
             kv[h] = now
         stats["trace_written_pages"] += len(hash_value)
         for xfer in aux_xfers:
@@ -4330,7 +4391,11 @@ class UnifiedRadixCache(BasePrefixCache):
             state_key = xfer.keys[-1]
             then = trace["state"].get(state_key)
             if then is not None:
-                stats["trace_rewrite_states_lt10m" if now - then[0] < 600 else "trace_rewrite_states_ge10m"] += 1
+                stats[
+                    "trace_rewrite_states_lt10m"
+                    if now - then[0] < 600
+                    else "trace_rewrite_states_ge10m"
+                ] += 1
             stats["trace_written_states"] += 1
             trace["state"][state_key] = (now, len(hash_value))
             if state_key != hash_value[-1]:
@@ -4339,7 +4404,9 @@ class UnifiedRadixCache(BasePrefixCache):
                 trace["writes_logged"] += 1
                 logger.info(
                     "HiCache L3 trace write: pages=%d last_page=%s state_key=%s object_keys=%s",
-                    len(hash_value), hash_value[-1], state_key,
+                    len(hash_value),
+                    hash_value[-1],
+                    state_key,
                     self._l3_trace_object_keys([state_key]),
                 )
 
@@ -4369,20 +4436,41 @@ class UnifiedRadixCache(BasePrefixCache):
             return
         if kv_pages:
             ages = [now - states[h][0] for h in chain[:kv_pages] if h in states]
-            stats["trace_present_no_state" if not ages else "trace_present_state_lt7m"
-                  if min(ages) < 420 else "trace_present_state_older"] += 1
+            stats[
+                "trace_present_no_state"
+                if not ages
+                else "trace_present_state_lt7m"
+                if min(ages) < 420
+                else "trace_present_state_older"
+            ] += 1
         else:
             then = kv.get(chain[0]) if chain else None
             age = None if then is None else now - then
-            stats["trace_absent_never" if age is None else "trace_absent_lt7m" if age < 420
-                  else "trace_absent_7to15m" if age < 900 else "trace_absent_ge15m"] += 1
+            stats[
+                "trace_absent_never"
+                if age is None
+                else "trace_absent_lt7m"
+                if age < 420
+                else "trace_absent_7to15m"
+                if age < 900
+                else "trace_absent_ge15m"
+            ] += 1
             if age is None:
-                fresh = [i for i, h in enumerate(chain) if h in states and now - states[h][0] < 420]
+                fresh = [
+                    i
+                    for i, h in enumerate(chain)
+                    if h in states and now - states[h][0] < 420
+                ]
                 if fresh:
                     stats["trace_absent_tail_in_l3"] += 1
-                    stats["trace_absent_tail_in_l3_tokens"] += (fresh[-1] + 1) * self.page_size
+                    stats["trace_absent_tail_in_l3_tokens"] += (
+                        fresh[-1] + 1
+                    ) * self.page_size
         counter = "present_logged" if kv_pages else "absent_logged"
-        if not kv_pages and trace[counter] >= envs.SGLANG_HICACHE_L3_TRACE_ABSENT_N.get():
+        if (
+            not kv_pages
+            and trace[counter] >= envs.SGLANG_HICACHE_L3_TRACE_ABSENT_N.get()
+        ):
             return
         trace[counter] += 1
         prefix = 0
@@ -4401,15 +4489,23 @@ class UnifiedRadixCache(BasePrefixCache):
             "HiCache L3 trace lookup: rid=%s storage_start=%d pages=%d kv_found=%d hit_pages=%d "
             "kv_written_prefix=%d kv_written_any=%d first_page_age_s=%s "
             "states_written(page,age_s,node_pages)=%s",
-            operation.request_id, operation.storage_start, len(chain), kv_pages,
-            operation.storage_hit_count // self.page_size, prefix, ever, first_age, at[-8:],
+            operation.request_id,
+            operation.storage_start,
+            len(chain),
+            kv_pages,
+            operation.storage_hit_count // self.page_size,
+            prefix,
+            ever,
+            first_age,
+            at[-8:],
         )
         if kv_pages and trace["queried_logged"] < 5:
             trace["queried_logged"] += 1
             pages = [p for p, _, _ in at[-2:]] + [min(kv_pages, len(chain))]
             logger.info(
                 "HiCache L3 trace queried: rid=%s pages=%s object_keys=%s",
-                operation.request_id, pages,
+                operation.request_id,
+                pages,
                 self._l3_trace_object_keys([chain[p - 1] for p in pages]),
             )
 
@@ -4449,7 +4545,8 @@ class UnifiedRadixCache(BasePrefixCache):
     def _storage_prefetch_meets_threshold(self, operation) -> bool:
         return (
             operation.storage_hit_count > 0
-            and operation.storage_hit_count >= self._storage_prefetch_min_hit_tokens(operation)
+            and operation.storage_hit_count
+            >= self._storage_prefetch_min_hit_tokens(operation)
         )
 
     def _alloc_prefetch_aux_staging(
@@ -4807,9 +4904,8 @@ class UnifiedRadixCache(BasePrefixCache):
             for operation in _drain_queue(
                 cc.ack_backup_queue, n, timed=pmicro_hoststats.ON
             ):
-                if (
-                    operation.id in self._l3_tombstone_quarantined_ops
-                    or getattr(operation, "l3_tombstone_quarantined", False)
+                if operation.id in self._l3_tombstone_quarantined_ops or getattr(
+                    operation, "l3_tombstone_quarantined", False
                 ):
                     raise RuntimeError(
                         "Refusing to release a quarantined Mamba storage source"
@@ -4838,12 +4934,9 @@ class UnifiedRadixCache(BasePrefixCache):
                         self.dec_host_lock_ref(node_id, lock_params)
                     if write_back is not None:
                         write_back_acks.append(operation)
-                    if (
-                        self._l3_tier_final is not None
-                        and (
-                            operation.id in self._write_behind_inflight
-                            or operation.id in self._write_behind_mamba_inflight
-                        )
+                    if self._l3_tier_final is not None and (
+                        operation.id in self._write_behind_inflight
+                        or operation.id in self._write_behind_mamba_inflight
                     ):
                         self._l3_tier_final.written_tokens += operation.completed_tokens
                     acked_tokens = self._write_behind_inflight.pop(operation.id, None)
@@ -5240,9 +5333,7 @@ class UnifiedRadixCache(BasePrefixCache):
                 if stream is None
                 else device_module.stream(stream)
             ):
-                written = self._execute_and_commit_kv_backup(
-                    backup_kv, write_back=True
-                )
+                written = self._execute_and_commit_kv_backup(backup_kv, write_back=True)
             if written > 0 or not self._wb_batch_locks:
                 break
             # Queued victims may hold the host space: land them, retry once.
@@ -5704,7 +5795,8 @@ class UnifiedRadixCache(BasePrefixCache):
             if now - self._l3_stats_logged_at >= 60.0:
                 self._l3_stats_logged_at = now
                 logger.info(
-                    "HiCache L3 prefetch stats: %s", self.prefetch_outcome_stats_snapshot()
+                    "HiCache L3 prefetch stats: %s",
+                    self.prefetch_outcome_stats_snapshot(),
                 )
         if self.buffer_pipeline is not None:
             self.buffer_pipeline.flush_pending_writes()
