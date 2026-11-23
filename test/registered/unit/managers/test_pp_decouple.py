@@ -846,20 +846,26 @@ class TestPPLaunchQueueScale(CustomTestCase):
 
 
 class TestHiCacheLoadRing(CustomTestCase):
-    """The layer-wise load-back event ring is sized by SGLANG_HICACHE_LAYER_LOAD_RING: a PP stage whose host runs
-    further ahead of its GPU has that many loads in flight, and a reused slot must hold a finished load."""
+    """The layer-wise load-back event ring holds one slot per micro-batch a PP stage can have in flight
+    (pp_size + pp_async_batch_depth, plus one), at least the 3 of the overlap scheduler; the env overrides."""
+
+    def test_ring_size_is_derived_from_the_pp_depth(self):
+        from sglang.srt.managers.cache_controller import layer_load_ring_size
+
+        self.assertEqual(layer_load_ring_size(pp_size=1, pp_async_batch_depth=0, override=0), 3)
+        self.assertEqual(layer_load_ring_size(pp_size=2, pp_async_batch_depth=0, override=0), 3)
+        self.assertEqual(layer_load_ring_size(pp_size=8, pp_async_batch_depth=0, override=0), 9)
+        self.assertEqual(layer_load_ring_size(pp_size=8, pp_async_batch_depth=2, override=0), 11)
+        self.assertEqual(layer_load_ring_size(pp_size=8, pp_async_batch_depth=0, override=4), 4)
 
     @unittest.skipUnless(torch.cuda.is_available(), "LayerLoadingEvent holds CUDA events")
-    def test_ring_size_follows_the_env_and_wraps(self):
-        from sglang.srt.environ import envs
+    def test_producer_wraps_over_the_ring(self):
         from sglang.srt.managers.cache_controller import LayerDoneCounter
 
         self.assertEqual(LayerDoneCounter(num_layers=2).num_counters, 3)
-        with envs.SGLANG_HICACHE_LAYER_LOAD_RING.override(8):
-            counter = LayerDoneCounter(num_layers=2)
-        self.assertEqual((counter.num_counters, len(counter.events)), (8, 8))
-        self.assertEqual([counter.update_producer() for _ in range(9)], [0, 1, 2, 3, 4, 5, 6, 7, 0])
-
+        counter = LayerDoneCounter(num_layers=2, num_counters=9)
+        self.assertEqual(len(counter.events), 9)
+        self.assertEqual([counter.update_producer() for _ in range(10)], list(range(9)) + [0])
 
 if __name__ == "__main__":
     unittest.main()
