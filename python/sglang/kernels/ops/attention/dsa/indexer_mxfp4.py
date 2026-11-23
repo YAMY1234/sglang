@@ -80,7 +80,8 @@ def _store_index_k_mxfp4_kernel(
     if slot >= 0:
         x = tl.load(key_ptr + tok * key_stride + tl.arange(0, HEAD_DIM)).to(tl.float32)
         packed, ue8m0 = _mxfp4_quant(x, HEAD_DIM)
-        page = cache_ptr + (slot // PAGE) * cache_page_stride
+        # int64 byte offsets: page * page bytes passes int32 range past ~31.6M slots at 64 x 68 B pages
+        page = cache_ptr + (slot // PAGE) * cache_page_stride.to(tl.int64)
         off = slot % PAGE
         tl.store(page + off * (HEAD_DIM // 2) + tl.arange(0, HEAD_DIM // 2), packed)
         scales = page + PAGE * (HEAD_DIM // 2) + off * (HEAD_DIM // _BLOCK)

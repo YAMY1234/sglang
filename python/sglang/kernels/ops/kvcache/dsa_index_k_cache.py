@@ -228,9 +228,9 @@ def _set_k_and_s_triton_kernel(
 ):
     token_id = tl.program_id(0)
 
-    loc = tl.load(loc_ptr + token_id)
+    loc = tl.load(loc_ptr + token_id).to(tl.int64)
 
-    in_k_offsets = token_id * index_k_ptr_stride_0 + tl.arange(0, NUM_K_ELEMS_PER_TOKEN)
+    in_k_offsets = token_id.to(tl.int64) * index_k_ptr_stride_0 + tl.arange(0, NUM_K_ELEMS_PER_TOKEN)
 
     # no need for `mask`, since we read 128B for k and 4B for scale, both pow of 2
     k = tl.load(index_k_ptr + in_k_offsets)
@@ -382,10 +382,11 @@ def _get_k_and_s_triton_kernel(
     token_offset_in_page = token_ids % page_size
     page_indices_base = batch_id * page_indice_batch_offset
     page_idx_valid_mask = page_idx < page_indice_batch_offset
+    # int64: page_index * buf_numel_per_page passes int32 range past ~16.3M index-K slots.
     page_index = tl.load(
         page_indices_ptr + page_idx + page_indices_base,
         mask=token_valid_mask & page_idx_valid_mask,
-    )
+    ).to(tl.int64)
 
     # ===== Load K data =====
     # The address calculation logic for K: page_index * total number of elements in a single page + K offset of the token within the page.
@@ -399,7 +400,7 @@ def _get_k_and_s_triton_kernel(
     k_data = tl.load(k_load_addr, mask=k_mask, other=0)
 
     # Store K to output
-    k_dst_token_offset = batch_token_offset + token_ids
+    k_dst_token_offset = (batch_token_offset + token_ids).to(tl.int64)
     k_dst_base_offset = k_dst_token_offset * index_head_dim
     k_store_addr = k_out_ptr + k_dst_base_offset[:, None] + k_offsets[None, :]
     tl.store(k_store_addr, k_data, mask=k_mask)
@@ -415,7 +416,7 @@ def _get_k_and_s_triton_kernel(
     s_data = tl.load(s_load_addr, mask=s_mask, other=0)
 
     # Store S to output
-    s_dst_token_offset = batch_token_offset + token_ids
+    s_dst_token_offset = (batch_token_offset + token_ids).to(tl.int64)
     s_dst_base_offset = s_dst_token_offset * 4
     s_store_addr = s_out_ptr + s_dst_base_offset[:, None] + s_offsets[None, :]
     tl.store(s_store_addr, s_data, mask=s_mask)
