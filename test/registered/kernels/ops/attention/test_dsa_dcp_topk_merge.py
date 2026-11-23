@@ -530,7 +530,8 @@ def _owner_merge(warps: int, sampled: bool = False, lpt: bool = False, owner: bo
 def test_dcp4_topk_merge_pushed_owner(kind: str, variant: str) -> None:
     """SGLANG_DCP4_PUSH_OWNER_MERGE: each row's candidates go only to its owner (row % 4), which
     sends t* to the others. Every rank's slots, localized rows and lengths equal the multicast
-    merge's element for element on the same inputs (same local top-k), and are exact. Then three
+    merge's on the same inputs, as sets per row (the local top-k's slot order varies from run to
+    run, and the merge keeps it), and are exact. Then three
     inputs, one CUDA graph each, replayed in turn for 300 calls per row slot (past the 255 tags):
     a non-owner reading a stale t* would write another input's keys."""
     _init_once()
@@ -551,7 +552,12 @@ def test_dcp4_topk_merge_pushed_owner(kind: str, variant: str) -> None:
         case.run_pushed(owner, span)
         torch.cuda.synchronize()
         bad = case.pushed_failures(rank, world)
-        same = all(torch.equal(x, y) for x, y in zip((case.out, case.local, case.lengths), ref))
+        n = case.lengths.tolist()
+        same = torch.equal(case.lengths, ref[2]) and all(
+            torch.equal(x[i, : n[i]].sort().values, y[i, : n[i]].sort().values)
+            for x, y in ((case.out, ref[0]), (case.local, ref[1]))
+            for i in range(case.rows)
+        )
         assert _all_ranks_ok(not bad and same), bad or ("outputs differ from the multicast merge" if not same else "failed on another rank")
 
     graphs = []
