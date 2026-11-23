@@ -250,6 +250,7 @@ def topk_transform_candidates_v2(
     cluster_size: Optional[int] = None,
     sampled: bool = False,
     sampled_min_len: int = 0,
+    lpt: bool = False,
 ) -> None:
     """Ragged top-k emitting candidates for a distributed top-k merge.
 
@@ -269,7 +270,8 @@ def topk_transform_candidates_v2(
     do not apply. There, with ``cluster_size`` 0, ``sampled`` runs rows longer than both
     16384 and ``sampled_min_len`` through a sampled-threshold single pass that selects the
     same set (slot order aside) and redoes on the exact path the rows it cannot certify;
-    ``overflow_rows`` counts those.
+    ``overflow_rows`` counts those. ``lpt`` (with ``sampled``, rows <= 1024) launches the blocks
+    longest row first, so a launch of more rows than resident blocks queues the shortest.
 
     NOTE: ``scores`` is written in place as for the ragged entry point.
     """
@@ -287,6 +289,7 @@ def topk_transform_candidates_v2(
             bool(sampled),
             int(sampled_min_len),
             overflow_rows,
+            bool(lpt),
         )
         return
     module.topk_transform_candidates(
@@ -318,6 +321,7 @@ def topk_transform_candidates_dcp_push(
     sampled: bool = False,
     sampled_min_len: int = 0,
     fallback_rows: Optional[torch.Tensor] = None,
+    lpt: bool = False,
 ) -> None:
     """DCP decode top-k that pushes its candidates to the merge.
 
@@ -330,7 +334,7 @@ def topk_transform_candidates_dcp_push(
     parity; see ``jit/csrc/dsa/dcp_topk_merge.cuh``). ``counters``: [max_rows]
     int64 merge calls per row slot; the merge advances them. ``sampled``,
     ``sampled_min_len`` and ``fallback_rows``: as ``sampled``, ``sampled_min_len`` and
-    ``overflow_rows`` of :func:`topk_transform_candidates_v2`.
+    ``overflow_rows`` of :func:`topk_transform_candidates_v2`, and ``lpt`` as there.
     """
     _jit_topk_v2_push_module().topk_transform_candidates_dcp_push(
         scores,
@@ -346,6 +350,7 @@ def topk_transform_candidates_dcp_push(
         bool(sampled),
         int(sampled_min_len),
         fallback_rows,
+        bool(lpt),
     )
 
 

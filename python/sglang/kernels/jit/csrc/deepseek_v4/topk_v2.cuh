@@ -609,11 +609,43 @@ candidates_sampled_one_block(const TopKCandidatesParams& params, const uint32_t 
   candidates_one_block<kPDL, kPush>(params, bx, &smem->exact.ragged, smem->exact.staged);
 }
 
-template <bool kPDL, bool kPush>
+/// LPT order (kLpt): block b takes the b-th longest row (ties by row index), so on a two-wave launch
+/// (one 1024-thread block per SM) the longest rows start first and the second wave holds the
+/// shortest. Every block ranks all rows from seq_lens alone (before the PDL wait, as the row length
+/// read already is), in the sampled path's shared memory before that is used. rows <= kBlockSize.
+struct LptRankSmem {
+  uint32_t len[kBlockSize];
+  uint32_t row;
+};
+
+SGL_DEVICE uint32_t lpt_row(const TopKCandidatesParams& params, const uint32_t rows, LptRankSmem* smem) {
+  const auto tx = threadIdx.x;
+  const auto mine = tx < rows ? static_cast<uint32_t>(params.seq_lens[tx]) : 0u;
+  smem->len[tx] = mine;
+  __syncthreads();
+  if (tx < rows) {
+    uint32_t rank = 0;
+#pragma unroll 4
+    for (uint32_t j = 0; j < rows; ++j) {  // every lane reads the same len[j]: a broadcast
+      const auto l = smem->len[j];
+      rank += (l > mine || (l == mine && j < tx)) ? 1u : 0u;
+    }
+    if (rank == blockIdx.x) smem->row = tx;
+  }
+  __syncthreads();
+  const auto row = smem->row;
+  __syncthreads();  // the rank storage is the sampled path's shared memory
+  return row;
+}
+
+template <bool kPDL, bool kPush, bool kLpt = false>
 TOPK_KERNEL void topk_candidates_sampled_kernel(const __grid_constant__ TopKCandidatesParams params) {
   device::enable_smem_spilling();
   __shared__ SampledCandidatesSmem smem;
-  candidates_sampled_one_block<kPDL, kPush>(params, blockIdx.x, &smem);
+  static_assert(sizeof(LptRankSmem) <= sizeof(SampledCandidatesSmem));
+  auto row = blockIdx.x;
+  if constexpr (kLpt) row = lpt_row(params, gridDim.x, reinterpret_cast<LptRankSmem*>(&smem));
+  candidates_sampled_one_block<kPDL, kPush>(params, row, &smem);
 }
 #endif  // !USE_ROCM
 
@@ -2146,7 +2178,7 @@ struct TopKKernel {
    * runs rows longer than `cluster_floor` on that many blocks, 0 one block. With `cluster_size` 0,
    * `sampled` takes rows longer than `sampled_min_len` and past the register paths through the
    * sampled single pass, counting the rows it redoes on the exact path in `fallback_rows`
-   * (int32 [1], optional).
+   * (int32 [1], optional); `lpt` launches its blocks longest row first (rows <= 1024).
    */
   static void transform_candidates_dcp(
       const tvm::ffi::TensorView scores,
@@ -2159,7 +2191,8 @@ struct TopKKernel {
       const int64_t cluster_floor,
       const bool sampled,
       const int64_t sampled_min_len,
-      const tvm::ffi::Optional<tvm::ffi::TensorView> fallback_rows) {
+      const tvm::ffi::Optional<tvm::ffi::TensorView> fallback_rows,
+      const bool lpt) {
     using namespace host;
     auto B = SymbolicSize{"batch_size"};
     auto L = SymbolicSize{"max_seq_len"};
@@ -2239,8 +2272,14 @@ struct TopKKernel {
 #endif
     if (sampled) {
 #ifdef USE_ROCM
+      static_cast<void>(lpt);
       RuntimeCheck(false, "the sampled candidate top-k needs CUDA");
 #else
+      if (lpt && rows <= kBlockSize) {  // longest rows first (topk_candidates_sampled_kernel)
+        return LaunchKernel(rows, kBlockSize, device_.unwrap())
+            .config({.use_pdl = kUsePDL})
+            .launch(topk_candidates_sampled_kernel<kUsePDL, false, true>, params);
+      }
       return LaunchKernel(rows, kBlockSize, device_.unwrap())
           .config({.use_pdl = kUsePDL})
           .launch(topk_candidates_sampled_kernel<kUsePDL, false>, params);
@@ -2273,7 +2312,8 @@ struct TopKKernel {
       const int64_t cluster_floor,
       const bool sampled,
       const int64_t sampled_min_len,
-      const tvm::ffi::Optional<tvm::ffi::TensorView> fallback_rows) {
+      const tvm::ffi::Optional<tvm::ffi::TensorView> fallback_rows,
+      const bool lpt) {
     using namespace host;
     auto B = SymbolicSize{"batch_size"};
     auto L = SymbolicSize{"max_seq_len"};
@@ -2350,8 +2390,14 @@ struct TopKKernel {
 #endif
     if (sampled) {
 #ifdef USE_ROCM
+      static_cast<void>(lpt);
       RuntimeCheck(false, "the sampled candidate top-k needs CUDA");
 #else
+      if (lpt && rows <= kBlockSize) {  // longest rows first (topk_candidates_sampled_kernel)
+        return LaunchKernel(rows, kBlockSize, device_.unwrap())
+            .config({.use_pdl = kUsePDL})
+            .launch(topk_candidates_sampled_kernel<kUsePDL, true, true>, params);
+      }
       return LaunchKernel(rows, kBlockSize, device_.unwrap())
           .config({.use_pdl = kUsePDL})
           .launch(topk_candidates_sampled_kernel<kUsePDL, true>, params);

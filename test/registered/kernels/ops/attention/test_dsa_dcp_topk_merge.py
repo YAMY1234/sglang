@@ -408,39 +408,43 @@ def test_dcp4_topk_merge_pushed_wide(kind: str, warps: int) -> None:
         assert _all_ranks_ok(not bad), bad or "failed on another rank"
 
 
-_SAMPLED_MERGES: dict[tuple[int, int], DcpTopKMerge] = {}
+_SAMPLED_MERGES: dict[tuple[int, int, bool], DcpTopKMerge] = {}
 
 
-def _sampled_merge(cand_k: int, min_len: int) -> DcpTopKMerge:
-    if (cand_k, min_len) not in _SAMPLED_MERGES:
+def _sampled_merge(cand_k: int, min_len: int, lpt: bool = False) -> DcpTopKMerge:
+    if (cand_k, min_len, lpt) not in _SAMPLED_MERGES:
         with (
             envs.SGLANG_DCP4_PUSH_CAND_K.override(cand_k),
             envs.SGLANG_DSA_DCP_TOPK_PUSH_SAMPLED.override(True),
             envs.SGLANG_DSA_DCP_TOPK_PUSH_SAMPLED_MIN_LEN.override(min_len),
+            envs.SGLANG_DSA_DCP_TOPK_PUSH_LPT.override(lpt),
         ):
-            _SAMPLED_MERGES[cand_k, min_len] = DcpTopKMerge(ps._WORLD, MAX_ROWS, TOPK, push=True)
-    return _SAMPLED_MERGES[cand_k, min_len]
+            _SAMPLED_MERGES[cand_k, min_len, lpt] = DcpTopKMerge(ps._WORLD, MAX_ROWS, TOPK, push=True)
+    return _SAMPLED_MERGES[cand_k, min_len, lpt]
 
 
+@pytest.mark.parametrize("lpt", [False, True])
 @pytest.mark.parametrize("min_len", [0, 32768])
 @pytest.mark.parametrize("cand_k", [768, 2048])
 @pytest.mark.parametrize(
     "kind", ["random", "long", "dense_top", "ties", "periodic", "skew", "short"]
 )
 @torch.inference_mode()
-def test_dcp4_topk_merge_pushed_sampled(kind: str, cand_k: int, min_len: int) -> None:
+def test_dcp4_topk_merge_pushed_sampled(kind: str, cand_k: int, min_len: int, lpt: bool) -> None:
     """SGLANG_DSA_DCP_TOPK_PUSH_SAMPLED: the sampled local top-k pushes the exact local
     candidate sets, so the merge is exact and fails its certificate on the same rows as
     with the exact local top-k; Gaussian rows need no exact redo of the local top-k.
-    min_len 32768 keeps the 32768-key local rows of `random` exact and samples `long`."""
+    min_len 32768 keeps the 32768-key local rows of `random` exact and samples `long`;
+    lpt (longest row first) changes only which block runs which row."""
     _init_once()
     world, rank = ps._WORLD.world_size, ps._WORLD.rank_in_group
     if world != 4:
         pytest.skip("the DCP4 push merge needs 4 ranks")
-    sampled, exact = _sampled_merge(cand_k, min_len), _push_merge(cand_k)
+    sampled, exact = _sampled_merge(cand_k, min_len, lpt), _push_merge(cand_k)
     if sampled.buffer is None:
         pytest.skip("multimem multicast unavailable")
     assert sampled.sampled and not exact.sampled and sampled.sampled_min_len == min_len
+    assert sampled.lpt == lpt
     span = PAGE_SIZE * world
     for seed in SEEDS:
         case = _Case(kind, seed, rank, world, span)

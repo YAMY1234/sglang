@@ -246,6 +246,8 @@ class DcpTopKMerge:
         # push only: the local top-k's sampled single pass, and the rows it redid exactly
         self.sampled = self.push and envs.SGLANG_DSA_DCP_TOPK_PUSH_SAMPLED.get()
         self.sampled_min_len = envs.SGLANG_DSA_DCP_TOPK_PUSH_SAMPLED_MIN_LEN.get()
+        # sampled only: blocks launched longest row first (when the rows take two waves)
+        self.lpt = self.sampled and envs.SGLANG_DSA_DCP_TOPK_PUSH_LPT.get()
         self.sampled_fallbacks: Optional[torch.Tensor] = None
         self._fallbacks_host: Optional[torch.Tensor] = None
         self._fallbacks_reported = 0
@@ -309,6 +311,11 @@ class DcpTopKMerge:
                     "keys select their candidates in one sampled-threshold pass "
                     "(SGLANG_DSA_DCP_TOPK_PUSH_SAMPLED, SGLANG_DSA_DCP_TOPK_PUSH_SAMPLED_MIN_LEN)"
                 )
+                if self.lpt:
+                    print_info_once(
+                        "DSA DCP top-k merge: local top-k blocks launch longest row first "
+                        "(SGLANG_DSA_DCP_TOPK_PUSH_LPT)"
+                    )
             return
         self.union_scratch = torch.empty(
             (max_rows, world * topk), dtype=torch.int64, device=group.device
@@ -370,6 +377,7 @@ class DcpTopKMerge:
             sampled=self.sampled,
             sampled_min_len=self.sampled_min_len,
             fallback_rows=self.sampled_fallbacks,
+            lpt=self.lpt,
         )
         local = torch.empty_like(out)
         lengths = torch.empty(rows, dtype=torch.int32, device=out.device)
