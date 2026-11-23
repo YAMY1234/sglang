@@ -47,6 +47,7 @@ from sglang.kernels.ops.attention.dsa.dcp_topk_merge import (
 )
 from sglang.kernels.ops.attention.dsv4.topk import (
     candidates_cluster_size,
+    topk_lpt_row_map,
     topk_transform_candidates_dcp_push,
     topk_transform_candidates_v2,
     topk_transform_packed_v2,
@@ -248,6 +249,8 @@ class DcpTopKMerge:
         self.sampled_min_len = envs.SGLANG_DSA_DCP_TOPK_PUSH_SAMPLED_MIN_LEN.get()
         # sampled only: blocks launched longest row first (when the rows take two waves)
         self.lpt = self.sampled and envs.SGLANG_DSA_DCP_TOPK_PUSH_LPT.get()
+        self.lpt_row_map: Optional[torch.Tensor] = None
+        self._lpt_layer: Optional[int] = None  # the first DSA layer of a step (prepare_step)
         self.sampled_fallbacks: Optional[torch.Tensor] = None
         self._fallbacks_host: Optional[torch.Tensor] = None
         self._fallbacks_reported = 0
@@ -312,9 +315,11 @@ class DcpTopKMerge:
                     "(SGLANG_DSA_DCP_TOPK_PUSH_SAMPLED, SGLANG_DSA_DCP_TOPK_PUSH_SAMPLED_MIN_LEN)"
                 )
                 if self.lpt:
+                    # this step's row map, written at its first DSA layer (prepare_step)
+                    self.lpt_row_map = torch.empty(max_rows, dtype=torch.int32, device=group.device)
                     print_info_once(
-                        "DSA DCP top-k merge: local top-k blocks launch longest row first "
-                        "(SGLANG_DSA_DCP_TOPK_PUSH_LPT)"
+                        "DSA DCP top-k merge: local top-k blocks launch longest row first, from a "
+                        "row map built once per step (SGLANG_DSA_DCP_TOPK_PUSH_LPT)"
                     )
             return
         self.union_scratch = torch.empty(
@@ -323,6 +328,19 @@ class DcpTopKMerge:
 
     def usable(self, rows: int) -> bool:
         return self.buffer is not None and rows <= self.max_rows
+
+    def prepare_step(self, local_lens: torch.Tensor, layer_id: int) -> None:
+        """LPT (SGLANG_DSA_DCP_TOPK_PUSH_LPT): at the first DSA layer of each step, before its
+        indexer logits, the row map every layer's local top-k of the step launches by (the
+        lengths are the step's, the same in every layer). Captured in the decode graph, so a
+        replay maps the replay's lengths."""
+        rows = local_lens.shape[0]
+        if self.lpt_row_map is None or not 1 <= rows <= min(1024, self.max_rows):
+            return
+        if self._lpt_layer is None:
+            self._lpt_layer = layer_id
+        if layer_id == self._lpt_layer:
+            topk_lpt_row_map(local_lens, self.lpt_row_map[:rows])
 
     def __call__(
         self,
@@ -377,7 +395,11 @@ class DcpTopKMerge:
             sampled=self.sampled,
             sampled_min_len=self.sampled_min_len,
             fallback_rows=self.sampled_fallbacks,
-            lpt=self.lpt,
+            lpt_row_map=(
+                self.lpt_row_map[:rows]
+                if self.lpt_row_map is not None and rows <= 1024
+                else None
+            ),
         )
         local = torch.empty_like(out)
         lengths = torch.empty(rows, dtype=torch.int32, device=out.device)
@@ -604,6 +626,13 @@ def _local_candidates(
         cluster_floor=_CANDIDATE_CLUSTER_FLOOR,
     )
     return out
+
+
+def dcp_topk_prepare_step(local_lens: torch.Tensor, layer_id: int) -> None:
+    """Per-step setup of the pushed DCP top-k merge (today the LPT row map); the indexer calls it
+    in every DSA layer before its logits, and the merge acts at the step's first DSA layer."""
+    if _TOPK_MERGE is not None and _TOPK_MERGE.push and _TOPK_MERGE.usable(local_lens.shape[0]):
+        _TOPK_MERGE.prepare_step(local_lens, layer_id)
 
 
 def dcp_global_topk(

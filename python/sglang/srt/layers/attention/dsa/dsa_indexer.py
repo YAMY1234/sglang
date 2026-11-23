@@ -35,6 +35,7 @@ from sglang.srt.layers.attention.dsa.dsa_dcp_sharded import (
     dcp_gather_request_rows,
     dcp_global_topk,
     dcp_row_gather_plan,
+    dcp_topk_prepare_step,
 )
 from sglang.srt.layers.attention.dsa.dsa_indexer_metadata import BaseIndexerMetadata
 from sglang.srt.layers.attention.dsa.dsa_npu_indexer import DSANPUIndexerMixin
@@ -1641,6 +1642,8 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 seqlens_32_2d = seqlens_32.reshape(-1).contiguous().view(-1, 1)
         else:
             seqlens_32_2d = seqlens_32.contiguous().view(-1, 1)
+        if dcp_size > 1:  # the step's setup of the pushed top-k merge (LPT row map), before the logits
+            dcp_topk_prepare_step(seqlens_32_2d.view(-1)[:q_offset], self.layer_id)
         if _is_cuda:
             if schedule_metadata is None:
                 schedule_metadata = resolve_paged_mqa_logits_metadata_fn()(
