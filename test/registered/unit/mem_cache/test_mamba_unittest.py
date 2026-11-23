@@ -491,6 +491,51 @@ class TestMamba(unittest.TestCase):
         ):
             self.assertTrue(torch.equal(t[:, dst.long()], r[:, ref_dst.long()]))
 
+    def test_cow_per_layer_bitwise_equals_whole_copy(self):
+        """Per-layer COW (copies interleaved with layer reads, rest by the flush) leaves
+        every byte of the pool equal to the one-shot copy: all slots of every conv /
+        temporal tensor, the side state, and req_to_token (COW touches no KV page)."""
+        pool, counter, _, _, _ = self._setup_cow_pool()
+        ref, ref_counter, _, _, _ = self._setup_cow_pool()
+        src, dst = pool.mamba_allocator.alloc(3), pool.mamba_allocator.alloc(3)
+        ref_src, ref_dst = ref.mamba_allocator.alloc(3), ref.mamba_allocator.alloc(3)
+        self.assertTrue(torch.equal(src, ref_src) and torch.equal(dst, ref_dst))
+
+        def state(p):
+            c = p.mamba_pool.mamba_cache
+            out = {f"conv{i}": t for i, t in enumerate(c.conv)}
+            out.update(
+                temporal=c.temporal,
+                ngram=p.ngram_pool.context,
+                req_to_token=p.req_to_token,
+            )
+            if p.mamba_pool.replayssm_write_pos is not None:
+                out["write_pos"] = p.mamba_pool.replayssm_write_pos
+            return out
+
+        for name, t in state(pool).items():
+            t.copy_(
+                torch.randn_like(t)
+                if t.is_floating_point()
+                else torch.randint_like(t, 0, 1000)
+            )
+            state(ref)[name].copy_(t)
+        before = {name: t.clone() for name, t in state(pool).items()}
+        counter.set_consumer(0)
+        ref_counter.set_consumer(0)
+        with envs.SGLANG_HICACHE_COW_PER_LAYER.override(True):
+            pool.copy_mamba_state(src, dst)
+            pool.mamba2_layer_cache(self.COW_MAMBA_LAYERS[0])
+            pool.mamba2_layer_cache(self.COW_MAMBA_LAYERS[2])
+            pool.flush_pending_cow()
+        ref.copy_mamba_state(ref_src, ref_dst)
+
+        self.assertIsNone(pool._pending_cow)
+        for name, t in state(pool).items():
+            self.assertTrue(torch.equal(t, state(ref)[name]), name)
+        self.assertFalse(torch.equal(state(pool)["temporal"], before["temporal"]))
+        self.assertTrue(torch.equal(pool.req_to_token, before["req_to_token"]))
+
     def test_cow_per_layer_flush_and_no_load_back(self):
         """Layers the forward did not read are copied by flush_pending_cow; without a
         load-back consumer the flag keeps the one-shot copy."""
