@@ -920,10 +920,25 @@ struct TopKSampled : TopKRadixBase<12> {
   /// Emits the top-k above the threshold bin as `emit_above(slot, score, index)` and leaves
   /// the rest as indices (+ problem.bias) in smem->staged[first_staged, topk); returns false,
   /// having emitted nothing, when theta missed.
-  template <bool kUsePDL, typename EmitAbove>
-  SGL_DEVICE static bool
-  forward(const TopKProblem& problem, Smem* smem, const EmitAbove& emit_above, uint32_t& first_staged) {
+  /// Bench only (kStamp): thread 0 takes the globaltimer into stamps[k] at a phase boundary (after a barrier).
+  template <bool kStamp>
+  SGL_DEVICE static void stamp(uint64_t* stamps, const uint32_t k) {
+    if constexpr (kStamp) {
+      if (threadIdx.x == 0) asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(stamps[k]));
+    }
+  }
+
+  /// kStamp (bench only): stamps[0..6] = entry, PDL wait done, theta known, collected, select threshold
+  /// known, above emitted, ties handled; the production instantiations use kStamp = false.
+  template <bool kUsePDL, typename EmitAbove, bool kStamp = false>
+  SGL_DEVICE static bool forward(
+      const TopKProblem& problem,
+      Smem* smem,
+      const EmitAbove& emit_above,
+      uint32_t& first_staged,
+      uint64_t* stamps = nullptr) {
     const auto tx = threadIdx.x;
+    stamp<kStamp>(stamps, 0);
     init_histogram(smem->histogram, tx);
     if (tx == 0) {
       smem->count_gt = 0;
@@ -934,14 +949,17 @@ struct TopKSampled : TopKRadixBase<12> {
     }
     __syncthreads();
     PDLWaitPrimary<kUsePDL>();
+    stamp<kStamp>(stamps, 1);
 
     const float theta = sample_threshold(problem, smem);
+    stamp<kStamp>(stamps, 2);
     init_histogram(smem->histogram, tx);  // for the candidates; sample_threshold ends on a barrier
     collect(problem, theta, smem);
     __syncthreads();
+    stamp<kStamp>(stamps, 3);
     const auto n = smem->n_ge;
     if (n < problem.topk || n > kCapacity) return false;
-    select_candidates<kUsePDL>(problem, theta, n, smem, emit_above, first_staged);
+    select_candidates<kUsePDL, EmitAbove, kStamp>(problem, theta, n, smem, emit_above, first_staged, stamps);
     return true;
   }
 
@@ -1090,14 +1108,15 @@ struct TopKSampled : TopKRadixBase<12> {
 
   /// TopKStreaming's phases 2-4 on the n buffered candidates. An overflowing threshold bin
   /// goes to refine_ties, whose rescans of the row keep to the candidates through v_lo >= theta.
-  template <bool kUsePDL, typename EmitAbove>
+  template <bool kUsePDL, typename EmitAbove, bool kStamp = false>
   SGL_DEVICE static void select_candidates(
       const TopKProblem& problem,
       const float theta,
       const uint32_t n,
       Smem* smem,
       const EmitAbove& emit_above,
-      uint32_t& first_staged) {
+      uint32_t& first_staged,
+      uint64_t* stamps = nullptr) {
     const auto tx = threadIdx.x;
     const auto topk = problem.topk;
     for (uint32_t i = tx; i < n; i += kBlockSize) {
@@ -1113,6 +1132,7 @@ struct TopKSampled : TopKRadixBase<12> {
     // The tie buffer overlays the histogram, which find_threshold has consumed.
     const auto v_lo = smem->v_lo;
     const auto v_hi = smem->v_hi;
+    stamp<kStamp>(stamps, 4);
     PDLTriggerSecondary<kUsePDL>();
 #pragma unroll 1
     for (uint32_t i0 = 0; i0 < n; i0 += kBlockSize) {
@@ -1126,6 +1146,7 @@ struct TopKSampled : TopKRadixBase<12> {
       if (tie && eq < kMaxNumTie) smem->tie_values[eq] = c;
     }
     __syncthreads();
+    stamp<kStamp>(stamps, 5);
     first_staged = smem->count_gt;
     // The staged slots overlay the candidates, consumed above.
     auto staged = problem;
@@ -1137,6 +1158,8 @@ struct TopKSampled : TopKRadixBase<12> {
     const auto count_eq = smem->count_eq;
     const auto remain_topk = count_gt < topk ? topk - count_gt : 0;
     handle_tie(smem->tie_values, staged, count_gt, min(count_eq, kMaxNumTie), remain_topk, &smem->tie_handle);
+    if constexpr (kStamp) __syncthreads();
+    stamp<kStamp>(stamps, 6);
   }
 };
 

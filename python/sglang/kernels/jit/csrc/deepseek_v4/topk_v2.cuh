@@ -467,7 +467,7 @@ struct TopKCandidatesParams {
   int32_t push_max_rows = 0;
   uint32_t sampled_min_len = 0;  // sampled variant only: rows up to this length stay on the exact path
   const int32_t* row_map = nullptr;  // kLpt: [1 + rows] {rows built for, the row each block runs} (lpt_row_map_kernel)
-  int64_t* lpt_trace = nullptr;      // bench only, kTrace: per block {start, row read, end, row} (globaltimer ns)
+  int64_t* lpt_trace = nullptr;      // bench only, kTrace: [rows, 16] per block, see topk_candidates_sampled_kernel
 
   SGL_DEVICE int32_t global_position(int32_t local) const {
     const auto b = cand_page_bits;
@@ -569,9 +569,10 @@ static_assert(sizeof(SampledCandidatesSmem) <= 48 * 1024, "static shared memory 
 /// `candidates_one_block`, except that rows longer than `sampled_min_len` and past the
 /// register paths take the sampled single pass (impl::TopKSampled), falling back to the
 /// exact path when it misses, counted in `overflow_rows`. Same selected set; slot order differs.
-template <bool kPDL, bool kPush>
-SGL_DEVICE void
-candidates_sampled_one_block(const TopKCandidatesParams& params, const uint32_t bx, SampledCandidatesSmem* smem) {
+/// kStamp (bench only): stamps[0..6] as Sampled::forward, stamps[7] after the staged slots are emitted.
+template <bool kPDL, bool kPush, bool kStamp = false>
+SGL_DEVICE void candidates_sampled_one_block(
+    const TopKCandidatesParams& params, const uint32_t bx, SampledCandidatesSmem* smem, uint64_t* stamps = nullptr) {
   constexpr uint32_t kVecSize = impl::TopKStreaming::kVecSize;
   const auto seq_len = static_cast<uint32_t>(params.seq_lens[bx]);
   const auto row_start = params.row_starts == nullptr ? 0u : static_cast<uint32_t>(params.row_starts[bx]);
@@ -598,11 +599,16 @@ candidates_sampled_one_block(const TopKCandidatesParams& params, const uint32_t 
   const auto emit_above = [&](uint32_t slot, float val, uint32_t idx) {
     sink.put(slot, __float_as_int(val), params.global_position(static_cast<int32_t>(idx - rem)));
   };
-  if (Sampled::forward<kPDL>(problem, &smem->sampled, emit_above, first_staged)) {
+  if (Sampled::template forward<kPDL, decltype(emit_above), kStamp>(
+          problem, &smem->sampled, emit_above, first_staged, stamps)) {
     __syncthreads();
     for (uint32_t slot = first_staged + threadIdx.x; slot < topk; slot += kBlockSize) {
       const auto idx = smem->sampled.staged[slot];
       sink.put(slot, __float_as_int(score[row_start + idx]), params.global_position(idx));
+    }
+    if constexpr (kStamp) {
+      __syncthreads();
+      Sampled::stamp<kStamp>(stamps, 7);
     }
     return;
   }
@@ -638,7 +644,8 @@ __global__ __launch_bounds__(kBlockSize, 1) void lpt_row_map_kernel(
 /// after the PDL wait, so it may come from any earlier kernel of the stream, the one just before
 /// included. A map built for another row count (row_map[0] != rows), or an entry out of range, falls
 /// back to block b running row b: a map that is late or foreign costs the order, never the result.
-/// kTrace (bench only, with kLpt): thread 0 stamps {start, row read, end, row} in params.lpt_trace;
+/// kTrace (bench only, with kLpt): thread 0 writes {start, row read, the sampled row's 8 phase stamps (0 when the
+/// row takes another path), end, row} into params.lpt_trace [rows, 16];
 /// the production launch uses kTrace = false and carries no timestamp code.
 template <bool kPDL, bool kPush, bool kLpt = false, bool kTrace = false>
 TOPK_KERNEL void topk_candidates_sampled_kernel(const __grid_constant__ TopKCandidatesParams params) {
@@ -647,6 +654,7 @@ TOPK_KERNEL void topk_candidates_sampled_kernel(const __grid_constant__ TopKCand
   static_assert(kLpt || !kTrace);
   if constexpr (kLpt) {
     uint64_t t0 = 0, t1 = 0;
+    uint64_t stamps[8] = {};  // kTrace: the phase boundaries of a sampled row (thread 0)
     if constexpr (kTrace) asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t0));
     device::PDLWaitPrimary<kPDL>();  // the map's producer is done (candidates_sampled_one_block waits again: a no-op)
     const auto rows = gridDim.x;
@@ -654,17 +662,19 @@ TOPK_KERNEL void topk_candidates_sampled_kernel(const __grid_constant__ TopKCand
     const auto mapped = static_cast<uint32_t>(params.row_map[1 + blockIdx.x]);
     const auto row = built_for == rows && mapped < rows ? mapped : blockIdx.x;
     if constexpr (kTrace) asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t1));
-    candidates_sampled_one_block<kPDL, kPush>(params, row, &smem);
+    candidates_sampled_one_block<kPDL, kPush, kTrace>(params, row, &smem, stamps);
     if constexpr (kTrace) {
       __syncthreads();
       if (threadIdx.x == 0) {
         uint64_t t2;
         asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t2));
-        auto* r = params.lpt_trace + 4 * static_cast<int64_t>(blockIdx.x);
+        auto* r = params.lpt_trace + 16 * static_cast<int64_t>(blockIdx.x);
         r[0] = static_cast<int64_t>(t0);
         r[1] = static_cast<int64_t>(t1);
-        r[2] = static_cast<int64_t>(t2);
-        r[3] = row;
+#pragma unroll
+        for (int k = 0; k < 8; ++k) r[2 + k] = static_cast<int64_t>(stamps[k]);
+        r[10] = static_cast<int64_t>(t2);
+        r[11] = row;
       }
     }
   } else {
@@ -2339,9 +2349,9 @@ struct TopKKernel {
       if (row_map.has_value() && rows <= kBlockSize) {  // longest rows first (topk_candidates_sampled_kernel)
         auto lpt = params;
         lpt.row_map = verify_row_map(row_map.value(), rows, device_);
-        if (lpt_trace.has_value()) {  // bench only: int64 [>= rows, 4], the timestamped instantiation
+        if (lpt_trace.has_value()) {  // bench only: int64 [>= rows, 16], the timestamped instantiation
           auto G = SymbolicSize{"lpt_trace_blocks"};
-          TensorMatcher({G, 4}).with_dtype<int64_t>().with_device(device_).verify(lpt_trace.value());
+          TensorMatcher({G, 16}).with_dtype<int64_t>().with_device(device_).verify(lpt_trace.value());
           RuntimeCheck(G.unwrap() >= rows, "lpt_trace has fewer rows than the grid");
           lpt.lpt_trace = static_cast<int64_t*>(lpt_trace.value().data_ptr());
           return LaunchKernel(rows, kBlockSize, device_.unwrap())
