@@ -650,6 +650,7 @@ struct PushedParams {
   int32_t rank;
   int32_t span;  // page_size * kNumRanks
   int32_t max_rows;
+  int64_t* trace = nullptr;  // bench only (merge_pushed_wide_kernel kTrace): [rows, 8] per CTA
 };
 
 // This rank failed the certificate: its keys >= t_lo, tagged into its full slot
@@ -924,7 +925,9 @@ __global__ void __launch_bounds__(32 * kNumRanks, kNumRanks == 8 ? 4 : 1)
 // kTopK / (32 * kWarpsPerRank) keys and the select's rounds have that many more warps in
 // flight. Same buffer protocol, same t*, and this rank's keys >= t* in candidate order, so
 // out / out_local / out_lengths equal merge_pushed_kernel's.
-template <int kNumRanks, int kTopK, int kWarpsPerRank, bool kUsePDL>
+/// kTrace (bench only): thread 0 writes p.trace[row] = {start, PDL wait done, every rank's candidates in, t* known,
+/// end, row} (globaltimer); the production launch uses kTrace = false.
+template <int kNumRanks, int kTopK, int kWarpsPerRank, bool kUsePDL, bool kTrace = false>
 __global__ void __launch_bounds__(32 * kNumRanks * kWarpsPerRank)
     merge_pushed_wide_kernel(const __grid_constant__ PushedParams p) {
   constexpr int kRankThreads = 32 * kWarpsPerRank;
@@ -940,8 +943,19 @@ __global__ void __launch_bounds__(32 * kNumRanks * kWarpsPerRank)
   const int row = blockIdx.x, tid = threadIdx.x;
   const int q = tid / kRankThreads, t = tid % kRankThreads;
   const uint32_t lane = device::get_lane_id();
+  const auto stamp = [&](int k) {  // straight to global: no register held across the kernel
+    if constexpr (kTrace) {
+      if (tid == 0) {
+        uint64_t now;
+        asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(now));
+        p.trace[row * 8 + k] = static_cast<int64_t>(now);
+      }
+    }
+  };
+  stamp(0);
   if (tid == 0) n_cand_smem = 0;
   device::PDLWaitPrimary<kUsePDL>();
+  stamp(1);
   const int64_t c = p.counters[row];
   const uint64_t tag = static_cast<uint64_t>(c % 255) + 1;
   const int64_t base = ((c & 1) * p.max_rows + row) * kSlot;
@@ -956,10 +970,12 @@ __global__ void __launch_bounds__(32 * kNumRanks * kWarpsPerRank)
   }
   mine = device::warp::reduce_sum(mine);
   __syncthreads();  // n_cand_smem zeroed
+  stamp(2);
   if (lane == 0) atomicAdd(&n_cand_smem, mine);
   __syncthreads();
   const int want = min(n_cand_smem, kTopK);
   const uint64_t ts = select_kth_adaptive(visit_keys(cand), want, s);
+  stamp(3);
   if (tid == 0) {
     p.fallback[row] = 0;
     if (row == 0) atomicAdd(&p.stats[kStatRows], static_cast<unsigned long long>(gridDim.x));
@@ -1016,6 +1032,10 @@ __global__ void __launch_bounds__(32 * kNumRanks * kWarpsPerRank)
   if (tid == 0) p.out_lengths[row] = n;
   __syncthreads();
   if (tid == 0) p.counters[row] = c + 1;
+  if constexpr (kTrace) {
+    stamp(4);
+    if (tid == 0) p.trace[row * 8 + 5] = row;
+  }
 }
 
 }  // namespace dcp_topk_merge
@@ -1194,6 +1214,46 @@ struct DcpTopKMergePushedWideKernel {
       tvm::ffi::TensorView stats,
       int64_t rank,
       int64_t span) {
+    run_impl<false>(logits, local_lens, buffer, peer_ptrs, counters, global_lens, page_table, out_slots, out_local, out_lengths, out_fallback, stats, rank, span, nullptr);
+  }
+
+  /// Bench only: `run`, plus each CTA's {start, PDL wait done, candidates in, t* known, end, row} into trace [rows, 8].
+  static void
+  run_traced(tvm::ffi::TensorView logits,
+      tvm::ffi::TensorView local_lens,
+      tvm::ffi::TensorView buffer,
+      tvm::ffi::TensorView peer_ptrs,
+      tvm::ffi::TensorView counters,
+      tvm::ffi::TensorView global_lens,
+      tvm::ffi::TensorView page_table,
+      tvm::ffi::TensorView out_slots,
+      tvm::ffi::TensorView out_local,
+      tvm::ffi::TensorView out_lengths,
+      tvm::ffi::TensorView out_fallback,
+      tvm::ffi::TensorView stats,
+      int64_t rank,
+      int64_t span,
+      tvm::ffi::TensorView trace) {
+    run_impl<true>(logits, local_lens, buffer, peer_ptrs, counters, global_lens, page_table, out_slots, out_local, out_lengths, out_fallback, stats, rank, span, &trace);
+  }
+
+  template <bool kTrace>
+  static void
+  run_impl(tvm::ffi::TensorView logits,
+      tvm::ffi::TensorView local_lens,
+      tvm::ffi::TensorView buffer,
+      tvm::ffi::TensorView peer_ptrs,
+      tvm::ffi::TensorView counters,
+      tvm::ffi::TensorView global_lens,
+      tvm::ffi::TensorView page_table,
+      tvm::ffi::TensorView out_slots,
+      tvm::ffi::TensorView out_local,
+      tvm::ffi::TensorView out_lengths,
+      tvm::ffi::TensorView out_fallback,
+      tvm::ffi::TensorView stats,
+      int64_t rank,
+      int64_t span,
+      const tvm::ffi::TensorView* trace) {
     using namespace host;
 
     auto R = SymbolicSize{"rows"};
@@ -1242,8 +1302,17 @@ struct DcpTopKMergePushedWideKernel {
         .span = static_cast<int32_t>(span),
         .max_rows = max_rows,
     };
-    LaunchKernel(rows, static_cast<int>(32 * kNumRanks * kWarpsPerRank), device_.unwrap())
-        .enable_pdl(kUsePDL)(kernel, params);
+    if constexpr (kTrace) {
+      TensorMatcher({R, 8}).with_strides({8, 1}).with_dtype<int64_t>().with_device(device_).verify(*trace);
+      auto traced = params;
+      traced.trace = static_cast<int64_t*>(trace->data_ptr());
+      LaunchKernel(rows, static_cast<int>(32 * kNumRanks * kWarpsPerRank), device_.unwrap())
+          .enable_pdl(kUsePDL)(
+              dcp_topk_merge::merge_pushed_wide_kernel<kNumRanks, kTopK, kWarpsPerRank, kUsePDL, true>, traced);
+    } else {
+      LaunchKernel(rows, static_cast<int>(32 * kNumRanks * kWarpsPerRank), device_.unwrap())
+          .enable_pdl(kUsePDL)(kernel, params);
+    }
   }
 };
 
