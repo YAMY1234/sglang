@@ -224,10 +224,14 @@ class KdaFlow:
     ``heads`` heads; ``ctas`` persistent CTAs; ``fused_fb``: the gate input is F_A
     [R, 128] and the kernel applies F_B, else it is the raw gate [R, heads * 128]."""
 
-    def __init__(self, heads, tokens, requests, ctas, fused_fb):
+    def __init__(self, heads, tokens, requests, ctas, fused_fb, prefetch=False):
         assert 2 <= tokens <= 5
         self.heads, self.tokens, self.requests = heads, tokens, requests
         self.ctas, self.fused_fb = ctas, fused_fb
+        # Pages issued before the PDL wait: the state was written by this layer's
+        # previous step, never by the kernels just before it. The fused F_B rows
+        # stage in the last page slot, so that mode prefetches one page fewer.
+        self.early_pages = (SLOTS - 1 if fused_fb else SLOTS) if prefetch else 0
         self.packed, self.fold_fence = PACKED, FOLD_FENCE
 
     @cute.jit
@@ -458,6 +462,13 @@ class KdaFlow:
                         copy_g2s(at(fbs, h, 0, 0), at(f_b, (h0 + h) * K, 0), K * K * 2,
                                  fb_full)  # fmt: skip
         cute.arch.sync_warp()
+        EARLY: cutlass.Constexpr = self.early_pages
+        if cutlass.const_expr(EARLY > 0):
+            if tid == 0:
+                for s in cutlass.range_constexpr(EARLY):
+                    if s < count:
+                        self.load_page(args, pages, s, table, s, state_full)
+            cute.arch.sync_warp()
         cute.arch.griddepcontrol_wait()
         cute.arch.griddepcontrol_launch_dependents()
         # The gate rows (F_A, or the raw gates themselves; 16 B per thread, all in
@@ -507,7 +518,7 @@ class KdaFlow:
         # The state stream starts once the small copies the prologue waits on have
         # landed; its first pages fill during the gate projection.
         if tid == 0:
-            for s in cutlass.range_constexpr(SLOTS - 1):
+            for s in cutlass.range_constexpr(EARLY, SLOTS - 1):
                 if s < count:
                     self.load_page(args, pages, s, table, s, state_full)
         cute.arch.sync_warp()
@@ -516,9 +527,10 @@ class KdaFlow:
             self.gate_projection(tid, count, h0, table, fbs, fas, raw)
         cute.arch.sync_warp()
         cute.arch.barrier()  # raw gates; the last page slot and the blocks are free
-        if tid == 0:
-            if SLOTS - 1 < count:
-                self.load_page(args, pages, SLOTS - 1, table, SLOTS - 1, state_full)
+        if cutlass.const_expr(EARLY < SLOTS):
+            if tid == 0:
+                if SLOTS - 1 < count:
+                    self.load_page(args, pages, SLOTS - 1, table, SLOTS - 1, state_full)
         cute.arch.sync_warp()
         ops = (xv, v_s, g_s, fw_s, fu_s, fd_s, ce_s)
         self.group_items(args, g, c, count, h0, pages, table, betas, raw, hcs,
