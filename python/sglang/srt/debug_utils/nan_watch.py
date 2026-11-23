@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import logging
 import time
+import zlib
 from collections import deque
 from typing import TYPE_CHECKING, Optional
 
@@ -25,6 +26,10 @@ logger = logging.getLogger(__name__)
 # Row columns; the last row of a record holds the per-forward counters. IN / OUT read the "hidden_states" proxy
 # (last stage OUT: logits rows); the K3 attention-residual bank rides beside it as "attn_res_bank".
 _IN, _STATE, _OUT, _SLOT, _KV_MIN, _KV_MAX, _IN_BANK, _OUT_BANK = range(8)
+# Row checksums of the proxy received (after the forward stream's wait on it) and the proxy sent; the readout
+# matches a stage's sent rows to the next stage's received rows of the same micro-batch.
+_XFER_IN, _XFER_OUT = 8, 9
+_XFER_KEYS = ("hidden_states", "attn_res_bank", "dspark_hidden_states")
 # Counter row, past the counters: up to 4 values the Mamba free list holds twice, up to 2 batch slots on it.
 _FREE_DUP_VALS, _SLOTS_ON_FREE = slice(6, 10), slice(10, 12)
 _NONE = torch.iinfo(torch.int64).max
@@ -52,6 +57,7 @@ class _Forward:
         self.dev = dev
         self.token_row, self.token_offset = token_row, token_offset
         self.points = {}  # (layer, point) -> column, in first-seen order
+        self.received = self.sent = False
         self.t = time.time()
 
 
@@ -84,6 +90,17 @@ def _add_proxy_flags(dev, cols, proxy, token_row, num_tokens):
         t = proxy.tensors.get(key)
         if t is not None:
             dev[:-1, col].index_add_(0, token_row, _bad_tokens(t, num_tokens))
+
+
+def _row_checksum(dev_col, proxy, token_row, token_offset, num_tokens) -> None:
+    """Per row: sum over its tokens of (offset + 1) * (sum of the token's 16-bit words); exact, in int64."""
+    for key in _XFER_KEYS:
+        t = proxy.tensors.get(key)
+        if t is None or t.shape[0] < num_tokens or t.element_size() not in (2, 4):
+            continue
+        words = t[:num_tokens].reshape(num_tokens, -1).view(torch.int16)
+        per_token = words.sum(-1, dtype=torch.int64) * (token_offset + 1)
+        dev_col.index_add_(0, token_row, per_token)
 
 
 def _dups(sorted_ids: torch.Tensor) -> torch.Tensor:
@@ -148,6 +165,10 @@ def begin(
     dev[:bs, _POINT_BASE + 1 :: 2] = _NONE
     if pp_proxy_tensors is not None:
         _add_proxy_flags(dev, (_IN, _IN_BANK), pp_proxy_tensors, token_row, num_tokens)
+        _row_checksum(
+            dev[:bs, _XFER_IN], pp_proxy_tensors, token_row, token_offset, num_tokens
+        )
+    received = pp_proxy_tensors is not None
 
     from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
 
@@ -202,6 +223,7 @@ def begin(
         token_row=token_row,
         token_offset=token_offset,
     )
+    _active.received = received
 
 
 def check_state(
@@ -266,6 +288,14 @@ def end(
         _add_proxy_flags(
             dev, (_OUT, _OUT_BANK), pp_proxy_tensors, token_row, num_tokens
         )
+        _row_checksum(
+            dev[:bs, _XFER_OUT],
+            pp_proxy_tensors,
+            watch.token_row,
+            watch.token_offset,
+            num_tokens,
+        )
+        watch.sent = True
     # Power-of-two pinned buffers, so the caching host allocator reuses blocks instead of a new cudaHostAlloc.
     rows = dev.shape[0]
     host = torch.empty(
@@ -296,6 +326,18 @@ def _report(watch: _Forward, rows) -> None:
     free_dup_vals = [v for v in rows[-1][_FREE_DUP_VALS] if v != _NONE]
     slots_on_free = [v for v in rows[-1][_SLOTS_ON_FREE] if v != _NONE]
     rows = rows[:-1]
+    if watch.received or watch.sent:
+        # One line per forward: the readout pairs stage s's sent rows with stage s+1's received rows by key.
+        key = zlib.crc32(
+            repr((watch.rids, watch.prefix_lens, watch.extend_lens)).encode()
+        )
+        logger.info(
+            "NaN watch xfer PP%d key=%08x in=%s out=%s",
+            watch.stage,
+            key,
+            [r[_XFER_IN] for r in rows] if watch.received else None,
+            [r[_XFER_OUT] for r in rows] if watch.sent else None,
+        )
     _totals["forwards"] += 1
     _totals["rows"] += len(rows)
     for k, v in counters.items():

@@ -4,6 +4,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
+import re
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -124,6 +125,31 @@ class TestNanWatch(unittest.TestCase):
         self.assertEqual(len(lines), 1)
         self.assertIn("rid=b ", lines[0])
         self.assertIn("points=[(39, 'attn', 2, 1), (39, 'out', 2, 1)]", lines[0])
+
+    def test_transfer_checksums_pair_rows_and_catch_a_changed_row(self):
+        received = torch.arange(15.0).reshape(5, 3)
+        sent = received.clone()
+        sent[3, 1] += 1  # a token of row 1
+        pool = _Pool([5, 6], [7, 8], self.rtt)
+        with patch("sglang.srt.mem_cache.memory_pool.HybridReqToTokenPool", _Pool):
+            nan_watch.begin(
+                self.batch,
+                PPProxyTensors({"hidden_states": received}),
+                model_runner=_runner(pool, [20]),
+                rids=["a", "b"],
+                stage=3,
+            )
+        nan_watch.end(
+            pp_proxy_tensors=PPProxyTensors({"hidden_states": sent}),
+            forward_batch=self.batch,
+        )
+        with self.assertLogs(nan_watch.logger, level="INFO") as logs:
+            nan_watch.poll()
+        line = next(m for m in logs.output if "NaN watch xfer PP3" in m)
+        got_in, got_out = re.search(r"in=\[(.*)\] out=\[(.*)\]", line).groups()
+        got_in, got_out = got_in.split(", "), got_out.split(", ")
+        self.assertEqual(got_in[0], got_out[0])
+        self.assertNotEqual(got_in[1], got_out[1])
 
     def test_shared_slots_are_counted(self):
         # Both rows on Mamba slot 5, which is also free; new KV token 41 sits on free page 10.
