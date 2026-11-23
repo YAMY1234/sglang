@@ -376,6 +376,24 @@ def _rel(got, want):
     return float((got.double() - want.double()).norm() / want.double().norm())
 
 
+class TestKdaFlowOperands(CustomTestCase):
+    """KdaFlow hands layer parameters (A_log, dt_bias, norm weight: nn.Parameter,
+    requires grad) to CuTe through DLPack, which refuses tensors that require grad;
+    the operands must be detached. Runs on CPU."""
+
+    def test_parameters_export(self):
+        try:
+            from sglang.kernels.ops.attention.kda_flow import cute_views
+        except ImportError as exc:  # no CuTe DSL in this environment
+            raise unittest.SkipTest(str(exc))
+        a_log = torch.nn.Parameter(torch.randn(24))
+        dt_bias = torch.nn.Parameter(torch.randn(24 * 128))
+        state = torch.zeros(3, 24, 128, 128)
+        views = cute_views((a_log, dt_bias, state, -5.0))
+        self.assertEqual(len(views), 4)
+        self.assertTrue(a_log.requires_grad)
+
+
 class TestKdaFlowVerify(CustomTestCase):
     """SGLANG_OPT_KDA_FLOW: the persistent verify folds the previous step's accepted
     rows from its RecoverSSM records and verifies q = 5 rows; over steps with partial
@@ -414,10 +432,12 @@ class TestKdaFlowVerify(CustomTestCase):
             return (torch.randn(*shape, device=dev, generator=gen) * scale).to(dtype)
 
         conv_w = [prepare_conv_weight(randn(3 * d, 4, scale=0.5)) for _ in range(layers)]
-        a_log = [randn(heads, scale=0.5) for _ in range(layers)]
-        dt = [randn(d, scale=0.5) for _ in range(layers)]
-        f_b = [randn(d, 128, scale=128**-0.5, dtype=bf16) for _ in range(layers)]
-        norm_w = randn(128, scale=0.1) + 1
+        # The layer attributes the backend passes are nn.Parameters (require grad).
+        param = torch.nn.Parameter
+        a_log = [param(randn(heads, scale=0.5)) for _ in range(layers)]
+        dt = [param(randn(d, scale=0.5)) for _ in range(layers)]
+        f_b = [param(randn(d, 128, scale=128**-0.5, dtype=bf16), requires_grad=False) for _ in range(layers)]
+        norm_w = param(randn(128, scale=0.1) + 1)
         spec = SimpleNamespace(
             temporal=randn(layers, num_slots, heads, 128, 128, scale=0.1),
             replayssm_rawv=torch.zeros(layers, num_slots, heads, ring, 128, device=dev, dtype=bf16),
@@ -454,7 +474,7 @@ class TestKdaFlowVerify(CustomTestCase):
             live = slots[:num_requests].long()
             for layer in range(layers):
                 f_a = bfa[:, :128]
-                raw = (f_a.float() @ f_b[layer].float().t()).to(bf16)
+                raw = (f_a.float() @ f_b[layer].detach().float().t()).to(bf16)
                 conv_before = spec.conv[0][layer][live].clone()
                 out = kda_flow_verify(
                     x=fused[:, : 3 * d], conv_weight=conv_w[layer],
@@ -569,7 +589,8 @@ class TestKdaFlowVerify(CustomTestCase):
     def test_matches_fp64_reference(self):
         for num_requests, fused_fb in ((33, False), (58, False), (58, True), (112, True)):
             with self.subTest(num_requests=num_requests, fused_fb=fused_fb):
-                report, flushed = self._run(num_requests=num_requests, fused_fb=fused_fb)
+                with torch.no_grad():  # as serving: Parameters still require grad
+                    report, flushed = self._run(num_requests=num_requests, fused_fb=fused_fb)
                 keys = ("out", "state", "corr", "v2_vs_ref", "flow_vs_v2")
                 worst = {k: max(r.get(k, 0.0) for r in report) for k in keys}
                 self.assertLess(worst["flow_vs_v2"], 1e-2, worst)

@@ -149,7 +149,6 @@ def kda_flow_verify(
     accepted rows into ``state``, writes the conv windows and this verify's records,
     returns the gated-RMSNorm output [R, D] BF16."""
     import cuda.bindings.driver as cuda
-    from cutlass.cute.runtime import from_dlpack
 
     rows, n = x.shape[0], slots.shape[0]
     tokens = rows // n
@@ -181,15 +180,23 @@ def kda_flow_verify(
                             device_index=device_index)  # fmt: skip
         _check_spills(compiled, device_index, key)
         _COMPILED[key] = compiled
-    import cutlass
+    stream = cuda.CUstream(torch.cuda.current_stream(x.device).cuda_stream)
+    compiled(*cute_views(args), stream)
+    return out
 
-    views = tuple(
-        from_dlpack(a.detach(), assumed_align=16) if isinstance(a, torch.Tensor) else cutlass.Float32(a)
+
+def cute_views(args):
+    """CuTe operands of ``args``: tensors through DLPack (detached: layer parameters
+    require grad and DLPack refuses to export those), scalars as Float32."""
+    import cutlass
+    from cutlass.cute.runtime import from_dlpack
+
+    return tuple(
+        from_dlpack(a.detach(), assumed_align=16)
+        if isinstance(a, torch.Tensor)
+        else cutlass.Float32(a)
         for a in args
     )
-    stream = cuda.CUstream(torch.cuda.current_stream(x.device).cuda_stream)
-    compiled(*views, stream)
-    return out
 
 
 # ---------------------------------------------------------------- reader flush
@@ -268,6 +275,7 @@ def fold_kda_flow_pending(
 
 
 __all__ = [
+    "cute_views",
     "fold_kda_flow_pending",
     "kda_flow_records",
     "kda_flow_verify",
