@@ -121,6 +121,7 @@ def _manager(memory, kv_ptrs, item_lens, num_draft, index_k_token_bytes, page_si
     manager.get_mla_kv_ptrs_with_pp = lambda src, dst, *_: (src, dst, len(src))
     manager.descriptors = 0
     manager.calls = 0
+    manager._dcp_send_stats = MooncakeKVManager._new_dcp_send_stats()
 
     def transfer(session, blocks):
         manager.descriptors += len(blocks)
