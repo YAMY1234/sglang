@@ -2690,6 +2690,9 @@ class Envs:
     # projections BF16 -> MXFP8 at load time, bit-identical to ModelOpt's
     # MXFP8QTensor (the TRT-LLM IBDB checkpoint's precision for these layers).
     SGLANG_K31_BASISB_MXFP8 = EnvBool(False)
+    # With SGLANG_K31_BASISB_MXFP8, cast only KDA's fused q/k/v/g; b, f_a and o stay BF16
+    # (decode role: separate MXFP8 b and f_a outlast q/k/v/g on the attention side stream).
+    SGLANG_K31_BASISB_KDA_QKVG_ONLY = EnvBool(False)
     SGLANG_K31_SM107_GEMM_TACTICS = EnvBool(False)
     # Optional path of a JSON table that replaces the built-in SM107 table.
     SGLANG_K31_SM107_GEMM_TABLE = EnvStr(None)
