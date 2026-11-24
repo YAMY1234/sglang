@@ -95,6 +95,13 @@ def _jit_hicache_staged_module(
 _coalesced_write_back_stats = [0, 0, 0]
 
 
+def _registration_chunk_args(dst: torch.Tensor) -> tuple[int, int]:
+    """(base, chunk_bytes) of dst's chunked cudaHostRegister ranges, or (0, 0) for a single registration."""
+    from sglang.srt.mem_cache.pool_host.common import registration_chunk_of
+
+    return registration_chunk_of(dst.data_ptr())
+
+
 def _use_coalesced_write_back(dst_indices: torch.Tensor, page_size: int) -> bool:
     if not envs.SGLANG_OPT_HICACHE_BATCH_WRITE_BACK_COPY.get():
         return False
@@ -468,9 +475,12 @@ def transfer_hicache_all_layer_staged_lf_pf(
     staging_v = staging_v.view(staging_v.shape[0], staging_v.shape[1], -1)
     dst_k = dst_k.view(dst_k.shape[0], dst_k.shape[1], -1)
     dst_v = dst_v.view(dst_v.shape[0], dst_v.shape[1], -1)
+    coalesced = _use_coalesced_write_back(dst_indices, page_size)
+    # K and V are views of one host buffer: one registration holds both.
+    reg = _registration_chunk_args(dst_k) if coalesced else ()
     launch = (
         module.launch_all_lf_pf_staged_coalesced
-        if _use_coalesced_write_back(dst_indices, page_size)
+        if coalesced
         else module.launch_all_lf_pf_staged
     )
     for page_begin in range(0, src_page_indices.numel(), staging_page_capacity):
@@ -488,6 +498,7 @@ def transfer_hicache_all_layer_staged_lf_pf(
             k_ptr_src,
             v_ptr_src,
             page_size,
+            *reg,
         )
 
 
@@ -517,9 +528,11 @@ def transfer_hicache_all_layer_mla_staged_lf_pf(
     staging_page_capacity = staging.shape[0] // page_size
     staging = staging.view(staging.shape[0], staging.shape[1], -1)
     dst = dst.view(dst.shape[0], dst.shape[1], -1)
+    coalesced = _use_coalesced_write_back(dst_indices, page_size)
+    reg = _registration_chunk_args(dst) if coalesced else ()
     launch = (
         module.launch_all_mla_lf_pf_staged_coalesced
-        if _use_coalesced_write_back(dst_indices, page_size)
+        if coalesced
         else module.launch_all_mla_lf_pf_staged
     )
     for page_begin in range(0, src_page_indices.numel(), staging_page_capacity):
@@ -534,6 +547,7 @@ def transfer_hicache_all_layer_mla_staged_lf_pf(
             src_page_indices[page_begin : page_begin + chunk_pages],
             ptr_src,
             page_size,
+            *reg,
         )
 
 
