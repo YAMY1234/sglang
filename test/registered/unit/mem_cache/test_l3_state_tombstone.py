@@ -403,6 +403,7 @@ class TestL3LifetimeAccounting(unittest.TestCase):
 
     def test_a_too_short_lookup_is_declined_with_a_ledger_event(self):
         cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
+        cache.tree_core = Mock(is_eagle=False)  # enable_storage / page_size forward to tree_core
         cache.enable_storage = True
         cache.cache_controller = Mock()
         cache.cache_controller.get_prefetch_submission.return_value = None
@@ -411,7 +412,6 @@ class TestL3LifetimeAccounting(unittest.TestCase):
         cache.host_memory_mode = "cache"
         cache.ongoing_prefetch = {}
         cache.buffer_pipeline = None
-        cache.tree_core = Mock(is_eagle=False)
         cache.tree_core.prefetch_anchor_info.return_value = (None, None)
         cache.tree_core.get_prefix_hash_values.return_value = ["a" * 64]
         cache.tree_core.get_hash_values.return_value = ["b" * 64]
