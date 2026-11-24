@@ -2226,6 +2226,11 @@ class Envs:
     # give every request this many pages of headroom in the same allocation (capped
     # at 8; 0 = off). Skipped when free pages are low and under HiSparse.
     SGLANG_OPT_SPEC_DECODE_HEADROOM_PAGES = EnvInt(2)
+    # DSpark static verify: an all-sampled step (no top-k / top-p) replays its
+    # sampling accept and commits as a CUDA graph right after the verify graph.
+    SGLANG_OPT_DSV41_SAMPLING_ACCEPT_GRAPH = EnvBool(
+        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
+    )
     SGLANG_OPT_USE_MULTI_STREAM_OVERLAP = EnvBool(True)
 
     # ===================================================================
@@ -2727,7 +2732,6 @@ _DEPRECATED_ENVS: Dict[str, _DeprecatedEnv] = {
         "SGLANG_DSPARK_DEFER_CONTEXT_KV",
         "SGLANG_OPT_DSV41_DSPARK_ONE_LAUNCH_COMMIT_STAGE",
         "SGLANG_OPT_DSV41_POST_FORWARD_CUDA_GRAPH",
-        "SGLANG_OPT_DSV41_SAMPLING_ACCEPT_GRAPH",
     )
 }
 
