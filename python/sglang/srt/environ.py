@@ -2668,6 +2668,9 @@ class Envs:
     # only an explicit 1 enables it, and only with a checked-in table. See
     # srt/layers/communication/k3_sp_collective.py.
     SGLANG_K3_SP_COLLECTIVE = EnvBool(False)
+    # TP4 push RS / AG at 448-767 global tokens (decode R ~75-127 at 6 rows) with 192 blocks;
+    # measured faster on SM107 at M 540 / 632, same reduction order.
+    SGLANG_OPT_K3_SP_TP4_WIDE_PUSH = EnvBool(False)
     # DCP MLA decode: push each peer's head partials straight into its
     # CustomAllReduceV2 push slot and combine by LSE in one kernel, in place of
     # the pack + all-to-all + combine (W_UV-before-reduce path, 128-wide heads).

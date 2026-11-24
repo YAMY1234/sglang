@@ -201,6 +201,74 @@ def test_sequence_parallel_collectives():
     torch.testing.assert_close(gather_output, expected_gather, rtol=0, atol=0)
 
 
+@torch.inference_mode()
+def test_sequence_parallel_wide_push_bitwise():
+    """The push grid only partitions rows; RS and AG output must not depend on it."""
+    _require_sm100()
+    comm = _init_comm()
+    rank, world_size = dist.get_rank(), comm.world_size
+    local_tokens = 135  # 540 global rows: decode R 90 at 6 verify rows under TP4
+    generator = torch.Generator(device="cuda").manual_seed(30 + rank)
+    reduce_input = torch.randn(
+        world_size * local_tokens,
+        _HIDDEN_SIZE,
+        generator=generator,
+        device=_device(),
+        dtype=torch.bfloat16,
+    )
+    residual = torch.randn(
+        local_tokens,
+        _HIDDEN_SIZE,
+        generator=generator,
+        device=_device(),
+        dtype=torch.bfloat16,
+    )
+    gather_input = torch.randn(
+        local_tokens,
+        _HIDDEN_SIZE,
+        generator=generator,
+        device=_device(),
+        dtype=torch.bfloat16,
+    )
+    reduced, gathered = [], []
+    for num_blocks in (64, 128, 192):
+        tuning = sp_collective.Tuning(num_blocks=num_blocks, block_size=512)
+        reduce_output = torch.empty_like(residual)
+        sp_collective.reduce_scatter_res(
+            world_size, reduce_input, reduce_output, residual, tuning=tuning
+        )
+        gather_output = torch.empty(
+            world_size * local_tokens,
+            _HIDDEN_SIZE,
+            device=_device(),
+            dtype=torch.bfloat16,
+        )
+        sp_collective.all_gather(
+            world_size, gather_input, gather_output, tuning=tuning
+        )
+        torch.cuda.synchronize()
+        reduced.append(reduce_output)
+        gathered.append(gather_output)
+    for out in reduced[1:]:
+        torch.testing.assert_close(out, reduced[0], rtol=0, atol=0)
+    for out in gathered[1:]:
+        torch.testing.assert_close(out, gathered[0], rtol=0, atol=0)
+
+    if world_size == 4 and torch.cuda.get_device_capability() == (10, 7):
+        wide = sp_collective.Tuning(192, 512)
+        key = ("reduce_scatter", 4, _HIDDEN_SIZE)
+        try:
+            sp_collective.override_push_tuning(*key, 448, 768, wide)
+            assert sp_collective.get_dispatch(
+                "reduce_scatter", 4, _HIDDEN_SIZE, 540, _device()
+            ) == sp_collective.Dispatch("push", wide)
+            assert sp_collective.get_dispatch(
+                "reduce_scatter", 4, _HIDDEN_SIZE, 336, _device()
+            ) == sp_collective.Dispatch("push", sp_collective.Tuning(128, 512))
+        finally:
+            sp_collective._PUSH_OVERRIDES.pop(key, None)
+
+
 @cache_once
 def _gemm_ag_operands():
     generator = torch.Generator().manual_seed(30)
