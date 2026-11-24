@@ -391,11 +391,12 @@ class DSparkWorkerV2(BaseSpecWorker):
         self._verify_epilogue = None
         self._deferred_draft_kv: Optional[DeferredDraftKVStore] = None
         self._sampling_accept_graph: Optional[DsparkSamplingAcceptGraph] = None
-        # Counter-based draws from the server seed: every TP rank draws the same coins,
-        # so no accept broadcast is needed.
+        # Sampled verify accepts draw with block-wise rejection: counter-based draws from
+        # the server seed, so every TP rank draws the same coins and no accept broadcast
+        # is needed.
         self._rejection_noise = (
             make_rejection_noise(self.target_worker.random_seed, self.device)
-            if is_cuda() and envs.SGLANG_OPT_DSV41_BLOCKWISE_REJECTION.get()
+            if is_cuda()
             else None
         )
         target_is_dsv41 = target_model_type(self.target_worker) == "deepseek_v41"

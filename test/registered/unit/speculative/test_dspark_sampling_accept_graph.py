@@ -200,7 +200,7 @@ def test_replay_equals_eager_at_same_seed(monkeypatch, bs):
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 @pytest.mark.parametrize("bs", [3])
 def test_blockwise_replay_equals_eager_at_same_counter(monkeypatch, bs):
-    """SGLANG_OPT_DSV41_BLOCKWISE_REJECTION in the region: its draws depend only on (seed,
+    """Block-wise rejection in the region: its draws depend only on (seed,
     device step counter, row, token), so a region replay equals the eager block-wise accept
     at the same counter; two noise objects from one seed advance once per step each."""
     from sglang.kernels.ops.speculative.dspark.blockwise_rejection import (

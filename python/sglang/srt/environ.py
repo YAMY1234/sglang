@@ -608,11 +608,6 @@ class Envs:
     SGLANG_DSPARK_NVLINK_VOCAB_GATHER = EnvBool(True)
     SGLANG_DSPARK_ENABLE_MULTI_STREAM = EnvBool(True)
     SGLANG_DSPARK_CONFIDENCE_RELAY_LAG_STEPS = EnvInt(2)
-    # Sampled DSpark verify accepts draw with block-wise rejection (blockwise_rejection.py:
-    # exact in law, counter-based draws agree across TP ranks) instead of the classic kernel.
-    SGLANG_OPT_DSV41_BLOCKWISE_REJECTION = EnvBool(
-        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
-    )
 
     # ===================================================================
     # Memory pools and KV-cache sizing
@@ -2720,6 +2715,7 @@ _DEPRECATED_ENVS: Dict[str, _DeprecatedEnv] = {
         "SGLANG_OPT_DSV41_TARGET_METADATA_EARLY",
         "SGLANG_OPT_SKIP_GLUED_REPLAY_VIEW",
         "SGLANG_OPT_DSV41_DSPARK_SIM_DRAW_AHEAD",
+        "SGLANG_OPT_DSV41_BLOCKWISE_REJECTION",
     )
 }
 

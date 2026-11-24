@@ -1,4 +1,4 @@
-"""Block-wise rejection sampling of a DSpark verify chain (SGLANG_OPT_DSV41_BLOCKWISE_REJECTION).
+"""Block-wise rejection sampling of a DSpark verify chain.
 
 Classic chain verification only. It replaces the draft / target softmax writes and the
 single-CTA ``speculative_sampling_classic_kernel``:
