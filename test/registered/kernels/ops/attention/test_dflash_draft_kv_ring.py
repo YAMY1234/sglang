@@ -348,6 +348,62 @@ def test_dspark_staging_unstage_copies_this_ranks_heads():
     assert item_lens == [16 * 64] * 4
 
 
+def test_dspark_staging_slots():
+    """With staging slots a decode lands each request's PD rows in the slot its
+    preallocation took; unstage copies (and rotates) them into the request's ring
+    rows, then frees the slot once the copy has run; a request that leaves before
+    its unstage gives its slot back and is skipped."""
+
+    class _Pool:
+        page_size = PAGE
+
+        def __init__(self, rows, heads):
+            self.bufs = [
+                torch.zeros((rows, heads, 8), dtype=torch.int32, device="cuda")
+                for _ in range(2)
+            ]
+
+        def _pd_registerable_tensors(self):
+            return self.bufs
+
+    ring = _dspark_ring(6, "cuda")
+    ring.pool = _Pool(PAGE + 6 * ring.rows_per_req, 2)
+    staging_rows = draft_kv_ring_pool_rows(
+        req_pool_rows=2, rows_per_req=ring.rows_per_req, page_size=PAGE, sink_rows=PAGE
+    )
+    staging = DraftKVRingStaging(
+        pool=ring.pool, num_rows=staging_rows, total_kv_heads=4
+    )
+    ring.attach_staging(staging, head_start=2, num_heads=2, slots=2)
+    n = 3 * ring.rows_per_req + 9
+    floors = {3: n - 700, 1: 0}  # request 3's floor inside its window
+    window = torch.arange(n - DSPARK_WINDOW_LEFT - 1, n, device="cuda")
+    for req in (3, 1):
+        ring.reset_floor(req, n)
+        dst = torch.from_numpy(ring.transfer_rows(req, n)).long().cuda()
+        assert bool(((dst >= PAGE) & (dst < staging_rows)).all())
+        for buf in staging.ring_buffers():
+            buf[dst] = (window * 10 + req).int().view(-1, 1, 1).expand(-1, 4, 8)
+        ring.min_pos[req] = floors[req]  # prefill's floor row lands
+    assert not ring.staging_slot_free()
+    with pytest.raises(RuntimeError):
+        ring.reset_floor(4, n)
+    ring.mark_unstage(3)
+    ring.mark_unstage(1)
+    ring.flush_unstage()
+    torch.cuda.synchronize()
+    for req in (3, 1):
+        kept = window[window >= floors[req]]
+        got = ring.pool.bufs[0][ring.locs(torch.full_like(kept, req), kept)]
+        assert torch.equal(got[:, 0, 0].long(), kept * 10 + req)
+    assert ring.staging_slot_free() and len(ring._free_slots) == 2
+    ring.reset_floor(4, n)
+    ring.release_staging_slot(4)
+    ring.mark_unstage(4)
+    ring.flush_unstage()
+    assert len(ring._free_slots) == 2 and not ring._slot_of
+
+
 def test_dspark_unsupported_drafts():
     from unittest import mock
 

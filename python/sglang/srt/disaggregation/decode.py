@@ -1516,6 +1516,10 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             if self.req_to_token_pool.available_size() <= 0:
                 break
 
+            draft_ring = get_draft_kv_ring()
+            if draft_ring is not None and not draft_ring.staging_slot_free():
+                break
+
             reserve_len = self._pre_alloc_fill_len(decode_req.req)
             if prealloc_cap_tokens is not None and not prealloc_cap_fits(
                 reserved_tokens, reserve_len, prealloc_cap_tokens
@@ -2860,6 +2864,9 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         kv_manager._staging_handler = self.staging_handler
 
     def _release_request(self, decode_req: DecodeRequest) -> None:
+        draft_ring = get_draft_kv_ring()
+        if draft_ring is not None and decode_req.req.kv.req_pool_idx is not None:
+            draft_ring.release_staging_slot(int(decode_req.req.kv.req_pool_idx))
         # HiSparse host pages are the transfer destination; free them with the KV.
         if self.scheduler.enable_hisparse:
             self.scheduler.hisparse_coordinator.request_finished(decode_req.req)
