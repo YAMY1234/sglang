@@ -1745,10 +1745,16 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         routing_bias = layer._situ_routing_bias_bf16
         topk_output = dispatch_output.topk_output
         if TopKOutputChecker.format_is_standard(topk_output):
-            from sglang.srt.layers.moe import expert_count_log
+            from sglang.srt.layers.moe import act_dump, expert_count_log
 
             expert_count_log.maybe_record(
                 layer.layer_id, topk_output.topk_ids, layer.num_experts
+            )
+            act_dump.maybe_dump(
+                layer.layer_id,
+                dispatch_output.hidden_states,
+                topk_output.topk_ids,
+                topk_output.topk_weights,
             )
         if (
             self.moe_runner_config.activation == "situ"
