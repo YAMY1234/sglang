@@ -2555,6 +2555,10 @@ class Envs:
     # decode scores MXFP4 Q x K with DeepGEMM's FP4 paged logits, prefill gathers K back
     # to FP8 exactly. Prefill and decode of a PD pair must agree (checked at bootstrap).
     SGLANG_K31_INDEXER_MXFP4 = EnvBool(False)
+    # PD debug: prefill and decode write the index-K rows of a few requests' sampled positions here
+    # (disaggregation/idxk_dump.py), compared offline; unset = off.
+    SGLANG_DEBUG_K31_IDXK_PD_DUMP_DIR = EnvStr(None)
+    SGLANG_DEBUG_K31_IDXK_PD_DUMP_MAX = EnvInt(8)
     SGLANG_ENABLE_PCG_DSV2_DUAL_STREAM = EnvBool(False)
     SGLANG_DSA_TOPK_BROADCAST = EnvBool(False)
     SGLANG_DISABLE_DSA_INDEXER_FUSION = EnvBool(False)

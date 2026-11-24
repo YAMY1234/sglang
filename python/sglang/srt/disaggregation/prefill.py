@@ -45,6 +45,7 @@ from sglang.srt.disaggregation.common.staging_buffer import (
     staging_grid_tokens,
 )
 from sglang.srt.disaggregation.fake.conn import FakeKVSender
+from sglang.srt.disaggregation.idxk_dump import maybe_dump_index_k
 from sglang.srt.disaggregation.minimax import minimax_index_transfer_pages
 from sglang.srt.disaggregation.utils import (
     FAKE_BOOTSTRAP_HOST,
@@ -1841,6 +1842,8 @@ class SchedulerDisaggregationPrefillMixin:
         first_output_id / send_aux: a last chunk sent before the result appends the
         first token (see _pp_pd_early_send_last_chunks).
         """
+        if last_chunk and envs.SGLANG_DEBUG_K31_IDXK_PD_DUMP_DIR.get():
+            maybe_dump_index_k(self, [req], "prefill")  # syncs: an early send runs before the forward ends
         page_size = self.token_to_kv_pool_allocator.page_size
         start_idx = req.start_send_idx
         transfer_input_len = len(req.origin_input_ids)

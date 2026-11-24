@@ -53,6 +53,7 @@ from sglang.srt.disaggregation.decode_hicache_mixin import (
     HiCacheRestoreGatedKVReceiver,
     HiCacheRestoreResult,
 )
+from sglang.srt.disaggregation.idxk_dump import maybe_dump_index_k
 from sglang.srt.disaggregation.minimax import minimax_index_transfer_pages
 from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
@@ -3340,6 +3341,8 @@ class SchedulerDisaggregationDecodeMixin:
             return None
         # Verify after host restore and before process_prebuilt caches any KV.
         self._verify_kv_checksums(batch)
+        if envs.SGLANG_DEBUG_K31_IDXK_PD_DUMP_DIR.get():
+            maybe_dump_index_k(self, batch.reqs, "decode")
         if batch.is_empty():
             return None
         self.ngram_embedding_manager.prepare_for_forward(
