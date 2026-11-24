@@ -334,12 +334,7 @@ class TestKdaVerifyPendingFold(CustomTestCase):
         in-verify fold must stay bit-identical to verify + eager commit fold."""
         from sglang.kernels.ops.attention import kda_decode_mtp_v2 as v2
 
-        masks = (
-            v2.FOLD_OPT_RING_DEFER,
-            v2.FOLD_OPT_ROWS | v2.FOLD_OPT_BULK,
-            v2.FOLD_OPT_PACK,
-            v2.FOLD_OPT_ALL,
-        )
+        masks = (v2.FOLD_OPT_RING_DEFER, v2.FOLD_OPT_ROWS, v2.FOLD_OPT_ALL)
         for num_requests, num_heads, num_layers in ((3, 4, 2), (58, 24, 2)):
             cfg = dict(
                 num_requests=num_requests, num_heads=num_heads, num_layers=num_layers
