@@ -2042,6 +2042,9 @@ class Envs:
     # KDA ReplaySSM spec commit: record the accepted ring rows per slot and fold
     # them inside the next P1_HOIST verify (bit-identical); off by default.
     SGLANG_OPT_KDA_PENDING_FOLD = EnvBool(False)
+    # With SGLANG_OPT_KDA_PENDING_FOLD: schedule the in-verify fold so its ring wait,
+    # barriers and state write-back overlap other work (bit-identical); off by default.
+    SGLANG_OPT_KDA_PENDING_FOLD_OVERLAP = EnvBool(False)
     SGLANG_ENABLE_LILICORR_SAMPLING = EnvBool(False)
     SGLANG_LILICORR_REQUIRE_SAMPLING = EnvBool(False)
     SGLANG_RAGGED_VERIFY_MODE = EnvStr("static")

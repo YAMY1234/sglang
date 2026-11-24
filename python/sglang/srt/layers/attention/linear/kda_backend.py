@@ -1933,6 +1933,12 @@ class KDAAttnBackend(MambaAttnBackendBase):
             # Only the phase-1-hoisted (v2) kernel folds pending rows.
             assert envs.SGLANG_OPT_KDA_MTP_VERIFY_P1_HOIST.get()
             pending_kwargs = dict(replayssm_pending=replayssm_pending)
+            if envs.SGLANG_OPT_KDA_PENDING_FOLD_OVERLAP.get():
+                from sglang.kernels.ops.attention.kda_decode_mtp_v2 import (
+                    FOLD_OPT_ALL,
+                )
+
+                pending_kwargs["fold_opt"] = FOLD_OPT_ALL
         if envs.SGLANG_OPT_KDA_MTP_VERIFY_P1_HOIST.get():
             from sglang.kernels.ops.attention.kda_decode_mtp_v2 import (
                 fused_kda_decode_mtp_dspark,
