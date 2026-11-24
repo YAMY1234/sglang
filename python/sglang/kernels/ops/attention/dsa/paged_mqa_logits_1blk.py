@@ -121,6 +121,13 @@ def fp8_paged_mqa_logits_1blk(
 # K 64 x 2, scale factors in TMEM) with one Q block per request; bitwise
 # ``deep_gemm.fp8_fp4_paged_mqa_logits((q_fp4, q_sf), ..., False, torch.float)``.
 MXFP4_BYTES_PER_KEY = HEAD_DIM // 2 + 4
+MXFP4_MAX_NEXT_N = (
+    7  # next_n 8: two 256-column accumulator stages leave no TMEM for the scale factors
+)
+
+
+def supports_mxfp4(next_n: int, num_heads: int, head_dim: int) -> bool:
+    return supports(next_n, num_heads, head_dim) and next_n <= MXFP4_MAX_NEXT_N
 
 
 def default_config_mxfp4(next_n: int) -> tuple[int, int, int, bool]:
@@ -184,7 +191,7 @@ def fp4_paged_mqa_logits_1blk(
     request's last 256-key split are left unwritten, as DeepGEMM leaves them.
     """
     batch_size, next_n = q.shape[0], q.shape[1]
-    assert supports(next_n, q.shape[2], q.shape[3] * 2), (
+    assert supports_mxfp4(next_n, q.shape[2], q.shape[3] * 2), (
         f"unsupported q shape {tuple(q.shape)}"
     )
     aligned = (max_context_len + SPLIT_KV - 1) // SPLIT_KV * SPLIT_KV
