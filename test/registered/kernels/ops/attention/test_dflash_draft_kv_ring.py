@@ -476,6 +476,94 @@ def test_dspark_unstage_burst_memory_bounded(burst, slots):
     assert not ring._pending_unstage
 
 
+def test_dspark_unstage_warmup_backlog():
+    """A counted window opens after a max_tokens=1 warm-up: 2,000 requests land on
+    129 req pool rows and finish without a draft step, then live requests land and
+    the first decode step flushes. Finished requests leave no pending unstage, the
+    flush's peak extra memory stays bounded, and the ring rows of the live requests
+    equal what the whole-row gather (e58941ac70) wrote, bit for bit."""
+    page, block, req_rows, heads, local, width, live = 256, 5, 129, 16, 4, 64, 50
+    torch.manual_seed(0)
+
+    class _Pool:
+        page_size = page
+
+        def __init__(self, rows):
+            self.bufs = [
+                torch.randint(0, 255, (rows, local, width), dtype=torch.uint8).cuda()
+                for _ in range(2)
+            ]
+
+        def _pd_registerable_tensors(self):
+            return self.bufs
+
+    rows_per_req = dspark_draft_kv_ring_rows_per_req(
+        window_left=DSPARK_WINDOW_LEFT, block_size=block, page_size=page
+    )
+    ring = DFlashDraftKVRing(
+        rows_per_req=rows_per_req,
+        dcp_size=1,
+        req_pool_rows=req_rows,
+        device="cuda",
+        window_left=DSPARK_WINDOW_LEFT,
+        sink_rows=page,
+        page_size=page,
+    )
+    ring.pool = _Pool(page + req_rows * rows_per_req)
+    staging = DraftKVRingStaging(
+        pool=ring.pool, num_rows=page + req_rows * rows_per_req, total_kv_heads=heads
+    )
+    ring.attach_staging(staging, head_start=8, num_heads=local)
+    seq = 50000
+
+    def land(req):
+        ring.reset_floor(req, seq)
+        rows = torch.from_numpy(ring.transfer_rows(req, seq)).long().cuda()
+        for buf in staging.ring_buffers():
+            buf[rows] = torch.randint(
+                0, 255, (rows.numel(), heads, width), dtype=torch.uint8, device="cuda"
+            )
+        ring.min_pos[req] = int(torch.randint(0, seq, ()))  # prefill's floor lands
+        ring.mark_unstage(req)
+
+    for i in range(2000):  # max_tokens=1 warm-up: land, then finish with no forward
+        req = int(torch.randint(0, req_rows, ()))
+        land(req)
+        ring.forget_request(req)
+    assert not ring._pending_unstage
+    alive = torch.randperm(req_rows)[:live].tolist()
+    for req in alive:
+        land(req)
+    assert len(ring._pending_unstage) <= live
+
+    # the whole-row gather of e58941ac70 on a copy, for the same live requests
+    ref = [b.clone() for b in ring.pool.bufs]
+    req = torch.tensor(alive, dtype=torch.int64, device="cuda")
+    first = page + req.unsqueeze(1) * rows_per_req
+    cols = torch.arange(rows_per_req, device="cuda")
+    rows = (first + cols).reshape(-1)
+    dst_rows = (
+        first + torch.remainder(cols - ring.min_pos[req].unsqueeze(1), rows_per_req)
+    ).reshape(-1)
+    for src, dst in zip(staging.ring_buffers(), ref):
+        dst[dst_rows] = src[rows][:, 8:12]
+
+    torch.cuda.synchronize()
+    torch.cuda.reset_peak_memory_stats()
+    base = torch.cuda.memory_allocated()
+    ring.flush_unstage()
+    torch.cuda.synchronize()
+    extra = torch.cuda.max_memory_allocated() - base
+    print(
+        f"warm-up 2000 land+finish, {live} live: pending at flush {live}, peak extra "
+        f"{extra / 2**20:.2f} MiB (whole-row gather of these {live}: "
+        f"{live * rows_per_req * heads * width / 2**20:.0f} MiB per buffer)"
+    )
+    assert extra <= 256 << 20, extra
+    for got, want in zip(ring.pool.bufs, ref):
+        assert torch.equal(got, want)
+
+
 def test_dspark_unsupported_drafts():
     from unittest import mock
 
