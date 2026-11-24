@@ -1786,6 +1786,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             cute_prefill_moe=(
                 layer.cute_prefill_moe
                 if envs.SGLANG_K31_PREFILL_MOE_CUTE_FC1.get()
+                and not envs.SGLANG_K31_PREFILL_MOE_A4W4.get()
                 else None
             ),
             a4w4_prefill_moe=(
