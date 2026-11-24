@@ -1,7 +1,9 @@
+import asyncio
 import json
 import sys
 import threading
 import unittest
+from array import array
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -17,22 +19,39 @@ from sglang.srt.disaggregation.prefill import (  # noqa: E402
     PrefillBootstrapQueue,
     SchedulerDisaggregationPrefillMixin,
 )
-from sglang.srt.disaggregation.utils import DisaggregationMode  # noqa: E402
+from sglang.srt.disaggregation.utils import (  # noqa: E402
+    DECODE_PROMPT_TAIL_LEN,
+    DisaggregationMode,
+    expand_decode_prompt,
+)
 from sglang.srt.environ import envs  # noqa: E402
 from sglang.srt.lora.lora_manager import LoRAManager  # noqa: E402
-from sglang.srt.managers.io_struct import AbortReq  # noqa: E402
+from sglang.srt.managers.io_struct import (  # noqa: E402
+    AbortReq,
+    GenerateReqInput,
+    TokenizedGenerateReqInput,
+)
 from sglang.srt.managers.schedule_batch import (  # noqa: E402
     FINISH_ABORT,
     Req,
     ReqKvInfo,
 )
 from sglang.srt.managers.scheduler import Scheduler  # noqa: E402
+from sglang.srt.managers.tokenizer_manager import TokenizerManager  # noqa: E402
 from sglang.srt.mem_cache.base_prefix_cache import CacheRequestOutcome
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache  # noqa: E402
 from sglang.srt.observability import req_time_stats
 from sglang.srt.observability.req_time_stats import SchedulerReqTimeStats
-from sglang.srt.runtime_context import get_context, publish, reset_context  # noqa: E402
+from sglang.srt.runtime_context import (  # noqa: E402
+    get_context,
+    get_disagg,
+    get_parallel,
+    publish,
+    reset_context,
+)
+from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.separate_buffer_allocator_double import (
     bind_separate_buffer_capacity,
@@ -759,6 +778,7 @@ class TestDecodePreallocQueueRebootstrapPayload(unittest.TestCase):
             cache_salt=None,
             routing_key=None,
             disagg_prefill_dp_rank=None,
+            decode_compact_prompt=False,
         )
 
     def test_build_rebootstrap_payload_converts_numpy_ids_to_json_lists(self):
@@ -781,6 +801,160 @@ class TestDecodePreallocQueueRebootstrapPayload(unittest.TestCase):
         self.assertNotIn("pd_rebootstrap_forced_output_id", payload)
         # Must be JSON-serializable (numpy scalars would raise here).
         json.dumps(payload)
+
+    def test_build_rebootstrap_payload_refuses_compact_decode_prompt(self):
+        req = self._new_req()
+        req.decode_compact_prompt = True
+
+        # Zeros stand in for all but its last tokens, so prefill cannot recompute it.
+        with self.assertRaisesRegex(AssertionError, "compact decode prompt"):
+            Req.build_rebootstrap_payload(req)
+
+
+class TestDecodeCompactPrompt(CustomTestCase):
+    """SGLANG_PD_DECODE_COMPACT_PROMPT: the decode TokenizerManager sends a prompt's
+    length and last tokens, and the scheduler pads the rest with zeros."""
+
+    PROMPT = list(range(1, 201))
+    TAIL = PROMPT[-DECODE_PROMPT_TAIL_LEN:]
+
+    def setUp(self):
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(ServerArgs(model_path="dummy"), role="tokenizer")
+
+    def _tokenizer_manager(self, mode):
+        manager = TokenizerManager.__new__(TokenizerManager)
+        manager.disaggregation_mode = mode
+        manager.max_req_input_len = 1000
+        manager.mm_processor = None
+        manager.model_config = SimpleNamespace(
+            hf_config=SimpleNamespace(architectures=["LlamaForCausalLM"])
+        )
+        manager._validate_one_request = MagicMock()
+        manager._create_tokenized_object = lambda obj, text, input_ids, *_: (
+            SimpleNamespace(input_ids=input_ids, decode_prompt_len=None)
+        )
+        return manager
+
+    def _tokenize(self, manager, compact=True, sampling_params=None, **kwargs):
+        obj = GenerateReqInput(
+            input_ids=list(self.PROMPT), sampling_params=sampling_params or {}, **kwargs
+        )
+        with envs.SGLANG_PD_DECODE_COMPACT_PROMPT.override(compact):
+            return asyncio.run(manager._tokenize_one_request(obj))
+
+    def _scheduler(self, mode, queued):
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler.session_controller = {}
+        scheduler.enable_session_radix_cache = False
+        scheduler.disaggregation_mode = mode
+        scheduler.model_config = SimpleNamespace(hf_eos_token_id=None, vocab_size=256)
+        scheduler.metrics_reporter = SimpleNamespace(enable_metrics=False)
+        scheduler.kv_events_publisher = SimpleNamespace(enable_kv_cache_events=False)
+        scheduler.tokenizer = None
+        scheduler.dllm_config = None
+        scheduler._maybe_namespace_elastic_radix_cache = lambda req: None
+        scheduler.init_req_max_new_tokens = lambda req: None
+        scheduler._add_request_to_queue = queued.append
+        scheduler.enable_hisparse = False
+        scheduler.token_to_kv_pool_allocator = SimpleNamespace(get_kvcache=lambda: None)
+        scheduler.spec_algorithm = SpeculativeAlgorithm.NONE
+        return scheduler
+
+    def _compact_recv(self):
+        return TokenizedGenerateReqInput(
+            rid="rid-0",
+            input_text="",
+            input_ids=array("q", self.TAIL),
+            input_embeds=None,
+            mm_inputs=None,
+            token_type_ids=None,
+            sampling_params=SamplingParams(max_new_tokens=4),
+            return_logprob=False,
+            logprob_start_len=-1,
+            top_logprobs_num=0,
+            token_ids_logprob=None,
+            stream=False,
+            bootstrap_port=1,
+            bootstrap_room=7,
+            decode_prompt_len=len(self.PROMPT),
+        )
+
+    def test_decode_tokenizer_sends_prompt_length_and_tail(self):
+        sent = self._tokenize(self._tokenizer_manager(DisaggregationMode.DECODE))
+
+        self.assertEqual(sent.decode_prompt_len, len(self.PROMPT))
+        self.assertEqual(sent.input_ids, self.TAIL)
+
+    def test_tokenizer_sends_whole_prompt_when_it_may_be_read(self):
+        decode = DisaggregationMode.DECODE
+        cases = {
+            "flag off": (decode, 1000, {"compact": False}),
+            "prefill server": (DisaggregationMode.PREFILL, 1000, {}),
+            "prompt the scheduler truncates": (decode, len(self.PROMPT), {}),
+            "logprobs": (decode, 1000, {"return_logprob": True}),
+            "prompt ids": (decode, 1000, {"return_prompt_token_ids": True}),
+            "grammar": (decode, 1000, {"sampling_params": {"regex": "a+"}}),
+            "custom logit processor": (decode, 1000, {"custom_logit_processor": "{}"}),
+        }
+        for name, (mode, max_req_input_len, kwargs) in cases.items():
+            with self.subTest(name):
+                manager = self._tokenizer_manager(mode)
+                manager.max_req_input_len = max_req_input_len
+                sent = self._tokenize(manager, **kwargs)
+
+                self.assertIsNone(sent.decode_prompt_len)
+                self.assertEqual(sent.input_ids, self.PROMPT)
+
+    def test_padded_prompt_detokenizes_like_whole_prompt(self):
+        padded = expand_decode_prompt(self.TAIL, len(self.PROMPT))
+        self.assertEqual(len(padded), len(self.PROMPT))
+        self.assertEqual(list(padded[-DECODE_PROMPT_TAIL_LEN:]), self.TAIL)
+
+        reads = []
+        for prompt in (array("q", self.PROMPT), padded):
+            req = Req("rid-0", "", prompt, SamplingParams())
+            req.output_ids.extend([7, 8, 9])
+            reads.append(req.init_incremental_detokenize())
+        self.assertEqual(reads[0], reads[1])
+
+    def test_scheduler_pads_compact_prompt_and_refuses_it_where_read_whole(self):
+        cases = {
+            "prefill server": (DisaggregationMode.PREFILL, {}, "not a decode server"),
+            "decode radix cache": (
+                DisaggregationMode.DECODE,
+                {"disaggregation_decode_enable_radix_cache": True},
+                "decode radix cache",
+            ),
+        }
+        for name, (mode, disagg, reason) in cases.items():
+            with self.subTest(name):
+                queued, built = [], []
+                scheduler = self._scheduler(mode, queued)
+                # An abort swaps origin_input_ids for one token: record what Req got.
+                scheduler._create_generation_req = lambda _, *args, **kwargs: (
+                    built.append(args[2]) or Req(*args, **kwargs)
+                )
+                with (
+                    get_parallel().override(tp_rank=0),
+                    get_disagg().override(**disagg),
+                ):
+                    scheduler.handle_generate_request(self._compact_recv())
+
+                (req,), (input_ids,) = queued, built
+                self.assertEqual(len(input_ids), len(self.PROMPT))
+                self.assertEqual(list(input_ids[-DECODE_PROMPT_TAIL_LEN:]), self.TAIL)
+                self.assertEqual(set(input_ids[:-DECODE_PROMPT_TAIL_LEN]), {0})
+                self.assertTrue(req.decode_compact_prompt)
+                self.assertIn(reason, req.to_finish.message)
+
+    def test_plain_decode_server_takes_compact_prompt(self):
+        scheduler = self._scheduler(DisaggregationMode.DECODE, [])
+        self.assertIsNone(scheduler._decode_compact_prompt_error())
+
+        scheduler.spec_algorithm = SpeculativeAlgorithm.NGRAM
+        self.assertIn("n-gram", scheduler._decode_compact_prompt_error())
 
 
 class TestCommonKVManagerPrefillRecompute(unittest.TestCase):

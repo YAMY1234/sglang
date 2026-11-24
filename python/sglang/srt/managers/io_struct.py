@@ -1177,6 +1177,9 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
     sampling_logprobs_mode: SamplingLogprobsMode = "selected"
     # LoRA adapter name; KV events namespace this request's blocks by it.
     lora_name: Optional[str] = None
+    # Decode with SGLANG_PD_DECODE_COMPACT_PROMPT: the prompt's full length while
+    # input_ids holds only its last tokens (the scheduler pads the rest with zeros).
+    decode_prompt_len: Optional[int] = None
 
     def wrap_pickle_fields(self):
         self.time_stats = wrap_as_pickle(self.time_stats)

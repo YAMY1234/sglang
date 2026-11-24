@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import random
+from array import array
 from collections import deque
 from contextlib import nullcontext
 from enum import Enum
@@ -53,6 +54,15 @@ if is_npu():
 # Constants & Enums
 #########################
 FAKE_BOOTSTRAP_HOST = "2.2.2.2"
+
+# Prompt tokens a compact decode request keeps (SGLANG_PD_DECODE_COMPACT_PROMPT): the
+# incremental detokenizer reads the last 5, a watermark context at most the last 64.
+DECODE_PROMPT_TAIL_LEN = 64
+
+
+def expand_decode_prompt(tail, prompt_len: int) -> array:
+    """Full-length ids for a compact decode prompt: zeros, then the kept tail."""
+    return array("q", [0]) * (prompt_len - len(tail)) + array("q", tail)
 
 
 def pp_sync_polls(

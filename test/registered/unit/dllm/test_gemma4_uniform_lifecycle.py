@@ -393,6 +393,7 @@ class TestGemma4RequestValidation(unittest.TestCase):
             session_id=None,
             input_embeds=None,
             bootstrap_port=1,
+            decode_prompt_len=None,
         )
         req = Req(
             "unsupported-logprobs",

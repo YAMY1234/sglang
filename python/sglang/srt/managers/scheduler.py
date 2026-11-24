@@ -99,6 +99,7 @@ from sglang.srt.disaggregation.utils import (
     MetadataBuffers,
     ReqToMetadataIdxAllocator,
     TransferBackend,
+    expand_decode_prompt,
     get_dsa_seed_metadata_dim,
     prepare_abort,
     unified_memory_disagg_move_gate,
@@ -308,6 +309,7 @@ from sglang.srt.mem_cache.common import (
     discard_kv_cache_backup,
     peek_uncached_tokens,
     release_kv_cache,
+    retraction_needs_rebootstrap,
 )
 from sglang.srt.mem_cache.events import KvEventLoraNames
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
@@ -376,6 +378,7 @@ from sglang.srt.utils.common import (
     BatchCountGCFreezer,
     is_confidential_compute,
     is_npu,
+    print_info_once,
 )
 from sglang.srt.utils.hf_transformers_utils import (
     get_processor,
@@ -3229,6 +3232,11 @@ class Scheduler(
             recv_req.session_id is not None and self.enable_session_radix_cache
         )
 
+        if recv_req.decode_prompt_len is not None:
+            recv_req.input_ids = expand_decode_prompt(
+                recv_req.input_ids, recv_req.decode_prompt_len
+            )
+
         if session_id is None or radix_native_session:
             # Normal non-session request, or a radix-native session request
             if recv_req.input_embeds is not None:
@@ -3382,6 +3390,17 @@ class Scheduler(
             self.init_req_max_new_tokens(req)
             self._add_request_to_queue(req)
             return
+
+        if recv_req.decode_prompt_len is not None:
+            req.decode_compact_prompt = True
+            if error_msg := self._decode_compact_prompt_error():
+                req.set_finish_with_abort(error_msg)
+                self.init_req_max_new_tokens(req)
+                self._add_request_to_queue(req)
+                return
+            print_info_once(
+                "SGLANG_PD_DECODE_COMPACT_PROMPT: decode prompts arrive compact"
+            )
 
         if error_msg := self.validate_dllm_request(req):
             abort_req = _make_abort_req(
@@ -3906,6 +3925,25 @@ class Scheduler(
         req.time_stats.trace_ctx.abort(abort_info={"reason": reason.message})
         req.update_finish_state()
         self.output_streamer.stream_output([req], req.return_logprob)
+
+    def _decode_compact_prompt_error(self) -> Optional[str]:
+        """A compact decode prompt (SGLANG_PD_DECODE_COMPACT_PROMPT) holds zeros before
+        its last tokens: refuse it where this server reads the whole prompt."""
+        if self.disaggregation_mode != DisaggregationMode.DECODE:
+            reason = "this is not a decode server"
+        elif get_disagg().disaggregation_decode_enable_radix_cache:
+            reason = "the decode radix cache matches the whole prompt"
+        elif get_disagg().disaggregation_decode_enable_offload_kvcache:
+            reason = "decode KV offload stores the whole prompt"
+        elif self.enable_hisparse or retraction_needs_rebootstrap(
+            self.token_to_kv_pool_allocator
+        ):
+            reason = "a retraction would resend the whole prompt to prefill"
+        elif self.spec_algorithm.is_ngram():
+            reason = "n-gram speculation matches the whole prompt"
+        else:
+            return None
+        return f"SGLANG_PD_DECODE_COMPACT_PROMPT is not supported: {reason}"
 
     def _add_request_to_queue(self, req: Req, is_retracted: bool = False):
         if not self._set_or_validate_priority(req):

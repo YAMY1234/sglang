@@ -1038,6 +1038,10 @@ class ReqKvInfo:
 class Req(ReqDllmMixin):
     """The input and output status of a request."""
 
+    # Decode with SGLANG_PD_DECODE_COMPACT_PROMPT: origin_input_ids holds zeros
+    # before the prompt's last tokens, so nothing may read the rest of it.
+    decode_compact_prompt = False
+
     def __init__(
         self,
         rid: str,
@@ -2179,6 +2183,9 @@ class Req(ReqDllmMixin):
         # carries token ``input_ids`` and drops any image/audio/video inputs, so
         # the rebootstrap recompute would not reproduce the original prefix KV
         # for multi-modal requests. Add multi-modal support before enabling it.
+        assert not self.decode_compact_prompt, (
+            "a compact decode prompt cannot be re-prefilled"
+        )
         sp = self.sampling_params
         return {
             "input_ids": [int(x) for x in self.origin_input_ids]

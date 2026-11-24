@@ -770,6 +770,9 @@ class Envs:
     # computed dynamically at runtime based on cpu_count; see disaggregation backends.
     SGLANG_DISAGGREGATION_THREAD_POOL_SIZE = EnvInt(None)
     SGLANG_DISAGGREGATION_QUEUE_SIZE = EnvInt(4)
+    # Decode: carry only a prompt's length and last tokens from the TokenizerManager to
+    # the scheduler; the decode server reads nothing else of the prompt.
+    SGLANG_PD_DECODE_COMPACT_PROMPT = EnvBool(False)
     # Enable on both P and D with the same --sampling-mask-max-tokens value.
     SGLANG_ENABLE_DISAGG_SAMPLING_MASK = EnvBool(False)
     # Retained only to reject the removed setting during startup.

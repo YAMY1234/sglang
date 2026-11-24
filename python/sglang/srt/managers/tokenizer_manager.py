@@ -64,7 +64,10 @@ from sglang.srt.beam_search.output import (
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.disaggregation.encoder.receiver import create_mm_receiver
-from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.disaggregation.utils import (
+    DECODE_PROMPT_TAIL_LEN,
+    DisaggregationMode,
+)
 from sglang.srt.elastic_ep.topology import (
     attn_replica_size,
     physical_ep_size_to_dp_size,
@@ -1272,8 +1275,39 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             mm_inputs = None
 
         self._validate_one_request(obj, input_ids)
-        return self._create_tokenized_object(
+        decode_prompt_len = None
+        if self._can_compact_decode_prompt(obj, input_ids, input_embeds, mm_inputs):
+            decode_prompt_len = len(input_ids)
+            input_ids = input_ids[-DECODE_PROMPT_TAIL_LEN:]
+        tokenized_obj = self._create_tokenized_object(
             obj, input_text, input_ids, input_embeds, mm_inputs, token_type_ids
+        )
+        if decode_prompt_len is not None:
+            tokenized_obj.decode_prompt_len = decode_prompt_len
+        return tokenized_obj
+
+    def _can_compact_decode_prompt(
+        self, obj, input_ids, input_embeds, mm_inputs
+    ) -> bool:
+        """A decode server reads only a prompt's length and last tokens unless the
+        request asks for prompt logprobs, the prompt ids, a session, media, a
+        grammar or a custom logit processor."""
+        return (
+            self.disaggregation_mode == DisaggregationMode.DECODE
+            and envs.SGLANG_PD_DECODE_COMPACT_PROMPT.get()
+            and isinstance(obj, GenerateReqInput)
+            and input_ids is not None
+            and len(input_ids) > DECODE_PROMPT_TAIL_LEN
+            # The scheduler would cut the end off a longer prompt.
+            and len(input_ids) < (self.max_req_input_len or 0)
+            and input_embeds is None
+            and not mm_inputs
+            and not obj.return_logprob
+            and not obj.return_prompt_token_ids
+            and obj.session_params is None
+            and obj.positional_embed_overrides is None
+            and obj.custom_logit_processor is None
+            and not self._request_has_grammar(obj)
         )
 
     @staticmethod
