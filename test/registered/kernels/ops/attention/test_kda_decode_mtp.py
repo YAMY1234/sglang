@@ -184,7 +184,9 @@ class TestKdaVerifyPendingFold(CustomTestCase):
         if get_device_sm() < 100:
             raise unittest.SkipTest("Kimi K3 compute kernels require SM100a+")
 
-    def _run(self, *, num_requests, num_heads, num_layers, pending_mode, steps=4):
+    def _run(
+        self, *, num_requests, num_heads, num_layers, pending_mode, steps=4, fold_opt=0
+    ):
         from types import SimpleNamespace
 
         from sglang.kernels.ops.attention.kda_decode_mtp_v2 import (
@@ -260,7 +262,11 @@ class TestKdaVerifyPendingFold(CustomTestCase):
                     kw[name].dtype
                 )
             kw["ssm_state_indices"] = slots.to(torch.int32)
-            extra = {"replayssm_pending": pending} if pending_mode else {}
+            extra = (
+                {"replayssm_pending": pending, "fold_opt": fold_opt}
+                if pending_mode
+                else {}
+            )
             outs = []
             for layer in range(num_layers):
                 outs.append(
@@ -321,11 +327,33 @@ class TestKdaVerifyPendingFold(CustomTestCase):
                 )
                 eager = self._run(pending_mode=False, **cfg)
                 pending = self._run(pending_mode=True, **cfg)
-                for step, (a, b) in enumerate(zip(eager, pending)):
-                    for i, (x, y) in enumerate(zip(a, b)):
-                        self.assertTrue(
-                            torch.equal(x, y), f"step {step} tensor {i} differs"
-                        )
+                self._assert_records_equal(eager, pending)
+
+    def test_pending_fold_schedules_match_eager(self):
+        """SGLANG_OPT_KDA_PENDING_FOLD_OVERLAP: every FOLD_OPT schedule of the
+        in-verify fold must stay bit-identical to verify + eager commit fold."""
+        from sglang.kernels.ops.attention import kda_decode_mtp_v2 as v2
+
+        masks = (
+            v2.FOLD_OPT_RING_DEFER,
+            v2.FOLD_OPT_ROWS | v2.FOLD_OPT_BULK,
+            v2.FOLD_OPT_PACK,
+            v2.FOLD_OPT_ALL,
+        )
+        for num_requests, num_heads, num_layers in ((3, 4, 2), (58, 24, 2)):
+            cfg = dict(
+                num_requests=num_requests, num_heads=num_heads, num_layers=num_layers
+            )
+            eager = self._run(pending_mode=False, **cfg)
+            for fold_opt in masks:
+                with self.subTest(num_requests=num_requests, fold_opt=fold_opt):
+                    pending = self._run(pending_mode=True, fold_opt=fold_opt, **cfg)
+                    self._assert_records_equal(eager, pending)
+
+    def _assert_records_equal(self, a_records, b_records):
+        for step, (a, b) in enumerate(zip(a_records, b_records)):
+            for i, (x, y) in enumerate(zip(a, b)):
+                self.assertTrue(torch.equal(x, y), f"step {step} tensor {i} differs")
 
 
 if __name__ == "__main__":

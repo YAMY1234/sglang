@@ -228,6 +228,126 @@ def _lane_sum4(e0, e1, e2, e3):
     return _add_rn(a, b)
 
 
+# FOLD_OPT bits (pending fold schedule; every bit keeps the arithmetic bit-identical).
+# Phase 1 stages its rawk / g ring rows in smem and stores the rings after the
+# pending rows are in smem, instead of waiting for them before phase 1.
+FOLD_OPT_RING_DEFER = 1
+# Each warp folds the 16 state rows its phase 2 reads: warp syncs, not barriers.
+FOLD_OPT_ROWS = 2
+# The folded rows go to the pool by cp.async.bulk instead of per-thread stores.
+FOLD_OPT_BULK = 4
+# Two rows' reductions and uu run as packed f32x2 adds.
+FOLD_OPT_PACK = 8
+FOLD_OPT_ALL = FOLD_OPT_RING_DEFER | FOLD_OPT_ROWS | FOLD_OPT_BULK | FOLD_OPT_PACK
+
+
+def _fold_row(
+    r,
+    *,
+    matched,
+    warp_idx,
+    row_grp,
+    frg,
+    rpp,
+    tile_v,
+    p2_batches,
+    num_v_rows,
+    p2_rows_lane,
+    stages,
+):
+    """(smem stage, row in stage, state row) of fold row r of a thread."""
+    if matched:
+        i_v = r // p2_batches
+        row = warp_idx * num_v_rows + (r % p2_batches) * p2_rows_lane + row_grp
+        return i_v % stages, row, i_v * tile_v + row
+    return (r * rpp) // tile_v, (r * rpp) % tile_v + frg, r * rpp + frg
+
+
+def _fold_decay_dot(r_fs, r_e, r_kn, r, b):
+    """Decay row r's column block b in place; return its four products with the key."""
+    i0 = (r * 4 + b) * 4
+    e0 = b * 4
+    h0_, h1_ = _f32x2_asm("mul", r_fs[i0], r_fs[i0 + 1], r_e[e0], r_e[e0 + 1])
+    h2_, h3_ = _f32x2_asm("mul", r_fs[i0 + 2], r_fs[i0 + 3], r_e[e0 + 2], r_e[e0 + 3])
+    r_fs[i0] = h0_
+    r_fs[i0 + 1] = h1_
+    r_fs[i0 + 2] = h2_
+    r_fs[i0 + 3] = h3_
+    p0, p1 = _f32x2_asm("mul", h0_, h1_, r_kn[e0], r_kn[e0 + 1])
+    p2, p3 = _f32x2_asm("mul", h2_, h3_, r_kn[e0 + 2], r_kn[e0 + 3])
+    return p0, p1, p2, p3
+
+
+def _fold_rank1(r_fs, r_kn, r, uu):
+    for b in range(4):
+        i0 = (r * 4 + b) * 4
+        e0 = b * 4
+        r_fs[i0], r_fs[i0 + 1] = _fma2_scalar_b(
+            r_kn[e0], r_kn[e0 + 1], uu, r_fs[i0], r_fs[i0 + 1]
+        )
+        r_fs[i0 + 2], r_fs[i0 + 3] = _fma2_scalar_b(
+            r_kn[e0 + 2], r_kn[e0 + 3], uu, r_fs[i0 + 2], r_fs[i0 + 3]
+        )
+
+
+def _fold_pair_uu(r_fs, r_e, r_kn, ra, vv_a, vv_b, bt):
+    """uu of rows ra, ra + 1 with the scalar path's operations in its order,
+    each add / sub / mul pairing the two rows in one .f32x2 instruction."""
+    xy = [
+        [_f32x2_asm("add", *_fold_decay_dot(r_fs, r_e, r_kn, r, b)) for b in range(4)]
+        for r in (ra, ra + 1)
+    ]
+    # blk[b] = (p0 + p2) + (p1 + p3) of each row, as _lane_sum4.
+    blk = [
+        _f32x2_asm("add", xy[0][b][0], xy[1][b][0], xy[0][b][1], xy[1][b][1])
+        for b in range(4)
+    ]
+    s02 = _f32x2_asm("add", blk[0][0], blk[0][1], blk[2][0], blk[2][1])
+    s13 = _f32x2_asm("add", blk[1][0], blk[1][1], blk[3][0], blk[3][1])
+    sa, sb = _f32x2_asm("add", s02[0], s02[1], s13[0], s13[1])
+    for off in [4, 2, 1]:
+        oa = cute.arch.shuffle_sync_bfly(sa, offset=off, mask=-1, mask_and_clamp=31)
+        ob = cute.arch.shuffle_sync_bfly(sb, offset=off, mask=-1, mask_and_clamp=31)
+        sa, sb = _f32x2_asm("add", sa, sb, oa, ob)
+    da, db = _f32x2_asm("sub", vv_a, vv_b, sa, sb)
+    return _f32x2_asm("mul", da, db, bt, bt)
+
+
+def _asm_void(asm, args=(), constraints=""):
+    llvm.inline_asm(
+        None,
+        args,
+        asm,
+        constraints,
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=0,
+    )
+
+
+def _fence_proxy_async_shared():
+    _asm_void("fence.proxy.async.shared::cta;")
+
+
+def _bulk_store_row(gmem_ptr, smem_ptr):
+    """One 512-byte (128 fp32) cp.async.bulk, shared -> global, in a bulk group."""
+    _asm_void(
+        "{ .reg .u32 sa; cvt.u32.u64 sa, $1; "
+        "cp.async.bulk.global.shared::cta.bulk_group [$0], [sa], 512; }",
+        [gmem_ptr.toint().ir_value(), smem_ptr.toint().ir_value()],
+        "l,l",
+    )
+
+
+def _bulk_commit():
+    _asm_void("cp.async.bulk.commit_group;")
+
+
+def _bulk_wait_read():
+    """The bulk stores of this thread have read their shared memory."""
+    _asm_void("cp.async.bulk.wait_group.read 0;")
+
+
 @cute.kernel
 def kda_decode_mtp_kernel(
     state_g2s_copy: cute.TiledCopy,
@@ -271,6 +391,7 @@ def kda_decode_mtp_kernel(
     onorm_eps: cutlass.Constexpr[float],
     fold_pend: cute.Tensor,
     FOLD_PENDING: cutlass.Constexpr[bool],
+    FOLD_OPT: cutlass.Constexpr[int],
 ):
     """KDA MTP decode — SMEM pre-compute + register-resident state.
 
@@ -356,6 +477,15 @@ def kda_decode_mtp_kernel(
         sE = smem.allocate_tensor(
             cutlass.Float32, cute.make_layout((T_LOOP * HEAD_DIM,)), 16
         )
+        if cutlass.const_expr(FOLD_OPT & FOLD_OPT_RING_DEFER):
+            # This verify's rawk / g ring rows, held until every thread's copy of
+            # the pending rows has landed (rawv and beta come from sVall / sBeta).
+            sRK = smem.allocate_tensor(
+                cutlass.BFloat16, cute.make_layout((T_LOOP * HEAD_DIM,)), 16
+            )
+            sRG = smem.allocate_tensor(
+                cutlass.Float32, cute.make_layout((T_LOOP * HEAD_DIM,)), 16
+            )
     r_q = cute.make_rmem_tensor(
         cute.make_layout((P2_VEC,), stride=(1,)), cutlass.Float32
     )
@@ -501,7 +631,7 @@ def kda_decode_mtp_kernel(
         )
 
     cute.arch.griddepcontrol_wait()
-    if cutlass.const_expr(FOLD_PENDING):
+    if cutlass.const_expr(FOLD_PENDING and not (FOLD_OPT & FOLD_OPT_RING_DEFER)):
         if n_pend > 0:
             # Phase 1 rewrites ring rows 0..T_LOOP-1 of this slot: the pending rows
             # (the first commit group) must have landed in every thread first.
@@ -662,7 +792,13 @@ def kda_decode_mtp_kernel(
                                     (KERNEL_WIDTH - 1) * VEC_SIZE + 2 * VEC_SIZE + i
                                 ] = r_xk
                             # Complete independent key chains before raw-ring stores.
-                            if cutlass.const_expr(CACHE_RING):
+                            if cutlass.const_expr(FOLD_OPT & FOLD_OPT_RING_DEFER):
+                                for i in range(VEC_SIZE):
+                                    k_idx = i * WARP_SIZE + in_warp_tid
+                                    sRK[i_t * HEAD_DIM + k_idx] = cutlass.BFloat16(
+                                        r_k[i]
+                                    )
+                            elif cutlass.const_expr(CACHE_RING):
                                 for i in range(VEC_SIZE):
                                     k_idx = i * WARP_SIZE + in_warp_tid
                                     ring_rawk[slot, i_hv, i_t, k_idx] = (
@@ -693,7 +829,9 @@ def kda_decode_mtp_kernel(
                                     cutlass.Float32(1.0)
                                     + cute.math.exp(-r_b_raw, fastmath=True)
                                 )
-                                if cutlass.const_expr(CACHE_RING):
+                                if cutlass.const_expr(
+                                    CACHE_RING and not (FOLD_OPT & FOLD_OPT_RING_DEFER)
+                                ):
                                     ring_beta[slot, i_hv, i_t] = sBeta[i_t]
                         else:
                             # Gate warps do not otherwise use r_q in this phase.
@@ -718,7 +856,9 @@ def kda_decode_mtp_kernel(
                                     qk_j // 4,
                                     qk_j % 4,
                                 ] = cute.math.exp(r_gk, fastmath=True)
-                                if cutlass.const_expr(CACHE_RING):
+                                if cutlass.const_expr(FOLD_OPT & FOLD_OPT_RING_DEFER):
+                                    sRG[i_t * HEAD_DIM + k_idx] = r_gk
+                                elif cutlass.const_expr(CACHE_RING):
                                     ring_g[slot, i_hv, i_t, k_idx] = r_gk
                         if cutlass.const_expr(_job == 0):
                             for i in range(VEC_SIZE):
@@ -818,7 +958,9 @@ def kda_decode_mtp_kernel(
                     sOnormGate[_t * HEAD_DIM + _v_idx] = cute.arch.rcp_approx(
                         cutlass.Float32(1.0) + cute.math.exp(-gate_raw, fastmath=True)
                     )
-                if cutlass.const_expr(CACHE_RING):
+                if cutlass.const_expr(
+                    CACHE_RING and not (FOLD_OPT & FOLD_OPT_RING_DEFER)
+                ):
                     ring_rawv[slot, i_hv, _t, _v_idx] = cutlass.BFloat16(_vconv)
                 for _w in cutlass.range_constexpr(KERNEL_WIDTH - 1):
                     intermediate_conv_v[scratch_row, _t, head_off + _v_idx, _w] = (
@@ -871,6 +1013,21 @@ def kda_decode_mtp_kernel(
             FOLD_RPT = HEAD_DIM // FOLD_RPP
             fj = tidx % 8
             frg = tidx // 8
+            # (stage, row in stage, state row) of this thread's r-th fold row.
+            frk = dict(
+                matched=bool(FOLD_OPT & FOLD_OPT_ROWS),
+                warp_idx=warp_idx,
+                frg=frg,
+                rpp=FOLD_RPP,
+                tile_v=TILE_V,
+                p2_batches=P2_BATCHES,
+                num_v_rows=NUM_V_ROWS,
+                p2_rows_lane=P2_ROWS_LANE,
+                stages=STATE_STAGES,
+            )
+            f_rows = []
+            for r in cutlass.range_constexpr(FOLD_RPT):
+                f_rows.append(_fold_row(r, row_grp=row_grp, **frk))
             r_fs = cute.make_rmem_tensor(
                 cute.make_layout((FOLD_RPT * 16,), stride=(1,)), cutlass.Float32
             )
@@ -880,9 +1037,9 @@ def kda_decode_mtp_kernel(
             r_e = cute.make_rmem_tensor(
                 cute.make_layout((16,), stride=(1,)), cutlass.Float32
             )
+
             for r in cutlass.range_constexpr(FOLD_RPT):
-                f_stage = (r * FOLD_RPP) // TILE_V
-                f_row = (r * FOLD_RPP) % TILE_V + frg
+                f_stage, f_row, _ = f_rows[r]
                 for b in cutlass.range_constexpr(4):
                     cute.autovec_copy(
                         cute.local_tile(
@@ -908,64 +1065,49 @@ def kda_decode_mtp_kernel(
                                 r_e.iterator + b * 4, cute.make_layout((4,))
                             ),
                         )
-                    for r in cutlass.range_constexpr(FOLD_RPT):
-                        blk = []
-                        for b in cutlass.range_constexpr(4):
-                            i0 = (r * 4 + b) * 4
-                            e0 = b * 4
-                            h0_, h1_ = _f32x2_asm(
-                                "mul", r_fs[i0], r_fs[i0 + 1], r_e[e0], r_e[e0 + 1]
-                            )
-                            h2_, h3_ = _f32x2_asm(
-                                "mul",
-                                r_fs[i0 + 2],
-                                r_fs[i0 + 3],
-                                r_e[e0 + 2],
-                                r_e[e0 + 3],
-                            )
-                            r_fs[i0] = h0_
-                            r_fs[i0 + 1] = h1_
-                            r_fs[i0 + 2] = h2_
-                            r_fs[i0 + 3] = h3_
-                            p0, p1 = _f32x2_asm("mul", h0_, h1_, r_kn[e0], r_kn[e0 + 1])
-                            p2, p3 = _f32x2_asm(
-                                "mul", h2_, h3_, r_kn[e0 + 2], r_kn[e0 + 3]
-                            )
-                            blk.append(_lane_sum4(p0, p1, p2, p3))
-                        sr = _add_rn(_add_rn(blk[0], blk[2]), _add_rn(blk[1], blk[3]))
-                        for off in [4, 2, 1]:
-                            sr = _add_rn(
-                                sr,
-                                cute.arch.shuffle_sync_bfly(
-                                    sr, offset=off, mask=-1, mask_and_clamp=31
+                    if cutlass.const_expr(FOLD_OPT & FOLD_OPT_PACK):
+                        for rp in cutlass.range_constexpr(FOLD_RPT // 2):
+                            uu = _fold_pair_uu(
+                                r_fs,
+                                r_e,
+                                r_kn,
+                                2 * rp,
+                                cutlass.Float32(sPV[t * HEAD_DIM + f_rows[2 * rp][2]]),
+                                cutlass.Float32(
+                                    sPV[t * HEAD_DIM + f_rows[2 * rp + 1][2]]
                                 ),
+                                bt,
                             )
-                        vv = cutlass.Float32(sPV[t * HEAD_DIM + r * FOLD_RPP + frg])
-                        uu = _f32_asm(
-                            "mul.rn.f32 $0, $1, $2;",
-                            _f32_asm("sub.rn.f32 $0, $1, $2;", vv, sr),
-                            bt,
-                        )
-                        for b in cutlass.range_constexpr(4):
-                            i0 = (r * 4 + b) * 4
-                            e0 = b * 4
-                            r_fs[i0], r_fs[i0 + 1] = _fma2_scalar_b(
-                                r_kn[e0], r_kn[e0 + 1], uu, r_fs[i0], r_fs[i0 + 1]
+                            for k in cutlass.range_constexpr(2):
+                                _fold_rank1(r_fs, r_kn, 2 * rp + k, uu[k])
+                    else:
+                        for r in cutlass.range_constexpr(FOLD_RPT):
+                            blk = []
+                            for b in cutlass.range_constexpr(4):
+                                p0, p1, p2, p3 = _fold_decay_dot(r_fs, r_e, r_kn, r, b)
+                                blk.append(_lane_sum4(p0, p1, p2, p3))
+                            sr = _add_rn(
+                                _add_rn(blk[0], blk[2]), _add_rn(blk[1], blk[3])
                             )
-                            r_fs[i0 + 2], r_fs[i0 + 3] = _fma2_scalar_b(
-                                r_kn[e0 + 2],
-                                r_kn[e0 + 3],
-                                uu,
-                                r_fs[i0 + 2],
-                                r_fs[i0 + 3],
+                            for off in [4, 2, 1]:
+                                sr = _add_rn(
+                                    sr,
+                                    cute.arch.shuffle_sync_bfly(
+                                        sr, offset=off, mask=-1, mask_and_clamp=31
+                                    ),
+                                )
+                            vv = cutlass.Float32(sPV[t * HEAD_DIM + f_rows[r][2]])
+                            uu = _f32_asm(
+                                "mul.rn.f32 $0, $1, $2;",
+                                _f32_asm("sub.rn.f32 $0, $1, $2;", vv, sr),
+                                bt,
                             )
+                            _fold_rank1(r_fs, r_kn, r, uu)
             # Back to smem (this verify's initial state) and to the pool (the
             # committed state the eager fold would have left).
             gState_f = h0[(slot, i_hv, None, None)]
             for r in cutlass.range_constexpr(FOLD_RPT):
-                f_stage = (r * FOLD_RPP) // TILE_V
-                f_row = (r * FOLD_RPP) % TILE_V + frg
-                g_row = r * FOLD_RPP + frg
+                f_stage, f_row, g_row = f_rows[r]
                 for b in cutlass.range_constexpr(4):
                     cute.autovec_copy(
                         cute.make_tensor(
@@ -975,13 +1117,33 @@ def kda_decode_mtp_kernel(
                             sState[(f_row, None, f_stage)], (4,), (b * 8 + fj,)
                         ),
                     )
-                    cute.autovec_copy(
-                        cute.make_tensor(
-                            r_fs.iterator + (r * 4 + b) * 4, cute.make_layout((4,))
-                        ),
-                        cute.local_tile(gState_f[(g_row, None)], (4,), (b * 8 + fj,)),
+                    if cutlass.const_expr(not (FOLD_OPT & FOLD_OPT_BULK)):
+                        cute.autovec_copy(
+                            cute.make_tensor(
+                                r_fs.iterator + (r * 4 + b) * 4, cute.make_layout((4,))
+                            ),
+                            cute.local_tile(
+                                gState_f[(g_row, None)], (4,), (b * 8 + fj,)
+                            ),
+                        )
+            if cutlass.const_expr(FOLD_OPT & FOLD_OPT_BULK):
+                # The warp's rows go to the pool as one 512-byte bulk copy each,
+                # off the LSU; phase 2 only reads sState, so nothing waits for it.
+                _fence_proxy_async_shared()
+                cute.arch.sync_warp()
+                if in_warp_tid < FOLD_RPT * 4:
+                    b_stage, b_row, b_grow = _fold_row(
+                        in_warp_tid // 4, row_grp=in_warp_tid % 4, **frk
                     )
-            cute.arch.barrier()
+                    _bulk_store_row(
+                        gState_f[(b_grow, None)].iterator,
+                        sState[(b_row, None, b_stage)].iterator,
+                    )
+                _bulk_commit()
+            if cutlass.const_expr(FOLD_OPT & FOLD_OPT_ROWS):
+                cute.arch.sync_warp()
+            else:
+                cute.arch.barrier()
 
     staged = cutlass.const_expr(STATE_STAGES < NUM_V_TILES)
     if cutlass.const_expr(not staged):
@@ -1024,9 +1186,66 @@ def kda_decode_mtp_kernel(
         if cutlass.const_expr(i_p == NUM_V_TILES // TILES_PER_PASS - 1):
             if cutlass.const_expr(not staged):
                 # State loads can precede the cross-warp precompute barrier.
-                cute.arch.barrier()
+                if cutlass.const_expr(FOLD_PENDING and FOLD_OPT & FOLD_OPT_ROWS):
+                    # A fold already passed one after phase 1.
+                    if n_pend == 0:
+                        cute.arch.barrier()
+                else:
+                    cute.arch.barrier()
             # Every global read this block makes has now landed in registers.
             cute.arch.griddepcontrol_launch_dependents()
+            if cutlass.const_expr(FOLD_PENDING and FOLD_OPT & FOLD_OPT_RING_DEFER):
+                # Every thread's pending-row copy has landed (a barrier followed
+                # its cp.async wait), so this verify's rows may overwrite them.
+                # 16-byte chunks of rawk, g, rawv (sVall rounded to bf16), then
+                # beta (sBeta): the values phase 1 stores directly otherwise.
+                FL_K = T_LOOP * (HEAD_DIM // 8)
+                FL_G = T_LOOP * (HEAD_DIM // 4)
+                FL_N = 2 * FL_K + FL_G + 1
+                r_fl = cute.make_rmem_tensor(cute.make_layout((8,)), cutlass.BFloat16)
+                r_flg = cute.make_rmem_tensor(cute.make_layout((4,)), cutlass.Float32)
+                for fl_it in cutlass.range_constexpr(
+                    (FL_N + BLOCK_THREADS - 1) // BLOCK_THREADS
+                ):
+                    fl_c = tidx + fl_it * BLOCK_THREADS
+                    if fl_c < FL_K:
+                        fl_t = fl_c // (HEAD_DIM // 8)
+                        fl_ch = (fl_c % (HEAD_DIM // 8)) * 8
+                        cute.autovec_copy(cute.local_tile(sRK, (8,), (fl_c,)), r_fl)
+                        cute.autovec_copy(
+                            r_fl,
+                            cute.local_tile(
+                                ring_rawk[(slot, i_hv, fl_t, None)], (8,), (fl_ch // 8,)
+                            ),
+                        )
+                    elif fl_c < FL_K + FL_G:
+                        fl_cg = fl_c - FL_K
+                        fl_t = fl_cg // (HEAD_DIM // 4)
+                        fl_ch = (fl_cg % (HEAD_DIM // 4)) * 4
+                        cute.autovec_copy(cute.local_tile(sRG, (4,), (fl_cg,)), r_flg)
+                        cute.autovec_copy(
+                            r_flg,
+                            cute.local_tile(
+                                ring_g[(slot, i_hv, fl_t, None)], (4,), (fl_ch // 4,)
+                            ),
+                        )
+                    elif fl_c < 2 * FL_K + FL_G:
+                        fl_cv = fl_c - FL_K - FL_G
+                        fl_t = fl_cv // (HEAD_DIM // 8)
+                        fl_ch = (fl_cv % (HEAD_DIM // 8)) * 8
+                        for fl_e in cutlass.range_constexpr(8):
+                            r_fl[fl_e] = cutlass.BFloat16(
+                                sVall[fl_t * HEAD_DIM + fl_ch + fl_e]
+                            )
+                        cute.autovec_copy(
+                            r_fl,
+                            cute.local_tile(
+                                ring_rawv[(slot, i_hv, fl_t, None)], (8,), (fl_ch // 8,)
+                            ),
+                        )
+                    elif fl_c < FL_N:
+                        for fl_bt in cutlass.range_constexpr(T_LOOP):
+                            ring_beta[slot, i_hv, fl_bt] = sBeta[fl_bt]
 
         for i_t in cutlass.range(T_LOOP):
             if cutlass.const_expr(STREAM_STATE):
@@ -1146,6 +1365,9 @@ def kda_decode_mtp_kernel(
                     o[0, bos + i_t, i_hv, v_idx] = cutlass.BFloat16(
                         raw_o * rms * weight * gate
                     )
+    if cutlass.const_expr(FOLD_PENDING and FOLD_OPT & FOLD_OPT_BULK):
+        # Shared memory must outlive the bulk stores' reads of it.
+        _bulk_wait_read()
 
 
 @cute.jit
@@ -1189,6 +1411,7 @@ def _run_kda_decode_mtp_dspark(
     APPLY_ONORM: cutlass.Constexpr[bool],
     onorm_eps: cutlass.Constexpr[float],
     FOLD_PENDING: cutlass.Constexpr[bool],
+    FOLD_OPT: cutlass.Constexpr[int],
     stream: cuda.CUstream,
 ):
     """Launch the fixed Kimi-K3/DSpARK bonus + NUM_SPEC-draft specialization."""
@@ -1242,6 +1465,8 @@ def _run_kda_decode_mtp_dspark(
             if FOLD_PENDING
             else 0
         )
+        # FOLD_OPT_RING_DEFER: this verify's rawk (bf16) and g (fp32) ring rows.
+        + (t_loop * TILE_K * 6 + 32 if FOLD_OPT & FOLD_OPT_RING_DEFER else 0)
         + 256
     )
     kda_decode_mtp_kernel(
@@ -1286,6 +1511,7 @@ def _run_kda_decode_mtp_dspark(
         onorm_eps,
         fold_pend,
         FOLD_PENDING,
+        FOLD_OPT,
     ).launch(
         grid=(H, N, 1),
         block=[BLOCK_THREADS, 1, 1],
@@ -1406,6 +1632,7 @@ def fused_kda_decode_mtp_dspark(
     onorm_weight=None,
     onorm_eps=None,
     replayssm_pending=None,
+    fold_opt=0,
 ):
     """Run Kimi-K3 KDA verify while preserving DSpARK rollback semantics.
 
@@ -1427,6 +1654,9 @@ def fused_kda_decode_mtp_dspark(
     replayssm_pending ([slots] int32, SGLANG_OPT_KDA_PENDING_FOLD): per-slot count
     of accepted ring rows the commit left unfolded; each verify folds them into
     recurrent_state (bit-identical to the commit fold) before its recurrence.
+
+    fold_opt (SGLANG_OPT_KDA_PENDING_FOLD_OVERLAP, with replayssm_pending): a
+    FOLD_OPT_* mask scheduling that fold differently; results stay bit-identical.
     """
     import torch
 
@@ -1526,6 +1756,12 @@ def fused_kda_decode_mtp_dspark(
             "replayssm_pending needs int32 counts, ReplaySSM rings of length >= 8 "
             "and 2..8 verify rows"
         )
+    if fold_opt and not fold_pending:
+        raise ValueError("fold_opt needs replayssm_pending")
+    if fold_opt & ~FOLD_OPT_ALL or (
+        fold_opt & FOLD_OPT_BULK and not fold_opt & FOLD_OPT_ROWS
+    ):
+        raise ValueError(f"unsupported fold_opt {fold_opt:#x}")
     block_threads = _block_threads(H=H, N=N)
     out = torch.empty_like(x_v)
     args = (
@@ -1571,6 +1807,7 @@ def fused_kda_decode_mtp_dspark(
         apply_onorm,
         float(onorm_eps) if apply_onorm else 0.0,
         fold_pending,
+        int(fold_opt),
         float(scale),
         float(lower_bound),
         *(_tensor_layout_key(tensor, fits) for tensor, fits in zip(args, fits_32bit)),
@@ -1595,6 +1832,7 @@ def fused_kda_decode_mtp_dspark(
             APPLY_ONORM=apply_onorm,
             onorm_eps=float(onorm_eps) if apply_onorm else 0.0,
             FOLD_PENDING=fold_pending,
+            FOLD_OPT=int(fold_opt),
             stream=stream,
         )
         _DSPARK_COMPILED[key] = compiled
