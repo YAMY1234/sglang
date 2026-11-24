@@ -414,7 +414,12 @@ class TargetVerifyExecutor:
             state_slot = (
                 batch.req_pool_indices[:bs].view(-1, 1).expand(bs, vlen).reshape(-1)
             )
-        cache_loc = self.kv_injector.ids_for(verify_window.kv_loc_plan)
+        cache_loc = self.kv_injector.ring_locs(
+            self.kv_injector.ids_for(verify_window.kv_loc_plan),
+            req_pool_indices=batch.req_pool_indices[:bs],
+            positions=verify_window.positions_2d.reshape(-1),
+            stride=verify_window.verify_cache_loc_2d.shape[1],
+        )
         self.kv_injector.inject_target_hidden(
             target_hidden=hidden.reshape(-1, hidden.shape[-1]),
             cache_loc=cache_loc,
@@ -773,7 +778,12 @@ class DsparkVerifyEpilogue:
             self._scatter_future_relay(io.req_pool_indices, bs)
         if not folds:
             return committed_engram
-        cache_loc = io.out_cache_loc
+        cache_loc = self.commit_ctx.kv_injector.ring_locs(
+            io.out_cache_loc,
+            req_pool_indices=io.req_pool_indices,
+            positions=io.positions,
+            stride=self.stride,
+        )
         state_slot = None
         if self.commit_ctx.kv_injector.swa_ring_size is not None:
             state_slot = (

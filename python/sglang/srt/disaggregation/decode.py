@@ -2994,6 +2994,11 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                         decode_req.req.finished_reason.message
                     )
                 else:
+                    ring = get_draft_kv_ring()
+                    if ring is not None:
+                        # A head-sharded draft ring copies its heads out of the
+                        # staging rows before the request's first draft step.
+                        ring.mark_unstage(decode_req.req.kv.req_pool_idx)
                     transferred_reqs.append(decode_req.req)
             elif poll in [
                 KVPoll.Bootstrapping,

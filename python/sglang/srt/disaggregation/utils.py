@@ -1942,21 +1942,22 @@ def setup_state_kv_args(
                 slice_outer_counts,
             )
 
-    # A DFLASH draft KV ring ships its last window and its floor, last on both
-    # sides so the component order matches. A PP stage without the draft keeps
-    # empty slots and sends nothing for them.
+    # A DFLASH or DSpark draft KV ring ships its last window and its floor, last
+    # on both sides so the component order matches. A PP stage without the draft
+    # keeps empty slots and sends nothing for them.
     from sglang.srt.speculative.dflash_draft_ring import (
         draft_kv_ring_enabled,
+        dspark_draft_kv_ring_enabled,
         get_draft_kv_ring,
     )
 
     ring = get_draft_kv_ring()
+    spec_name = str(get_spec().speculative_algorithm).upper()
     if ring is not None:
         append_state_component(kv_args, StateType.DRAFT_RING, *ring.ring_buf_infos())
         append_state_component(kv_args, StateType.REQUEST_ROW, *ring.floor_buf_infos())
-    elif (
-        str(get_spec().speculative_algorithm).upper() == "DFLASH"
-        and draft_kv_ring_enabled()
+    elif (spec_name == "DFLASH" and draft_kv_ring_enabled()) or (
+        spec_name == "DSPARK" and dspark_draft_kv_ring_enabled()
     ):
         append_state_component(kv_args, StateType.DRAFT_RING, [], [], [])
         append_state_component(kv_args, StateType.REQUEST_ROW, [], [], [])

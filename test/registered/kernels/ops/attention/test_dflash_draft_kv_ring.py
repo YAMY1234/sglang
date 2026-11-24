@@ -11,9 +11,12 @@ import torch
 from sglang.kernels.ops.attention.mla_window_indices import mla_window_sparse_indices
 from sglang.srt.speculative.dflash_draft_ring import (
     DFlashDraftKVRing,
+    DraftKVRingStaging,
     draft_kv_ring_pool_rows,
     draft_kv_ring_rows_per_req,
     draft_kv_ring_unsupported_reason,
+    dspark_draft_kv_ring_rows_per_req,
+    dspark_draft_kv_ring_unsupported_reason,
 )
 from sglang.test.ci.ci_register import register_cuda_ci
 
@@ -160,6 +163,139 @@ def test_decode_floor_reset_and_unsupported_drafts():
     assert reason(layers=("sliding_attention", "full_attention")) is not None
     assert reason(backend="flashinfer") is not None
     assert reason(window=4096) is not None
+
+
+# DSpark: a page-aligned ring (sink page, whole pages per request) read through a
+# paged trtllm_mha block table.
+DSPARK_WINDOW_LEFT = 2047
+DSPARK_BLOCK = 6
+PAGE = 64
+
+
+def _dspark_ring(req_pool_rows, device):
+    return DFlashDraftKVRing(
+        rows_per_req=dspark_draft_kv_ring_rows_per_req(
+            window_left=DSPARK_WINDOW_LEFT, block_size=DSPARK_BLOCK, page_size=PAGE
+        ),
+        dcp_size=1,
+        req_pool_rows=req_pool_rows,
+        device=device,
+        window_left=DSPARK_WINDOW_LEFT,
+        sink_rows=PAGE,
+        page_size=PAGE,
+    )
+
+
+def test_dspark_page_table_reads_the_rows_the_ring_writes():
+    """For every request, the block table's page of each window or block position
+    is the page of the row the ring writes it to, at the same offset; the rows are
+    distinct and inside the request's ring."""
+    ring = _dspark_ring(9, "cpu")
+    assert ring.rows_per_req % PAGE == 0
+    req_pool_indices = torch.tensor([3, 7, 1, 0], dtype=torch.int32)
+    seq_lens = [9000, 2054, 70, 3 * ring.rows_per_req + 5]
+    width = (max(seq_lens) + DSPARK_BLOCK) // PAGE + 2
+    table = torch.full((4, width), -1, dtype=torch.int32)
+    ring.page_table_into(req_pool_indices, table)
+    for b, seq_len in enumerate(seq_lens):
+        req = int(req_pool_indices[b])
+        keys = torch.arange(
+            max(0, seq_len - DSPARK_WINDOW_LEFT - 1), seq_len + DSPARK_BLOCK
+        )
+        locs = ring.locs(torch.full_like(keys, req), keys)
+        assert torch.equal(locs // PAGE, table[b, keys // PAGE].to(torch.int64))
+        assert torch.equal(locs % PAGE, keys % PAGE)
+        assert locs.unique().numel() == keys.numel()
+        lo = PAGE + req * ring.rows_per_req
+        assert bool(((locs >= lo) & (locs < lo + ring.rows_per_req)).all())
+    pool_rows = draft_kv_ring_pool_rows(
+        req_pool_rows=9, rows_per_req=ring.rows_per_req, page_size=PAGE, sink_rows=PAGE
+    )
+    assert pool_rows == PAGE + 9 * ring.rows_per_req
+
+
+def test_dspark_extend_and_pd_rows():
+    """A long chunk keeps only its readable tail; prefill's and decode's window
+    rows pair positionally and each is the row its side's ring reads."""
+    ring = _dspark_ring(4, "cpu")
+    n = 3 * ring.rows_per_req + 777
+    positions = torch.arange(n)
+    locs = ring.extend_locs(
+        req_pool_indices=torch.tensor([2]),
+        positions=positions,
+        extend_lens=torch.tensor([n]),
+        seq_ends=torch.tensor([n]),
+    )
+    kept = locs != 0
+    assert int(kept.sum()) == ring.span and bool(kept[-ring.span :].all())
+    assert locs[kept].unique().numel() == ring.span
+    decode = _dspark_ring(6, "cpu")
+    src = ring.transfer_rows(2, n)
+    dst = decode.transfer_rows(5, n)
+    window = torch.arange(n - DSPARK_WINDOW_LEFT - 1, n)
+    assert torch.equal(
+        torch.from_numpy(src).long(), ring.locs(torch.full_like(window, 2), window)
+    )
+    assert torch.equal(
+        torch.from_numpy(dst).long(), decode.locs(torch.full_like(window, 5), window)
+    )
+
+
+def test_dspark_staging_unstage_copies_this_ranks_heads():
+    """A head-sharded decode ring lands whole rows in staging and copies its own
+    head columns into the ring rows of the marked requests only."""
+
+    class _Pool:
+        page_size = PAGE
+
+        def __init__(self, rows, heads):
+            self.bufs = [
+                torch.zeros((rows, heads, 64), dtype=torch.uint8) for _ in range(4)
+            ]
+
+        def _pd_registerable_tensors(self):
+            return self.bufs
+
+    ring = _dspark_ring(3, "cpu")
+    rows = PAGE + 3 * ring.rows_per_req
+    pool = _Pool(rows, 4)
+    ring.pool = pool
+    staging = DraftKVRingStaging(pool=pool, num_rows=rows, total_kv_heads=16)
+    ring.attach_staging(staging, head_start=8, num_heads=4)
+    for i, buf in enumerate(staging.ring_buffers()):
+        buf.copy_(torch.randint(0, 255, buf.shape, dtype=torch.uint8))
+    ring.mark_unstage(1)
+    ring.flush_unstage()
+    r1 = slice(PAGE + ring.rows_per_req, PAGE + 2 * ring.rows_per_req)
+    for src, dst in zip(staging.ring_buffers(), pool.bufs):
+        assert torch.equal(dst[r1], src[r1][:, 8:12])
+        assert int(dst[: r1.start].sum()) == 0 and int(dst[r1.stop :].sum()) == 0
+    _, _, item_lens = ring.ring_buf_infos()
+    assert item_lens == [16 * 64] * 4
+
+
+def test_dspark_unsupported_drafts():
+    from unittest import mock
+
+    from sglang.srt.speculative import dflash_utils
+
+    def reason(mla=False, layers=("sliding_attention",) * 5, backend="trtllm_mha"):
+        with (
+            mock.patch.object(
+                dflash_utils, "is_dflash_mla_draft_config", return_value=mla
+            ),
+            mock.patch.object(
+                dflash_utils, "get_dflash_layer_types", return_value=list(layers)
+            ),
+        ):
+            return dspark_draft_kv_ring_unsupported_reason(
+                object(), draft_backend=backend
+            )
+
+    assert reason() is None
+    assert reason(mla=True) is not None
+    assert reason(layers=("sliding_attention", "full_attention")) is not None
+    assert reason(backend="flashinfer") is not None
 
 
 if __name__ == "__main__":

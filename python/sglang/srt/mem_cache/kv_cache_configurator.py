@@ -820,23 +820,26 @@ class KVCacheConfigurator:
 
         if self._uses_dflash_draft_kv_ring() and req_to_token_pool is not None:
             from sglang.srt.speculative.dflash_draft_ring import (
+                draft_kv_ring_geometry,
                 draft_kv_ring_pool_rows,
-                draft_kv_ring_rows_per_req,
-                draft_kv_ring_window_left,
             )
 
             # The draft keeps a per-request ring of rows, not one per target slot.
-            rows_per_req = draft_kv_ring_rows_per_req(
-                window_left=draft_kv_ring_window_left(self.model_config.hf_config),
+            page_size = max(int(self.pool_page_size or 1), 1)
+            rows_per_req, sink_rows = draft_kv_ring_geometry(
+                self.spec_algorithm,
+                self.model_config.hf_config,
                 block_size=int(get_spec().speculative_num_draft_tokens),
                 dcp_size=get_parallel().attn_dcp_size,
+                page_size=page_size,
             )
             sizes = msgspec.structs.replace(
                 sizes,
                 max_total_num_tokens=draft_kv_ring_pool_rows(
                     req_pool_rows=req_to_token_pool.req_to_token.shape[0],
                     rows_per_req=rows_per_req,
-                    page_size=max(int(self.pool_page_size or 1), 1),
+                    page_size=page_size,
+                    sink_rows=sink_rows,
                 ),
             )
 
@@ -2835,11 +2838,11 @@ class KVCacheConfigurator:
         return token_to_kv_pool
 
     def _uses_dflash_draft_kv_ring(self) -> bool:
-        if not (self.is_draft_worker and self.spec_algorithm.is_dflash()):
+        if not self.is_draft_worker:
             return False
-        from sglang.srt.speculative.dflash_draft_ring import draft_kv_ring_enabled
+        from sglang.srt.speculative.dflash_draft_ring import draft_kv_ring_active
 
-        return draft_kv_ring_enabled()
+        return draft_kv_ring_active(self.spec_algorithm)
 
     def _hybrid_full_attention_pool_class(
         self, *, mha_pool_class: type, mla_pool_class: type, dsa_pool_class: type

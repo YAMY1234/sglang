@@ -2689,6 +2689,15 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     # A side without the draft (a PP stage, or a peer whose
                     # draft KV ring resolved off) registered empty slots.
                     continue
+                if st == StateType.DRAFT_RING and list(src_item_lens) != list(
+                    dst_item_lens
+                ):
+                    # Ring rows are copied whole: a head-sharded decode lands them
+                    # in a staging ring of the prefill's row width.
+                    raise RuntimeError(
+                        "PD draft KV ring rows differ between prefill and decode: "
+                        f"{list(src_item_lens)} vs {list(dst_item_lens)}"
+                    )
                 is_qwen4_qsa_state = st in (
                     StateType.QSA_PENDING,
                     StateType.QSA_COMPRESSED,
