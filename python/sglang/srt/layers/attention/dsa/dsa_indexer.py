@@ -1756,6 +1756,9 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 q_offset=q_offset,
                 B=B,
                 next_n=next_n if use_dg_native else 1,
+                one_block=use_dg_native
+                and envs.SGLANG_K31_DSA_PAGED_MQA_ONEBLOCK.get()
+                and paged_mqa_logits_1blk.supports_mxfp4(next_n, self.n_heads, self.head_dim),
             )
         elif self.paged_mqa_logits_backend.is_aiter():
             logits = aiter_paged_mqa_logits(

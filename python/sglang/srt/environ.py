@@ -2550,6 +2550,7 @@ class Envs:
     # DG-native decode verify (next_n <= 8, 32 heads x 128): paged MQA logits with
     # one Q block per request (kernels/ops/attention/dsa/paged_mqa_logits_1blk.py),
     # bitwise DeepGEMM's logits; DeepGEMM streams next_n > 4 requests' KV twice.
+    # Covers the MXFP4 index-K too (SGLANG_K31_INDEXER_MXFP4: paged_mqa_logits_1blk_mxfp4.cuh).
     SGLANG_K31_DSA_PAGED_MQA_ONEBLOCK = EnvBool(False)
     # Kimi-K3.1 DSA index-K cache in MXFP4 (68 B/token, vLLM's layout), not FP8 (132 B);
     # decode scores MXFP4 Q x K with DeepGEMM's FP4 paged logits, prefill gathers K back

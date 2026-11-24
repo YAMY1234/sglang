@@ -79,7 +79,9 @@ def _store_index_k_mxfp4_kernel(
     slot = tl.load(loc_ptr + tok).to(tl.int64)
     # DCP: loc holds widened slots; this rank keeps the slots it owns, at slot // dcp_size (fused FP8 store's rule).
     if dcp_size > 1:
-        slot = tl.where((slot >= 0) & (slot % dcp_size == dcp_rank), slot // dcp_size, -1)
+        slot = tl.where(
+            (slot >= 0) & (slot % dcp_size == dcp_rank), slot // dcp_size, -1
+        )
     if slot >= 0:
         x = tl.load(key_ptr + tok * key_stride + tl.arange(0, HEAD_DIM)).to(tl.float32)
         packed, ue8m0 = _mxfp4_quant(x, HEAD_DIM)
@@ -103,7 +105,10 @@ def store_index_k_mxfp4(
     ``[pages, page_size * (D/2 + D/32)]`` uint8 (an ``IndexKeyCache`` layer buffer). Negative slots are skipped."""
     key = key.view(-1, key.shape[-1])
     head_dim = key.shape[1]
-    assert key.dtype == torch.bfloat16 and key.stride(-1) == 1, (key.dtype, key.stride())
+    assert key.dtype == torch.bfloat16 and key.stride(-1) == 1, (
+        key.dtype,
+        key.stride(),
+    )
     assert head_dim % MXFP4_BLOCK == 0
     assert cache.dtype == torch.uint8 and cache.dim() == 2
     assert cache.shape[1] == page_size * index_k_bytes_per_token(head_dim), cache.shape
@@ -143,15 +148,31 @@ def _q_mxfp4_kernel(
     head0 = tl.program_id(1) * HEADS
     offs = tl.arange(0, HEADS * HEAD_DIM)
     head = head0 + offs // HEAD_DIM
-    q = tl.load(q_ptr + tok * q_stride0 + head * q_stride1 + offs % HEAD_DIM, mask=head < num_heads, other=0.0)
+    q = tl.load(
+        q_ptr + tok * q_stride0 + head * q_stride1 + offs % HEAD_DIM,
+        mask=head < num_heads,
+        other=0.0,
+    )
     packed, ue8m0 = _mxfp4_quant(q.to(tl.float32), HEADS * HEAD_DIM)
     out = head0 * (HEAD_DIM // 2) + tl.arange(0, HEADS * HEAD_DIM // 2)
     sc = head0 * (HEAD_DIM // _BLOCK) + tl.arange(0, HEADS * (HEAD_DIM // _BLOCK))
     heads = head0 + tl.arange(0, HEADS)
-    tl.store(q_out_ptr + tok * num_heads * (HEAD_DIM // 2) + out, packed, mask=out < num_heads * (HEAD_DIM // 2))
-    tl.store(q_scale_ptr + tok * num_heads * (HEAD_DIM // _BLOCK) + sc, ue8m0, mask=sc < num_heads * (HEAD_DIM // _BLOCK))
+    tl.store(
+        q_out_ptr + tok * num_heads * (HEAD_DIM // 2) + out,
+        packed,
+        mask=out < num_heads * (HEAD_DIM // 2),
+    )
+    tl.store(
+        q_scale_ptr + tok * num_heads * (HEAD_DIM // _BLOCK) + sc,
+        ue8m0,
+        mask=sc < num_heads * (HEAD_DIM // _BLOCK),
+    )
     w = tl.load(w_ptr + tok * w_stride + heads, mask=heads < num_heads)
-    tl.store(w_out_ptr + tok * num_heads + heads, w.to(tl.float32) * weight_scale, mask=heads < num_heads)
+    tl.store(
+        w_out_ptr + tok * num_heads + heads,
+        w.to(tl.float32) * weight_scale,
+        mask=heads < num_heads,
+    )
 
 
 def q_quant_mxfp4(
@@ -199,20 +220,28 @@ def mxfp4_paged_mqa_logits(
     q_offset: int,
     B: int,
     next_n: int,
+    one_block: bool = False,
 ) -> torch.Tensor:
     """fp32 paged MQA logits of the MXFP4 query ``(E2M1 [T, H, D/2], UE8M0 x4 [T, H])`` over the
     MXFP4 index-K ``[blocks, 64, 1, 68]`` with DeepGEMM's FP4 kernel (sgl-deep-gemm 0.2.8 legacy
     API), in the FP8 path's layouts: ``next_n > 1`` is the native call (``[B, next_n]`` lengths,
     one block-table row per request), ``next_n == 1`` one row per entry. Rows past ``q_offset``
-    are left out, as the FP8 wrappers do."""
+    are left out, as the FP8 wrappers do. ``one_block`` (native layout only) runs the one-block
+    kernel, which reads each request's index K once for all next_n rows; bitwise the same logits."""
     import deep_gemm
 
     from sglang.kernels.ops.attention.dsa.paged_mqa_logits import _restore_row_stride
 
     global _paged_logged
-    if not _paged_logged:  # one line per process: the decode-path engagement check of the accuracy twins
+    if (
+        not _paged_logged
+    ):  # one line per process: the decode-path engagement check of the accuracy twins
         _paged_logged = True
-        logger.info("K31 indexer MXFP4: DeepGEMM FP4 paged MQA logits engaged (rows %d, next_n %d)", q_offset, next_n)
+        logger.info(
+            "K31 indexer MXFP4: DeepGEMM FP4 paged MQA logits engaged (rows %d, next_n %d)",
+            q_offset,
+            next_n,
+        )
     q_fp4, q_sf = q
     heads = q_fp4.shape[1]
     if next_n > 1:
@@ -222,6 +251,21 @@ def mxfp4_paged_mqa_logits(
         )
         # block_tables[::next_n] de-expands the caller's repeat_interleave without a copy
         block_tables = block_tables[::next_n]
+        if one_block:
+            from sglang.kernels.ops.attention.dsa.paged_mqa_logits_1blk import (
+                fp4_paged_mqa_logits_1blk,
+            )
+
+            return fp4_paged_mqa_logits_1blk(
+                q_mx[0],
+                q_mx[1],
+                kv_cache,
+                weights[:q_offset],
+                ctx_lens_2d,
+                block_tables,
+                schedule_metadata,
+                max_seq_len,
+            )
     else:
         q_mx = (
             q_fp4[:q_offset].view(torch.int8).unsqueeze(1),
@@ -261,10 +305,14 @@ def mxfp4_quant_ref(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     # round to nearest, ties to the even code (even code = even index into the grid)
     d = (a[..., None] - grid).abs()
     best = d.min(-1, keepdim=True).values
-    cand = (d == best)
-    idx = torch.where(cand[..., ::2].any(-1),
-                      (cand.float() * torch.tensor([1.0, 0, 1, 0, 1, 0, 1, 0], device=x.device)).argmax(-1),
-                      cand.float().argmax(-1))
+    cand = d == best
+    idx = torch.where(
+        cand[..., ::2].any(-1),
+        (
+            cand.float() * torch.tensor([1.0, 0, 1, 0, 1, 0, 1, 0], device=x.device)
+        ).argmax(-1),
+        cand.float().argmax(-1),
+    )
     # cvt.rn.satfinite keeps the sign of values that round to zero (-0 is code 0x8)
     code = (idx | torch.signbit(scaled).long() << 3).to(torch.uint8)
     code = code.reshape(*shp[:-1], shp[-1])
