@@ -249,6 +249,19 @@ _K31_SM107_TGV_M_RANGES = {
     (2112, 7168): ((528, 528, 24), (912, 960, 28)),
     (7168, 3584): ((52, 64, 23), (132, 144, 27)),
 }
+# Under SGLANG_K31_SM107_DG_BF16: the TP4-attention decode rows where cuBLAS is
+# slowest (CUDA graph, cold weights, us per GEMM, cuBLAS -> DeepGEMM bf16_gemm_nt,
+# bitwise equal): KDA qkvg M 260-288 36.8-39.5 -> 21.4-22.0, M 290-320
+# 28.0-29.6 -> 21.3-22.9; o_proj M 225-256 9.2-9.6 -> 8.0-8.1, M 290-320
+# 11.1-11.3 -> 9.2-9.3 (cuBLAS wins at 260-288). TGV tactic 23 takes the latent
+# up_proj at 50-51 rows too (cuBLAS 10.0 -> 7.0, bitwise).
+_K31_SM107_DG_BF16_M_RANGES = {
+    (12288, 7168): ((257, 320),),  # KDA fused qkvg, attention TP4
+    (7168, 3072): ((225, 256), (289, 320)),  # KDA o_proj, attention TP4
+}
+_K31_SM107_DG_SWITCH_TGV_M_RANGES = {
+    (7168, 3584): ((50, 51, 23),),  # latent up_proj, below the table's 52-64
+}
 # Side-stream [f_a | b] beside qkvg on SM107 (the same file's "side"; per-M
 # intersection of both sweeps), used up to SGLANG_K31_SM107_BFA_SIDE_MAX_TOKENS.
 _K31_SM107_BFA_SIDE_TGV_M_RANGES = {
@@ -3844,6 +3857,13 @@ class KimiK3LinearForCausalLM(nn.Module):
                 register_tgv_m_ranges(_K31_GB300_TGV_M_RANGES)
             elif _k31_sm107_tuning(config):
                 register_tgv_m_ranges(_k31_sm107_tables()[0])
+                if envs.SGLANG_K31_SM107_DG_BF16.get():
+                    from sglang.srt.layers.quantization.unquant import (
+                        register_dg_bf16_m_ranges,
+                    )
+
+                    register_tgv_m_ranges(_K31_SM107_DG_SWITCH_TGV_M_RANGES)
+                    register_dg_bf16_m_ranges(_K31_SM107_DG_BF16_M_RANGES)
         if quant_config is not None:
             if isinstance(quant_config, ModelSlimConfig):
                 model_mapping = {
@@ -4467,6 +4487,10 @@ class KimiK3ForConditionalGeneration(nn.Module):
             self.language_model.post_load_weights()
 
     def precompile_kernels_after_loading(self) -> None:
+        from sglang.srt.layers.quantization.unquant import precompile_dg_bf16_gemms
+
+        if self.language_model is not None and precompile_dg_bf16_gemms():
+            logger.info("Precompiled K3.1 DeepGEMM BF16 decode GEMMs")
         if self.config.language_only:
             return
         if self.vision_tower.precompile_fused_rope():

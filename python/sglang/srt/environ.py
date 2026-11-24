@@ -2718,6 +2718,10 @@ class Envs:
     SGLANG_K31_SM107_GEMM_TACTICS = EnvBool(False)
     # Optional path of a JSON table that replaces the built-in SM107 table.
     SGLANG_K31_SM107_GEMM_TABLE = EnvStr(None)
+    # Under SGLANG_K31_SM107_GEMM_TACTICS on SM107: KDA q/k/v/g and o_proj at the decode rows
+    # where cuBLAS is slowest go to DeepGEMM bf16_gemm_nt (bitwise equal to cuBLAS there), and
+    # the latent up_proj takes TGV down to 50 rows.
+    SGLANG_K31_SM107_DG_BF16 = EnvBool(False)
     # Under SGLANG_K31_SM107_GEMM_TACTICS on SM107: the largest graphed rows
     # whose KDA [f_a | b] GEMM runs on the side stream beside [q,k,v,g]
     # (default 1152 = the largest verify rows, the stable table's

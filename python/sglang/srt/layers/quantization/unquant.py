@@ -290,6 +290,49 @@ def precompile_splitk_tactics() -> bool:
     return True
 
 
+# DeepGEMM bf16_gemm_nt routes a model registers: (n, k) -> ((m_lo, m_hi), ...).
+_DG_BF16_M_RANGES: dict[tuple[int, int], tuple[tuple[int, int], ...]] = {}
+
+
+def register_dg_bf16_m_ranges(
+    shapes: dict[tuple[int, int], tuple[tuple[int, int], ...]],
+) -> None:
+    """Route a model's dense-GEMM shapes ``(n, k)`` to DeepGEMM's bf16_gemm_nt
+    for the given ``(m_lo, m_hi)`` rows, for every bias-free BF16 caller."""
+    for shape, ranges in shapes.items():
+        _DG_BF16_M_RANGES[shape] = tuple(sorted(ranges))
+
+
+def _use_dg_bf16_gemm(m: int, n: int, k: int) -> bool:
+    return any(lo <= m <= hi for lo, hi in _DG_BF16_M_RANGES.get((n, k), ()))
+
+
+def _dg_bf16_gemm_nt(
+    x_2d: torch.Tensor, weight: torch.Tensor, out: torch.Tensor
+) -> torch.Tensor:
+    import deep_gemm
+
+    deep_gemm.bf16_gemm_nt(x_2d, weight, out)
+    return out
+
+
+def precompile_dg_bf16_gemms() -> bool:
+    """JIT-compile DeepGEMM for every registered shape and row count, so CUDA
+    graph capture never hits a cold kernel."""
+    if not _DG_BF16_M_RANGES:
+        return False
+    device = torch.cuda.current_device()
+    for (n, k), ranges in _DG_BF16_M_RANGES.items():
+        weight = torch.zeros(n, k, dtype=torch.bfloat16, device=device)
+        for lo, hi in ranges:
+            for m in range(lo, hi + 1):
+                x = torch.zeros(m, k, dtype=torch.bfloat16, device=device)
+                out = torch.empty(m, n, dtype=torch.bfloat16, device=device)
+                _dg_bf16_gemm_nt(x, weight, out)
+    torch.cuda.synchronize()
+    return True
+
+
 def should_enable_bf16_splitk_gemm(backend: Bf16GemmBackend) -> bool:
     """Return whether the optional Split-K path should be initialized."""
     return backend.is_cutedsl() and envs.SGLANG_ENABLE_BF16_SPLITK_GEMM.get()
@@ -443,6 +486,16 @@ def _bf16_gemm_dispatch_impl(
         output = _hopper_bf16_gemv(x.view(-1, x.shape[-1]), weight).view(
             *x.shape[:-1], -1
         )
+    elif (
+        bias is None
+        and _use_dg_bf16_gemm(m, weight.shape[0], weight.shape[1])
+        and x.is_contiguous()
+        and weight.is_contiguous()
+    ):
+        x_2d = x.view(-1, x.shape[-1])
+        output = _dg_bf16_gemm_nt(
+            x_2d, weight, x_2d.new_empty((m, weight.shape[0]))
+        ).view(*x.shape[:-1], -1)
     elif _use_cutedsl_bf16_gemm is not None and _use_cutedsl_bf16_gemm(
         m, weight.shape[0], weight.shape[1]
     ):
@@ -656,6 +709,22 @@ class UnquantizedLinearMethod(LinearMethodBase):
             )
         ):
             return _bf16_splitk_gemm_out(x, layer.weight, None, output)
+        if (
+            bias is None
+            and x.is_cuda
+            and x.ndim == 2
+            and x.is_contiguous()
+            and x.dtype == torch.bfloat16
+            and layer.weight.dtype == torch.bfloat16
+            and output.dtype == torch.bfloat16
+            and output.is_contiguous()
+            and output.shape == (x.shape[0], layer.weight.shape[0])
+            and not layer.weight.requires_grad
+            and _use_dg_bf16_gemm(
+                x.shape[0], layer.weight.shape[0], layer.weight.shape[1]
+            )
+        ):
+            return _dg_bf16_gemm_nt(x, layer.weight, output)
         if (
             get_bf16_gemm_backend().is_cutedsl()
             and x.is_cuda

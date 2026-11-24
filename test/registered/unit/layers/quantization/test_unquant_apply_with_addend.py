@@ -197,5 +197,75 @@ class TestApplyWithAddend(CustomTestCase):
             self.assertEqual(kernel_calls, [route])
 
 
+@unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
+class TestDeepGemmBf16Route(CustomTestCase):
+    """register_dg_bf16_m_ranges sends the registered (n, k) rows to DeepGEMM's
+    bf16_gemm_nt; every other row, and any biased call, keeps its route."""
+
+    def setUp(self):
+        torch.manual_seed(0)
+        self.projection = ReplicatedLinear(
+            64, 128, bias=False, params_dtype=torch.bfloat16
+        ).cuda()
+        self.projection.weight.copy_(torch.randn_like(self.projection.weight) / 8.0)
+        self.method = self.projection.quant_method
+        self.calls = []
+
+        def fake_deep_gemm(x_2d, weight, out):
+            self.calls.append(x_2d.shape[0])
+            return torch.mm(x_2d, weight.t(), out=out)
+
+        stack = ExitStack()
+        self.addCleanup(stack.close)
+        cutedsl = unquant.Bf16GemmBackend.CUTEDSL
+        stack.enter_context(patch.object(unquant, "_BF16_GEMM_BACKEND", cutedsl))
+        stack.enter_context(patch.object(unquant, "_use_cutedsl_bf16_gemm", None))
+        stack.enter_context(patch.object(unquant, "_dg_bf16_gemm_nt", fake_deep_gemm))
+        stack.enter_context(patch.dict(unquant._DG_BF16_M_RANGES, clear=True))
+        unquant.register_dg_bf16_m_ranges({(128, 64): ((16, 24),)})
+
+    def _reference(self, x, bias=None):
+        return F.linear(x, self.projection.weight, bias)
+
+    @torch.inference_mode()
+    def test_registered_rows_take_deep_gemm(self):
+        for m, routed in ((15, False), (16, True), (24, True), (25, False)):
+            with self.subTest(m=m):
+                self.calls.clear()
+                x = torch.randn(m, 64, device="cuda", dtype=torch.bfloat16)
+
+                output = self.method.apply(self.projection, x)
+
+                self.assertEqual(self.calls, [m] if routed else [])
+                torch.testing.assert_close(
+                    output, self._reference(x), rtol=_BF16_RTOL, atol=_BF16_ATOL
+                )
+
+    @torch.inference_mode()
+    def test_apply_into_writes_the_caller_buffer(self):
+        x = torch.randn(16, 64, device="cuda", dtype=torch.bfloat16)
+        output = torch.empty(16, 128, device="cuda", dtype=torch.bfloat16)
+
+        result = self.method.apply_into(self.projection, x, output)
+
+        self.assertEqual(self.calls, [16])
+        self.assertEqual(result.data_ptr(), output.data_ptr())
+        torch.testing.assert_close(
+            output, self._reference(x), rtol=_BF16_RTOL, atol=_BF16_ATOL
+        )
+
+    @torch.inference_mode()
+    def test_bias_keeps_its_route(self):
+        x = torch.randn(16, 64, device="cuda", dtype=torch.bfloat16)
+        bias = torch.randn(128, device="cuda", dtype=torch.bfloat16)
+
+        output = self.method.apply(self.projection, x, bias)
+
+        self.assertEqual(self.calls, [])
+        torch.testing.assert_close(
+            output, self._reference(x, bias), rtol=_BF16_RTOL, atol=_BF16_ATOL
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
