@@ -215,7 +215,7 @@ class DraftKVRingStaging:
 # ``unstage`` copies through one fixed buffer of at most this many bytes (rows x this
 # rank's heads), allocated with the staging ring, so a burst of landed requests (a
 # window opening) needs no memory proportional to its size.
-UNSTAGE_CHUNK_BYTES = 128 << 20
+UNSTAGE_CHUNK_BYTES = 32 << 20
 
 
 def _as_bytes(t: torch.Tensor) -> torch.Tensor:
