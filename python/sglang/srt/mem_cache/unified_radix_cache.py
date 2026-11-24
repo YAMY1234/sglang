@@ -1314,6 +1314,18 @@ class UnifiedRadixCache(BasePrefixCache):
             self._apply_cache_actions(result.cache_actions)
             self._drain_l3_lifetime_events()
 
+    def _ledger_lookup_event(
+        self, event, req_id, node_id, storage_start, prefetch_length, tree_kv_tokens, **fields
+    ) -> None:
+        # Diagnostics: the request's page-hash chain, root to the anchor (16-hex prefixes), joins a
+        # lookup to the state keys and writes on its path; path_pages * page_size < storage_start = truncated.
+        tc = self.tree_core
+        path = [h[:16] for h in tc.get_prefix_hash_values(node_id) + tc.get_hash_values(node_id)]
+        self._l3_lifetime_ledger.emit(
+            event, rid=req_id, storage_start=storage_start, prefetch_length=prefetch_length,
+            tree_kv_tokens=tree_kv_tokens, path_pages=len(path), path=path, **fields,
+        )
+
     def _drain_l3_lifetime_events(self) -> None:
         if self._l3_lifetime_ledger is not None:
             self._l3_lifetime_ledger.drain_tree(self.tree_core)
@@ -3403,12 +3415,22 @@ class UnifiedRadixCache(BasePrefixCache):
         if prefetch_length + tree_kv_tokens < self.prefetch_threshold:
             if prefetch_length > 0:
                 stats["declined_too_short"] += 1
+                if self._l3_lifetime_ledger is not None:
+                    self._ledger_lookup_event(
+                        "storage_lookup_declined", req_id, last_host_node_id, storage_start,
+                        prefetch_length, tree_kv_tokens, reason="too_short",
+                    )
             # No lookup was issued, so no retry is armed: polling here would
             # spend the re-issue budget the admission-time device-hit-loss
             # re-query needs once the device match evicts while queued.
             return
         if not buffer_mode and self.cache_controller.prefetch_rate_limited():
             stats["declined_rate_limited"] += 1
+            if self._l3_lifetime_ledger is not None:
+                self._ledger_lookup_event(
+                    "storage_lookup_declined", req_id, last_host_node_id, storage_start,
+                    prefetch_length, tree_kv_tokens, reason="rate_limited",
+                )
             # Paced: the limiter clears as transfers finish, not on the next pass.
             self.storage_prefetch_retries.poll_miss(req_id, storage_hit_end)
             return
@@ -3487,6 +3509,11 @@ class UnifiedRadixCache(BasePrefixCache):
         # the hit hash chain can shrink as device coverage changes.
         operation.stats_requested_tokens = prefetch_length
         operation.storage_start = storage_start
+        if self._l3_lifetime_ledger is not None:
+            self._ledger_lookup_event(
+                "storage_lookup_issue", req_id, last_host_node_id, storage_start,
+                prefetch_length, tree_kv_tokens, op_id=operation.id,
+            )
         if submission.decision is not None:
             return submission.decision
 

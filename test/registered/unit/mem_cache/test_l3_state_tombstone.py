@@ -387,6 +387,49 @@ class TestL3LifetimeAccounting(unittest.TestCase):
         self.assertIsNone(event.kwargs["D"])
         self.assertIsNone(event.kwargs["checkpoint_hash"])
 
+    def test_lookup_events_carry_the_root_to_anchor_path(self):
+        cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
+        cache._l3_lifetime_ledger = Mock()
+        cache.tree_core = Mock()
+        cache.tree_core.get_prefix_hash_values.return_value = ["a" * 64, "b" * 64]
+        cache.tree_core.get_hash_values.return_value = ["c" * 64]
+        cache._ledger_lookup_event("storage_lookup_issue", "r1", 7, 192, 16384, 64, op_id=3)
+        event = cache._l3_lifetime_ledger.emit.call_args
+        self.assertEqual(event.args[0], "storage_lookup_issue")
+        self.assertEqual(event.kwargs["path"], ["a" * 16, "b" * 16, "c" * 16])
+        self.assertEqual((event.kwargs["path_pages"], event.kwargs["storage_start"], event.kwargs["op_id"]), (3, 192, 3))
+        cache.tree_core.get_prefix_hash_values.assert_called_once_with(7)
+        cache.tree_core.get_hash_values.assert_called_once_with(7)
+
+    def test_a_too_short_lookup_is_declined_with_a_ledger_event(self):
+        cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
+        cache.enable_storage = True
+        cache.cache_controller = Mock()
+        cache.cache_controller.get_prefetch_submission.return_value = None
+        cache.storage_prefetch_retries = Mock()
+        cache._storage_prefetch_wait = {}
+        cache.host_memory_mode = "cache"
+        cache.ongoing_prefetch = {}
+        cache.buffer_pipeline = None
+        cache.tree_core = Mock(is_eagle=False)
+        cache.tree_core.prefetch_anchor_info.return_value = (None, None)
+        cache.tree_core.get_prefix_hash_values.return_value = ["a" * 64]
+        cache.tree_core.get_hash_values.return_value = ["b" * 64]
+        cache.page_size = 64
+        cache.prefetch_threshold = 8192
+        cache._prefetch_outcome_stats = defaultdict(int)
+        cache._l3_lifetime_ledger = Mock()
+        handle = CacheRequestHandle("short", 0)
+        cache.prefetch_from_storage(handle, 7, list(range(1024)), matched_prefix_tokens=list(range(128)))
+        self.assertEqual(cache._prefetch_outcome_stats["declined_too_short"], 1)
+        event = cache._l3_lifetime_ledger.emit.call_args
+        self.assertEqual(event.args[0], "storage_lookup_declined")
+        self.assertEqual(
+            (event.kwargs["reason"], event.kwargs["storage_start"], event.kwargs["prefetch_length"], event.kwargs["path_pages"]),
+            ("too_short", 128, 1024, 2),
+        )
+        cache.cache_controller.submit_prefetch.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()
