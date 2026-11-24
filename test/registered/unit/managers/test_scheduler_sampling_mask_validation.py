@@ -47,6 +47,7 @@ class TestSchedulerSamplingMaskValidation(CustomTestCase):
                     input_embeds=None,
                     bootstrap_port=1,
                     bootstrap_room=9,
+                    decode_prompt_len=None,
                 )
                 req = MagicMock(return_sampling_mask=True, return_logprob=False)
                 with (

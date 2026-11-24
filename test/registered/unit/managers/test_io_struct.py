@@ -176,6 +176,28 @@ class TestTokenizedReqInputMsgpack(unittest.TestCase):
             torch.equal(decoded.mm_inputs.token_type_ids, torch.tensor([0, 0]))
         )
 
+    def test_decode_prompt_len_round_trips(self):
+        def tokenized(**kwargs):
+            return TokenizedGenerateReqInput(
+                input_text="",
+                input_ids=array("q", [7, 8]),
+                input_embeds=None,
+                mm_inputs=None,
+                token_type_ids=None,
+                sampling_params=SamplingParams(),
+                return_logprob=False,
+                logprob_start_len=-1,
+                top_logprobs_num=0,
+                token_ids_logprob=None,
+                stream=False,
+                **kwargs,
+            )
+
+        self.assertIsNone(self._round_trip(tokenized()).decode_prompt_len)
+        decoded = self._round_trip(tokenized(decode_prompt_len=1000))
+        self.assertEqual(decoded.decode_prompt_len, 1000)
+        self.assertEqual(list(decoded.input_ids), [7, 8])
+
     def test_dynamic_model_specific_attribute_round_trip(self):
         mm_inputs = self._make_mm_inputs()
         mm_inputs.mm_items[0].audio_feature_lens = torch.tensor([2])
