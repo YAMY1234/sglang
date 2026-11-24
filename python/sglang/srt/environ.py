@@ -597,6 +597,7 @@ class Envs:
     # requests (slots taken at preallocation, freed after unstage; preallocation waits for
     # a free slot). 0: one staging block per req pool row.
     SGLANG_DSPARK_DRAFT_KV_RING_STAGING_SLOTS = EnvInt(0)
+    SGLANG_LOG_UNSTAGE_FLUSH = EnvBool(False)
     # DSpark draft graph: its in-graph attention-metadata prep runs on a side stream
     # and joins at the first draft KV store, overlapping the embedding.
     SGLANG_OPT_DSV41_DSPARK_DRAFT_PREP_FORK = EnvBool(False)
