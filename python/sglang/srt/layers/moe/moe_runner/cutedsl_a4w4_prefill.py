@@ -194,7 +194,7 @@ def _run_tuned(
 
 
 def _get_workspace(weights: CuteDslA4W4Weights, top_k: int) -> _Workspace:
-    """Allocated on the first call, after the KV pool is sized, so it comes out of the activation headroom."""
+    """Allocated by ensure_tuned at load, before the KV pool is sized, so the pool sizing accounts for it."""
     global _workspace
     if _workspace is None:
         from flashinfer.fused_moe.cute_dsl.moe_utils import (
@@ -352,12 +352,21 @@ def ensure_tuned(weights: CuteDslA4W4Weights, *, top_k: int, max_tokens: int) ->
     with fi_autotune(True):
         _run_tuned(weights, x, ids, w, output=out)
     torch.cuda.synchronize(device)
+    del x, ids, w, out
     _tuned_max_tokens = max_tokens
     _table = _resolve_tactics("CuteDslFusedMoE::run_moe_w4a4::Situ", max_tokens)
+    workspace_bytes = 0
+    if _table.tactics:
+        ws = _get_workspace(weights, top_k)
+        workspace_bytes = sum(
+            getattr(ws, f).nbytes for f in _Workspace.__struct_fields__
+        )
     logger.info(
         "SGLANG_K31_PREFILL_MOE_A4W4: tuned the CuTe DSL MoE up to %d tokens; "
-        "%d bucket tactics up to %d tokens resolved for the direct path",
+        "%d bucket tactics up to %d tokens resolved for the direct path; "
+        "workspace %.3f GB",
         max_tokens,
         len(_table.tactics),
         _table.max_tokens,
+        workspace_bytes / 1e9,
     )
