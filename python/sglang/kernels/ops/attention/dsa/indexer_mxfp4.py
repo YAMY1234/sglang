@@ -13,6 +13,7 @@ the same bf16 key and query.
 
 from __future__ import annotations
 
+import logging
 from typing import Tuple
 
 import torch
@@ -21,6 +22,8 @@ import triton.language as tl
 
 MXFP4_BLOCK = 32
 _BLOCK = tl.constexpr(MXFP4_BLOCK)
+logger = logging.getLogger(__name__)
+_paged_logged = False
 
 
 def index_k_bytes_per_token(head_dim: int) -> int:
@@ -206,6 +209,10 @@ def mxfp4_paged_mqa_logits(
 
     from sglang.kernels.ops.attention.dsa.paged_mqa_logits import _restore_row_stride
 
+    global _paged_logged
+    if not _paged_logged:  # one line per process: the decode-path engagement check of the accuracy twins
+        _paged_logged = True
+        logger.info("K31 indexer MXFP4: DeepGEMM FP4 paged MQA logits engaged (rows %d, next_n %d)", q_offset, next_n)
     q_fp4, q_sf = q
     heads = q_fp4.shape[1]
     if next_n > 1:
