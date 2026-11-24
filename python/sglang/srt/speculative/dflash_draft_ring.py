@@ -41,6 +41,7 @@ PD rows land there, and the slot frees once ``unstage`` has copied it; prealloca
 waits while none is free (``staging_slot_free``).
 """
 
+import logging
 from collections import deque
 from contextlib import nullcontext
 from typing import Dict, List, Optional, Tuple
@@ -50,6 +51,8 @@ import torch
 
 from sglang.kernels.ops.speculative.dflash_ring_locs import dflash_ring_block_locs
 from sglang.srt.environ import envs
+
+logger = logging.getLogger(__name__)
 
 
 def draft_kv_ring_enabled() -> bool:
@@ -473,6 +476,10 @@ class DFlashDraftKVRing:
             return
         reqs = list(self._pending_unstage)
         self._pending_unstage.clear()
+        if envs.SGLANG_LOG_UNSTAGE_FLUSH.get():
+            logger.info(
+                "UNSTAGE_FLUSH entries %d unique %d", len(reqs), len(set(reqs))
+            )
         if self._staging_slots:
             # A request that left before its unstage has no slot (and no rows).
             reqs = [r for r in reqs if r in self._slot_of]
