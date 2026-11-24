@@ -194,9 +194,12 @@ def _page_shard_row_bytes(kvc: KVCacheConfigurator) -> int:
                 model_config=model_config, kv_cache_dtype=kvc.kv_cache_dtype
             )
             index_head_dim = get_dsa_index_head_dim(model_config.hf_config)
-            # FP8 index K plus one FP32 scale per 128 elements. The scratch
-            # indexer exists even when some persistent layers skip top-k.
-            return kv_dim * kv_size + index_head_dim + index_head_dim // 128 * 4
+            from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
+
+            # The scratch indexer exists even when some persistent layers skip top-k.
+            return kv_dim * kv_size + sum(
+                DSATokenToKVPool.index_k_token_bytes(index_head_dim)
+            )
         return (model_config.kv_lora_rank + model_config.qk_rope_head_dim) * kv_size
     return (
         model_config.get_num_kv_heads(get_parallel().attn_tp_size)

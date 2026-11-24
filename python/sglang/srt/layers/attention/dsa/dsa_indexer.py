@@ -20,6 +20,11 @@ from sglang.kernels.ops.attention.dsa.fp8_fused_writer_hip import (
     prepare_aiter_rope_caches,
 )
 from sglang.kernels.ops.attention.dsa.head_gate import indexer_q_quant_head_gate
+from sglang.kernels.ops.attention.dsa.indexer_mxfp4 import (
+    mxfp4_paged_mqa_logits,
+    q_quant_mxfp4,
+    store_index_k_mxfp4,
+)
 from sglang.kernels.ops.kvcache.dsa_fused_store_index_cache import (
     can_use_dsa_fused_store,
     fused_store_index_k_cache,
@@ -639,6 +644,12 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             self._fused_fp8_cos_cache = None
             self._fused_fp8_sin_cache = None
         self.softmax_scale = self.head_dim**-0.5
+        # MXFP4 index-K: decode scores MXFP4 Q x K, prefill gathers K back to FP8
+        self.index_k_fp4 = envs.SGLANG_K31_INDEXER_MXFP4.get()
+        if self.index_k_fp4 and not (_is_cuda and self.skip_rope):
+            raise ValueError(
+                "SGLANG_K31_INDEXER_MXFP4 needs CUDA and Kimi-K3.1's NoPE indexer"
+            )
         # [wk | weights_proj] rows for the merged GEMM, see prepare_merged_k_gate
         self._wk_gate_weight: Optional[torch.Tensor] = None
         self.num_init_tokens = self.num_local_tokens = 0
@@ -1455,6 +1466,13 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
     def _fused_q_quant(
         self, q: torch.Tensor, weights_raw: torch.Tensor, positions: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if self.index_k_fp4:
+            # vLLM's MXFP4 query: the MX scales stay in the logits MMA, so the head
+            # weights take only (heads * dim)^-0.5, an exact power of two at 32 x 128
+            q_fp4, q_sf, weights = q_quant_mxfp4(
+                q.contiguous(), weights_raw, self.softmax_scale * self.n_heads**-0.5
+            )
+            return (q_fp4, q_sf), weights.unsqueeze(-1)
         if self.skip_rope:
             return indexer_q_quant_head_gate(
                 q.contiguous(), weights_raw, self.softmax_scale, self.scale_fmt
@@ -1580,7 +1598,12 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         # Reuse pre-computed schedule metadata if available (from init_forward_metadata),
         # otherwise fall back to computing it here.
         schedule_metadata = getattr(metadata, "paged_mqa_schedule_metadata", None)
-        assert len(q_fp8.shape) == 3
+        # MXFP4: q_fp8 is (E2M1 [T, H, D/2] uint8, UE8M0 x4 [T, H] int32)
+        assert isinstance(q_fp8, tuple) == self.index_k_fp4, (
+            "an MXFP4 index-K needs the MXFP4 query of the merged K/gate decode path"
+        )
+        q_rows = q_fp8[0] if self.index_k_fp4 else q_fp8
+        assert len(q_rows.shape) == 3
         # attn_tp_size > 1 or MAX_LEN padding mode can leave padding in the
         # hidden states; q_offset is the real (unpadded) q length.
         q_offset = sum(metadata.get_dsa_extend_len_cpu())
@@ -1597,6 +1620,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             self.paged_mqa_logits_backend.is_cutedsl()
             and not forward_batch.forward_mode.is_draft_extend_v2()
             and dcp_size == 1
+            and not self.index_k_fp4
         )
         dsl_expand_factor, dsl_atom = 1, 1
         if (
@@ -1653,7 +1677,12 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         assert len(kv_cache_fp8.shape) == 2
         block_kv = page_size
         num_heads_kv = 1
-        head_dim_with_sf = 132
+        # bytes per token in a page: FP8 128 + fp32 scale, or MXFP4 64 + 4 UE8M0
+        head_dim_with_sf = (
+            self.head_dim // 2 + self.head_dim // 32
+            if self.index_k_fp4
+            else self.head_dim + 4
+        )
         kv_cache_fp8 = kv_cache_fp8.view(
             kv_cache_fp8.shape[0], block_kv, num_heads_kv, head_dim_with_sf
         )
@@ -1715,7 +1744,20 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 )
             return torch.cat(logits_chunks, dim=0)
 
-        if self.paged_mqa_logits_backend.is_aiter():
+        if self.index_k_fp4:
+            logits = mxfp4_paged_mqa_logits(
+                q_fp8,
+                kv_cache_fp8,
+                weights,
+                seqlens_32_2d,
+                block_tables,
+                schedule_metadata,
+                max_seq_len,
+                q_offset=q_offset,
+                B=B,
+                next_n=next_n if use_dg_native else 1,
+            )
+        elif self.paged_mqa_logits_backend.is_aiter():
             logits = aiter_paged_mqa_logits(
                 q_fp8,
                 kv_cache_fp8,
@@ -1806,8 +1848,8 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             self._mask_init_and_local_tokens(logits, seqlens_32)
             topk_result = metadata.topk_transform(logits, self.index_topk)
         # Restore possible padding exist in the hidden states.
-        if not _is_hip and q_offset < q_fp8.shape[0]:
-            pad_len = q_fp8.shape[0] - q_offset
+        if not _is_hip and q_offset < q_rows.shape[0]:
+            pad_len = q_rows.shape[0] - q_offset
             padding = torch.full(
                 (pad_len, topk_result.shape[1]),
                 -1,
@@ -2814,6 +2856,16 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             return
 
         dcp_size, dcp_rank = _index_k_dcp()
+        if self.index_k_fp4:
+            self._store_index_k_mxfp4(
+                pool,
+                layer_id,
+                key,
+                out_cache_loc,
+                dcp_size=dcp_size,
+                dcp_rank=dcp_rank,
+            )
+            return
         if (
             _is_cuda
             and (not _is_fp8_fnuz)
@@ -2887,6 +2939,33 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             index_k=k_fp8,
             index_k_scale=k_scale,
         )
+
+    @staticmethod
+    def _store_index_k_mxfp4(
+        pool,
+        layer_id: int,
+        key: torch.Tensor,
+        out_cache_loc: torch.Tensor,
+        *,
+        dcp_size: int,
+        dcp_rank: int,
+    ) -> None:
+        key = key.to(torch.bfloat16)
+        if dcp_size > 1:
+            # K3.1 shards index-K by token: the store keeps this rank's slots
+            buf = pool.get_index_k_with_scale_buffer(layer_id=layer_id)
+            targets = ((buf, out_cache_loc, None),)
+        else:
+            targets = _index_k_write_targets(pool, layer_id, out_cache_loc)
+        for buf, loc, rows in targets:
+            store_index_k_mxfp4(
+                key if rows is None else key.index_select(0, rows),
+                buf,
+                loc,
+                page_size=pool.index_page_size,
+                dcp_size=dcp_size,
+                dcp_rank=dcp_rank,
+            )
 
     def forward_native(self, *args, **kwargs):
         # The indexer has no pure-torch reference path; it only runs on

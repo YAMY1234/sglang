@@ -140,14 +140,18 @@ def _run_relayout(
     num_index_k=2,
     total_tokens=None,
     chunk_tokens=4 * 64 * 8,
+    index_k_widths=(128, 4),
+    tag_index_k=False,
 ):
     """Send a request in chunks to every decode DCP rank; return the decode
-    buffers and the manager, which counts the transfer descriptors."""
+    buffers and the manager, which counts the transfer descriptors.
+    ``tag_index_k`` fills every source index-K row with its slot id + 1 (int32
+    words in both the value and the scale piece) instead of random bytes."""
     rng = np.random.default_rng(seed)
     page_size, dcp = 64, 8
     target_width, draft_width = 576, 576
     num_target = 3
-    value_bytes, scale_bytes = 128, 4
+    value_bytes, scale_bytes = index_k_widths
     index_k_page = page_size * (value_bytes + scale_bytes)
     decode_prefix_len = int(rng.integers(0, 3)) * page_size * dcp
     if total_tokens is None:
@@ -165,8 +169,18 @@ def _run_relayout(
         for _ in range(num_draft)
     ]
     src_index_k = [
-        memory.alloc(src_pool_pages * index_k_page, rng=rng) for _ in range(num_index_k)
+        memory.alloc(src_pool_pages * index_k_page, rng=None if tag_index_k else rng)
+        for _ in range(num_index_k)
     ]
+    if tag_index_k:
+        for base in src_index_k:
+            pages = memory.buffers[base].reshape(src_pool_pages, index_k_page)
+            ids = np.arange(1, src_pool_pages * page_size + 1, dtype=np.int32)
+            ids = ids.reshape(src_pool_pages, page_size, 1)
+            values = np.repeat(ids, value_bytes // 4, axis=2).view(np.uint8)
+            scales = np.repeat(ids, scale_bytes // 4, axis=2).view(np.uint8)
+            pages[:, : page_size * value_bytes] = values.reshape(src_pool_pages, -1)
+            pages[:, page_size * value_bytes :] = scales.reshape(src_pool_pages, -1)
     src_pages = rng.permutation(src_pool_pages)[: -(-total_tokens // page_size)]
     src_pages = src_pages.astype(np.int32)
     # Decode virtual pages: some runs, some scattered.
@@ -306,6 +320,43 @@ class TestDcpChunkPackRelayout(CustomTestCase):
         for ref_bufs, new_bufs in zip(reference, packed):
             for ref, new in zip(ref_bufs, new_bufs):
                 np.testing.assert_array_equal(ref, new)
+
+
+class TestDcpIndexKFormats(CustomTestCase):
+    def _slot_ids(self, widths, chunk_pack, seed):
+        """Per decode rank and index-K buffer: the source slot id each destination row
+        received, read once from its value piece and once from its scale piece."""
+        value_bytes, scale_bytes = widths
+        snapshot, _, _, tokens = _run_relayout(
+            chunk_pack=chunk_pack,
+            seed=seed,
+            index_k_widths=widths,
+            tag_index_k=True,
+        )
+        ids = []
+        for bufs in snapshot:
+            for buf in bufs[-2:]:  # num_index_k = 2
+                pages = buf.reshape(-1, 64 * (value_bytes + scale_bytes))
+                values = pages[:, : 64 * value_bytes].reshape(-1, 64, value_bytes)
+                scales = pages[:, 64 * value_bytes :].reshape(-1, 64, scale_bytes)
+                value_id = values[..., :4].copy().view(np.int32).reshape(-1)
+                scale_id = scales[..., :4].copy().view(np.int32).reshape(-1)
+                np.testing.assert_array_equal(value_id, scale_id)
+                ids.append(value_id)
+        return ids, tokens
+
+    def test_mxfp4_rows_land_where_fp8_rows_do(self):
+        # FP8 (128 B + fp32 scale) is the production layout; an MXFP4 index-K
+        # (64 B E2M1 + 4 UE8M0) must move every token to the same decode row.
+        for chunk_pack in (False, True):
+            for seed in (1, 4, 5):
+                with self.subTest(chunk_pack=chunk_pack, seed=seed):
+                    fp8, tokens = self._slot_ids((128, 4), chunk_pack, seed)
+                    fp4, _ = self._slot_ids((64, 4), chunk_pack, seed)
+                    for a, b in zip(fp8, fp4):
+                        np.testing.assert_array_equal(a, b)
+                    # every token reached one row of one rank, per index-K buffer
+                    self.assertEqual(sum(int((a > 0).sum()) for a in fp4), 2 * tokens)
 
 
 if __name__ == "__main__":

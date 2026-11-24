@@ -54,6 +54,8 @@ class GetKAndS:
     ):
         from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype
 
+        assert not pool.index_k_fp4
+
         page_size = pool.index_page_size
         index_head_dim = pool.index_head_dim
         quant_block_size = pool.quant_block_size
@@ -104,6 +106,16 @@ class GetKAndS:
                  k_fp8: (seq_len, index_head_dim), uint8
                  k_scale: (seq_len, 4), uint8
         """
+        if pool.index_k_fp4:
+            return _get_k_and_s_mxfp4_triton(
+                buf=buf,
+                page_indices=page_indices,
+                seq_lens=seq_len_tensor,
+                seq_len_sum=seq_len_sum,
+                max_seq_len=max_seq_len,
+                page_size=pool.index_page_size,
+                index_head_dim=pool.index_head_dim,
+            )
         return _get_k_and_s_triton(
             buf=buf,
             page_indices=page_indices,
@@ -420,3 +432,107 @@ def _get_k_and_s_triton_kernel(
     s_dst_base_offset = s_dst_token_offset * 4
     s_store_addr = s_out_ptr + s_dst_base_offset[:, None] + s_offsets[None, :]
     tl.store(s_store_addr, s_data, mask=s_mask)
+
+
+def _get_k_and_s_mxfp4_triton(
+    buf: torch.Tensor,
+    page_indices: torch.Tensor,
+    seq_lens: torch.Tensor,
+    seq_len_sum: int,
+    max_seq_len: int,
+    page_size: int,
+    index_head_dim: int,
+):
+    """Gather an MXFP4 index-K (pages ``[64 x D/2 E2M1 | 64 x D/32 UE8M0]``) into the FP8
+    gather's outputs: E4M3 keys ``(seq_len, D)`` uint8 and one fp32 scale ``(seq_len, 4)``
+    uint8 per token. The scale is ``2^ceil(log2(max(1e-4, amax) / 448))`` of the token's
+    MXFP4 values, so E4M3 x scale is the MXFP4 value bit for bit while the token's block
+    exponents lie within 14 binades of each other."""
+    assert index_head_dim == 128 and page_size == 64, (index_head_dim, page_size)
+    k_out = torch.empty(
+        (seq_len_sum, index_head_dim), dtype=torch.uint8, device=buf.device
+    )
+    s_out = torch.empty((seq_len_sum, 4), dtype=torch.uint8, device=buf.device)
+    seq_num = seq_lens.shape[0]
+    if seq_num == 0 or seq_len_sum == 0:
+        return k_out, s_out
+    grid = (seq_num, triton.cdiv(max_seq_len, page_size))
+    _get_k_and_s_mxfp4_kernel[grid](
+        buf,
+        page_indices,
+        k_out,
+        s_out.view(torch.float32),
+        seq_lens,
+        page_indices.shape[1],
+        buf.shape[1],
+        SEQ_NUM_POW2=triton.next_power_of_2(seq_num),
+        PAGE=page_size,
+        HEAD_DIM=index_head_dim,
+        num_warps=4,
+    )
+    return k_out, s_out
+
+
+@triton.jit
+def _get_k_and_s_mxfp4_kernel(
+    buf_ptr,
+    page_indices_ptr,
+    k_out_ptr,
+    s_out_ptr,
+    seq_len_ptr,
+    pages_per_req,
+    page_bytes,
+    SEQ_NUM_POW2: tl.constexpr,
+    PAGE: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+):
+    # One program per (request, page): PAGE tokens, all in one physical page.
+    batch_id = tl.program_id(0)
+    page_idx = tl.program_id(1)
+    seq_len = tl.load(seq_len_ptr + batch_id)
+    if page_idx * PAGE >= seq_len:
+        return
+    prev = tl.arange(0, SEQ_NUM_POW2)
+    out_base = tl.sum(tl.load(seq_len_ptr + prev, mask=prev < batch_id, other=0))
+    tok = tl.arange(0, PAGE)
+    valid = page_idx * PAGE + tok < seq_len
+    page = tl.load(page_indices_ptr + batch_id * pages_per_req + page_idx).to(tl.int64)
+    page_ptr = buf_ptr + page * page_bytes
+
+    VALUE_BYTES: tl.constexpr = HEAD_DIM // 2
+    BLOCKS: tl.constexpr = HEAD_DIM // 32
+    packed = tl.load(
+        page_ptr + tok[:, None] * VALUE_BYTES + tl.arange(0, VALUE_BYTES)[None, :],
+        mask=valid[:, None],
+        other=0,
+    ).to(tl.int32)
+    ue8m0 = tl.load(
+        page_ptr + PAGE * VALUE_BYTES + tok[:, None] * BLOCKS + tl.arange(0, BLOCKS)[None, :],
+        mask=valid[:, None],
+        other=127,
+    ).to(tl.int32)
+    # 2^(ue8m0 - 127) from its bits (byte 0 is the subnormal 2^-127)
+    block_scale = tl.where(ue8m0 > 0, ue8m0 << 23, 0x00400000).to(tl.float32, bitcast=True)
+    # even element in the low nibble; E2M1 magnitude codes 0..7 are 0, .5, 1, 1.5, 2, 3, 4, 6
+    code = tl.reshape(tl.join(packed & 0xF, packed >> 4), (PAGE, HEAD_DIM))
+    mag = code & 7
+    twice = tl.where(mag < 4, mag, (2 + (mag & 1)) << ((mag >> 1) - 1))
+    val = twice.to(tl.float32) * 0.5
+    val = tl.where((code & 8) != 0, -val, val)
+    val = tl.reshape(
+        tl.reshape(val, (PAGE, BLOCKS, 32)) * block_scale[:, :, None],
+        (PAGE, HEAD_DIM),
+    )
+    # the fused FP8 store's scale, rounded up to a power of two
+    scale = tl.maximum(tl.max(tl.abs(val), axis=1), 1e-4) / 448.0
+    bits = scale.to(tl.int32, bitcast=True)
+    exp = ((bits >> 23) & 0xFF) + ((bits & 0x7FFFFF) != 0).to(tl.int32)
+    scale = (tl.minimum(tl.maximum(exp, 1), 254) << 23).to(tl.float32, bitcast=True)
+    k = (val * (1.0 / scale)[:, None]).to(tl.float8e4nv).to(tl.uint8, bitcast=True)
+    row = (out_base + page_idx * PAGE + tok).to(tl.int64)
+    tl.store(
+        k_out_ptr + row[:, None] * HEAD_DIM + tl.arange(0, HEAD_DIM)[None, :],
+        k,
+        mask=valid[:, None],
+    )
+    tl.store(s_out_ptr + row, scale, mask=valid)

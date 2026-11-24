@@ -72,8 +72,9 @@ logger = logging.getLogger(__name__)
 def dsa_indexer_bytes_per_token_per_layer(
     *, index_head_dim: int, quant_block_size: int
 ) -> int:
-    # packed index keys plus one fp32 scale per quant block, stored as uint8
-    elems = index_head_dim + index_head_dim // quant_block_size * 4
+    # packed index keys plus scales (fp32 per quant block, or UE8M0 per 32), uint8
+    assert quant_block_size == DSATokenToKVPool.quant_block_size
+    elems = sum(DSATokenToKVPool.index_k_token_bytes(index_head_dim))
     return elems * DSATokenToKVPool.index_k_with_scale_buffer_dtype.itemsize
 
 

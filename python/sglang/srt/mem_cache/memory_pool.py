@@ -5492,6 +5492,17 @@ class DSATokenToKVPool(MLATokenToKVPool):
     index_k_with_scale_buffer_dtype = torch.uint8
     rope_storage_dtype = torch.bfloat16  # rope is always stored in bf16
 
+    @staticmethod
+    def index_k_token_bytes(index_head_dim: int) -> Tuple[int, int]:
+        """(value, scale) bytes of one token's index key in a page: FP8 with one fp32
+        scale per 128, or with SGLANG_K31_INDEXER_MXFP4 E2M1 with a UE8M0 per 32."""
+        if envs.SGLANG_K31_INDEXER_MXFP4.get():
+            return index_head_dim // 2, index_head_dim // 32
+        return (
+            index_head_dim,
+            index_head_dim // DSATokenToKVPool.quant_block_size * 4,
+        )
+
     def __init__(
         self,
         size: int,
@@ -5566,6 +5577,15 @@ class DSATokenToKVPool(MLATokenToKVPool):
         self.index_buf_size = index_buf_size
         # num head == 1 and head dim == 128 for index_k in DSA
         assert index_head_dim == 128
+        self.index_k_fp4 = envs.SGLANG_K31_INDEXER_MXFP4.get()
+        self.index_k_value_bytes, self.index_k_scale_bytes = self.index_k_token_bytes(
+            index_head_dim
+        )
+        if self.index_k_fp4 and not (_is_cuda and index_kpool == 1):
+            raise ValueError(
+                "SGLANG_K31_INDEXER_MXFP4 needs CUDA and an unpooled index-K "
+                f"(index_kpool 1, got {index_kpool})"
+            )
 
         self.skip_topk_layers = (
             list(skip_topk_layers)
@@ -5800,6 +5820,7 @@ class DSATokenToKVPool(MLATokenToKVPool):
         index_k: torch.Tensor,
         index_k_scale: torch.Tensor,
     ) -> None:
+        assert not self.index_k_fp4, "MXFP4 index-K is written by store_index_k_mxfp4"
         self.index_key_cache.store_quantized(layer_id, loc, index_k, index_k_scale)
 
     def _get_compress_tail_cpu_copy(self, req_pool_index):

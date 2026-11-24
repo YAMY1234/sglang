@@ -184,6 +184,56 @@ def q_quant_mxfp4(
     return q_out, q_scale, w_out
 
 
+def mxfp4_paged_mqa_logits(
+    q: Tuple[torch.Tensor, torch.Tensor],
+    kv_cache: torch.Tensor,
+    weights: torch.Tensor,
+    ctx_lens_2d: torch.Tensor,
+    block_tables: torch.Tensor,
+    schedule_metadata: torch.Tensor,
+    max_seq_len: int,
+    *,
+    q_offset: int,
+    B: int,
+    next_n: int,
+) -> torch.Tensor:
+    """fp32 paged MQA logits of the MXFP4 query ``(E2M1 [T, H, D/2], UE8M0 x4 [T, H])`` over the
+    MXFP4 index-K ``[blocks, 64, 1, 68]`` with DeepGEMM's FP4 kernel (sgl-deep-gemm 0.2.8 legacy
+    API), in the FP8 path's layouts: ``next_n > 1`` is the native call (``[B, next_n]`` lengths,
+    one block-table row per request), ``next_n == 1`` one row per entry. Rows past ``q_offset``
+    are left out, as the FP8 wrappers do."""
+    import deep_gemm
+
+    from sglang.kernels.ops.attention.dsa.paged_mqa_logits import _restore_row_stride
+
+    q_fp4, q_sf = q
+    heads = q_fp4.shape[1]
+    if next_n > 1:
+        q_mx = (
+            q_fp4[:q_offset].view(torch.int8).view(B, next_n, heads, -1),
+            q_sf[:q_offset].view(B, next_n, heads),
+        )
+        # block_tables[::next_n] de-expands the caller's repeat_interleave without a copy
+        block_tables = block_tables[::next_n]
+    else:
+        q_mx = (
+            q_fp4[:q_offset].view(torch.int8).unsqueeze(1),
+            q_sf[:q_offset].unsqueeze(1),
+        )
+    logits = deep_gemm.fp8_fp4_paged_mqa_logits(
+        q_mx,
+        kv_cache,
+        weights[:q_offset],
+        ctx_lens_2d,
+        block_tables,
+        schedule_metadata,
+        max_seq_len,
+        False,
+        torch.float,
+    )
+    return _restore_row_stride(logits)
+
+
 # ------------------------------------------------------------------ torch references (tests and offline tools)
 
 _E2M1 = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)

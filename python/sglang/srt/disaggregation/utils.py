@@ -1554,9 +1554,10 @@ def setup_state_kv_args(
         # then their scales. A PD DCP relayout moves the two parts separately.
         if pool.index_kpool != 1:
             return
-        value_bytes = pool.index_head_dim
-        scale_bytes = pool.index_head_dim // pool.quant_block_size * 4
-        kv_args.dsa_index_k_token_bytes = (value_bytes, scale_bytes)
+        kv_args.dsa_index_k_token_bytes = (
+            pool.index_k_value_bytes,
+            pool.index_k_scale_bytes,
+        )
 
     def append_dsa_tail(pool) -> None:
         if not pool.kpool_use_compress:
@@ -1999,9 +2000,17 @@ def get_dsv41_spec_layout(kv_args: KVArgs) -> Optional[dict]:
 def get_pd_kv_layout(token_to_kv_pool) -> Optional[str]:
     """The KV byte layout both PD roles must share, for pools that have more than one."""
     from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
+    from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool, HybridLinearKVPool
 
     if isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool):
         return token_to_kv_pool.pd_kv_layout()
+    if isinstance(token_to_kv_pool, HybridLinearKVPool):
+        token_to_kv_pool = token_to_kv_pool.full_kv_pool
+    if isinstance(token_to_kv_pool, DSATokenToKVPool):
+        # The PD relayout moves index-K token by token at the sender's widths, so an
+        # FP8 (132 B) and an MXFP4 (68 B) peer would read each other's bytes as garbage.
+        fp4 = token_to_kv_pool.index_k_fp4
+        return "dsa_index_k_mxfp4" if fp4 else "dsa_index_k_fp8"
     return None
 
 
