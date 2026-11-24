@@ -28,6 +28,12 @@ and ``page_table_into`` gives the kernel the same pages ``req_to_token`` would i
 held ring locs. Such a draft is head-sharded on decode while a TP-1 prefill holds
 every head, so decode receives whole rows into a staging ring and ``unstage`` copies
 its heads into the ring before the request's first draft step.
+
+A paged reader cannot floor its window, so a page-aligned ring is rebased on
+``min_pos``: position ``pos`` lives at ``pos - min_pos[req]`` in the formulas above
+and the reader gets ``window_seq_lens`` (``seq_lens - min_pos``); the window then
+starts at the floor, never on rows from before it. Decode lands PD rows at their
+absolute positions and ``unstage`` rotates them once the floor has landed.
 """
 
 from collections import deque
@@ -243,6 +249,10 @@ class DFlashDraftKVRing:
             self.min_pos = torch.zeros(req_pool_rows, dtype=torch.int32, device=device)
         self._floor_rids: Dict[int, str] = {}
         self._fused_block_locs = envs.SGLANG_OPT_DFLASH_RING_LOCS_FUSED.get()
+        # A page-aligned ring stores positions relative to min_pos (module doc);
+        # the host floors are prefill's, for transfer_rows.
+        self.rebased = page_size is not None
+        self._floor_host: Dict[int, int] = {}
         # page_table_into's per-column ring pages, by table (width, dtype).
         self._page_cols: Dict[Tuple[int, torch.dtype], torch.Tensor] = {}
 
@@ -251,9 +261,12 @@ class DFlashDraftKVRing:
     ) -> torch.Tensor:
         """Ring locs of ``positions``, ``req_pool_indices`` given per row."""
         positions = positions.to(torch.int64)
+        req_pool_indices = req_pool_indices.to(torch.int64)
+        if self.rebased:
+            positions = positions - self.min_pos[req_pool_indices]
         local = (
             self.sink_rows
-            + req_pool_indices.to(torch.int64) * self.rows_per_req
+            + req_pool_indices * self.rows_per_req
             + torch.remainder(positions // self.dcp_size, self.rows_per_req)
         )
         return local * self.dcp_size + torch.remainder(positions, self.dcp_size)
@@ -272,6 +285,18 @@ class DFlashDraftKVRing:
             rows_per_req=self.rows_per_req,
             dcp_size=self.dcp_size,
             sink_rows=self.sink_rows,
+            floors=self.min_pos if self.rebased else None,
+        )
+
+    def window_seq_lens(
+        self, req_pool_indices: torch.Tensor, seq_lens: torch.Tensor
+    ) -> torch.Tensor:
+        """A paged reader's sequence lengths: a rebased ring's window starts at
+        ``min_pos``."""
+        if not self.rebased:
+            return seq_lens
+        return seq_lens - self.min_pos[req_pool_indices.to(torch.int64)].to(
+            seq_lens.dtype
         )
 
     def extend_locs(
@@ -304,6 +329,7 @@ class DFlashDraftKVRing:
             slot = req.kv.req_pool_idx
             if self._floor_rids.get(slot) != req.rid:
                 self._floor_rids[slot] = req.rid
+                self._floor_host[slot] = int(prefix_len)
                 slots.append(slot)
                 floors.append(int(prefix_len))
         if slots:
@@ -317,14 +343,17 @@ class DFlashDraftKVRing:
 
     def transfer_rows(self, req_pool_idx: int, seq_len: int) -> np.ndarray:
         """This rank's ring rows of the last window before ``seq_len``, in
-        position order; row 0 (the sink) for a position another rank owns."""
+        position order; row 0 (the sink) for a position another rank owns. A
+        rebased ring sends from its floor and lands at absolute positions
+        (``reset_floor``)."""
         positions = np.arange(
             max(0, seq_len - self.window_left - 1), seq_len, dtype=np.int64
         )
+        base = self._floor_host.get(req_pool_idx, 0) if self.rebased else 0
         rows = (
             self.sink_rows
             + req_pool_idx * self.rows_per_req
-            + (positions // self.dcp_size) % self.rows_per_req
+            + ((positions - base) // self.dcp_size) % self.rows_per_req
         )
         rows[positions % self.dcp_size != self.dcp_rank] = 0
         return rows.astype(np.int32)
@@ -358,9 +387,10 @@ class DFlashDraftKVRing:
         self.staging = (staging_pool, head_start, num_heads)
 
     def mark_unstage(self, req_pool_idx: int) -> None:
-        """A request's PD rows landed in the staging ring; copy them before its
-        first draft step (``flush_unstage``, on the forward stream)."""
-        if self.staging is not None:
+        """A request's PD rows landed (in the staging ring, or at absolute
+        positions of a rebased ring); copy them into place before its first draft
+        step (``flush_unstage``, on the forward stream)."""
+        if self.staging is not None or self.rebased:
             self._pending_unstage.append(int(req_pool_idx))
 
     def flush_unstage(self) -> None:
@@ -369,25 +399,37 @@ class DFlashDraftKVRing:
             reqs.append(self._pending_unstage.popleft())
         if not reqs:
             return
-        staging_pool, head_start, num_heads = self.staging
         device = self.min_pos.device
         req = torch.tensor(reqs, dtype=torch.int64).to(device, non_blocking=True)
-        rows = (
-            self.sink_rows
-            + req.unsqueeze(1) * self.rows_per_req
-            + torch.arange(self.rows_per_req, device=device, dtype=torch.int64)
-        ).reshape(-1)
-        heads = slice(head_start, head_start + num_heads)
-        for src, dst in zip(
-            staging_pool.ring_buffers(), self.pool._pd_registerable_tensors()
-        ):
-            dst[rows] = src[rows][:, heads]
+        first = self.sink_rows + req.unsqueeze(1) * self.rows_per_req
+        cols = torch.arange(self.rows_per_req, device=device, dtype=torch.int64)
+        rows = (first + cols).reshape(-1)
+        dst_rows = rows
+        if self.rebased:
+            # Row j holds a position p = j mod rows_per_req; it belongs at p - floor.
+            dst_rows = (
+                first
+                + torch.remainder(
+                    cols - self.min_pos[req].unsqueeze(1), self.rows_per_req
+                )
+            ).reshape(-1)
+        dsts = self.pool._pd_registerable_tensors()
+        if self.staging is None:
+            srcs, heads = dsts, slice(None)
+        else:
+            staging_pool, head_start, num_heads = self.staging
+            srcs = staging_pool.ring_buffers()
+            heads = slice(head_start, head_start + num_heads)
+        for src, dst in zip(srcs, dsts):
+            # The gather copies first, so an in-place rotation reads unrotated rows.
+            dst[dst_rows] = src[rows][:, heads]
 
     def reset_floor(self, req_pool_idx: int, seq_len: int) -> None:
         """PD decode, at preallocation: no draft context until prefill's floor
         row lands, so a prefill that ships no ring leaves an empty window
         rather than a stale one."""
         self.min_pos[req_pool_idx].fill_(seq_len)
+        self._floor_host.pop(req_pool_idx, None)
 
     def ring_buf_infos(self) -> Tuple[List[int], List[int], List[int]]:
         """The PD buffers (the staging ring's when there is one) with one item per

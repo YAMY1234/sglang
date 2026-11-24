@@ -222,6 +222,7 @@ def test_dspark_page_table_reads_the_rows_the_ring_writes():
 def test_fused_block_locs_match_locs(dspark):
     """The one-launch block locs equal ``locs`` for a sink row and a sink page."""
     ring = _dspark_ring(9, "cuda") if dspark else _ring(8, 9, "cuda")
+    ring.min_pos[3], ring.min_pos[7] = 8000, 2053
     block = DSPARK_BLOCK if dspark else BLOCK
     req_pool_indices = torch.tensor([3, 7, 1, 0], dtype=torch.int64, device="cuda")
     starts = torch.tensor([9000, 2054, 70, 123457], device="cuda")
@@ -229,6 +230,62 @@ def test_fused_block_locs_match_locs(dspark):
     expected = ring.locs(req_pool_indices.repeat_interleave(block), positions)
     ring._fused_block_locs = True
     assert torch.equal(ring.block_locs(req_pool_indices, positions, block), expected)
+
+
+def test_dspark_window_starts_at_the_floor():
+    """A rebased ring with a prefix floor: the reader's window (window_seq_lens and
+    the block table) covers exactly the positions from max(floor, seq_len - window)
+    on, at the rows the ring writes; prefill's PD rows pair with decode's absolute
+    landing rows, and unstage rotates them to where the decode ring reads them."""
+    ring = _dspark_ring(9, "cpu")
+    req_pool_indices = torch.tensor([3, 7, 1], dtype=torch.int32)
+    seq_lens = torch.tensor([9000, 2054, 3 * ring.rows_per_req + 5])
+    floors = [8300, 1000, 2 * ring.rows_per_req + 77]
+    reqs = [
+        type("R", (), {"rid": f"r{b}", "kv": type("K", (), {"req_pool_idx": int(r)})})()
+        for b, r in enumerate(req_pool_indices.tolist())
+    ]
+    ring.record_floors(reqs, floors)
+    lens = ring.window_seq_lens(req_pool_indices, seq_lens)
+    assert lens.tolist() == [int(n) - f for n, f in zip(seq_lens, floors)]
+    width = int(lens.max() + DSPARK_BLOCK) // PAGE + 2
+    table = torch.full((3, width), -1, dtype=torch.int32)
+    ring.page_table_into(req_pool_indices, table)
+    for b in range(3):
+        req, floor = int(req_pool_indices[b]), floors[b]
+        logical = torch.arange(
+            max(0, int(lens[b]) - DSPARK_WINDOW_LEFT - 1), int(lens[b]) + DSPARK_BLOCK
+        )
+        read = table[b, logical // PAGE].to(torch.int64) * PAGE + logical % PAGE
+        assert torch.equal(
+            read, ring.locs(torch.full_like(logical, req), logical + floor)
+        )
+        assert read.unique().numel() == logical.numel()
+
+    # PD: prefill sends from its floor; decode lands at absolute rows, then rotates.
+    n, req = int(seq_lens[0]), int(req_pool_indices[0])
+    src = torch.from_numpy(ring.transfer_rows(req, n)).long()
+    window = torch.arange(n - DSPARK_WINDOW_LEFT - 1, n)
+    assert torch.equal(src, ring.locs(torch.full_like(window, req), window))
+
+    class _Pool:
+        def __init__(self, rows):
+            self.bufs = [torch.zeros((rows, 2, 8), dtype=torch.int32)]
+
+        def _pd_registerable_tensors(self):
+            return self.bufs
+
+    decode = _dspark_ring(6, "cpu")
+    decode.pool = _Pool(PAGE + 6 * decode.rows_per_req)
+    decode.reset_floor(5, n)
+    dst = torch.from_numpy(decode.transfer_rows(5, n)).long()
+    decode.pool.bufs[0][dst] = window.view(-1, 1, 1).int().expand(-1, 2, 8)
+    decode.min_pos[5] = floors[0]  # prefill's floor row lands
+    decode.mark_unstage(5)
+    decode.flush_unstage()
+    kept = window[window >= floors[0]]
+    got = decode.pool.bufs[0][decode.locs(torch.full_like(kept, 5), kept)]
+    assert torch.equal(got[:, 0, 0].long(), kept)
 
 
 def test_dspark_extend_and_pd_rows():
