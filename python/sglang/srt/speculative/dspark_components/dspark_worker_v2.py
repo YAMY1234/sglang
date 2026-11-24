@@ -467,11 +467,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             self.model_runner.capture_tail_hooks.append(
                 self._verify_epilogue.capture_hook
             )
-            if (
-                envs.SGLANG_OPT_DSV41_SAMPLING_ACCEPT_GRAPH.get()
-                and static_epilogue_supported
-                and is_cuda()
-            ):
+            if static_epilogue_supported and is_cuda():
                 self._sampling_accept_graph = DsparkSamplingAcceptGraph(
                     epilogue=self._verify_epilogue,
                     resolve_draft_sampler=lambda: self._draft_sampler,
