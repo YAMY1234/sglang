@@ -1,7 +1,9 @@
 import unittest
+from unittest import mock
 
 import torch
 
+from sglang.kernels.ops.moe import moe_front
 from sglang.kernels.ops.moe.moe_front import NUM_EXPERTS, TOPK, fused_front
 from sglang.kernels.ops.moe.moe_fused_gate import moe_fused_gate
 from sglang.srt.utils import get_device_sm
@@ -83,6 +85,26 @@ class TestMoeFront(CustomTestCase):
                 merged[:, NUM_EXPERTS:].to(torch.bfloat16),
             )
         )
+
+    def test_vr_epilogue_table_resolves_from_device_name(self):
+        # VR reports "NVIDIA VR NVL72"; its table is built in (no JSON file), so a
+        # broken lookup would fall back to the default silently.
+        with (
+            mock.patch.object(
+                moe_front.torch.cuda, "get_device_name", return_value="NVIDIA VR NVL72"
+            ),
+            mock.patch.dict(moe_front._tables, clear=True),
+        ):
+            picks = {
+                m: moe_front.get_config(
+                    "epilogue", m, 0, moe_front.DEFAULT_EPILOGUE_CONFIG
+                )
+                for m in (384, 447, 448, 1024)
+            }
+        self.assertEqual(picks[384]["block_size"], 448)
+        self.assertEqual(picks[447]["block_size"], 448)
+        self.assertEqual(picks[448]["block_size"], 224)
+        self.assertTrue(picks[1024]["cast_first"])
 
 
 if __name__ == "__main__":

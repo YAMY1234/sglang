@@ -80,6 +80,23 @@ _CONFIG_DIR = os.path.join(os.path.dirname(__file__), "configs", "moe_front")
 # select beat issuing it before almost everywhere.
 DEFAULT_EPILOGUE_CONFIG = {"block_size": 224, "cast_vec": 8, "cast_first": False}
 
+# Tables kept in Python because source overlays ship .py files only; same format as
+# the JSON files, which take precedence. VR: in-block sweep, every config bit-identical.
+_BUILTIN_TABLES = {
+    ("epilogue", "NVIDIA_VR_NVL72"): {
+        **{
+            m: {"block_size": 448, "cast_vec": 8, "cast_first": False}
+            for m in (1, 2, 4, 8, 16, 24, 32, 40, 48, 56, 64, 66, 70, 72, 80, 88)
+            + (94, 96, 104, 112, 120, 128, 140, 160, 192, 224, 256, 320, 384)
+        },
+        **{
+            m: {"block_size": 224, "cast_vec": 8, "cast_first": False}
+            for m in (448, 512, 640, 768, 896)
+        },
+        1024: {"block_size": 224, "cast_vec": 8, "cast_first": True},
+    },
+}
+
 _tables = {}
 
 
@@ -89,7 +106,7 @@ def _table(kind: str, device_name: str):
         f"{kind},E={NUM_EXPERTS},topk={TOPK},device_name={device_name}.json",
     )
     if path not in _tables:
-        table = None
+        table = _BUILTIN_TABLES.get((kind, device_name))
         if os.path.exists(path):
             with open(path) as f:
                 table = {int(k): v for k, v in json.load(f)["configs"].items()}
