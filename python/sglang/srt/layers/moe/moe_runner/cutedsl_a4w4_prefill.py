@@ -8,6 +8,7 @@ GEMM alphas. Tokens and the FC1 output are quantized to NVFP4 with global scale 
 from __future__ import annotations
 
 import logging
+from typing import Optional
 
 import msgspec
 import torch
@@ -19,6 +20,8 @@ _SF_VEC = 16
 _E4M3_POW2_MIN, _E4M3_POW2_MAX = -9, 8
 # CuteDSL's fused gated GEMM1 reads [up, gate] in alternating 64-row groups.
 _W13_INTERLEAVE_ROWS = 64
+# Experts per repack step: at the K3.1 shape the int16 scale temporaries stay under ~100 MB. Arbitrary.
+_REPACK_EXPERT_CHUNK = 64
 
 
 class CuteDslA4W4Weights(msgspec.Struct, frozen=True, kw_only=True):
@@ -74,20 +77,31 @@ def _up_gate_interleave_rows(inter: int, device: torch.device) -> torch.Tensor:
     return torch.where(group % 2 == 0, inter + half_row, half_row)
 
 
-def _mma_sf(sf: torch.Tensor, num_experts: int, m: int, k: int) -> torch.Tensor:
+def _mma_sf(
+    weight: torch.Tensor, scale: torch.Tensor, rows: Optional[torch.Tensor]
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """MXFP4 [E, N, K/2] + UE8M0 [E, N, K/32] -> (E4M3 scales in CuteDSL's MMA layout, global exponent [E]), rows
+    reordered by `rows` if given. Built in expert chunks into one buffer allocated up front: freeing scale-sized
+    temporaries between persistent allocations strands cached segments that the KV pool sizing then cannot use."""
     from flashinfer.cute_dsl.utils import convert_sf_to_mma_layout
 
     from sglang.srt.layers.quantization.utils import swizzle_blockscale
 
-    swizzled = (
-        swizzle_blockscale(sf.view(torch.float8_e4m3fn))
-        .contiguous()
-        .view(torch.uint8)
-        .reshape(-1)
+    e, n, kb = scale.shape
+    if n % 128 or (2 * kb) % 4:
+        raise ValueError(f"scale shape {tuple(scale.shape)} needs swizzle padding")
+    out = torch.empty((e, n, 2 * kb), dtype=torch.uint8, device=scale.device)
+    g = torch.empty(e, dtype=torch.int16, device=scale.device)
+    for s in range(0, e, _REPACK_EXPERT_CHUNK):
+        t = slice(s, s + _REPACK_EXPERT_CHUNK)
+        sf, g[t] = _nvfp4_scales(weight[t], scale[t])
+        if rows is not None:
+            sf = sf.index_select(1, rows)
+        out[t] = swizzle_blockscale(sf.view(torch.float8_e4m3fn)).view(torch.uint8)
+    mma = convert_sf_to_mma_layout(
+        out.view(-1), m=n, k=kb * 32, num_groups=e, sf_vec_size=_SF_VEC
     )
-    return convert_sf_to_mma_layout(
-        swizzled, m=m, k=k, num_groups=num_experts, sf_vec_size=_SF_VEC
-    )
+    return mma, g
 
 
 def prepare_weights(
@@ -106,15 +120,16 @@ def prepare_weights(
         raise ValueError(
             f"unsupported MoE shape: w13 {tuple(w13.shape)}, w2 {tuple(w2.shape)}"
         )
-    sf13, g13 = _nvfp4_scales(w13, s13)
-    sf2, g2 = _nvfp4_scales(w2, s2)
     rows = _up_gate_interleave_rows(inter, w13.device)
+    w13_out = w13.view(torch.uint8).index_select(1, rows)
+    w13_sf, g13 = _mma_sf(w13, s13, rows)
+    w2_sf, g2 = _mma_sf(w2, s2, None)
     return CuteDslA4W4Weights(
-        w13=w13.view(torch.uint8).index_select(1, rows),
-        w13_sf=_mma_sf(sf13.index_select(1, rows), e, two_i, hidden),
+        w13=w13_out,
+        w13_sf=w13_sf,
         w1_alpha=torch.exp2(g13.to(torch.float32)),
         w2=w2.view(torch.uint8).contiguous(),
-        w2_sf=_mma_sf(sf2, e, hidden, inter),
+        w2_sf=w2_sf,
         w2_alpha=torch.exp2(g2.to(torch.float32)),
         unit_scale=torch.ones(1, dtype=torch.float32, device=w13.device),
         hidden=hidden,
