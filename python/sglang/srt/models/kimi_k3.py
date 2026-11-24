@@ -579,11 +579,47 @@ class KimiK3MLP(nn.Module):
         else:
             raise ValueError(f"Unsupported activation: {hidden_act}")
 
+    # (rows lo, rows hi, SMs): gate_up through DeepGEMM bf16_gemm_nt on a capped SM count
+    # (SGLANG_K31_SHARED_GATEUP_DG_SMS, set on the MegaMoE shared experts); None: off.
+    _k31_gate_up_dg = None
+
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        return self.forward_act_down(self.forward_gate_up(hidden_states))
+
+    def forward_gate_up(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        dg = self._k31_gate_up_dg
+        if (
+            dg is not None
+            and dg[0] <= hidden_states.shape[0] <= dg[1]
+            and self.gate_up_proj.weight.dtype == torch.bfloat16
+        ):
+            return _k31_dg_bf16_gemm_on_sms(
+                hidden_states, self.gate_up_proj.weight, dg[2]
+            )
         gate_up, _ = self.gate_up_proj(hidden_states)
+        return gate_up
+
+    def forward_act_down(self, gate_up: torch.Tensor) -> torch.Tensor:
         hidden_states = self.act_fn(gate_up)
         hidden_states, _ = self.down_proj(hidden_states)
         return hidden_states
+
+
+def _k31_dg_bf16_gemm_on_sms(
+    x: torch.Tensor, weight: torch.Tensor, num_sms: int
+) -> torch.Tensor:
+    """x @ weight.T (bf16) by DeepGEMM's persistent bf16_gemm_nt on at most num_sms SMs, so
+    it fits beside the router GEMM in one wave instead of queueing a second one."""
+    import deep_gemm
+
+    out = x.new_empty((x.shape[0], weight.shape[0]))
+    prev = deep_gemm.get_num_sms()
+    deep_gemm.set_num_sms(min(num_sms - num_sms % 2, prev))
+    try:
+        deep_gemm.bf16_gemm_nt(x.contiguous(), weight, out)
+    finally:
+        deep_gemm.set_num_sms(prev)
+    return out
 
 
 def _add3(
@@ -1031,6 +1067,9 @@ class KimiK3MoE(nn.Module):
             # The full TP group, which _reduce_shared sums over, whatever the
             # dense MLP's sharding.
             shared_experts_parallel_group = "tp"
+        self._k31_shared_tail_after_predispatch = (
+            envs.SGLANG_K31_SHARED_TAIL_AFTER_PREDISPATCH.get()
+        )
         if self.num_shared_experts is not None and self.num_shared_experts > 0:
             shared_intermediate_size = moe_intermediate_size * self.num_shared_experts
             if shared_tp is not None and shared_intermediate_size % shared_tp != 0:
@@ -1048,6 +1087,10 @@ class KimiK3MoE(nn.Module):
                 activation_situ_linear_beta=config.activation_situ_linear_beta,
                 parallel_group=shared_experts_parallel_group,
             )
+            dg_sms = envs.SGLANG_K31_SHARED_GATEUP_DG_SMS.get()
+            if dg_sms > 0 and _K31MoEStart.mode() and self._shared_experts_tp1:
+                rows = envs.SGLANG_K31_SHARED_GATEUP_DG_ROWS.get().split("-")
+                self.shared_experts._k31_gate_up_dg = (int(rows[0]), int(rows[1]), dg_sms)
         else:
             self.shared_experts = None
 
@@ -1652,13 +1695,22 @@ class KimiK3MoE(nn.Module):
         #   alt:     all-gather ----- shared MLP -------- reduce-scatter
         fine_grained_overlap = self._can_overlap_shared_experts_npu(hidden_states)
         k31_start = self._k31_moe_start_mode(hidden_states, fine_grained_overlap)
+        # Shared act + down_proj queue behind mega_moe_pre_dispatch, so a gate_up that
+        # finishes early cannot hand them the SMs MegaMoE is about to need.
+        split_tail = (
+            self._k31_shared_tail_after_predispatch
+            and "early" in k31_start
+            and self._sbo_shared_overlap
+            and not self._shared_experts_tp_comm
+        )
         shared_input = None
+        shared_gate_up = None
         shared_output = None
         shared_event = None
         shared_compute_event = None
 
         def issue_shared():
-            nonlocal shared_input, shared_output, shared_event
+            nonlocal shared_input, shared_gate_up, shared_output, shared_event
             if self.shared_experts is None or hidden_states.shape[0] == 0:
                 return
             if fine_grained_overlap:
@@ -1680,10 +1732,25 @@ class KimiK3MoE(nn.Module):
                 shared_input.record_stream(self.alt_stream)
                 self.alt_stream.wait_stream(current_stream)
                 with torch.cuda.stream(self.alt_stream):
-                    shared_output = self.shared_experts(shared_input)
-                    shared_event = self.alt_stream.record_event()
+                    if split_tail:
+                        shared_gate_up = self.shared_experts.forward_gate_up(
+                            shared_input
+                        )
+                    else:
+                        shared_output = self.shared_experts(shared_input)
+                        shared_event = self.alt_stream.record_event()
             else:
                 shared_output = self._forward_shared_experts(hidden_states)
+
+        def issue_shared_tail():
+            nonlocal shared_output, shared_event
+            if shared_gate_up is None:
+                return
+            # Called on the routed stream right after mega_moe_pre_dispatch is queued.
+            self.alt_stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(self.alt_stream):
+                shared_output = self.shared_experts.forward_act_down(shared_gate_up)
+                shared_event = self.alt_stream.record_event()
 
         def run_experts(expert_input, topk_output, after_pre_dispatch=None):
             if not fine_grained_overlap:
@@ -1825,7 +1892,11 @@ class KimiK3MoE(nn.Module):
             expert_output = run_experts(
                 routed_input,
                 topk_output,
-                after_pre_dispatch=issue_shared if "order" in k31_start else None,
+                after_pre_dispatch=(
+                    issue_shared
+                    if "order" in k31_start
+                    else issue_shared_tail if split_tail else None
+                ),
             )
             if expert_output.shape[0] == 0:
                 # The EP combine returns one row per source token.  Keep the
