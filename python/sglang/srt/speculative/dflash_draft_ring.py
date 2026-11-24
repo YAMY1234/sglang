@@ -212,6 +212,17 @@ class DraftKVRingStaging:
         )
 
 
+# ``unstage`` copies through one fixed buffer of at most this many bytes (rows x this
+# rank's heads), allocated with the staging ring, so a burst of landed requests (a
+# window opening) needs no memory proportional to its size.
+UNSTAGE_CHUNK_BYTES = 128 << 20
+
+
+def _as_bytes(t: torch.Tensor) -> torch.Tensor:
+    # index_select / index_copy_ on 1-byte (fp8) KV through a uint8 view.
+    return t.view(torch.uint8) if t.element_size() == 1 else t
+
+
 class DFlashDraftKVRing:
     def __init__(
         self,
@@ -245,7 +256,10 @@ class DFlashDraftKVRing:
             )
         # A head-sharded ring's staging ring and this rank's head columns in it.
         self.staging = None
-        self._pending_unstage: deque = deque()
+        # Requests to unstage, by req pool row (a row reused before its unstage keeps
+        # one entry: the copy then takes its newest rows).
+        self._pending_unstage: Dict[int, None] = {}
+        self._unstage = None
         # Staging slots (attach_staging(slots=...)): request -> slot from its decode
         # preallocation to its unstage; a slot frees once its unstage copy has run.
         self._staging_slots = 0
@@ -404,6 +418,27 @@ class DFlashDraftKVRing:
         self.staging = (staging_pool, head_start, num_heads)
         self._staging_slots = slots
         self._free_slots = deque(range(slots))
+        self._unstage_buffers(self.pool._pd_registerable_tensors()[0], num_heads)
+
+    def _unstage_buffers(self, like: torch.Tensor, num_heads: int):
+        """The fixed unstage copy buffer and its row-index buffers."""
+        if self._unstage is None:
+            like = _as_bytes(like)
+            width = like.shape[2]
+            per_req = self.rows_per_req * num_heads * width * like.element_size()
+            reqs = max(1, UNSTAGE_CHUNK_BYTES // per_req)
+            dev = like.device
+            self._unstage = (
+                torch.empty(
+                    (reqs * self.rows_per_req, num_heads, width),
+                    dtype=like.dtype,
+                    device=dev,
+                ),
+                torch.empty((reqs, self.rows_per_req), dtype=torch.int64, device=dev),
+                torch.empty((reqs, self.rows_per_req), dtype=torch.int64, device=dev),
+                torch.arange(self.rows_per_req, dtype=torch.int64, device=dev),
+            )
+        return self._unstage
 
     def staging_slot_free(self) -> bool:
         """Whether a decode preallocation can take a staging slot now."""
@@ -424,53 +459,70 @@ class DFlashDraftKVRing:
         positions of a rebased ring); copy them into place before its first draft
         step (``flush_unstage``, on the forward stream)."""
         if self.staging is not None or self.rebased:
-            self._pending_unstage.append(int(req_pool_idx))
+            self._pending_unstage[int(req_pool_idx)] = None
 
     def flush_unstage(self) -> None:
-        reqs = []
-        while self._pending_unstage:
-            reqs.append(self._pending_unstage.popleft())
+        if not self._pending_unstage:
+            return
+        reqs = list(self._pending_unstage)
+        self._pending_unstage.clear()
         if self._staging_slots:
             # A request that left before its unstage has no slot (and no rows).
             reqs = [r for r in reqs if r in self._slot_of]
-        if not reqs:
-            return
-        device = self.min_pos.device
-        req = torch.tensor(reqs, dtype=torch.int64).to(device, non_blocking=True)
-        first = self.sink_rows + req.unsqueeze(1) * self.rows_per_req
-        cols = torch.arange(self.rows_per_req, device=device, dtype=torch.int64)
-        rows = (first + cols).reshape(-1)
-        src_rows = rows
-        if self._staging_slots:
-            slots = [self._slot_of.pop(r) for r in reqs]
-            slot = torch.tensor(slots, dtype=torch.int64).to(device, non_blocking=True)
-            src_rows = (
-                self.sink_rows + slot.unsqueeze(1) * self.rows_per_req + cols
-            ).reshape(-1)
-        dst_rows = rows
-        if self.rebased:
-            # Row j holds a position p = j mod rows_per_req; it belongs at p - floor.
-            dst_rows = (
-                first
-                + torch.remainder(
-                    cols - self.min_pos[req].unsqueeze(1), self.rows_per_req
-                )
-            ).reshape(-1)
+            if not reqs:
+                return
         dsts = self.pool._pd_registerable_tensors()
         if self.staging is None:
-            srcs, heads = dsts, slice(None)
+            srcs, head_start, num_heads = dsts, 0, dsts[0].shape[1]
         else:
             staging_pool, head_start, num_heads = self.staging
             srcs = staging_pool.ring_buffers()
-            heads = slice(head_start, head_start + num_heads)
-        for src, dst in zip(srcs, dsts):
-            # The gather copies first, so an in-place rotation reads unrotated rows.
-            dst[dst_rows] = src[src_rows][:, heads]
+        buf, src_idx, dst_idx, cols = self._unstage_buffers(dsts[0], num_heads)
+        chunk = src_idx.shape[0]
+        device = self.min_pos.device
+        released = []
+        for c0 in range(0, len(reqs), chunk):
+            part = reqs[c0 : c0 + chunk]
+            n, rows = len(part), len(part) * self.rows_per_req
+            req = torch.tensor(part, dtype=torch.int64).to(device, non_blocking=True)
+            block = req
+            if self._staging_slots:
+                slots = [self._slot_of.pop(r) for r in part]
+                released += slots
+                block = torch.tensor(slots, dtype=torch.int64).to(
+                    device, non_blocking=True
+                )
+            src = src_idx[:n]
+            torch.add(
+                (self.sink_rows + block * self.rows_per_req).unsqueeze(1), cols, out=src
+            )
+            dst = dst_idx[:n]
+            if self.rebased:
+                # Row j holds a position p = j mod rows_per_req; it belongs at p - floor.
+                torch.sub(cols, self.min_pos[req].unsqueeze(1), out=dst)
+                dst.remainder_(self.rows_per_req)
+                dst.add_((self.sink_rows + req * self.rows_per_req).unsqueeze(1))
+            else:
+                torch.add(
+                    (self.sink_rows + req * self.rows_per_req).unsqueeze(1),
+                    cols,
+                    out=dst,
+                )
+            for src_buf, dst_buf in zip(srcs, dsts):
+                # This rank's heads only, through the fixed buffer; the chunk is read
+                # whole before it is written, so an in-place rotation reads unrotated rows.
+                torch.index_select(
+                    _as_bytes(src_buf).narrow(1, head_start, num_heads),
+                    0,
+                    src.view(-1),
+                    out=buf[:rows],
+                )
+                _as_bytes(dst_buf).index_copy_(0, dst.view(-1), buf[:rows])
         if self._staging_slots:
             # A slot takes new PD rows only after this copy has read it.
             done = torch.cuda.Event()
             done.record()
-            self._releasing.append((done, slots))
+            self._releasing.append((done, released))
 
     def reset_floor(self, req_pool_idx: int, seq_len: int) -> None:
         """PD decode, at preallocation: no draft context until prefill's floor
