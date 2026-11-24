@@ -243,6 +243,8 @@ class DFlashDraftKVRing:
             self.min_pos = torch.zeros(req_pool_rows, dtype=torch.int32, device=device)
         self._floor_rids: Dict[int, str] = {}
         self._fused_block_locs = envs.SGLANG_OPT_DFLASH_RING_LOCS_FUSED.get()
+        # page_table_into's per-column ring pages, by table (width, dtype).
+        self._page_cols: Dict[Tuple[int, torch.dtype], torch.Tensor] = {}
 
     def locs(
         self, req_pool_indices: torch.Tensor, positions: torch.Tensor
@@ -260,7 +262,7 @@ class DFlashDraftKVRing:
         self, req_pool_indices: torch.Tensor, positions: torch.Tensor, block_size: int
     ) -> torch.Tensor:
         """Ring locs of a draft block: ``block_size`` positions per request."""
-        if not self._fused_block_locs or self.sink_rows != 1:
+        if not self._fused_block_locs:
             return self.locs(req_pool_indices.repeat_interleave(block_size), positions)
 
         return dflash_ring_block_locs(
@@ -269,6 +271,7 @@ class DFlashDraftKVRing:
             block_size=block_size,
             rows_per_req=self.rows_per_req,
             dcp_size=self.dcp_size,
+            sink_rows=self.sink_rows,
         )
 
     def extend_locs(
@@ -335,15 +338,19 @@ class DFlashDraftKVRing:
         and the window, which never span more than ``pages_per_req`` pages."""
         pages_per_req = self.rows_per_req // self.page_size
         bs = req_pool_indices.shape[0]
-        cols = torch.remainder(
-            torch.arange(out.shape[1], device=out.device, dtype=torch.int64),
-            pages_per_req,
+        key = (out.shape[1], out.dtype)
+        cols = self._page_cols.get(key)
+        if cols is None:
+            cols = self._page_cols[key] = (
+                self.sink_rows // self.page_size
+                + torch.arange(out.shape[1], device=out.device) % pages_per_req
+            ).to(out.dtype)
+        torch.add(
+            cols,
+            req_pool_indices.to(device=out.device, dtype=out.dtype).unsqueeze(1),
+            alpha=pages_per_req,
+            out=out[:bs],
         )
-        base = (
-            self.sink_rows // self.page_size
-            + req_pool_indices.to(device=out.device, dtype=torch.int64) * pages_per_req
-        )
-        out[:bs].copy_(base.unsqueeze(1) + cols.unsqueeze(0))
 
     def attach_staging(self, staging_pool, head_start: int, num_heads: int) -> None:
         """Receive PD rows (every head) into ``staging_pool``, a ring of the same

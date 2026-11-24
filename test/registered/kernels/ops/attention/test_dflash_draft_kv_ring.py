@@ -212,6 +212,23 @@ def test_dspark_page_table_reads_the_rows_the_ring_writes():
         req_pool_rows=9, rows_per_req=ring.rows_per_req, page_size=PAGE, sink_rows=PAGE
     )
     assert pool_rows == PAGE + 9 * ring.rows_per_req
+    # A second batch reuses the cached columns.
+    table2 = torch.full((2, width), -1, dtype=torch.int32)
+    ring.page_table_into(req_pool_indices[2:], table2)
+    assert torch.equal(table2, table[2:])
+
+
+@pytest.mark.parametrize("dspark", [False, True])
+def test_fused_block_locs_match_locs(dspark):
+    """The one-launch block locs equal ``locs`` for a sink row and a sink page."""
+    ring = _dspark_ring(9, "cuda") if dspark else _ring(8, 9, "cuda")
+    block = DSPARK_BLOCK if dspark else BLOCK
+    req_pool_indices = torch.tensor([3, 7, 1, 0], dtype=torch.int64, device="cuda")
+    starts = torch.tensor([9000, 2054, 70, 123457], device="cuda")
+    positions = (starts.unsqueeze(1) + torch.arange(block, device="cuda")).reshape(-1)
+    expected = ring.locs(req_pool_indices.repeat_interleave(block), positions)
+    ring._fused_block_locs = True
+    assert torch.equal(ring.block_locs(req_pool_indices, positions, block), expected)
 
 
 def test_dspark_extend_and_pd_rows():
