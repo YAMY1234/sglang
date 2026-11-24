@@ -621,6 +621,14 @@ class DraftBlockProposer:
             self.draft_model_runner.kv_index_translator,
             cols=slice(0, query_token_num),
         )
+        ring = self.draft_model_runner.draft_kv_ring
+        if ring is not None:
+            # The block's draft KV goes to its ring rows, read back by the ring's
+            # page table (trtllm_mha), not by the target slots bind wrote.
+            draft_forward_batch.out_cache_loc = ring.block_locs(
+                batch.req_pool_indices, draft_positions, query_token_num
+            )
+            draft_forward_batch.out_cache_loc_virtual = None
         self._fill_dp_moe_sync_metadata(draft_forward_batch, batch)
         graph_runner = self.draft_model_runner.decode_cuda_graph_runner
         runs_graph = graph_runner is not None and graph_runner.can_run_graph(
