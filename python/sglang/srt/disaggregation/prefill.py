@@ -1843,7 +1843,8 @@ class SchedulerDisaggregationPrefillMixin:
         first token (see _pp_pd_early_send_last_chunks).
         """
         if last_chunk and envs.SGLANG_DEBUG_K31_IDXK_PD_DUMP_DIR.get():
-            maybe_dump_index_k(self, [req], "prefill")  # syncs: an early send runs before the forward ends
+            # it syncs the device: an early send runs before the forward ends
+            maybe_dump_index_k(self, [req], "prefill")
         page_size = self.token_to_kv_pool_allocator.page_size
         start_idx = req.start_send_idx
         transfer_input_len = len(req.origin_input_ids)
