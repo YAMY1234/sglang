@@ -589,6 +589,10 @@ class Envs:
     # Static verify graphs stage the draft context-KV commit; the next draft graph
     # writes it on a side stream forked at its head, joined at its first KV store.
     SGLANG_DSPARK_DEFER_CONTEXT_KV = EnvBool(False)
+    # Keep an all-sliding-window GQA DSpark draft's KV in a per-request, page-aligned
+    # ring of window + verify-block rows instead of one row per target slot. Off by
+    # default; resolved at startup, and an unsupported draft or backend raises.
+    SGLANG_DSPARK_DRAFT_KV_RING = EnvBool(False)
     # DSpark draft graph: its in-graph attention-metadata prep runs on a side stream
     # and joins at the first draft KV store, overlapping the embedding.
     SGLANG_OPT_DSV41_DSPARK_DRAFT_PREP_FORK = EnvBool(False)

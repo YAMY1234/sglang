@@ -46,12 +46,30 @@ class TargetHiddenKvInjector:
         self.device = device
         self.verify_num_draft_tokens = verify_num_draft_tokens
         self._block_pos_offsets = block_pos_offsets
+        # A draft KV ring (SGLANG_DSPARK_DRAFT_KV_RING) addresses rows by
+        # (req, pos), not by target slot.
+        self.draft_kv_ring = None
 
     @property
     def swa_ring_size(self) -> Optional[int]:
         """The ring length when the draft's SWA KV is a per-request ring."""
         return getattr(
             self.draft_model_runner.token_to_kv_pool, "swa_req_ring_size", None
+        )
+
+    def ring_locs(
+        self,
+        cache_loc: torch.Tensor,
+        *,
+        req_pool_indices: torch.Tensor,
+        positions: torch.Tensor,
+        stride: int,
+    ) -> torch.Tensor:
+        """``cache_loc`` (``stride`` tokens per request), or its draft KV ring rows."""
+        if self.draft_kv_ring is None:
+            return cache_loc
+        return self.draft_kv_ring.block_locs(req_pool_indices, positions, stride).to(
+            cache_loc.dtype
         )
 
     def ids_for(self, plan: KVLocPlan, *, cols: Optional[Cols] = None) -> torch.Tensor:
@@ -100,6 +118,15 @@ class TargetHiddenKvInjector:
                 repeats,
                 output_size=num_tokens,
             )
+        if self.draft_kv_ring is not None:
+            # A chunk keeps ring rows only for the positions a later window reads.
+            cache_loc = self.draft_kv_ring.extend_locs(
+                req_pool_indices=batch.req_pool_indices,
+                positions=positions,
+                extend_lens=ctx_lens,
+                seq_ends=draft_seq_lens + ctx_lens,
+            )
+            return PrefillPlacement(cache_loc, positions, None, None, None)
         # The draft KV goes to the slots the target prefill writes.
         cache_loc = self.ids_for(self.model_runner.kv_index_translator.own_plan(batch))
         pool = self.draft_model_runner.token_to_kv_pool
@@ -398,7 +425,12 @@ class TargetHiddenKvInjector:
             return
 
         positions_2d = prefix_lens.unsqueeze(1) + self._block_pos_offsets
-        verify_cache_loc = self.ids_for(kv_loc_plan)
+        verify_cache_loc = self.ring_locs(
+            self.ids_for(kv_loc_plan),
+            req_pool_indices=batch.req_pool_indices[:bs],
+            positions=positions_2d.reshape(-1),
+            stride=stride,
+        )
         verify_cache_loc_2d = verify_cache_loc.view(bs, stride)
         self.inject_target_hidden(
             target_hidden=hidden.reshape(-1, hidden.shape[-1]),

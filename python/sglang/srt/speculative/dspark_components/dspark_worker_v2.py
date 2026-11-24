@@ -31,7 +31,20 @@ from sglang.srt.runtime_context import (
     mamba_track_grid,
 )
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
+from sglang.srt.speculative.base_spec_worker import (
+    BaseSpecWorker,
+    HiCacheDraftPlan,
+)
+from sglang.srt.speculative.dflash_draft_ring import (
+    DFlashDraftKVRing,
+    DraftKVRingStaging,
+    draft_kv_ring_geometry,
+    draft_kv_ring_pool_rows,
+    draft_kv_ring_window_left,
+    dspark_draft_kv_ring_enabled,
+    dspark_draft_kv_ring_unsupported_reason,
+    set_draft_kv_ring,
+)
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.dp_spec_prefill_coordination import (
     DPSpecPrefillCoordinationPlan,
@@ -171,6 +184,12 @@ class DSparkWorkerV2(BaseSpecWorker):
     def weight_update_runners(self) -> list[tuple[str, "ModelRunner"]]:
         return [("draft", self.draft_model_runner)] if self._hosts_draft else []
 
+    def _build_hicache_draft_plan(self) -> HiCacheDraftPlan:
+        # A ring holds no prefix: a cached prefix brings no draft KV back.
+        if dspark_draft_kv_ring_enabled():
+            return HiCacheDraftPlan()
+        return super()._build_hicache_draft_plan()
+
     def __init__(
         self,
         server_args: ServerArgs,
@@ -189,6 +208,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         self.page_size = get_schedule().page_size
         self.device = target_worker.device
         self._draft_worker = None
+        self.draft_kv_ring: Optional[DFlashDraftKVRing] = None
         self.enable_dp_spec_prefill_coordination = (
             envs.SGLANG_ENABLE_DP_SPEC_PREFILL_COORDINATION.get()
         )
@@ -241,6 +261,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         self._draft_worker = bundle.draft_worker
         self.draft_model_runner = bundle.draft_model_runner
         self.draft_model = bundle.draft_model
+        self._draft_attention_backend = bundle.resolved_attention_backend
         self._draft_sampler = None
 
         # The mask token is input-only (it is embedded, never sampled), so its
@@ -555,6 +576,93 @@ class DSparkWorkerV2(BaseSpecWorker):
             req_to_token_pool=req_to_token_pool,
             token_to_kv_pool_allocator=token_to_kv_pool_allocator,
         )
+        if dspark_draft_kv_ring_enabled():
+            with self._draft_context():
+                self._init_draft_kv_ring()
+
+    def _init_draft_kv_ring(self) -> None:
+        reason = dspark_draft_kv_ring_unsupported_reason(
+            self.draft_model_runner.model_config.hf_config,
+            draft_backend=self._draft_attention_backend,
+        )
+        if reason is not None:
+            raise ValueError(f"SGLANG_DSPARK_DRAFT_KV_RING=1, but {reason}.")
+        pool = self.draft_model_runner.token_to_kv_pool
+        buffers = pool._pd_registerable_tensors()
+        if any(b.dim() != 3 for b in buffers):
+            raise ValueError(
+                "SGLANG_DSPARK_DRAFT_KV_RING needs [rows, heads, head_dim] draft "
+                f"KV buffers, got {[tuple(b.shape) for b in buffers[:1]]}."
+            )
+        page_size = pool.page_size
+        req_pool_rows = self.model_runner.req_to_token_pool.req_to_token.shape[0]
+        rows_per_req, sink_rows = draft_kv_ring_geometry(
+            self.model_runner.spec_algorithm,
+            self.draft_model_runner.model_config.hf_config,
+            block_size=int(get_spec().speculative_num_draft_tokens),
+            dcp_size=1,
+            page_size=page_size,
+        )
+        pool_rows = draft_kv_ring_pool_rows(
+            req_pool_rows=req_pool_rows,
+            rows_per_req=rows_per_req,
+            page_size=page_size,
+            sink_rows=sink_rows,
+        )
+        if buffers[0].shape[0] < pool_rows:
+            raise ValueError(
+                f"DSpark draft KV ring needs {pool_rows} pool rows, the draft pool "
+                f"has {buffers[0].shape[0]}."
+            )
+        mem_pool = pool.maybe_get_custom_mem_pool()
+        ring = DFlashDraftKVRing(
+            rows_per_req=rows_per_req,
+            dcp_size=1,
+            req_pool_rows=req_pool_rows,
+            device=self.device,
+            window_left=draft_kv_ring_window_left(
+                self.draft_model_runner.model_config.hf_config
+            ),
+            pool=pool,
+            mem_pool=mem_pool,
+            sink_rows=sink_rows,
+            page_size=page_size,
+        )
+        # A head-sharded decode draft lands a TP-1 prefill's whole rows in a staging
+        # ring and copies its heads before the request's first draft step.
+        total_heads = self.draft_model_runner.model_config.get_total_num_kv_heads()
+        local_heads = buffers[0].shape[1]
+        if get_disagg().disaggregation_mode == "decode" and local_heads < total_heads:
+            parallel = get_parallel()
+            if local_heads * parallel.attn_tp_size != total_heads:
+                raise ValueError(
+                    "DSpark draft KV ring staging needs evenly sharded KV heads: "
+                    f"{local_heads} x attn_tp {parallel.attn_tp_size} != {total_heads}."
+                )
+            ring.attach_staging(
+                DraftKVRingStaging(
+                    pool=pool,
+                    num_rows=pool_rows,
+                    total_kv_heads=total_heads,
+                    mem_pool=mem_pool,
+                ),
+                head_start=parallel.attn_tp_rank * local_heads,
+                num_heads=local_heads,
+            )
+        self.draft_kv_ring = ring
+        self.draft_model_runner.draft_kv_ring = ring
+        self._kv_injector.draft_kv_ring = ring
+        set_draft_kv_ring(ring)
+        if self._target_tp_rank == 0:
+            logger.info(
+                "DSpark draft KV ring: %d rows per request (%d pages), %d req pool "
+                "rows, %d pool rows, staging %s.",
+                rows_per_req,
+                rows_per_req // page_size,
+                req_pool_rows,
+                pool_rows,
+                "on" if ring.staging is not None else "off",
+            )
 
     def init_attention_backends(self):
         if not self._hosts_draft:
@@ -624,6 +732,12 @@ class DSparkWorkerV2(BaseSpecWorker):
         """SGLANG_DSPARK_DEFER_CONTEXT_KV: only where nothing moves or reads draft KV
         between a verify and the next draft forward but this worker's forwards."""
         if not envs.SGLANG_DSPARK_DEFER_CONTEXT_KV.get():
+            return False
+        if dspark_draft_kv_ring_enabled():
+            logger.warning(
+                "SGLANG_DSPARK_DEFER_CONTEXT_KV refused: the draft KV ring commits "
+                "in the verify graph."
+            )
             return False
         from sglang.srt.layers.attention.dsv4.unified_kv_gate import (
             is_unified_kv_triton,
@@ -820,6 +934,8 @@ class DSparkWorkerV2(BaseSpecWorker):
         commit = self._deferred_commit()
         if commit is not None:
             commit.flush()
+        if self.draft_kv_ring is not None:
+            self.draft_kv_ring.record_floors(batch.reqs, batch.prefix_lens)
         # Placing the draft KV reads scheduler-shared tables, which prefill
         # read-done releases once the target forward's own reads end.
         placement = self._kv_injector.place_prefill(batch)
@@ -1007,6 +1123,9 @@ class DSparkWorkerV2(BaseSpecWorker):
         batch.seq_lens.record_stream(
             torch.get_device_module(self.device).current_stream()
         )
+        if self.draft_kv_ring is not None:
+            # PD rows that landed in the staging ring, before any draft reads them.
+            self.draft_kv_ring.flush_unstage()
         bs = len(batch.seq_lens)
         device = self.device
         prefix_lens = batch.seq_lens

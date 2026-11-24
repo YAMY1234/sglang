@@ -251,6 +251,8 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         self.q_data_type = model_runner.dtype
         self.page_size = model_runner.page_size
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
+        # A draft runner's KV ring (set after the pools, before any forward).
+        self._ring_runner = model_runner
         self.device = model_runner.device
 
         # XQA (SM90/SM120) consumes the legacy linear NVFP4 scale layout and
@@ -592,6 +594,10 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         buffer width use the static ``max_num_pages`` upper bound while the actual
         writes stay bounded by ``cache_seqlens`` — no host-side max / D2H sync.
         """
+        ring = self._draft_kv_ring
+        if ring is not None:
+            ring.page_table_into(req_pool_indices, metadata.page_table)
+            return
         has_swa = self._swa_kv_pool is not None
         build_trtllm_mha_page_table(
             req_to_token=self.req_to_token,
@@ -604,6 +610,11 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 self._swa_kv_pool.full_to_swa_index_mapping if has_swa else None
             ),
         )
+
+    @property
+    def _draft_kv_ring(self):
+        """A draft KV ring's page table replaces `req_to_token` for this runner."""
+        return getattr(self._ring_runner, "draft_kv_ring", None)
 
     def _get_layer_cache_loc(
         self,
@@ -1034,7 +1045,10 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         # bounds real KV reads by cache_seqlens, so this is a fixed loop
         # bound only — never a host max / seq_lens_cpu D2H sync.
         max_seq_pages = self.max_num_pages
-        unified = self.kv_index_translator.is_translating
+        # A ring's page table is refilled out of graph (init_forward_metadata_out_graph).
+        unified = (
+            self.kv_index_translator.is_translating or self._draft_kv_ring is not None
+        )
         update_trtllm_mha_graph_metadata(
             req_pool_indices=req_pool_indices,
             seq_lens=seq_lens,
@@ -1047,9 +1061,17 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             max_seq_pages=max_seq_pages,
             page_size=self.page_size,
             swa_mapping=self._swa_full_to_swa_mapping,
-            swa_page_table=None if unified else metadata.swa_page_table,
+            swa_page_table=(
+                None
+                if self.kv_index_translator.is_translating
+                else metadata.swa_page_table
+            ),
             out_cache_loc=out_cache_loc,
-            swa_out_cache_loc=None if unified else metadata.swa_out_cache_loc,
+            swa_out_cache_loc=(
+                None
+                if self.kv_index_translator.is_translating
+                else metadata.swa_out_cache_loc
+            ),
             cu_seqlens_q=cu_seqlens_q,
             qlens=qlens,
             q_stride=q_stride,
@@ -1160,6 +1182,14 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         else:
             raise ValueError(
                 f"Invalid forward mode: {forward_mode=} for CUDA Graph replay."
+            )
+
+        ring = self._draft_kv_ring
+        if ring is not None:
+            # Like a unified pool's table: written here on capture and on every
+            # replay-prep; the recorded metadata kernel skips its page-table writes.
+            ring.page_table_into(
+                forward_batch.req_pool_indices[:bs], self.forward_metadata.page_table
             )
 
         if self.kv_index_translator.is_translating:
