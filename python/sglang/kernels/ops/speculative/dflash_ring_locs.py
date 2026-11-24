@@ -1,4 +1,4 @@
-"""A DFLASH draft block's KV ring locs in one launch, bitwise equal to
+"""A draft block's KV ring locs in one launch, bitwise equal to
 ``DFlashDraftKVRing.locs(req_pool_indices.repeat_interleave(block_size), positions)``."""
 
 import torch
@@ -17,6 +17,7 @@ def _dflash_ring_block_locs_kernel(
     block_size,
     rows_per_req,
     dcp_size,
+    sink_rows,
     BLOCK: tl.constexpr,
 ):
     offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
@@ -36,7 +37,7 @@ def _dflash_ring_block_locs_kernel(
     r = tl.where(r < 0, r + dcp_size, r)
     row = q % rows_per_req
     row = tl.where(row < 0, row + rows_per_req, row)
-    local = 1 + req * rows_per_req + row
+    local = sink_rows + req * rows_per_req + row
     tl.store(out_ptr + offs, local * dcp_size + r, mask=mask)
 
 
@@ -47,6 +48,7 @@ def dflash_ring_block_locs(
     block_size: int,
     rows_per_req: int,
     dcp_size: int,
+    sink_rows: int = 1,
 ) -> torch.Tensor:
     """Ring locs (int64 [num_tokens]) of ``positions``, ``block_size`` per request of
     ``req_pool_indices`` in order."""
@@ -74,6 +76,7 @@ def dflash_ring_block_locs(
         int(block_size),
         int(rows_per_req),
         int(dcp_size),
+        int(sink_rows),
         BLOCK=block,
         num_warps=1 if block <= 128 else 4,
     )
