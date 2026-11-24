@@ -906,7 +906,8 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
             return mega_moe._mega_moe_decode_block_m(num_tokens=num_tokens, **args)
 
         with patch.dict(sys.modules, {"deep_gemm": self.deep_gemm}):
-            self.assertEqual(pick(150), (96, 16))
+            with envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_DECODE_BLOCK_M_LARGE.override(0):
+                self.assertEqual(pick(150), (96, 16))
             for large, tiles in ((128, (128, 32)), (192, (192, 48))):
                 with envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_DECODE_BLOCK_M_LARGE.override(
                     large
