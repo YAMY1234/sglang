@@ -327,6 +327,31 @@ class TestKdaVerifyPendingFold(CustomTestCase):
                             torch.equal(x, y), f"step {step} tensor {i} differs"
                         )
 
+    def test_split_setup_matches_fused(self):
+        """SGLANG_OPT_KDA_VERIFY_SPLIT_P1: the setup as its own launch must leave
+        outputs, rings, conv scratch and states bit-identical to the fused verify."""
+        from sglang.srt.environ import envs
+
+        for num_requests, pending_mode in ((58, True), (77, True), (58, False)):
+            with (
+                self.subTest(num_requests=num_requests, pending_mode=pending_mode),
+                envs.SGLANG_OPT_KDA_REPLAYSSM_FAST_FOLD.override(True),
+            ):
+                cfg = dict(
+                    num_requests=num_requests,
+                    num_heads=24,
+                    num_layers=3,
+                    pending_mode=pending_mode,
+                )
+                fused = self._run(**cfg)
+                with envs.SGLANG_OPT_KDA_VERIFY_SPLIT_P1.override(True):
+                    split = self._run(**cfg)
+                for step, (a, b) in enumerate(zip(fused, split)):
+                    for i, (x, y) in enumerate(zip(a, b)):
+                        self.assertTrue(
+                            torch.equal(x, y), f"step {step} tensor {i} differs"
+                        )
+
 
 if __name__ == "__main__":
     unittest.main()

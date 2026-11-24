@@ -2031,6 +2031,9 @@ class Envs:
     # KDA ReplaySSM spec commit: record the accepted ring rows per slot and fold
     # them inside the next P1_HOIST verify (bit-identical); off by default.
     SGLANG_OPT_KDA_PENDING_FOLD = EnvBool(False)
+    # KDA CuTe verify (narrow block): run its setup (conv, gates, norms, ring
+    # writes) as a separate higher-occupancy launch (bit-identical); off by default.
+    SGLANG_OPT_KDA_VERIFY_SPLIT_P1 = EnvBool(False)
     SGLANG_ENABLE_LILICORR_SAMPLING = EnvBool(False)
     SGLANG_LILICORR_REQUIRE_SAMPLING = EnvBool(False)
     SGLANG_RAGGED_VERIFY_MODE = EnvStr("static")
