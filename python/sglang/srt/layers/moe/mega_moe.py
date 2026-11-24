@@ -103,6 +103,9 @@ def _configure_mega_moe_deep_gemm_num_sms(deep_gemm):
 # DeepGEMM's BLOCK_M -> (BLOCK_M, store BLOCK_M) for decode-graph calls (decode block-M tiers from
 # sgl-project/sglang pull request #46593).
 _MEGA_MOE_DECODE_BLOCK_M = {16: (64, 16), 32: (64, 16), 64: (96, 16)}
+# SGLANG_OPT_DEEPGEMM_MEGA_MOE_DECODE_BLOCK_M_LARGE -> (BLOCK_M, store BLOCK_M); the store
+# block must divide BLOCK_M / 2 (DeepGEMM's own picks for these tiles).
+_MEGA_MOE_DECODE_BLOCK_M_LARGE = {128: (128, 32), 192: (192, 48)}
 
 
 @functools.lru_cache(maxsize=None)
@@ -128,6 +131,13 @@ def _mega_moe_decode_block_m(
         mma_type=mma_type,
     )
     tiles = _MEGA_MOE_DECODE_BLOCK_M.get(default_block_m)
+    large = envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_DECODE_BLOCK_M_LARGE.get()
+    if (
+        tiles is not None
+        and large
+        and num_tokens >= envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_DECODE_BLOCK_M_LARGE_MIN_ROWS.get()
+    ):
+        return _MEGA_MOE_DECODE_BLOCK_M_LARGE[large]
     min_tokens = envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_DECODE_BLOCK_M_96_MIN_TOKENS.get()
     expected = num_tokens * num_ranks * num_topk / num_experts
     if tiles is not None and tiles[0] == 96 and expected < min_tokens:

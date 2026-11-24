@@ -891,6 +891,31 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
                 quant_method=method,
             )
 
+    def test_decode_block_m_large_rows(self):
+        self.deep_gemm.get_block_m_for_mega_moe = MagicMock(return_value=64)
+        args = dict(
+            num_ranks=16,
+            num_experts=896,
+            num_max_tokens_per_rank=1536,
+            num_topk=16,
+            mma_type="fp8xfp4",
+        )
+
+        def pick(num_tokens):
+            mega_moe._mega_moe_decode_block_m.cache_clear()
+            return mega_moe._mega_moe_decode_block_m(num_tokens=num_tokens, **args)
+
+        with patch.dict(sys.modules, {"deep_gemm": self.deep_gemm}):
+            self.assertEqual(pick(150), (96, 16))
+            for large, tiles in ((128, (128, 32)), (192, (192, 48))):
+                with envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_DECODE_BLOCK_M_LARGE.override(
+                    large
+                ):
+                    self.assertEqual(pick(127), (96, 16))
+                    self.assertEqual(pick(128), tiles)
+                    self.assertEqual(pick(174), tiles)
+        mega_moe._mega_moe_decode_block_m.cache_clear()
+
     def _get_test_buffer(self, group):
         with patch.dict(sys.modules, {"deep_gemm": self.deep_gemm}):
             return mega_moe._get_mega_moe_symm_buffer(

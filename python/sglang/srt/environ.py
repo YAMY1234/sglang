@@ -1856,6 +1856,11 @@ class Envs:
     # With the raise on: keep BLOCK_M 64 (instead of 96) while the expected tokens per expert
     # (rows per rank x ranks x top-k / experts) stay below this. 0: always raise.
     SGLANG_OPT_DEEPGEMM_MEGA_MOE_DECODE_BLOCK_M_96_MIN_TOKENS = EnvFloat(0.0)
+    # With the raise on: BLOCK_M for decode-graph calls of at least
+    # ..._LARGE_MIN_ROWS rows per rank (128 or 192; 0: keep the raised 96). Hot experts
+    # past 96 tokens otherwise re-read their weights once per extra M block.
+    SGLANG_OPT_DEEPGEMM_MEGA_MOE_DECODE_BLOCK_M_LARGE = EnvInt(0)
+    SGLANG_OPT_DEEPGEMM_MEGA_MOE_DECODE_BLOCK_M_LARGE_MIN_ROWS = EnvInt(128)
     # Opt-in, SM107: split each FP8xFP4 MegaMoE weight between the GPU's two locality domains
     # (deep_gemm.localize; DeepGEMM 0.2.5 or newer) so every SM streams die-local weights.
     SGLANG_OPT_DEEPGEMM_MEGA_MOE_LOCALIZE = EnvBool(False)
