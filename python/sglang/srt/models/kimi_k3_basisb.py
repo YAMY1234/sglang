@@ -93,9 +93,10 @@ def k31_basisb_linear_config(
 
 @lru_cache(maxsize=1)
 def _log_engaged() -> None:
+    kda = "q/k/v/g (b/f_a/o BF16)" if k31_basisb_kda_qkvg_only() else "q/k/v/g/b/f_a/o"
     log_info_on_rank0(
         logger,
-        "K3.1 basis B ENGAGED: shared experts and KDA q/k/v/g/b/f_a/o load BF16 and "
+        f"K3.1 basis B ENGAGED: shared experts and KDA {kda} load BF16 and "
         "cast to MXFP8 (ModelOpt MXFP8QTensor numerics), dense backend "
         f"{resolve_mxfp8_dense_gemm_backend().name}",
     )
@@ -103,3 +104,7 @@ def _log_engaged() -> None:
 
 def k31_basisb_enabled() -> bool:
     return envs.SGLANG_K31_BASISB_MXFP8.get()
+
+
+def k31_basisb_kda_qkvg_only() -> bool:
+    return k31_basisb_enabled() and envs.SGLANG_K31_BASISB_KDA_QKVG_ONLY.get()

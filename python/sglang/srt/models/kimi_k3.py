@@ -142,6 +142,7 @@ from sglang.srt.models.deepseek_common.attention_forward_methods.forward_methods
 from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA, MoEGate
 from sglang.srt.models.kimi_k3_basisb import (
     k31_basisb_enabled,
+    k31_basisb_kda_qkvg_only,
     k31_basisb_linear_config,
 )
 from sglang.srt.models.kimi_k3_vl import (
@@ -2284,11 +2285,14 @@ class KimiK3DeltaAttention(nn.Module):
         # experts; attention linears resolve to UnquantizedLinearMethod, so a
         # non-None quant_config is fine for the merged projection.
         self.do_fuse_qkvbfg = quant_config is None and self.head_tp_size == self.tp_size
-        # Basis B: q/k/v/g, b, f_a and o load-time MXFP8; f_b stays BF16.
+        # Basis B: q/k/v/g, b, f_a and o load-time MXFP8; f_b stays BF16. Under
+        # SGLANG_K31_BASISB_KDA_QKVG_ONLY only q/k/v/g, and [f_a | b] merges as in BF16.
         self._basisb = self.use_full_rank_gate and k31_basisb_enabled()
-        proj_quant_config = (
+        self._basisb_bfao = self._basisb and not k31_basisb_kda_qkvg_only()
+        qkvg_quant_config = (
             k31_basisb_linear_config(quant_config) if self._basisb else quant_config
         )
+        proj_quant_config = qkvg_quant_config if self._basisb_bfao else quant_config
 
         if self.use_full_rank_gate:
             # Fuse only the wide projections [q, k, v, g]: folding b (12/rank)
@@ -2305,7 +2309,7 @@ class KimiK3DeltaAttention(nn.Module):
                     projection_size,
                 ],
                 bias=False,
-                quant_config=proj_quant_config,
+                quant_config=qkvg_quant_config,
                 parallel_group=self.head_group,
                 prefix=f"{prefix}.fused_qkvg_proj",
             )
@@ -2559,7 +2563,7 @@ class KimiK3DeltaAttention(nn.Module):
 
         Called once after weight loading. Block-FP8 inputs are dequantized into
         the BF16 tiny-GEMM buffers here."""
-        if not self.use_full_rank_gate or self._basisb:
+        if not self.use_full_rank_gate or self._basisb_bfao:
             return
         if _is_npu:
             return
@@ -2848,7 +2852,7 @@ class KimiK3DeltaAttention(nn.Module):
                 )
                 beta = bfa[..., n_fa : n_fa + n_b]
             elif (
-                self._basisb
+                self._basisb_bfao
                 and self._bfa_alt_stream is not None
                 and get_is_capture_mode()
                 and 0 < hidden_states.shape[0] <= self._bfa_bs_limit
