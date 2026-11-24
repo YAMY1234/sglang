@@ -1297,6 +1297,9 @@ class Envs:
     # MXFP4 trtllm-gen MoE (SM107, prefill servers): routed experts run as CuTe DSL grouped GEMMs (permute pass,
     # FC1 with fused SiTU + MXFP8, FC2) instead of the trtllm-gen body; weights take that layout at load, EP 1 only.
     SGLANG_K31_PREFILL_MOE_CUTE_FC1 = EnvBool(False)
+    # MXFP4 trtllm-gen MoE (SM107, prefill servers): routed experts run as NVFP4 W4A4 through FlashInfer's CuTe DSL
+    # fused MoE; the MXFP4 experts are repacked to NVFP4 at load without changing any value, EP 1 only.
+    SGLANG_K31_PREFILL_MOE_A4W4 = EnvBool(False)
     # Manual MoE input row limit (EPv1 and EPv2); 0 leaves it to SGLANG_MORI_RECV_BOUND.
     SGLANG_MORI_MOE_MAX_INPUT_TOKENS = EnvInt(0)
 
