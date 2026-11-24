@@ -125,7 +125,40 @@ def prepare_weights(
     )
 
 
-def run(
+class _TacticTable(msgspec.Struct, frozen=True, kw_only=True):
+    max_tokens: int  # largest tuned bucket; larger calls take the tuner's own lookup
+    tactics: dict  # tuning bucket -> (tile_size, gemm1 tactic, gemm2 tactic)
+
+
+class _Workspace(msgspec.Struct, frozen=True, kw_only=True):
+    # moe_sort outputs and the NVFP4 FC1 output, flat, sized for max_tokens at the largest tile; one per process
+    tile_expert: torch.Tensor
+    tile_limit: torch.Tensor
+    expanded_to_permuted: torch.Tensor
+    permuted_to_expanded: torch.Tensor
+    total_padded: torch.Tensor
+    non_exiting_tiles: torch.Tensor
+    fc1: torch.Tensor
+    fc1_sf: torch.Tensor
+
+
+_table: _TacticTable | None = None
+_workspace: _Workspace | None = None
+
+
+def _quantize_tokens(weights: CuteDslA4W4Weights, x: torch.Tensor):
+    from sglang.srt.layers.quantization.fp4_utils import fp4_quantize
+
+    num_tokens = x.shape[0]
+    x_fp4, x_sf = fp4_quantize(
+        x, weights.unit_scale, sf_vec_size=_SF_VEC, is_sf_swizzled_layout=False
+    )
+    return x_fp4.reshape(num_tokens, weights.hidden // 2), x_sf.view(
+        torch.float8_e4m3fn
+    ).reshape(num_tokens, weights.hidden // _SF_VEC)
+
+
+def _run_tuned(
     weights: CuteDslA4W4Weights,
     x: torch.Tensor,
     topk_ids: torch.Tensor,
@@ -133,19 +166,14 @@ def run(
     *,
     output: torch.Tensor,
 ) -> torch.Tensor:
-    """Routed experts for BF16 tokens x [T, H] into output [T, H] (BF16; the finalize adds with atomics)."""
+    """FlashInfer's functional API: per call it builds a runner, looks the tactic up and allocates its buffers."""
     from flashinfer import cute_dsl_fused_moe
     from flashinfer.tllm_enums import ActivationType
 
-    from sglang.srt.layers.quantization.fp4_utils import fp4_quantize
-
-    num_tokens = x.shape[0]
-    x_fp4, x_sf = fp4_quantize(
-        x, weights.unit_scale, sf_vec_size=_SF_VEC, is_sf_swizzled_layout=False
-    )
+    x_fp4, x_sf = _quantize_tokens(weights, x)
     return cute_dsl_fused_moe(
-        x_fp4.reshape(num_tokens, weights.hidden // 2),
-        x_sf.view(torch.float8_e4m3fn).reshape(num_tokens, weights.hidden // _SF_VEC),
+        x_fp4,
+        x_sf,
         topk_ids.to(torch.int32),
         topk_weights,
         weights.w13,
@@ -165,13 +193,144 @@ def run(
     )
 
 
+def _get_workspace(weights: CuteDslA4W4Weights, top_k: int) -> _Workspace:
+    """Allocated on the first call, after the KV pool is sized, so it comes out of the activation headroom."""
+    global _workspace
+    if _workspace is None:
+        from flashinfer.fused_moe.cute_dsl.moe_utils import (
+            get_max_num_permuted_tokens,
+            get_max_num_tiles,
+        )
+
+        assert _table is not None
+        e, t = weights.num_experts, _table.max_tokens
+        tiles = {s for s, _, _ in _table.tactics.values()}
+        num_tiles = max(get_max_num_tiles(t, top_k, e, s) for s in tiles)
+        permuted = max(get_max_num_permuted_tokens(t, top_k, e, s) for s in tiles)
+        new = lambda n, dtype=torch.int32: torch.empty(
+            n, dtype=dtype, device=weights.w13.device
+        )
+        _workspace = _Workspace(
+            tile_expert=new(num_tiles),
+            tile_limit=new(num_tiles),
+            expanded_to_permuted=new(t * top_k),
+            permuted_to_expanded=new(permuted),
+            total_padded=new(1),
+            non_exiting_tiles=new(1),
+            fc1=new(permuted * weights.inter // 2, torch.uint8),
+            fc1_sf=new(permuted * _fc1_sf_cols(weights.inter), torch.uint8),
+        )
+    return _workspace
+
+
+def _fc1_sf_cols(inter: int) -> int:
+    # FlashInfer's FC1 scale atom: 4 rows x 4 scales (64 columns) per 128-row tile column
+    return 4 * ((inter + 4 * _SF_VEC - 1) // (4 * _SF_VEC))
+
+
+def run(
+    weights: CuteDslA4W4Weights,
+    x: torch.Tensor,
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    *,
+    output: torch.Tensor,
+) -> torch.Tensor:
+    """Routed experts for BF16 tokens x [T, H] into output [T, H] (BF16; the finalize adds with atomics).
+
+    The same kernels and tactic as FlashInfer's functional API, minus its per-call host work: the tactic comes from
+    the table resolved after tuning, and moe_sort / FC1 write into views of one persistent workspace."""
+    from flashinfer.fused_moe.cute_dsl.fused_moe import _moe_core_impl
+    from flashinfer.fused_moe.cute_dsl.moe_utils import (
+        get_max_num_permuted_tokens,
+        get_max_num_tiles,
+    )
+    from flashinfer.fused_moe.cute_dsl.tuner import _extract_tactic_params
+    from flashinfer.fused_moe.utils import map_to_hybrid_bucket
+    from flashinfer.tllm_enums import ActivationType
+
+    num_tokens, top_k = topk_ids.shape
+    tactic = None
+    if _table is not None and num_tokens <= _table.max_tokens:
+        tactic = _table.tactics.get(map_to_hybrid_bucket(num_tokens, _table.max_tokens))
+    if tactic is None:
+        return _run_tuned(weights, x, topk_ids, topk_weights, output=output)
+    p = _extract_tactic_params(tactic)
+    tile, e = p["tile_size"], weights.num_experts
+    ws = _get_workspace(weights, top_k)
+    num_tiles = get_max_num_tiles(num_tokens, top_k, e, tile)
+    permuted = get_max_num_permuted_tokens(num_tokens, top_k, e, tile)
+    x_fp4, x_sf = _quantize_tokens(weights, x)
+    return _moe_core_impl(
+        x=x_fp4,
+        x_sf=x_sf,
+        token_selected_experts=topk_ids.to(torch.int32),
+        token_final_scales=topk_weights,
+        w1_weight=weights.w13,
+        w1_weight_sf=weights.w13_sf,
+        w1_alpha=weights.w1_alpha,
+        fc2_input_scale=weights.unit_scale,
+        w2_weight=weights.w2,
+        w2_weight_sf=weights.w2_sf,
+        w2_alpha=weights.w2_alpha,
+        num_experts=e,
+        top_k=top_k,
+        num_local_experts=e,
+        tile_size=tile,
+        gemm1_mma_tiler_mn=p["gemm1_mma_tiler_mn"],
+        gemm1_cluster_shape_mn=p["gemm1_cluster_shape_mn"],
+        gemm2_mma_tiler_mn=p["gemm2_mma_tiler_mn"],
+        gemm2_cluster_shape_mn=p["gemm2_cluster_shape_mn"],
+        gemm1_mma_tiler=p["gemm1_mma_tiler"],
+        gemm1_mma_inst_shape=p["gemm1_mma_inst_shape"],
+        gemm2_mma_tiler=p["gemm2_mma_tiler"],
+        gemm2_mma_inst_shape=p["gemm2_mma_inst_shape"],
+        moe_sort_buffers=dict(
+            out_tile_idx_to_expert_idx=ws.tile_expert[:num_tiles],
+            out_tile_idx_to_mn_limit=ws.tile_limit[:num_tiles],
+            out_expanded_idx_to_permuted_idx=ws.expanded_to_permuted[
+                : num_tokens * top_k
+            ].view(num_tokens, top_k),
+            out_permuted_idx_to_expanded_idx=ws.permuted_to_expanded[:permuted],
+            out_total_num_padded_tokens=ws.total_padded,
+            out_num_non_exiting_tiles=ws.non_exiting_tiles,
+        ),
+        gemm1_out=ws.fc1[: permuted * weights.inter // 2].view(
+            permuted, weights.inter // 2
+        ),
+        gemm1_out_scale=ws.fc1_sf[: permuted * _fc1_sf_cols(weights.inter)].view(
+            32, 4, permuted // 128, 4, _fc1_sf_cols(weights.inter) // 4, 1
+        ),
+        moe_output=output,
+        output_dtype=torch.bfloat16,
+        use_async_memset=True,
+        use_fused_finalize=True,
+        enable_pdl=True,
+        activation_type=ActivationType.Swiglu.value,
+        situ_beta=weights.beta,
+        situ_linear_beta=weights.lbeta,
+    )
+
+
+def _resolve_tactics(op_name: str, max_tokens: int) -> _TacticTable:
+    """The tuner's winners for this op, by token bucket (they are shared by every layer of the process)."""
+    from flashinfer.autotuner import AutoTuner
+
+    tactics = {
+        key.nearest_profile[0][0]: value[0]
+        for key, value in AutoTuner.get().profiling_cache.items()
+        if key.custom_op == op_name and value[0] != -1
+    }
+    return _TacticTable(max_tokens=max(tactics, default=0), tactics=tactics)
+
+
 _tuned_max_tokens = 0
 
 
 def ensure_tuned(weights: CuteDslA4W4Weights, *, top_k: int, max_tokens: int) -> None:
     """Tune the kernel tactics for every token bucket up to max_tokens once per process (all layers share them);
     the default tactic is far slower at prefill sizes and the K3 model has no EXTEND autotune pass."""
-    global _tuned_max_tokens
+    global _tuned_max_tokens, _table
     if max_tokens <= _tuned_max_tokens:
         return
     from flashinfer.autotuner import autotune as fi_autotune
@@ -189,10 +348,14 @@ def ensure_tuned(weights: CuteDslA4W4Weights, *, top_k: int, max_tokens: int) ->
     w = torch.full((max_tokens, top_k), 1.0 / top_k, device=device, dtype=torch.float32)
     out = torch.empty(max_tokens, weights.hidden, device=device, dtype=torch.bfloat16)
     with fi_autotune(True):
-        run(weights, x, ids, w, output=out)
+        _run_tuned(weights, x, ids, w, output=out)
     torch.cuda.synchronize(device)
     _tuned_max_tokens = max_tokens
+    _table = _resolve_tactics("CuteDslFusedMoE::run_moe_w4a4::Situ", max_tokens)
     logger.info(
-        "SGLANG_K31_PREFILL_MOE_A4W4: tuned the CuTe DSL MoE up to %d tokens",
+        "SGLANG_K31_PREFILL_MOE_A4W4: tuned the CuTe DSL MoE up to %d tokens; "
+        "%d bucket tactics up to %d tokens resolved for the direct path",
         max_tokens,
+        len(_table.tactics),
+        _table.max_tokens,
     )
