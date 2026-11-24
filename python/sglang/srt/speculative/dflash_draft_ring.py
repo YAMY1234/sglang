@@ -36,6 +36,7 @@ starts at the floor, never on rows from before it. Decode lands PD rows at their
 absolute positions and ``unstage`` rotates them once the floor has landed.
 """
 
+import logging
 from collections import deque
 from contextlib import nullcontext
 from typing import Dict, List, Optional, Tuple
@@ -45,6 +46,8 @@ import torch
 
 from sglang.kernels.ops.speculative.dflash_ring_locs import dflash_ring_block_locs
 from sglang.srt.environ import envs
+
+logger = logging.getLogger(__name__)
 
 
 def draft_kv_ring_enabled() -> bool:
@@ -399,6 +402,10 @@ class DFlashDraftKVRing:
             reqs.append(self._pending_unstage.popleft())
         if not reqs:
             return
+        if envs.SGLANG_LOG_MEM_CHECKPOINTS.get():
+            logger.info(
+                "UNSTAGE_FLUSH entries %d unique %d", len(reqs), len(set(reqs))
+            )
         device = self.min_pos.device
         req = torch.tensor(reqs, dtype=torch.int64).to(device, non_blocking=True)
         first = self.sink_rows + req.unsqueeze(1) * self.rows_per_req
