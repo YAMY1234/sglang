@@ -579,11 +579,44 @@ class KimiK3MLP(nn.Module):
         else:
             raise ValueError(f"Unsupported activation: {hidden_act}")
 
+    # Rows whose down_proj runs as DeepGEMM bf16_gemm_nt (SGLANG_K31_MOE_SIDE_DG_ROWS "down").
+    _k31_down_dg_rows = ()
+
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         gate_up, _ = self.gate_up_proj(hidden_states)
         hidden_states = self.act_fn(gate_up)
+        if (
+            _k31_in_rows(hidden_states.shape[0], self._k31_down_dg_rows)
+            and self.down_proj.weight.dtype == torch.bfloat16
+        ):
+            return _k31_dg_bf16_gemm(hidden_states, self.down_proj.weight)
         hidden_states, _ = self.down_proj(hidden_states)
         return hidden_states
+
+
+def _k31_dg_bf16_gemm(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    """x @ weight.T (bf16) by DeepGEMM's bf16_gemm_nt."""
+    import deep_gemm
+
+    out = x.new_empty((x.shape[0], weight.shape[0]))
+    deep_gemm.bf16_gemm_nt(x.contiguous(), weight, out)
+    return out
+
+
+def _k31_parse_dg_rows(spec: str) -> dict:
+    """SGLANG_K31_MOE_SIDE_DG_ROWS "up=145-156,160-168;down=129-162" ->
+    {"up": ((145, 156), (160, 168)), "down": ((129, 162),)}."""
+    out = {}
+    for part in filter(None, (p.strip() for p in (spec or "").split(";"))):
+        name, ranges = part.split("=")
+        out[name.strip()] = tuple(
+            tuple(int(v) for v in r.split("-")) for r in ranges.split(",") if r
+        )
+    return out
+
+
+def _k31_in_rows(m: int, rows: tuple) -> bool:
+    return any(lo <= m <= hi for lo, hi in rows)
 
 
 def _add3(
@@ -1095,6 +1128,10 @@ class KimiK3MoE(nn.Module):
             self.routed_expert_down_proj = None
             self.routed_expert_norm = None
             self.routed_expert_up_proj = None
+        side_dg = _k31_parse_dg_rows(envs.SGLANG_K31_MOE_SIDE_DG_ROWS.get())
+        self._k31_up_dg_rows = side_dg.get("up", ())
+        if self.shared_experts is not None and self._shared_experts_tp1:
+            self.shared_experts._k31_down_dg_rows = side_dg.get("down", ())
 
         # Static eligibility for fusing the latent all-reduce with the RMSNorm
         # epilogue (SGLANG_K3_AR_FUSION): kernel needs latent == NORM_DIM and
@@ -1835,7 +1872,13 @@ class KimiK3MoE(nn.Module):
             else:
                 latent = self._reduce_latent(expert_output)
                 # up_proj is replicated, so the routed output is now fully reduced.
-                out, _ = self.routed_expert_up_proj(latent)
+                if (
+                    _k31_in_rows(latent.shape[0], self._k31_up_dg_rows)
+                    and self.routed_expert_up_proj.weight.dtype == torch.bfloat16
+                ):
+                    out = _k31_dg_bf16_gemm(latent, self.routed_expert_up_proj.weight)
+                else:
+                    out, _ = self.routed_expert_up_proj(latent)
         if k31_routed is not None:
             k31_main.wait_stream(k31_routed)
             out.record_stream(k31_main)

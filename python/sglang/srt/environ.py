@@ -2741,6 +2741,10 @@ class Envs:
     # where cuBLAS is slowest go to DeepGEMM bf16_gemm_nt (bitwise equal to cuBLAS there), and
     # the latent up_proj takes TGV down to 50 rows.
     SGLANG_K31_SM107_DG_BF16 = EnvBool(False)
+    # Kimi-K3.1 MegaMoE decode: rows ("up=lo-hi,...;down=lo-hi,...") where the latent up_proj and
+    # the replicated shared down_proj run as DeepGEMM bf16_gemm_nt instead of the default BF16
+    # GEMM; from a per-row sweep over the captured graph sizes ("" or unset: off).
+    SGLANG_K31_MOE_SIDE_DG_ROWS = EnvStr("")
     # Under SGLANG_K31_SM107_GEMM_TACTICS on SM107: the largest graphed rows
     # whose KDA [f_a | b] GEMM runs on the side stream beside [q,k,v,g]
     # (default 1152 = the largest verify rows, the stable table's
