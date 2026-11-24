@@ -21,6 +21,17 @@ logger = logging.getLogger(__name__)
 _is_hip = is_hip()
 
 _CUDA_HOST_REGISTERED_RANGES_ATTR = "_sglang_cuda_host_registered_ranges"
+# Buffers registered in more than one cudaHostRegister range: (base, end, chunk_bytes). A copy must not span two
+# ranges, so the coalesced write-back cuts its merged runs at base + k * chunk_bytes (registration_chunk_of).
+_CHUNKED_HOST_REGISTRATIONS: list[tuple[int, int, int]] = []
+
+
+def registration_chunk_of(ptr: int) -> tuple[int, int]:
+    """(base, chunk_bytes) of the chunked registration holding ptr, else (0, 0)."""
+    for base, end, chunk in _CHUNKED_HOST_REGISTRATIONS:
+        if base <= ptr < end:
+            return base, chunk
+    return 0, 0
 
 
 class HostTensorAllocator:
@@ -190,6 +201,8 @@ def _cuda_host_register(
         # cudaHostUnregister to receive each base pointer, not just the tensor's
         # original base once after several independent registrations.
         setattr(buffer, _CUDA_HOST_REGISTERED_RANGES_ATTR, registered_ranges)
+        if len(registered_ranges) > 1:
+            _CHUNKED_HOST_REGISTRATIONS.append((base, base + total, chunk_bytes))
     except Exception:
         remaining_ranges = _cuda_host_unregister_ranges(
             cudart, registered_ranges, operation="registration rollback"
@@ -230,6 +243,8 @@ def _cuda_host_unregister(buffer: torch.Tensor) -> None:
     if not registered_ranges:
         return
 
+    base = registered_ranges[0][0]
+    _CHUNKED_HOST_REGISTRATIONS[:] = [r for r in _CHUNKED_HOST_REGISTRATIONS if r[0] != base]
     remaining_ranges = _cuda_host_unregister_ranges(
         cudart, registered_ranges, operation="host-pool destroy"
     )
