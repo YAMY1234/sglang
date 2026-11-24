@@ -1554,9 +1554,16 @@ def setup_state_kv_args(
         # then their scales. A PD DCP relayout moves the two parts separately.
         if pool.index_kpool != 1:
             return
+        if isinstance(pool, DSATokenToKVPool):
+            # FP8 (128, 4), or MXFP4 (64, 4) with SGLANG_K31_INDEXER_MXFP4
+            kv_args.dsa_index_k_token_bytes = (
+                pool.index_k_value_bytes,
+                pool.index_k_scale_bytes,
+            )
+            return
         kv_args.dsa_index_k_token_bytes = (
-            pool.index_k_value_bytes,
-            pool.index_k_scale_bytes,
+            pool.index_head_dim,
+            pool.index_head_dim // pool.quant_block_size * 4,
         )
 
     def append_dsa_tail(pool) -> None:

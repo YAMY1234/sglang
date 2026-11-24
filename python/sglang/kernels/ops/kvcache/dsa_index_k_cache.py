@@ -51,10 +51,11 @@ class GetKAndS:
         seq_len_tensor: torch.Tensor,
         seq_len_sum: int,
         max_seq_len: int,
+        mxfp4: bool = False,
     ):
         from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype
 
-        assert not pool.index_k_fp4
+        assert not mxfp4
 
         page_size = pool.index_page_size
         index_head_dim = pool.index_head_dim
@@ -95,9 +96,11 @@ class GetKAndS:
         seq_len_tensor: torch.Tensor,
         seq_len_sum: int,
         max_seq_len: int,
+        mxfp4: bool = False,
     ):
         """
         Triton implementation for gathering both K and S data from paged buffer in a single call.
+        mxfp4: the buffer holds MXFP4 pages, converted back to the FP8 outputs exactly.
         :param page_indices: (num_pages,), int32/int64
         :param seq_len_tensor: (num_pages,), int32/int64
         :param seq_len_sum: sum of all sequence len, int32
@@ -106,7 +109,7 @@ class GetKAndS:
                  k_fp8: (seq_len, index_head_dim), uint8
                  k_scale: (seq_len, 4), uint8
         """
-        if pool.index_k_fp4:
+        if mxfp4:
             return _get_k_and_s_mxfp4_triton(
                 buf=buf,
                 page_indices=page_indices,

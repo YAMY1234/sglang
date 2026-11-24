@@ -113,6 +113,7 @@ class LayerSplitIndexKeyCache(IndexKeyCache):
             seq_len_tensor=seq_len_tensor,
             seq_len_sum=seq_len_sum,
             max_seq_len=max_seq_len,
+            mxfp4=self.pool.index_k_fp4,
         )
 
     def store_quantized(
