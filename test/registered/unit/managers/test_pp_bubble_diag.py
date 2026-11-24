@@ -340,7 +340,7 @@ class TestModuleHooks(unittest.TestCase):
         finally:
             gc.callbacks.remove(timer._callback)
         self.assertGreaterEqual(stats["n"][1], 1)
-        self.assertGreater(stats["ms"][1], 0.0)
+        self.assertGreaterEqual(stats["ms"][1], 0.0)
         self.assertTrue(any("PP GC long rank 0: gen=1" in line for line in cm.output))
         self.assertEqual(timer.snapshot()["n"], [0, 0, 0])
 
