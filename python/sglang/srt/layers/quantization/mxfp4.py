@@ -48,6 +48,7 @@ from sglang.srt.layers.quantization.utils import is_layer_skipped
 from sglang.srt.runtime_context import (
     get_exec,
     get_platform,
+    max_prefill_buffer_tokens,
 )
 from sglang.srt.utils import (
     cpu_has_amx_support,
@@ -893,6 +894,20 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
 
             if (
                 self._fi_kernel == "trtllm_sm100"
+                and envs.SGLANG_K31_PREFILL_MOE_A4W4.get()
+            ):
+                self._process_weights_for_a4w4_prefill_moe(
+                    layer,
+                    w13_weight=w13_weight,
+                    w13_weight_scale=w13_weight_scale,
+                    w2_weight=w2_weight,
+                    w2_weight_scale=w2_weight_scale,
+                    beta=_alpha,
+                    lbeta=_limit,
+                )
+                return
+            if (
+                self._fi_kernel == "trtllm_sm100"
                 and envs.SGLANG_K31_PREFILL_MOE_CUTE_FC1.get()
             ):
                 self._process_weights_for_cute_prefill_moe(
@@ -1263,6 +1278,48 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         layer.cute_prefill_moe = weights
         logger.info(
             "SGLANG_K31_PREFILL_MOE_CUTE_FC1: MoE layer %d weights in the CuTe prefill layout", layer.layer_id
+        )
+
+    def _process_weights_for_a4w4_prefill_moe(
+        self,
+        layer,
+        *,
+        w13_weight,
+        w13_weight_scale,
+        w2_weight,
+        w2_weight_scale,
+        beta,
+        lbeta,
+    ):
+        from sglang.srt.layers.moe.moe_runner import cutedsl_a4w4_prefill as a4w4
+
+        # The repack takes gate rows [0, I) and up rows [I, 2I) (K3 Latent MoE).
+        if getattr(layer.moe_runner_config, "gate_up_interleaved", True):
+            raise NotImplementedError(
+                "SGLANG_K31_PREFILL_MOE_A4W4 needs non-interleaved gate/up rows"
+            )
+        if layer.num_local_experts != layer.num_experts:
+            raise NotImplementedError("SGLANG_K31_PREFILL_MOE_A4W4 runs EP 1 only")
+        weights = a4w4.prepare_weights(
+            w13_weight,
+            w13_weight_scale,
+            w2_weight,
+            w2_weight_scale,
+            beta=beta,
+            lbeta=lbeta,
+        )
+        # One copy per layer: the params hold the NVFP4 layout and the MXFP4 scales are freed.
+        layer.w13_weight = Parameter(weights.w13, requires_grad=False)
+        layer.w13_weight_scale = Parameter(weights.w13_sf, requires_grad=False)
+        layer.w2_weight = Parameter(weights.w2, requires_grad=False)
+        layer.w2_weight_scale = Parameter(weights.w2_sf, requires_grad=False)
+        layer.a4w4_prefill_moe = weights
+        a4w4.ensure_tuned(
+            weights, top_k=layer.top_k, max_tokens=max_prefill_buffer_tokens()
+        )
+        logger.info(
+            "SGLANG_K31_PREFILL_MOE_A4W4: MoE layer %d weights repacked to NVFP4",
+            layer.layer_id,
         )
 
     def _process_weights_for_sm90_cutlass(self, layer):
@@ -1723,6 +1780,11 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             cute_prefill_moe=(
                 layer.cute_prefill_moe
                 if envs.SGLANG_K31_PREFILL_MOE_CUTE_FC1.get()
+                else None
+            ),
+            a4w4_prefill_moe=(
+                layer.a4w4_prefill_moe
+                if envs.SGLANG_K31_PREFILL_MOE_A4W4.get()
                 else None
             ),
         )

@@ -228,14 +228,25 @@ def resolve_cutedsl_standard_scales(
 
 
 def _cutedsl_wrapper_activation_type(activation: str, activation_type_cls: Any) -> Any:
-    if activation == "silu":
+    # SiTU runs as the gated Swiglu type with situ_beta set (_cutedsl_situ_kwargs).
+    if activation in ("silu", "situ"):
         return activation_type_cls.Swiglu
     if activation == "relu2":
         return activation_type_cls.Relu2
     raise ValueError(
-        f"CuteDSL MoE wrapper supports 'silu' (gated) or 'relu2' (non-gated) "
-        f"activation, got {activation!r}."
+        f"CuteDSL MoE wrapper supports 'silu' or 'situ' (gated) or 'relu2' "
+        f"(non-gated) activation, got {activation!r}."
     )
+
+
+def _cutedsl_situ_kwargs(config: MoeRunnerConfig) -> dict[str, Any]:
+    """K3 keeps SiTU's gate and up tanh scales in gemm1_alpha / gemm1_clamp_limit."""
+    if config.activation != "situ":
+        return {}
+    return {
+        "situ_beta": config.gemm1_alpha,
+        "situ_linear_beta": config.gemm1_clamp_limit,
+    }
 
 
 def _make_per_token_global_scale(input_tensor: torch.Tensor) -> torch.Tensor:
@@ -366,6 +377,7 @@ def ensure_cutedsl_wrapper(layer: torch.nn.Module) -> None:
                 layer.moe_runner_config.activation, ActivationType
             ),
             quant_mode=quant_mode,
+            **_cutedsl_situ_kwargs(layer.moe_runner_config),
         )
 
         w1_alpha, fc2_input_scale, w2_alpha, used_input_scale = (
@@ -447,9 +459,10 @@ def fused_experts_none_to_flashinfer_cutedsl_fp4(
 
     assert runner_config.activation in (
         "silu",
+        "situ",
         "relu2",
     ), (
-        f"CuteDSL MoE supports 'silu' (gated) or 'relu2' (non-gated), got {runner_config.activation!r}."
+        f"CuteDSL MoE supports 'silu' or 'situ' (gated) or 'relu2' (non-gated), got {runner_config.activation!r}."
     )
     assert quant_info.wrapper is not None, "CuteDSL v2 path requires CuteDslMoEWrapper."
 
@@ -540,9 +553,10 @@ def fused_experts_flashinfer_to_flashinfer_cutedsl_fp4(
 
     assert runner_config.activation in (
         "silu",
+        "situ",
         "relu2",
     ), (
-        f"CuteDSL MoE supports 'silu' (gated) or 'relu2' (non-gated), got {runner_config.activation!r}."
+        f"CuteDSL MoE supports 'silu' or 'situ' (gated) or 'relu2' (non-gated), got {runner_config.activation!r}."
     )
     assert quant_info.wrapper is not None, "CuteDSL v2 path requires CuteDslMoEWrapper."
 
