@@ -26,6 +26,7 @@ from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.runtime_context import get_serving, get_spec, mamba_checkpoint_grid
+from sglang.srt.speculative.dflash_draft_ring import get_draft_kv_ring
 from sglang.srt.utils.common import ceil_align
 
 if TYPE_CHECKING:
@@ -474,6 +475,10 @@ def discard_kv_cache_backup(
 def release_kv_cache(req: Req, tree_cache: BasePrefixCache, *, checkpoint: bool):
     """Give the request's kv row back; with ``checkpoint`` the tree first keeps
     what it can key."""
+    draft_ring = get_draft_kv_ring()
+    if draft_ring is not None and req.kv.req_pool_idx is not None:
+        # A pending draft KV unstage of this row has no request left to serve.
+        draft_ring.forget_request(int(req.kv.req_pool_idx))
     assert (not req.kv.holds_kv) == req.kv.is_kv_released
     # A mamba-capable cache may alloc mamba state before alloc KV cache
     if not req.kv.holds_kv:

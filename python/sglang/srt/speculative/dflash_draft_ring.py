@@ -454,6 +454,13 @@ class DFlashDraftKVRing:
         if slot is not None:
             self._free_slots.append(slot)
 
+    def forget_request(self, req_pool_idx: int) -> None:
+        """A request releases its req pool row (finished, aborted or failed): its
+        unstage, if still pending, has nothing left to serve (a max_tokens=1 request
+        finishes on decode without a draft step), and its slot frees."""
+        self._pending_unstage.pop(req_pool_idx, None)
+        self.release_staging_slot(req_pool_idx)
+
     def mark_unstage(self, req_pool_idx: int) -> None:
         """A request's PD rows landed (in the staging ring, or at absolute
         positions of a rebased ring); copy them into place before its first draft
