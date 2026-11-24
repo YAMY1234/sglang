@@ -134,9 +134,17 @@ def check(scheduler, batch, result) -> None:
             f"site#{site} {_names[site]} rows={rows} of {rows_n} bs={bs} per_req={per} "
             + "; ".join(desc)
         )
+    # Tokens per DP rank at this step: 0 is an idle rank; ranks below the max run padded graphs.
+    gnt = batch.global_num_tokens
+    shape = ""
+    if gnt:
+        shape = (
+            f" global_num_tokens={list(gnt)} idle_ranks={[i for i, n in enumerate(gnt) if n == 0]}"
+            f" padded_to={max(gnt)}"
+        )
     msg = (
         f"NaN probe tripped: DP{rank} step={scheduler.forward_ct} batch={len(batch.reqs)} "
-        f"waiting={len(scheduler.waiting_queue)} first={_names[hit[0]]}\n  "
+        f"waiting={len(scheduler.waiting_queue)} first={_names[hit[0]]}{shape}\n  "
         + "\n  ".join(lines)
     )
     logger.error(msg)

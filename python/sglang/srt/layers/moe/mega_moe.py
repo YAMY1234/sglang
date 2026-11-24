@@ -24,6 +24,7 @@ from typing import TYPE_CHECKING, NamedTuple, Optional
 import torch
 
 from sglang.kernels.ops.moe.dsv4 import mega_moe_pre_dispatch
+from sglang.srt.debug_utils import nan_probe
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
@@ -342,6 +343,7 @@ def forward_mega_moe(
 
     # MegaMoE counts the layer's EPLB load in-kernel; the router must not count it too.
     eplb_load_row = _local_eplb_load_row(moe)
+    probe = nan_probe.enabled()
     with (
         mega_stream_ctx,
         (
@@ -350,6 +352,8 @@ def forward_mega_moe(
             else nullcontext()
         ),
     ):
+        if probe:
+            nan_probe.record(f"moe.L{moe.layer_id}.in", hidden_states, forward_batch)
         y = _run_mega_routed(
             moe,
             hidden_states,
@@ -358,6 +362,9 @@ def forward_mega_moe(
             num_tokens,
             eplb_load_row=eplb_load_row,
         )
+        if probe:
+            # The routed combine output: rows come back from expert compute on other EP ranks.
+            nan_probe.record(f"moe.L{moe.layer_id}.combine_out", y, forward_batch)
 
     if fork_mega_moe:
         current_stream.wait_stream(moe.alt_stream)
