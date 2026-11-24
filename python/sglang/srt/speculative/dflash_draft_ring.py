@@ -34,6 +34,11 @@ A paged reader cannot floor its window, so a page-aligned ring is rebased on
 and the reader gets ``window_seq_lens`` (``seq_lens - min_pos``); the window then
 starts at the floor, never on rows from before it. Decode lands PD rows at their
 absolute positions and ``unstage`` rotates them once the floor has landed.
+
+With staging slots (SGLANG_DSPARK_DRAFT_KV_RING_STAGING_SLOTS) the staging ring holds
+only that many requests: a decode preallocation takes a slot (``reset_floor``), its
+PD rows land there, and the slot frees once ``unstage`` has copied it; preallocation
+waits while none is free (``staging_slot_free``).
 """
 
 from collections import deque
@@ -241,6 +246,12 @@ class DFlashDraftKVRing:
         # A head-sharded ring's staging ring and this rank's head columns in it.
         self.staging = None
         self._pending_unstage: deque = deque()
+        # Staging slots (attach_staging(slots=...)): request -> slot from its decode
+        # preallocation to its unstage; a slot frees once its unstage copy has run.
+        self._staging_slots = 0
+        self._free_slots: deque = deque()
+        self._slot_of: Dict[int, int] = {}
+        self._releasing: deque = deque()
         # Positions a ring holds without wrapping onto each other.
         self.span = rows_per_req * dcp_size
         # PD writes min_pos rows remotely; Mooncake's NVLink transport only
@@ -350,9 +361,11 @@ class DFlashDraftKVRing:
             max(0, seq_len - self.window_left - 1), seq_len, dtype=np.int64
         )
         base = self._floor_host.get(req_pool_idx, 0) if self.rebased else 0
+        # A decode with staging slots lands in the request's slot.
+        block = self._slot_of.get(req_pool_idx, req_pool_idx)
         rows = (
             self.sink_rows
-            + req_pool_idx * self.rows_per_req
+            + block * self.rows_per_req
             + ((positions - base) // self.dcp_size) % self.rows_per_req
         )
         rows[positions % self.dcp_size != self.dcp_rank] = 0
@@ -381,10 +394,30 @@ class DFlashDraftKVRing:
             out=out[:bs],
         )
 
-    def attach_staging(self, staging_pool, head_start: int, num_heads: int) -> None:
-        """Receive PD rows (every head) into ``staging_pool``, a ring of the same
-        rows; ``unstage`` copies heads ``[head_start, head_start + num_heads)``."""
+    def attach_staging(
+        self, staging_pool, head_start: int, num_heads: int, slots: int = 0
+    ) -> None:
+        """Receive PD rows (every head) into ``staging_pool``; ``unstage`` copies heads
+        ``[head_start, head_start + num_heads)``. Without ``slots`` the staging ring
+        has the ring's rows; with ``slots`` it holds that many requests, each in the
+        slot ``reset_floor`` gave it."""
         self.staging = (staging_pool, head_start, num_heads)
+        self._staging_slots = slots
+        self._free_slots = deque(range(slots))
+
+    def staging_slot_free(self) -> bool:
+        """Whether a decode preallocation can take a staging slot now."""
+        if not self._staging_slots:
+            return True
+        while self._releasing and self._releasing[0][0].query():
+            self._free_slots.extend(self._releasing.popleft()[1])
+        return bool(self._free_slots)
+
+    def release_staging_slot(self, req_pool_idx: int) -> None:
+        """A request leaves before its unstage (failed or aborted transfer)."""
+        slot = self._slot_of.pop(req_pool_idx, None)
+        if slot is not None:
+            self._free_slots.append(slot)
 
     def mark_unstage(self, req_pool_idx: int) -> None:
         """A request's PD rows landed (in the staging ring, or at absolute
@@ -397,6 +430,9 @@ class DFlashDraftKVRing:
         reqs = []
         while self._pending_unstage:
             reqs.append(self._pending_unstage.popleft())
+        if self._staging_slots:
+            # A request that left before its unstage has no slot (and no rows).
+            reqs = [r for r in reqs if r in self._slot_of]
         if not reqs:
             return
         device = self.min_pos.device
@@ -404,6 +440,13 @@ class DFlashDraftKVRing:
         first = self.sink_rows + req.unsqueeze(1) * self.rows_per_req
         cols = torch.arange(self.rows_per_req, device=device, dtype=torch.int64)
         rows = (first + cols).reshape(-1)
+        src_rows = rows
+        if self._staging_slots:
+            slots = [self._slot_of.pop(r) for r in reqs]
+            slot = torch.tensor(slots, dtype=torch.int64).to(device, non_blocking=True)
+            src_rows = (
+                self.sink_rows + slot.unsqueeze(1) * self.rows_per_req + cols
+            ).reshape(-1)
         dst_rows = rows
         if self.rebased:
             # Row j holds a position p = j mod rows_per_req; it belongs at p - floor.
@@ -422,7 +465,12 @@ class DFlashDraftKVRing:
             heads = slice(head_start, head_start + num_heads)
         for src, dst in zip(srcs, dsts):
             # The gather copies first, so an in-place rotation reads unrotated rows.
-            dst[dst_rows] = src[rows][:, heads]
+            dst[dst_rows] = src[src_rows][:, heads]
+        if self._staging_slots:
+            # A slot takes new PD rows only after this copy has read it.
+            done = torch.cuda.Event()
+            done.record()
+            self._releasing.append((done, slots))
 
     def reset_floor(self, req_pool_idx: int, seq_len: int) -> None:
         """PD decode, at preallocation: no draft context until prefill's floor
@@ -430,6 +478,13 @@ class DFlashDraftKVRing:
         rather than a stale one."""
         self.min_pos[req_pool_idx].fill_(seq_len)
         self._floor_host.pop(req_pool_idx, None)
+        if self._staging_slots and req_pool_idx not in self._slot_of:
+            if not self.staging_slot_free():
+                raise RuntimeError(
+                    "No free draft KV staging slot: a decode preallocation must "
+                    "check staging_slot_free() first."
+                )
+            self._slot_of[req_pool_idx] = self._free_slots.popleft()
 
     def ring_buf_infos(self) -> Tuple[List[int], List[int], List[int]]:
         """The PD buffers (the staging ring's when there is one) with one item per
