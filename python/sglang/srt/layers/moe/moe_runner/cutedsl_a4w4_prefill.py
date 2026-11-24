@@ -303,7 +303,9 @@ def run(
         ),
         moe_output=output,
         output_dtype=torch.bfloat16,
-        use_async_memset=True,
+        # The output memset stays on this stream: FlashInfer's aux stream comes from torch's round-robin stream
+        # pool, so in a server it can alias a busy stream whose queued work would then gate GEMM2.
+        use_async_memset=False,
         use_fused_finalize=True,
         enable_pdl=True,
         activation_type=ActivationType.Swiglu.value,
