@@ -1379,6 +1379,8 @@ class FlashInferTrtllmGenMxfp4MoeQuantInfo(MoeQuantInfo):
     routing_bias: Optional[torch.Tensor] = None
     # SGLANG_K31_PREFILL_MOE_CUTE_FC1: weights in cute_prefill_moe's layout (the w13/w2 fields hold the same tensors)
     cute_prefill_moe: Optional[Any] = None
+    # SGLANG_K31_PREFILL_MOE_A4W4: NVFP4 weights in cutedsl_a4w4_prefill's layout (same tensors as w13/w2)
+    a4w4_prefill_moe: Optional[Any] = None
 
 
 def _run_cute_prefill_moe(
@@ -1426,6 +1428,40 @@ def _run_cute_prefill_moe(
     return StandardCombineInput(hidden_states=output)
 
 
+def _run_a4w4_prefill_moe(
+    *,
+    quant_info: FlashInferTrtllmGenMxfp4MoeQuantInfo,
+    x: torch.Tensor,
+    topk_output,
+    runner_config: MoeRunnerConfig,
+) -> StandardCombineInput:
+    from sglang.srt.layers import zero_copy_context
+    from sglang.srt.layers.moe.moe_runner import cutedsl_a4w4_prefill as a4w4
+    from sglang.srt.layers.moe.token_dispatcher.standard import StandardCombineInput
+    from sglang.srt.layers.moe.topk import TopKOutputChecker
+
+    assert (
+        TopKOutputChecker.format_is_standard(topk_output)
+        and runner_config.activation == "situ"
+    ), "SGLANG_K31_PREFILL_MOE_A4W4 covers the standard-topk SiTU path only"
+    # The fused finalize scatter-adds into the output, so there is no permuted GEMM2 output to defer.
+    assert not _deferred_finalize_enabled.get(), (
+        "SGLANG_K31_PREFILL_MOE_A4W4 has no deferred finalize"
+    )
+    x = x.view(-1, x.shape[-1])
+    output = zero_copy_context.get_moe_output_spec(x.shape, torch.bfloat16, x.device)
+    if output is None:
+        output = torch.empty(x.shape, dtype=torch.bfloat16, device=x.device)
+    a4w4.run(
+        quant_info.a4w4_prefill_moe,
+        x,
+        topk_output.topk_ids,
+        topk_output.topk_weights,
+        output=output,
+    )
+    return StandardCombineInput(hidden_states=output)
+
+
 def _fused_experts_flashinfer_mxfp4_sm100_trtllm_gen(
     dispatch_output: StandardDispatchOutput,
     quant_info: FlashInferTrtllmGenMxfp4MoeQuantInfo,
@@ -1437,6 +1473,13 @@ def _fused_experts_flashinfer_mxfp4_sm100_trtllm_gen(
 
     x = dispatch_output.hidden_states
     topk_output = dispatch_output.topk_output
+    if quant_info.a4w4_prefill_moe is not None:
+        return _run_a4w4_prefill_moe(
+            quant_info=quant_info,
+            x=x,
+            topk_output=topk_output,
+            runner_config=runner_config,
+        )
 
     origin_hidden_states_dim = x.shape[-1]
     prepared_packed_topk = None

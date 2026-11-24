@@ -1883,6 +1883,8 @@ class KimiK3MoE(nn.Module):
                     and method._fi_kernel == "trtllm_sm100"
                     and method.flashinfer_mxfp4_moe_precision == "default"
                     and method.hidden_size == self.moe_hidden_size
+                    # the A4W4 path quantizes dense bf16 rows to NVFP4 itself
+                    and not envs.SGLANG_K31_PREFILL_MOE_A4W4.get()
                 )
                 or (
                     runner is not None
@@ -1908,6 +1910,7 @@ class KimiK3MoE(nn.Module):
             and not method.use_marlin
             and method.flashinfer_mxfp4_moe_precision == "default"
             and self.experts.moe_runner_config.activation == "situ"
+            and not envs.SGLANG_K31_PREFILL_MOE_A4W4.get()
         )
 
     def _forward_routed(self, hidden_states, router_logits, routed_input, latent):
