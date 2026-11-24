@@ -629,6 +629,10 @@ class DraftBlockProposer:
                 batch.req_pool_indices, draft_positions, query_token_num
             )
             draft_forward_batch.out_cache_loc_virtual = None
+            # The window starts at the request's floor (no rows from before it).
+            draft_forward_batch.seq_lens = ring.window_seq_lens(
+                batch.req_pool_indices, prefix_lens
+            )
         self._fill_dp_moe_sync_metadata(draft_forward_batch, batch)
         graph_runner = self.draft_model_runner.decode_cuda_graph_runner
         runs_graph = graph_runner is not None and graph_runner.can_run_graph(

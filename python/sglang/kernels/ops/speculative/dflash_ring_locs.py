@@ -1,6 +1,8 @@
 """A draft block's KV ring locs in one launch, bitwise equal to
 ``DFlashDraftKVRing.locs(req_pool_indices.repeat_interleave(block_size), positions)``."""
 
+from typing import Optional
+
 import torch
 import triton
 import triton.language as tl
@@ -10,6 +12,7 @@ import triton.language as tl
 def _dflash_ring_block_locs_kernel(
     req_pool_indices_ptr,
     positions_ptr,
+    floors_ptr,
     out_ptr,
     num_tokens,
     req_pool_indices_stride,
@@ -18,6 +21,7 @@ def _dflash_ring_block_locs_kernel(
     rows_per_req,
     dcp_size,
     sink_rows,
+    HAS_FLOORS: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
     offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
@@ -30,6 +34,8 @@ def _dflash_ring_block_locs_kernel(
     pos = tl.load(positions_ptr + offs * positions_stride, mask=mask, other=0).to(
         tl.int64
     )
+    if HAS_FLOORS:
+        pos -= tl.load(floors_ptr + req, mask=mask, other=0).to(tl.int64)
     # Floor division and remainder as torch computes them (the divisors are positive).
     q = pos // dcp_size
     r = pos - q * dcp_size
@@ -49,9 +55,11 @@ def dflash_ring_block_locs(
     rows_per_req: int,
     dcp_size: int,
     sink_rows: int = 1,
+    floors: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Ring locs (int64 [num_tokens]) of ``positions``, ``block_size`` per request of
-    ``req_pool_indices`` in order."""
+    ``req_pool_indices`` in order; a rebased ring's positions count from
+    ``floors[req]``."""
     if req_pool_indices.dim() != 1 or positions.dim() != 1:
         raise ValueError(
             "DFLASH ring block locs take 1-D req_pool_indices and positions."
@@ -69,6 +77,7 @@ def dflash_ring_block_locs(
     _dflash_ring_block_locs_kernel[(triton.cdiv(num_tokens, block),)](
         req_pool_indices,
         positions,
+        positions if floors is None else floors,
         out,
         num_tokens,
         req_pool_indices.stride(0),
@@ -77,6 +86,7 @@ def dflash_ring_block_locs(
         int(rows_per_req),
         int(dcp_size),
         int(sink_rows),
+        HAS_FLOORS=floors is not None,
         BLOCK=block,
         num_warps=1 if block <= 128 else 4,
     )
