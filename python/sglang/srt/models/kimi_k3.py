@@ -251,12 +251,14 @@ _K31_SM107_TGV_M_RANGES = {
 }
 # Under SGLANG_K31_SM107_DG_BF16: the TP4-attention decode rows where cuBLAS is
 # slowest (CUDA graph, cold weights, us per GEMM, cuBLAS -> DeepGEMM bf16_gemm_nt,
-# bitwise equal): KDA qkvg M 260-288 36.8-39.5 -> 21.4-22.0, M 290-320
-# 28.0-29.6 -> 21.3-22.9; o_proj M 225-256 9.2-9.6 -> 8.0-8.1, M 290-320
-# 11.1-11.3 -> 9.2-9.3 (cuBLAS wins at 260-288). TGV tactic 23 takes the latent
-# up_proj at 50-51 rows too (cuBLAS 10.0 -> 7.0, bitwise).
+# bitwise equal). KDA qkvg runs beside the [f_a | b] side stream, which slows the
+# persistent DeepGEMM kernel by ~11 us, so it takes only M 257-288: there the
+# in-proj block goes 42.0 -> 33.2 us; at M 300-320 DeepGEMM alone is faster
+# (22 vs 34 us) but the block is slower (29.0-29.8 -> 31.8-33.5). o_proj M 225-256
+# 9.2-9.6 -> 8.0-8.1, M 290-320 11.1-11.3 -> 9.2-9.3 (cuBLAS wins at 260-288). TGV
+# tactic 23 takes the latent up_proj at 50-51 rows too (cuBLAS 10.0 -> 7.0, bitwise).
 _K31_SM107_DG_BF16_M_RANGES = {
-    (12288, 7168): ((257, 320),),  # KDA fused qkvg, attention TP4
+    (12288, 7168): ((257, 288),),  # KDA fused qkvg, attention TP4
     (7168, 3072): ((225, 256), (289, 320)),  # KDA o_proj, attention TP4
 }
 _K31_SM107_DG_SWITCH_TGV_M_RANGES = {
