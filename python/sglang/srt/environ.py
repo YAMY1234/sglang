@@ -1997,6 +1997,8 @@ class Envs:
     )
     # Compute a draft block's ring locs in one Triton launch; off by default.
     SGLANG_OPT_DFLASH_RING_LOCS_FUSED = EnvBool(False)
+    # Log startup GPU memory checkpoints (utils/mem_checkpoint.py); diagnostic, default off.
+    SGLANG_LOG_MEM_CHECKPOINTS = EnvBool(False)
     # Capture the DFLASH aux append (draft KV) as CUDA graphs.
     SGLANG_DFLASH_AUX_GRAPH = EnvBool(
         SGLANG_ENABLE_NV_MEGA_RUNTIME_K31_GB_OPTIMIZATION.get

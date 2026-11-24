@@ -34,6 +34,7 @@ from sglang.srt.configs.model_config import (
 )
 from sglang.srt.distributed.utils import get_pp_indices
 from sglang.srt.environ import envs
+from sglang.srt.utils.mem_checkpoint import mem_checkpoint
 from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
     get_kv_cache_quant_method,
     resolve_kv_cache_quant,
@@ -535,6 +536,7 @@ class KVCacheConfigurator:
             f"Memory pool end. "
             f"avail mem={get_available_gpu_memory(self.device, self.gpu_id):.2f} GB"
         )
+        mem_checkpoint("kv pool end")
 
         return KVCacheConfigResult(
             max_total_num_tokens=sizes.max_total_num_tokens,

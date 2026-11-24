@@ -61,6 +61,7 @@ from sglang.srt.runtime_context import (
 )
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import MultiprocessingSerializer, broadcast_pyobj, set_random_seed
+from sglang.srt.utils.mem_checkpoint import mem_checkpoint
 from sglang.srt.utils.hf_transformers_utils import (
     get_processor,
     get_tokenizer,
@@ -426,12 +427,15 @@ class TpModelWorker(BaseTpWorker):
 
     def init_attention_backends(self):
         """Initialize attention backends for all model runners."""
+        mem_checkpoint("attention backends begin")
         self.model_runner.init_attention_backends()
         for mr in self.model_runner_list[1:]:
             mr.init_attention_backends()
+        mem_checkpoint("attention backends end")
 
     def init_cuda_graphs(self, capture_decode_cuda_graph: bool = True):
         """Capture cuda graphs for all model runners."""
+        mem_checkpoint("cuda graphs begin")
         self.model_runner.init_cuda_graphs(
             capture_decode_cuda_graph=capture_decode_cuda_graph
         )

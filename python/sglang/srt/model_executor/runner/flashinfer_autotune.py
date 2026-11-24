@@ -40,6 +40,7 @@ from sglang.srt.runtime_context import (
 )
 from sglang.srt.utils import empty_context, log_info_on_rank0
 from sglang.srt.utils.common import get_eager_max_batch_size
+from sglang.srt.utils.mem_checkpoint import mem_checkpoint
 
 if TYPE_CHECKING:
     from flashinfer.autotuner import AutoTuner
@@ -327,6 +328,7 @@ def flashinfer_autotune_context(model_runner: ModelRunner, *, run_lm_head: bool)
     from flashinfer.autotuner import AutoTuner, _collect_metadata, autotune
 
     mr = model_runner
+    mem_checkpoint(f"flashinfer autotune begin (draft={mr.is_draft_worker})")
     cache_path = flashinfer_autotune_cache_path(mr)
     sync_group = _autotune_tactic_sync_group(get_parallel().tp_group)
     reuse_cache = envs.SGLANG_FLASHINFER_AUTOTUNE_CACHE.get()
@@ -387,6 +389,7 @@ def flashinfer_autotune_context(model_runner: ModelRunner, *, run_lm_head: bool)
                     autotune_cache.unlink(missing_ok=True)
                 torch.cuda.current_stream().wait_stream(mr.forward_stream)
                 logger.info("FlashInfer autotune skipped: reused cached tactics.")
+                mem_checkpoint("flashinfer autotune end (cached)")
                 return
         mega_context = empty_context()
         if (
@@ -427,6 +430,7 @@ def flashinfer_autotune_context(model_runner: ModelRunner, *, run_lm_head: bool)
             _apply_autotune_overrides(tuner, env)
     torch.cuda.current_stream().wait_stream(mr.forward_stream)
     logger.info("FlashInfer autotune completed.")
+    mem_checkpoint("flashinfer autotune end")
 
 
 def run_flashinfer_autotune_forward(

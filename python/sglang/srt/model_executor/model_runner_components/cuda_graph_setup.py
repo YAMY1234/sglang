@@ -55,6 +55,7 @@ from sglang.srt.runtime_context import (
     get_spec,
 )
 from sglang.srt.utils import get_available_gpu_memory, log_info_on_rank0
+from sglang.srt.utils.mem_checkpoint import mem_checkpoint
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
@@ -763,6 +764,7 @@ def capture_decode_graph(*, model_runner: ModelRunner) -> GraphCapture:
         f"backend={decode_backend}, num_tokens_per_req={num_tokens_per_req}, "
         f"avail mem={before_mem:.2f} GB"
     )
+    mem_checkpoint(f"capture {capture_name} begin")
 
     GraphRunnerCls = current_platform.get_graph_runner_cls()
     if GraphRunnerCls is None:
@@ -793,6 +795,7 @@ def capture_decode_graph(*, model_runner: ModelRunner) -> GraphCapture:
         f"elapsed={capture_time:.2f} s, "
         f"mem usage={memory_usage_gb:.2f} GB, avail mem={after_mem:.2f} GB."
     )
+    mem_checkpoint(f"capture {capture_name} end")
     return GraphCapture(
         runner=runner,
         memory_phase=memory_phase,

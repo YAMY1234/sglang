@@ -116,6 +116,7 @@ from sglang.srt.utils import (
     is_npu,
 )
 from sglang.srt.utils.common import async_h2d
+from sglang.srt.utils.mem_checkpoint import mem_checkpoint
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
@@ -651,6 +652,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             )
         self.draft_kv_ring = ring
         self.draft_model_runner.draft_kv_ring = ring
+        mem_checkpoint("dspark draft ring + staging")
         self._kv_injector.draft_kv_ring = ring
         set_draft_kv_ring(ring)
         if self._target_tp_rank == 0:
@@ -713,7 +715,9 @@ class DSparkWorkerV2(BaseSpecWorker):
                 # from being the intended precision fallback, skipping the
                 # unused hook avoids paying for two proposal computations.
                 if envs.SGLANG_DSPARK_FOLDED_PROPOSAL.get():
+                    mem_checkpoint("dspark draft sampler begin")
                     self._draft_sampler = self._maybe_build_draft_sampler()
+                    mem_checkpoint("dspark draft sampler end")
                     if self._draft_sampler is not None:
                         self.draft_model_runner.capture_tail_hooks.append(
                             make_draft_sampler_capture_hook(self._draft_sampler)
