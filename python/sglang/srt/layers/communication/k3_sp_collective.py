@@ -123,6 +123,12 @@ def _init_state() -> Optional[_State]:
 
     sp_collective.register_comm(comm.obj)
     attn_res_collective.register_comm(comm.obj)
+    if envs.SGLANG_OPT_K3_SP_TP4_WIDE_PUSH.get() and group.world_size == 4:
+        for kind in ("reduce_scatter", "all_gather"):
+            sp_collective.override_push_tuning(
+                kind, 4, _HIDDEN_SIZE, 448, 768, sp_collective.Tuning(192, 512)
+            )
+        logger.info("K3 SP collective: TP4 push at 448-767 tokens uses 192 blocks")
     _STATE = _State(group, comm)
     logger.info(
         "K3 SP collective enabled (TP%d, fused RS residual + AG)",

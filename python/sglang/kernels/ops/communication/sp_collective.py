@@ -206,10 +206,31 @@ def get_dispatch(
             return None
     if config["strategy"] == "nccl":
         return None
-    return Dispatch(
-        config["strategy"],
-        Tuning(config["num_blocks"], config["block_size"]),
-    )
+    tuning = Tuning(config["num_blocks"], config["block_size"])
+    override = _PUSH_OVERRIDES.get((kind, world_size, hidden_size))
+    if (
+        config["strategy"] == "push"
+        and override is not None
+        and override[0] <= num_tokens < override[1]
+    ):
+        tuning = override[2]
+    return Dispatch(config["strategy"], tuning)
+
+
+# (kind, world_size, hidden_size) -> (min_tokens, end_tokens, Tuning) replacing a push
+# entry's grid; the reduction order does not depend on the grid, so results stay bitwise.
+_PUSH_OVERRIDES: dict[tuple[str, int, int], tuple[int, int, Tuning]] = {}
+
+
+def override_push_tuning(
+    kind: str,
+    world_size: int,
+    hidden_size: int,
+    min_tokens: int,
+    end_tokens: int,
+    tuning: Tuning,
+) -> None:
+    _PUSH_OVERRIDES[(kind, world_size, hidden_size)] = (min_tokens, end_tokens, tuning)
 
 
 def get_fusion_dispatch(
