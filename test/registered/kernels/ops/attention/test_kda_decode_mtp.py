@@ -184,7 +184,17 @@ class TestKdaVerifyPendingFold(CustomTestCase):
         if get_device_sm() < 100:
             raise unittest.SkipTest("Kimi K3 compute kernels require SM100a+")
 
-    def _run(self, *, num_requests, num_heads, num_layers, pending_mode, steps=4):
+    def _run(
+        self,
+        *,
+        num_requests,
+        num_heads,
+        num_layers,
+        pending_mode,
+        steps=4,
+        num_spec=4,
+        ring_len=16,
+    ):
         from types import SimpleNamespace
 
         from sglang.kernels.ops.attention.kda_decode_mtp_v2 import (
@@ -196,7 +206,7 @@ class TestKdaVerifyPendingFold(CustomTestCase):
             reset_kda_pending,
         )
 
-        num_spec, ring_len, dim, rows = 4, 16, 128, num_requests + 1
+        dim, rows = 128, num_requests + 1
         kw = _make_inputs(rows, num_spec, num_heads=num_heads)
         gen = torch.Generator(device="cuda").manual_seed(7)
         num_slots = 2 * num_requests + 3
@@ -296,6 +306,42 @@ class TestKdaVerifyPendingFold(CustomTestCase):
         # A finished request's slot keeps its pending rows (its state is dropped).
         records.append([spec_state.temporal[:, slots[:num_requests]].clone()])
         return records
+
+    def test_ring_len_8_matches_16(self):
+        """--linear-replayssm-cache-len 8: every verify rewrites ring rows from 0 and
+        folds at most num_spec + 1 of them, so a ring of 8 gives the same outputs,
+        states and live ring rows as 16 for 6 (K5) and 8 (K7) verify rows."""
+        from sglang.srt.environ import envs
+
+        for num_spec, pending_mode, fast_fold, num_requests, num_heads in (
+            (5, True, True, 58, 24),
+            (5, True, False, 3, 4),
+            (5, False, True, 77, 24),
+            (7, True, True, 58, 24),
+            (7, False, False, 3, 4),
+        ):
+            with (
+                self.subTest(num_spec=num_spec, pending=pending_mode, fast=fast_fold),
+                envs.SGLANG_OPT_KDA_REPLAYSSM_FAST_FOLD.override(fast_fold),
+            ):
+                cfg = dict(
+                    num_requests=num_requests,
+                    num_heads=num_heads,
+                    num_layers=2,
+                    pending_mode=pending_mode,
+                    num_spec=num_spec,
+                )
+                r16 = self._run(ring_len=16, **cfg)
+                r8 = self._run(ring_len=8, **cfg)
+                for step, (a, b) in enumerate(zip(r16, r8)):
+                    for i, (x, y) in enumerate(zip(a, b)):
+                        if x.shape != y.shape:
+                            # A ring ([layers, slots, heads, L, ...]): rows 8..15 of
+                            # the 16-row ring are never written.
+                            x = x.narrow(3, 0, 8)
+                        self.assertTrue(
+                            torch.equal(x, y), f"step {step} tensor {i} differs"
+                        )
 
     def test_pending_fold_matches_eager(self):
         from sglang.srt.environ import envs
