@@ -23,6 +23,7 @@ from sglang.kernels.ops.attention.dsa.head_gate import indexer_q_quant_head_gate
 from sglang.kernels.ops.kvcache.dsa_fused_store_index_cache import (
     can_use_dsa_fused_store,
     fused_store_index_k_cache,
+    mxfp4_roundtrip_index_k,
 )
 from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype, is_fp8_fnuz
 from sglang.srt.compilation.compilation_config import register_split_op
@@ -526,6 +527,8 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         self.is_neox_style = is_neox_style
         self.block_size = block_size
         self.scale_fmt = scale_fmt
+        # Accuracy twin: index-K on the MXFP4 grid, stored exactly in the FP8 cache
+        self.emulate_mxfp4_k = envs.SGLANG_TEST_DSA_INDEXER_MXFP4_K_EMULATION.get()
         self.use_dsa_indexer_fusion = (
             _is_cuda
             and not envs.SGLANG_DISABLE_DSA_INDEXER_FUSION.get()
@@ -1269,7 +1272,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                     key, forward_batch
                 )
             current_stream.wait_stream(self.alt_stream)
-            return query, key, weights_raw
+            return query, self._maybe_mxfp4_k(key), weights_raw
         else:
             query = self._maybe_rotate(query)
             key = self._maybe_rotate(key)
@@ -1277,7 +1280,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         # allgather+rerrange
         if is_cp_active(forward_batch):
             key = get_cp_strategy().materialize_full_indexer_k_cache(key, forward_batch)
-        return query, key, weights_raw
+        return query, self._maybe_mxfp4_k(key), weights_raw
 
     def _get_k_bf16(
         self,
@@ -1315,7 +1318,10 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         if apply_hadamard and self.apply_hadamard:
             key = rotate_activation(key)
 
-        return key
+        return self._maybe_mxfp4_k(key)
+
+    def _maybe_mxfp4_k(self, key: torch.Tensor) -> torch.Tensor:
+        return mxfp4_roundtrip_index_k(key) if self.emulate_mxfp4_k else key
 
     def _fused_k_prepare_and_store(
         self,
@@ -1348,6 +1354,8 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             and out_cache_loc is not None
             # under DCP the store goes through _store_index_k_cache's owner rule
             and not dsa_shards_index_k()
+            # the MXFP4 emulation rounds K between the K kernel and the store
+            and not self.emulate_mxfp4_k
             and can_use_dsa_fused_store(torch.bfloat16, out_cache_loc.dtype, page_size)
         ):
             for buf, loc, rows in _index_k_write_targets(pool, layer_id, out_cache_loc):
@@ -2806,6 +2814,8 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
 
         if out_cache_loc is None:
             out_cache_loc = forward_batch.out_cache_loc
+        # idempotent, so a key already rounded by _get_[q_]k_bf16 is unchanged
+        key = self._maybe_mxfp4_k(key)
 
         pool = get_token_to_kv_pool()
         if hasattr(pool, "invalidate_index_buffer_for_layer"):
@@ -2834,6 +2844,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                     pool.index_page_size,
                     dcp_size=dcp_size,
                     dcp_rank=dcp_rank,
+                    pow2_scale=self.emulate_mxfp4_k,
                 )
             else:
                 for buf, loc, rows in _index_k_write_targets(
@@ -2844,6 +2855,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                         buf,
                         loc,
                         pool.index_page_size,
+                        pow2_scale=self.emulate_mxfp4_k,
                     )
             return
 

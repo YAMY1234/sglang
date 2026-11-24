@@ -2514,6 +2514,10 @@ class Envs:
     SGLANG_EXPERIMENTAL_DSA_KPOOL_METADATA_FUSION = EnvBool(True)
     SGLANG_DSA_TOPK_FLASHINFER_DETERMINISTIC = EnvBool(False)
     SGLANG_DSA_TOPK_FLASHINFER_TIE_BREAK = EnvStr(None)
+    # Accuracy test: round the indexer's K onto the MXFP4 grid (DeepGEMM per_token_cast_to_fp4,
+    # UE8M0 per 32) and store it with a power-of-two scale, so the FP8 index-K cache and logits
+    # kernels serve the MXFP4 values exactly; Q stays FP8. CUDA paths only.
+    SGLANG_TEST_DSA_INDEXER_MXFP4_K_EMULATION = EnvBool(False)
     SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD = EnvInt(2048)
     SGLANG_DSA_HIP_DISABLE_PRESHUFFLE = EnvBool(False)
     SGLANG_DSA_MQA_LOGITS_FREE_MEM_FRACTION = EnvFloat(0.2)

@@ -38,7 +38,7 @@ SGL_DEVICE fp8x2_e4m3_t pack_fp8(float x, float y) {
   return fp8x2_e4m3_t{fp32x2_t{fp8_e4m3_clip(x), fp8_e4m3_clip(y)}};
 }
 
-template <typename KeyT, typename IndicesT, uint32_t kPageBits, bool kUsePDL>
+template <typename KeyT, typename IndicesT, uint32_t kPageBits, bool kUsePDL, bool kPow2Scale>
 __global__ void fused_store_indexer_cache(const __grid_constant__ FusedStoreCacheParam param) {
   using namespace device;
 
@@ -70,7 +70,13 @@ __global__ void fused_store_indexer_cache(const __grid_constant__ FusedStoreCach
   const auto local_max = fmaxf(fmaxf(fabs(x0), fabs(x1)), fmaxf(fabs(y0), fabs(y1)));
   const auto abs_max = warp::reduce_max(local_max);
   // use normal fp32 scale
-  const auto scale = fmaxf(1e-4f, abs_max) / kFP8E4M3Max;
+  float scale = fmaxf(1e-4f, abs_max) / kFP8E4M3Max;
+  if constexpr (kPow2Scale) {
+    // round up to a power of two (DeepGEMM ceil_to_ue8m0): an MXFP4-grid row then stores exactly
+    const uint32_t bits = __float_as_uint(scale);
+    const uint32_t exp = ((bits >> 23) & 0xFFu) + ((bits & 0x7FFFFFu) != 0u);
+    scale = __uint_as_float(min(max(exp, 1u), 254u) << 23);
+  }
   const auto inv_scale = 1.0f / scale;
   // a negative index skips the store (e.g. a token owned by another DCP rank)
   if (index >= 0) {
@@ -89,12 +95,12 @@ __global__ void fused_store_indexer_cache(const __grid_constant__ FusedStoreCach
   PDLTriggerSecondary<kUsePDL>();  // launch secondary kernel
 }
 
-template <typename KeyT, typename IndicesT, uint32_t kPageSize, bool kUsePDL>
+template <typename KeyT, typename IndicesT, uint32_t kPageSize, bool kUsePDL, bool kPow2Scale = false>
 struct FusedStoreCacheIndexerKernel {
   static constexpr int32_t kLogSize = std::countr_zero(kPageSize);
   /// NOTE: 132 = 128 + 4 (128 represent K and 4 represent scale)
   static constexpr int64_t kPageBytes = 132 * kPageSize;
-  static constexpr auto kernel = fused_store_indexer_cache<KeyT, IndicesT, kLogSize, kUsePDL>;
+  static constexpr auto kernel = fused_store_indexer_cache<KeyT, IndicesT, kLogSize, kUsePDL, kPow2Scale>;
 
   static_assert(std::has_single_bit(kPageSize), "kPageSize must be a power of 2");
   static_assert(1 << kLogSize == kPageSize);

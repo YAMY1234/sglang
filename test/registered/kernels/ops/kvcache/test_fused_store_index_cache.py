@@ -28,6 +28,7 @@ try:
     from sglang.kernels.ops.kvcache.dsa_fused_store_index_cache import (
         can_use_dsa_fused_store,
         fused_store_index_k_cache,
+        mxfp4_roundtrip_index_k,
     )
 
     HAS_FUSED = True
@@ -454,6 +455,126 @@ def test_reference_writes_nonzero():
 
     assert deq.abs().sum().item() > 0, "Reference buffer is all zeros — error!"
     torch.testing.assert_close(deq, key.float(), rtol=0.15, atol=5e-2)
+
+
+# TEST 7: MXFP4 index-K emulation (SGLANG_TEST_DSA_INDEXER_MXFP4_K_EMULATION)
+def _ue8m0_ceil(x: torch.Tensor) -> torch.Tensor:
+    bits = x.abs().float().view(torch.int32)
+    exp = ((bits >> 23) & 0xFF) + (bits & 0x7FFFFF).ne(0).to(torch.int32)
+    return (exp.clamp(1, 254) << 23).view(torch.float32)
+
+
+def _mxfp4_cases(device) -> dict:
+    gen = torch.Generator(device="cpu").manual_seed(7)
+    cases = {
+        f"randn_x{mag:g}": torch.randn(256, HEAD_DIM, generator=gen) * mag
+        for mag in (1e-3, 0.1, 1.0, 7.0, 300.0, 3e4)
+    }
+    # Row amax at 448 * 2^j and one bf16 step below / above, j in [-12, 12].
+    edge = torch.randn(75, HEAD_DIM, generator=gen).clamp(-1, 1)
+    for i in range(75):
+        top = 448.0 * 2.0 ** (i // 3 - 12) * (1.0, 0.996, 1.004)[i % 3]
+        edge[i] *= top * 0.5
+        edge[i, 0] = top
+    cases["amax_at_448x2^j"] = edge
+    cases["below_1e-4_clamp"] = torch.randn(64, HEAD_DIM, generator=gen) * 2e-5
+    cases["zeros"] = torch.zeros(8, HEAD_DIM)
+    signed = torch.randn(32, HEAD_DIM, generator=gen)
+    signed[:, ::3] = 0.0
+    signed[:, 1::7] = -0.0
+    cases["signed_zeros"] = signed
+    return {k: v.to(device=device, dtype=torch.bfloat16) for k, v in cases.items()}
+
+
+def _grid_key(
+    num_tokens: int, spread: int, device, top_code: float = 6.0
+) -> torch.Tensor:
+    """Rows already on the MXFP4 grid whose 32-wide groups span `spread` binades,
+    group 0 topped by top_code and group 3 holding a code 0.5 (the tightest case)."""
+    gen = torch.Generator(device="cpu").manual_seed(spread)
+    codes = torch.tensor([0.5, 1.0, 1.5, 2.0, 3.0, 4.0])
+    x = codes[torch.randint(0, 6, (num_tokens, 4, 32), generator=gen)]
+    x = x * torch.where(torch.rand(num_tokens, 4, 32, generator=gen) < 0.5, -1.0, 1.0)
+    x[:, 0, 0] = top_code
+    x[:, 3, 0] = 0.5
+    exps = torch.tensor([3, 3 - spread // 3, 3 - 2 * spread // 3, 3 - spread])
+    x = x * torch.pow(2.0, exps.float()).view(1, 4, 1)
+    return x.reshape(num_tokens, HEAD_DIM).to(device=device, dtype=torch.bfloat16)
+
+
+def _store_and_read(key, *, pow2_scale: bool, dcp_size: int = 1, dcp_rank: int = 0):
+    num_tokens = key.shape[0]
+    loc = torch.arange(num_tokens, device=key.device, dtype=torch.int64)
+    rows = loc if dcp_size == 1 else loc[loc % dcp_size == dcp_rank] // dcp_size
+    buf = _make_buffer(_num_pages(loc, PAGE_SIZE))
+    fused_store_index_k_cache(
+        key,
+        buf,
+        loc,
+        page_size=PAGE_SIZE,
+        dcp_size=dcp_size,
+        dcp_rank=dcp_rank,
+        pow2_scale=pow2_scale,
+    )
+    torch.cuda.synchronize()
+    fp8_f32, scales = _gather_tokens(buf, rows)
+    kept = loc if dcp_size == 1 else loc[loc % dcp_size == dcp_rank]
+    return fp8_f32 * scales.unsqueeze(-1), scales, kept, buf
+
+
+def test_mxfp4_roundtrip_matches_deepgemm_and_is_idempotent():
+    _skip_if_unavailable()
+    math = pytest.importorskip("deep_gemm.utils.math")
+    for name, key in _mxfp4_cases("cuda").items():
+        packed, sf = math.per_token_cast_to_fp4(key, use_ue8m0=True, gran_k=32)
+        expected = math.cast_back_from_fp4(packed, sf, gran_k=32)
+        got = mxfp4_roundtrip_index_k(key)
+        assert torch.equal(got.float().view(torch.int32), expected.view(torch.int32)), (
+            name
+        )
+        assert torch.equal(mxfp4_roundtrip_index_k(got), got), name
+
+
+@pytest.mark.parametrize("dcp_size,dcp_rank", [(1, 0), (4, 0), (4, 3)])
+def test_pow2_store_is_exact_on_mxfp4_grid(dcp_size: int, dcp_rank: int):
+    _skip_if_unavailable()
+    for name, key in _mxfp4_cases("cuda").items():
+        key = mxfp4_roundtrip_index_k(key)
+        deq, scales, kept, _ = _store_and_read(
+            key, pow2_scale=True, dcp_size=dcp_size, dcp_rank=dcp_rank
+        )
+        # Exact: the scale is a power of two, an E2M1 value (2 significant bits) fits
+        # E4M3's 3-bit mantissa, and a row's group exponents span <= 14 binades.
+        expected = key[kept].float()
+        assert torch.equal(deq.view(torch.int32), expected.view(torch.int32)), name
+        assert torch.equal(scales, _ue8m0_ceil(scales)), name
+
+
+@pytest.mark.parametrize("top_code", [6.0, 4.0])  # 4.0: the row amax is a power of two
+def test_pow2_store_spread_limit(top_code: float):
+    _skip_if_unavailable()
+    exact = _grid_key(64, 14, "cuda", top_code=top_code)
+    assert torch.equal(mxfp4_roundtrip_index_k(exact), exact)
+    deq, _, _, _ = _store_and_read(exact, pow2_scale=True)
+    assert torch.equal(deq.view(torch.int32), exact.float().view(torch.int32))
+    # Past the limit the smallest code falls under E4M3's subnormal step: documented mismatch.
+    past = _grid_key(64, 15, "cuda")
+    deq, _, _, _ = _store_and_read(past, pow2_scale=True)
+    assert (deq != past.float()).any(dim=1).all()
+
+
+def test_pow2_scale_off_is_the_default_store():
+    _skip_if_unavailable()
+    key = torch.randn(257, HEAD_DIM, device="cuda", dtype=torch.bfloat16)
+    _, _, _, default_buf = _store_and_read(key, pow2_scale=False)
+    loc = torch.arange(257, device="cuda", dtype=torch.int64)
+    buf = _make_buffer(_num_pages(loc, PAGE_SIZE))
+    fused_store_index_k_cache(key, buf, loc, page_size=PAGE_SIZE)
+    torch.cuda.synchronize()
+    assert torch.equal(buf, default_buf)
+    _, scales = _gather_tokens(buf, loc)
+    expected = key.float().abs().amax(dim=1).clamp(min=1e-4) / FP8_E4M3_MAX
+    torch.testing.assert_close(scales, expected, rtol=1e-6, atol=0)
 
 
 if __name__ == "__main__":
