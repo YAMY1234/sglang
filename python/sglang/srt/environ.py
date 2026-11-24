@@ -593,6 +593,10 @@ class Envs:
     # ring of window + verify-block rows instead of one row per target slot. Off by
     # default; resolved at startup, and an unsupported draft or backend raises.
     SGLANG_DSPARK_DRAFT_KV_RING = EnvBool(False)
+    # With the draft KV ring on a head-sharded PD decode: the staging ring holds this many
+    # requests (slots taken at preallocation, freed after unstage; preallocation waits for
+    # a free slot). 0: one staging block per req pool row.
+    SGLANG_DSPARK_DRAFT_KV_RING_STAGING_SLOTS = EnvInt(0)
     # DSpark draft graph: its in-graph attention-metadata prep runs on a side stream
     # and joins at the first draft KV store, overlapping the embedding.
     SGLANG_OPT_DSV41_DSPARK_DRAFT_PREP_FORK = EnvBool(False)
