@@ -404,6 +404,78 @@ def test_dspark_staging_slots():
     assert len(ring._free_slots) == 2 and not ring._slot_of
 
 
+@pytest.mark.parametrize("burst,slots", [(1000, 0), (72, 72)])
+def test_dspark_unstage_burst_memory_bounded(burst, slots):
+    """A window opening lands many requests at once (and short requests that finish
+    without a draft step leave their unstage pending): K3.1 decode geometry (page 256,
+    16 staged heads, 4 local), 200 req pool rows, ``burst`` unstage marks over them.
+    The flush copies each request's newest rows once, this rank's heads only, through
+    the fixed buffer: no memory beyond it, however large the burst."""
+    from sglang.srt.speculative.dflash_draft_ring import UNSTAGE_CHUNK_BYTES
+
+    page, block, req_rows, heads, local, width = 256, 5, 200, 16, 4, 64
+
+    class _Pool:
+        page_size = page
+
+        def __init__(self, rows):
+            self.bufs = [
+                torch.zeros((rows, local, width), dtype=torch.uint8, device="cuda")
+                for _ in range(2)
+            ]
+
+        def _pd_registerable_tensors(self):
+            return self.bufs
+
+    rows_per_req = dspark_draft_kv_ring_rows_per_req(
+        window_left=DSPARK_WINDOW_LEFT, block_size=block, page_size=page
+    )
+    ring = DFlashDraftKVRing(
+        rows_per_req=rows_per_req,
+        dcp_size=1,
+        req_pool_rows=req_rows,
+        device="cuda",
+        window_left=DSPARK_WINDOW_LEFT,
+        sink_rows=page,
+        page_size=page,
+    )
+    pool_rows = page + req_rows * rows_per_req
+    ring.pool = _Pool(pool_rows)
+    staging_rows = page + (slots or req_rows) * rows_per_req
+    staging = DraftKVRingStaging(
+        pool=ring.pool, num_rows=staging_rows, total_kv_heads=heads
+    )
+    ring.attach_staging(staging, head_start=8, num_heads=local, slots=slots)
+    head_tag = torch.arange(heads, dtype=torch.uint8, device="cuda").view(1, -1, 1)
+    for buf in staging.ring_buffers():
+        buf.copy_(head_tag.expand_as(buf))
+    marked = []
+    for i in range(burst):
+        req = i % (slots or req_rows)
+        if slots:
+            ring.reset_floor(req, 4096)
+            ring.min_pos[req] = 0
+        ring.mark_unstage(req)
+        marked.append(req)
+    torch.cuda.synchronize()
+    torch.cuda.reset_peak_memory_stats()
+    base = torch.cuda.memory_allocated()
+    ring.flush_unstage()
+    torch.cuda.synchronize()
+    extra = torch.cuda.max_memory_allocated() - base
+    gathered_all_heads = len(set(marked)) * rows_per_req * heads * width
+    print(
+        f"burst {burst} (unique {len(set(marked))}), slots {slots}: peak extra "
+        f"{extra / 2**20:.2f} MiB; buffer {UNSTAGE_CHUNK_BYTES / 2**20:.0f} MiB; "
+        f"a whole-row gather per buffer {gathered_all_heads / 2**20:.0f} MiB"
+    )
+    assert extra <= 16 << 20, extra
+    for buf in ring.pool.bufs:
+        rows = torch.arange(page, page + len(set(marked)) * rows_per_req)
+        assert bool((buf[rows.cuda()] == head_tag[:, 8:12]).all())
+    assert not ring._pending_unstage
+
+
 def test_dspark_unsupported_drafts():
     from unittest import mock
 
