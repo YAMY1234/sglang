@@ -2750,6 +2750,10 @@ class Envs:
     # Under SGLANG_K31_MOE_START=early: the shared experts' activation and down_proj wait
     # for mega_moe_pre_dispatch, so their CTAs queue behind the MegaMoE launch.
     SGLANG_K31_SHARED_TAIL_AFTER_PREDISPATCH = EnvBool(False)
+    # Kimi-K3.1 MegaMoE decode: rows ("up=lo-hi,...;down=lo-hi,...") where the latent up_proj and
+    # the replicated shared down_proj run as DeepGEMM bf16_gemm_nt instead of the default BF16
+    # GEMM; from a per-row sweep over the captured graph sizes ("" or unset: off).
+    SGLANG_K31_MOE_SIDE_DG_ROWS = EnvStr("")
     # Under SGLANG_K31_SM107_GEMM_TACTICS on SM107: the largest graphed rows
     # whose KDA [f_a | b] GEMM runs on the side stream beside [q,k,v,g]
     # (default 1152 = the largest verify rows, the stable table's

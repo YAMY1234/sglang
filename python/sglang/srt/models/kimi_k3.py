@@ -582,6 +582,8 @@ class KimiK3MLP(nn.Module):
     # (rows lo, rows hi, SMs): gate_up through DeepGEMM bf16_gemm_nt on a capped SM count
     # (SGLANG_K31_SHARED_GATEUP_DG_SMS, set on the MegaMoE shared experts); None: off.
     _k31_gate_up_dg = None
+    # Rows whose down_proj runs as DeepGEMM bf16_gemm_nt (SGLANG_K31_MOE_SIDE_DG_ROWS "down").
+    _k31_down_dg_rows = ()
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return self.forward_act_down(self.forward_gate_up(hidden_states))
@@ -601,18 +603,26 @@ class KimiK3MLP(nn.Module):
 
     def forward_act_down(self, gate_up: torch.Tensor) -> torch.Tensor:
         hidden_states = self.act_fn(gate_up)
+        if (
+            _k31_in_rows(hidden_states.shape[0], self._k31_down_dg_rows)
+            and self.down_proj.weight.dtype == torch.bfloat16
+        ):
+            return _k31_dg_bf16_gemm_on_sms(hidden_states, self.down_proj.weight)
         hidden_states, _ = self.down_proj(hidden_states)
         return hidden_states
 
 
 def _k31_dg_bf16_gemm_on_sms(
-    x: torch.Tensor, weight: torch.Tensor, num_sms: int
+    x: torch.Tensor, weight: torch.Tensor, num_sms: Optional[int] = None
 ) -> torch.Tensor:
-    """x @ weight.T (bf16) by DeepGEMM's persistent bf16_gemm_nt on at most num_sms SMs, so
-    it fits beside the router GEMM in one wave instead of queueing a second one."""
+    """x @ weight.T (bf16) by DeepGEMM's persistent bf16_gemm_nt, on at most num_sms SMs
+    when given (None: DeepGEMM's current SM count)."""
     import deep_gemm
 
     out = x.new_empty((x.shape[0], weight.shape[0]))
+    if num_sms is None:
+        deep_gemm.bf16_gemm_nt(x.contiguous(), weight, out)
+        return out
     prev = deep_gemm.get_num_sms()
     deep_gemm.set_num_sms(min(num_sms - num_sms % 2, prev))
     try:
@@ -620,6 +630,22 @@ def _k31_dg_bf16_gemm_on_sms(
     finally:
         deep_gemm.set_num_sms(prev)
     return out
+
+
+def _k31_parse_dg_rows(spec: str) -> dict:
+    """SGLANG_K31_MOE_SIDE_DG_ROWS "up=145-156,160-168;down=129-162" ->
+    {"up": ((145, 156), (160, 168)), "down": ((129, 162),)}."""
+    out = {}
+    for part in filter(None, (p.strip() for p in (spec or "").split(";"))):
+        name, ranges = part.split("=")
+        out[name.strip()] = tuple(
+            tuple(int(v) for v in r.split("-")) for r in ranges.split(",") if r
+        )
+    return out
+
+
+def _k31_in_rows(m: int, rows: tuple) -> bool:
+    return any(lo <= m <= hi for lo, hi in rows)
 
 
 def _add3(
@@ -1138,6 +1164,10 @@ class KimiK3MoE(nn.Module):
             self.routed_expert_down_proj = None
             self.routed_expert_norm = None
             self.routed_expert_up_proj = None
+        side_dg = _k31_parse_dg_rows(envs.SGLANG_K31_MOE_SIDE_DG_ROWS.get())
+        self._k31_up_dg_rows = side_dg.get("up", ())
+        if self.shared_experts is not None and self._shared_experts_tp1:
+            self.shared_experts._k31_down_dg_rows = side_dg.get("down", ())
 
         # Static eligibility for fusing the latent all-reduce with the RMSNorm
         # epilogue (SGLANG_K3_AR_FUSION): kernel needs latent == NORM_DIM and
@@ -1906,7 +1936,15 @@ class KimiK3MoE(nn.Module):
             else:
                 latent = self._reduce_latent(expert_output)
                 # up_proj is replicated, so the routed output is now fully reduced.
-                out, _ = self.routed_expert_up_proj(latent)
+                if (
+                    _k31_in_rows(latent.shape[0], self._k31_up_dg_rows)
+                    and self.routed_expert_up_proj.weight.dtype == torch.bfloat16
+                ):
+                    out = _k31_dg_bf16_gemm_on_sms(
+                        latent, self.routed_expert_up_proj.weight
+                    )
+                else:
+                    out, _ = self.routed_expert_up_proj(latent)
         if k31_routed is not None:
             k31_main.wait_stream(k31_routed)
             out.record_stream(k31_main)
