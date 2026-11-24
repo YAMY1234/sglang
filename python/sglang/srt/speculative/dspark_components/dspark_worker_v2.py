@@ -639,15 +639,30 @@ class DSparkWorkerV2(BaseSpecWorker):
                     "DSpark draft KV ring staging needs evenly sharded KV heads: "
                     f"{local_heads} x attn_tp {parallel.attn_tp_size} != {total_heads}."
                 )
+            # Staging slots: only requests between preallocation and unstage hold rows.
+            slots = min(
+                envs.SGLANG_DSPARK_DRAFT_KV_RING_STAGING_SLOTS.get(), req_pool_rows
+            )
+            staging_rows = (
+                draft_kv_ring_pool_rows(
+                    req_pool_rows=slots,
+                    rows_per_req=rows_per_req,
+                    page_size=page_size,
+                    sink_rows=sink_rows,
+                )
+                if slots
+                else pool_rows
+            )
             ring.attach_staging(
                 DraftKVRingStaging(
                     pool=pool,
-                    num_rows=pool_rows,
+                    num_rows=staging_rows,
                     total_kv_heads=total_heads,
                     mem_pool=mem_pool,
                 ),
                 head_start=parallel.attn_tp_rank * local_heads,
                 num_heads=local_heads,
+                slots=slots,
             )
         self.draft_kv_ring = ring
         self.draft_model_runner.draft_kv_ring = ring
@@ -661,7 +676,11 @@ class DSparkWorkerV2(BaseSpecWorker):
                 rows_per_req // page_size,
                 req_pool_rows,
                 pool_rows,
-                "on" if ring.staging is not None else "off",
+                "off"
+                if ring.staging is None
+                else f"{ring._staging_slots} slots"
+                if ring._staging_slots
+                else "on",
             )
 
     def init_attention_backends(self):
