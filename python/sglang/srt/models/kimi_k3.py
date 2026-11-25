@@ -140,6 +140,11 @@ from sglang.srt.models.deepseek_common.attention_forward_methods.forward_methods
     AttnForwardMethod,
 )
 from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA, MoEGate
+from sglang.srt.models.kimi_k3_basisb import (
+    k31_basisb_enabled,
+    k31_basisb_kda_qkvg_only,
+    k31_basisb_linear_config,
+)
 from sglang.srt.models.kimi_k3_vl import (
     KimiK3MultiModalProjector,
     KimiK3VisionTower,
@@ -1042,7 +1047,7 @@ class KimiK3MoE(nn.Module):
                 hidden_size=config.hidden_size,
                 intermediate_size=shared_intermediate_size,
                 hidden_act=config.hidden_act,
-                quant_config=quant_config,
+                quant_config=k31_basisb_linear_config(quant_config),
                 prefix=f"{prefix}.shared_experts",
                 activation_situ_beta=config.activation_situ_beta,
                 activation_situ_linear_beta=config.activation_situ_linear_beta,
@@ -1139,7 +1144,13 @@ class KimiK3MoE(nn.Module):
         # control of weight layout.
         if not (get_platform().is_cuda or get_platform().is_hip):
             return
-        if self.shared_experts is not None and get_moe_a2a_backend().is_none():
+        # Basis-B shared experts are cast to MXFP8 after this merge runs; a BF16
+        # view taken here would keep the BF16 copy and feed a BF16 front.
+        if (
+            self.shared_experts is not None
+            and get_moe_a2a_backend().is_none()
+            and not k31_basisb_enabled()
+        ):
             mods = [
                 self.shared_experts.gate_up_proj,
                 self.gate,
@@ -2274,6 +2285,14 @@ class KimiK3DeltaAttention(nn.Module):
         # experts; attention linears resolve to UnquantizedLinearMethod, so a
         # non-None quant_config is fine for the merged projection.
         self.do_fuse_qkvbfg = quant_config is None and self.head_tp_size == self.tp_size
+        # Basis B: q/k/v/g, b, f_a and o load-time MXFP8; f_b stays BF16. Under
+        # SGLANG_K31_BASISB_KDA_QKVG_ONLY only q/k/v/g, and [f_a | b] merges as in BF16.
+        self._basisb = self.use_full_rank_gate and k31_basisb_enabled()
+        self._basisb_bfao = self._basisb and not k31_basisb_kda_qkvg_only()
+        qkvg_quant_config = (
+            k31_basisb_linear_config(quant_config) if self._basisb else quant_config
+        )
+        proj_quant_config = qkvg_quant_config if self._basisb_bfao else quant_config
 
         if self.use_full_rank_gate:
             # Fuse only the wide projections [q, k, v, g]: folding b (12/rank)
@@ -2290,7 +2309,7 @@ class KimiK3DeltaAttention(nn.Module):
                     projection_size,
                 ],
                 bias=False,
-                quant_config=quant_config,
+                quant_config=qkvg_quant_config,
                 parallel_group=self.head_group,
                 prefix=f"{prefix}.fused_qkvg_proj",
             )
@@ -2302,7 +2321,7 @@ class KimiK3DeltaAttention(nn.Module):
                 self.hidden_size,
                 self.num_heads,
                 bias=False,
-                quant_config=quant_config,
+                quant_config=proj_quant_config,
                 parallel_group=self.head_group,
                 prefix=f"{prefix}.b_proj",
                 # TP8 shards K3's 96 beta rows below the 128-row FP8 block.
@@ -2312,7 +2331,7 @@ class KimiK3DeltaAttention(nn.Module):
                 self.hidden_size,
                 self.head_dim,
                 bias=False,
-                quant_config=quant_config,
+                quant_config=proj_quant_config,
                 prefix=f"{prefix}.f_a_proj",
             )
             self.f_b_proj = ColumnParallelLinear(
@@ -2480,7 +2499,7 @@ class KimiK3DeltaAttention(nn.Module):
             bias=False,
             # The stage boundary completes the attention-TP sum.
             reduce_results=False,
-            quant_config=quant_config,
+            quant_config=proj_quant_config,
             parallel_group=self.head_group,
             # Symmetric memory of the attention-TP group, which sums the output;
             # off under all_reduce_fusion, whose caller owns the output buffer,
@@ -2544,7 +2563,7 @@ class KimiK3DeltaAttention(nn.Module):
 
         Called once after weight loading. Block-FP8 inputs are dequantized into
         the BF16 tiny-GEMM buffers here."""
-        if not self.use_full_rank_gate:
+        if not self.use_full_rank_gate or self._basisb_bfao:
             return
         if _is_npu:
             return
@@ -2762,6 +2781,11 @@ class KimiK3DeltaAttention(nn.Module):
         )
         self._kda_fused_decode_ready = True
 
+    def _unfused_b_f(self, hidden_states: torch.Tensor, defer_f_b: bool):
+        beta = self.b_proj(hidden_states)[0]
+        f_a = self.f_a_proj(hidden_states)[0]
+        return beta, f_a if defer_f_b else self.f_b_proj(f_a)[0]
+
     def forward_qkvbfg_fused(
         self, hidden_states: torch.Tensor, defer_f_b: bool = False
     ):
@@ -2827,12 +2851,24 @@ class KimiK3DeltaAttention(nn.Module):
                     else gemm(bfa[..., :n_fa], self._bfa_f_b_w)
                 )
                 beta = bfa[..., n_fa : n_fa + n_b]
+            elif (
+                self._basisb_bfao
+                and self._bfa_alt_stream is not None
+                and get_is_capture_mode()
+                and 0 < hidden_states.shape[0] <= self._bfa_bs_limit
+            ):
+                alt = self._bfa_alt_stream
+                cur = torch.cuda.current_stream()
+                alt.wait_stream(cur)
+                fused_states, _ = self.fused_qkvg_proj(hidden_states)
+                with torch.cuda.stream(alt):
+                    beta, forget_gate = self._unfused_b_f(hidden_states, defer_f_b)
+                qkv, g_proj_states = torch.split(fused_states, self.split_sizes, dim=-1)
+                cur.wait_stream(alt)
             else:
                 fused_states, _ = self.fused_qkvg_proj(hidden_states)
                 qkv, g_proj_states = torch.split(fused_states, self.split_sizes, dim=-1)
-                beta = self.b_proj(hidden_states)[0]
-                f_a = self.f_a_proj(hidden_states)[0]
-                forget_gate = f_a if defer_f_b else self.f_b_proj(f_a)[0]
+                beta, forget_gate = self._unfused_b_f(hidden_states, defer_f_b)
         else:
             fused_states = self.fused_qkvbfg_a_proj(hidden_states)
             qkv, beta, fg_a_states = torch.split(fused_states, self.split_sizes, dim=-1)

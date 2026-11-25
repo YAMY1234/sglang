@@ -1121,9 +1121,12 @@ class Fp8LinearMethod(LinearMethodBase):
                 )
             copy_or_rebind_param(layer, "weight_scale_inv_deepgemm", scale_packed)
 
+    def _mxfp8_weight_cast(self, weight: torch.Tensor):
+        return mxfp8_group_quantize(weight)
+
     def _quantize_mxfp8_weights(self, layer: Module) -> None:
         weight = layer.weight.data
-        qweight, weight_scale = mxfp8_group_quantize(weight)
+        qweight, weight_scale = self._mxfp8_weight_cast(weight)
         # Keep parameter objects to preserve weight_loader attrs for hot reload.
         layer.weight.data = qweight
         layer.weight.requires_grad_(False)
