@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import json
 import logging
+import os
+import sys
 from collections import defaultdict, deque
 from contextlib import nullcontext
 from dataclasses import dataclass
@@ -10,6 +13,7 @@ import torch
 import torch.distributed
 
 from sglang.srt.disaggregation.base.conn import KVPoll
+from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.disaggregation.utils import poll_and_all_reduce_attn_cp_tp_group
 from sglang.srt.distributed.communication_op import attn_cp_tp_broadcast_pyobj
 from sglang.srt.distributed.parallel_state import P2PWork
@@ -40,6 +44,89 @@ from sglang.srt.utils.device import is_npu
 
 _is_npu = is_npu()
 logger = logging.getLogger(__name__)
+
+
+def _pp_stream_roles(scheduler):
+    """Read initialized CUDA stream attributes without creating streams or work.
+
+    Shared model streams keep their owner paths: repeated handles in this map
+    describe sharing, including intentional reuse of one alt stream by layers.
+    Streams created lazily after PP initialization are outside this snapshot.
+    """
+    roles = {}
+
+    def add_attributes(obj, prefix):
+        if obj is None:
+            return
+        for name, value in vars(obj).items():
+            path = f"{prefix}.{name}"
+            if isinstance(value, torch.cuda.Stream):
+                roles[path] = value
+            elif isinstance(value, (list, tuple)):
+                for index, item in enumerate(value):
+                    if isinstance(item, torch.cuda.Stream):
+                        roles[f"{path}[{index}]"] = item
+            elif isinstance(value, dict):
+                for key, item in value.items():
+                    if isinstance(item, torch.cuda.Stream):
+                        roles[f"{path}[{key!r}]"] = item
+
+    for name in ("forward_stream", "schedule_stream", "copy_stream", "pp_comm_stream"):
+        stream = getattr(scheduler, name, None)
+        if isinstance(stream, torch.cuda.Stream):
+            roles[name] = stream
+
+    runner_roles = {}
+    workers = [
+        (name, getattr(scheduler, name, None))
+        for name in ("tp_worker", "draft_worker")
+    ]
+    # EAGLEWorkerV2 owns a plan stream itself. Its EagleDraftWorker, when
+    # hosted on this rank, owns another plan stream and the draft runner.
+    eagle = getattr(scheduler, "draft_worker", None)
+    draft = getattr(eagle, "_draft_worker", None)
+    workers.append(("draft_worker._draft_worker", draft))
+    workers.append(
+        ("draft_worker._draft_worker.draft_worker", getattr(draft, "draft_worker", None))
+    )
+    for worker_name, worker in workers:
+        if worker is None:
+            continue
+        add_attributes(worker, worker_name)
+        for name, runner in vars(worker).items():
+            if not hasattr(runner, "model") or not hasattr(runner, "forward_stream"):
+                continue
+            prefix = f"{worker_name}.{name}"
+            if id(runner) in runner_roles:
+                for suffix, stream in runner_roles[id(runner)]:
+                    roles[prefix + suffix] = stream
+                continue
+            previous = set(roles)
+            add_attributes(runner, prefix)
+            backend = getattr(runner, "attn_backend", None)
+            add_attributes(backend, f"{prefix}.attn_backend")
+            for child in ("prefill_candidates", "decode_candidates"):
+                add_attributes(getattr(backend, child, None), f"{prefix}.attn_backend.{child}")
+            model = runner.model
+            if model is not None:
+                for module_name, module in model.named_modules():
+                    module_path = f"{prefix}.model"
+                    if module_name:
+                        module_path += f".{module_name}"
+                    add_attributes(module, module_path)
+            runner_roles[id(runner)] = [
+                (path[len(prefix):], roles[path]) for path in roles.keys() - previous
+            ]
+
+    controller = getattr(getattr(scheduler, "tree_cache", None), "cache_controller", None)
+    add_attributes(controller, "cache_controller")
+    engine = getattr(controller, "l2_transfer_engine", None)
+    add_attributes(engine, "cache_controller.l2_transfer_engine")
+    add_attributes(getattr(scheduler, "future_map", None), "future_map")
+    # Inspect only an already imported module; never create its lazy side stream.
+    dcp = sys.modules.get("sglang.srt.layers.attention.dsa.dsa_dcp_sharded")
+    add_attributes(dcp, "dsa_dcp_sharded")
+    return roles
 
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import Scheduler
@@ -93,6 +180,25 @@ class PPBatchMetadata:
     verify_out_cache_loc: Optional[torch.Tensor] = None
     # Rank-local; never sent over the wire.
     fpm_timing: Optional[FpmTiming] = None
+    # Decided once at launch, identically on every stage: skip the output ring.
+    pd_local_result: bool = False
+    # PD local result: this mb's forward-completion event. Without the ring, an
+    # earlier stage waits on it before checkpointing or sending the mb's KV.
+    forward_event: Optional[torch.Event] = None
+
+
+@dataclass
+class PPHiCacheCounts:
+    """PP0's HiCache ready counts of one loop iteration, appended to the request relay."""
+
+    counts: List[List[int]]
+
+
+@dataclass
+class PPPrefetchVerdicts:
+    """PP0's prefetch stop verdicts of one loop iteration, in call order."""
+
+    verdicts: List[int]
 
 
 class SchedulerPPMixin:
@@ -100,6 +206,17 @@ class SchedulerPPMixin:
     # ran init_pp_loop_state (plain TP, unit-test doubles) read False;
     # init_pp_loop_state overwrites it per instance.
     _pp_spec_relay: bool = False
+    # HiCache controller handed each launch's forward-start event for the
+    # relaxed write_back eviction fence; Scheduler.__init__ sets it when on.
+    _pp_fence_controller = None
+    # Opt-in PD prefill options, set by _pp_init_pd_async_options.
+    _pp_pd_local_result_enabled: bool = False
+    _pp_hicache_piggyback: bool = False
+    _pp_prefetch_verdict_relay: bool = False
+    _pp_prefill_relay_before_d2h: bool = False
+    # SGLANG_HICACHE_PP_LAGGED_DRAIN: the ring min rides the release consensus to PP0.
+    _pp_lagged_drain: bool = False
+    _pp_prefill_host_output_copy: bool = False
 
     @DynamicGradMode()
     def event_loop_pp(self: Scheduler):
@@ -254,6 +371,7 @@ class SchedulerPPMixin:
 
         """
         self.init_pp_loop_state()
+        self._pp_init_pd_async_options()
 
         # PD additional state initialization
         tmbs = [None] * self.pp_loop_size
@@ -261,6 +379,17 @@ class SchedulerPPMixin:
         release_rids: Optional[Dict[str, bool]] = None
         send_transfer_work = []
         send_release_work = []
+        # A peer stage reports Success before its staging chunks land.
+        stream_early_finish = (
+            envs.SGLANG_OPT_DISAGG_PP_PREFILL_EARLY_FINISH.get()
+            and self.pp_group.is_first_rank
+            and not self.enable_staging
+        )
+        if stream_early_finish:
+            logger.info(
+                "PP prefill streams a request's finish once every stage sent its KV "
+                "(SGLANG_OPT_DISAGG_PP_PREFILL_EARLY_FINISH)"
+            )
 
         while True:
             server_is_idle = True
@@ -341,10 +470,21 @@ class SchedulerPPMixin:
 
                 if tmbs[next_mb_id] is not None:
                     next_release_rids = self._pp_recv_pyobj_from_prev_stage()
+                    if self._pp_lagged_drain and self.pp_group.is_first_rank:
+                        next_release_rids = self._pp_take_lag_mark(next_release_rids)
                 self._pp_commit_comm_work(send_release_work)
+                # The current forward is already submitted. Publish its inputs
+                # after the release protocol, before waiting on the OLD result.
+                if self._pp_prefill_relay_before_d2h and not self.pp_group.is_last_rank:
+                    self.send_req_work = self._pp_send_reqs_to_next_stage(recv_reqs)
+                    send_transfer_work = self._pp_send_pyobj_to_next_stage(
+                        transferred_rids, async_send=True
+                    )
+                    if cur_batch:
+                        self._pp_send_proxy_to_next_stage(result)
                 # post-process the coming microbatch
                 if self.mbs[next_mb_id] is not None:
-                    d2h_event.synchronize()
+                    self._pp_prefill_output_d2h_sync(d2h_event)
                     self._pp_process_batch_result(
                         self.mbs[next_mb_id],
                         next_batch_result,
@@ -353,7 +493,9 @@ class SchedulerPPMixin:
 
                 if tmbs[next_mb_id] is not None:
                     self.process_disagg_prefill_transfer_queue(next_release_rids)
-                if not self.pp_group.is_last_rank:
+                if stream_early_finish:
+                    self.stream_pp_transferred_finish()
+                if not self._pp_prefill_relay_before_d2h and not self.pp_group.is_last_rank:
                     self.send_req_work = self._pp_send_reqs_to_next_stage(recv_reqs)
                     send_transfer_work = self._pp_send_pyobj_to_next_stage(
                         transferred_rids, async_send=True
@@ -585,7 +727,14 @@ class SchedulerPPMixin:
         """Hold a pause, and the inputs after it, until no micro-batch is
         unprocessed."""
         has_unprocessed_mb = any(mb is not None for mb in self.mbs)
-        return self.ingest_requests(stop_at_pause=has_unprocessed_mb)
+        return self.ingest_requests(
+            stop_at_pause=has_unprocessed_mb,
+            take_relay_extras=(
+                self._pp_take_relay_extras
+                if self._pp_hicache_piggyback or self._pp_prefetch_verdict_relay
+                else None
+            ),
+        )
 
     def _pp_may_launch(self: Scheduler) -> bool:
         """No new micro-batch once a pause is held or applied."""
@@ -637,21 +786,240 @@ class SchedulerPPMixin:
             and torch.cuda.is_available()
             and str(self.device).startswith("cuda")
         ):
-            self.pp_comm_stream = allocate_distinct_stream(
-                self.device_module,
-                (self.schedule_stream, self.forward_stream, self.copy_stream),
-            )
+            avoid_streams = (self.schedule_stream, self.forward_stream, self.copy_stream)
+            if envs.SGLANG_PP_COMM_STREAM_AVOID_SIDE_STREAMS.get():
+                avoid_streams += tuple(_pp_stream_roles(self).values())
+            self.pp_comm_stream = allocate_distinct_stream(self.device_module, avoid_streams)
             self.pp_comm_stream_ctx = self.device_module.stream(self.pp_comm_stream)
             logger.info(
                 "PP tensor communication overlap enabled on a dedicated CUDA stream"
+            )
+        if self._pp_fence_controller is not None and self.pp_comm_stream is None:
+            # Without it the sends make the schedule stream, and so every copy
+            # submitted from it, wait on the in-flight forward.
+            raise ValueError(
+                "SGLANG_ENABLE_HICACHE_WB_EVICT_RELAXED_FENCE=1 requires the PP "
+                "comm stream (SGLANG_PP_COMM_OVERLAP=1 on CUDA)"
             )
 
         self._pp_tensor_dict_inbox: Dict[
             str, deque[Tuple[Dict[str, torch.Tensor], Optional[torch.Event]]]
         ] = defaultdict(deque)
+        # Last stage, PD local result: own outputs held until the mb is processed.
+        self._pp_local_outputs: Dict[int, Tuple[torch.Event, PPProxyTensors]] = {}
+
+        if envs.SGLANG_PP_STREAM_IDENTITY_LOG.get():
+            self._pp_log_stream_identities()
+
+    def _pp_log_stream_identities(self):
+        """One init-only observer line, with no CUDA submissions or PG warmup."""
+        try:
+            roles = _pp_stream_roles(self)
+            handles = {name: int(stream.cuda_stream) for name, stream in roles.items()}
+            shared = defaultdict(list)
+            for name, handle in handles.items():
+                shared[handle].append(name)
+            receipt = {
+                "pp_rank": get_parallel().pp_rank,
+                "pid": os.getpid(),
+                "device": str(self.device),
+                "torch_version": torch.__version__,
+                "priority_range": torch.cuda.Stream.priority_range(),
+                "cuda_streams": handles,
+                "stream_priorities": {
+                    name: stream.priority for name, stream in roles.items()
+                },
+                "shared_handles": {
+                    str(handle): names for handle, names in shared.items() if len(names) > 1
+                },
+                "TORCH_NCCL_HIGH_PRIORITY": os.environ.get("TORCH_NCCL_HIGH_PRIORITY"),
+                "SGLANG_PLB_STREAM_PRIORITY": envs.SGLANG_PLB_STREAM_PRIORITY.get(),
+                "avoid_side_streams": envs.SGLANG_PP_COMM_STREAM_AVOID_SIDE_STREAMS.get(),
+                "pg_p2p_stream": {
+                    "status": "UNKNOWN",
+                    "reason": "ProcessGroupNCCL exposes no Python stream getter; caller events are not its internal stream",
+                },
+                "coverage": "initialized runner/model module stream attributes and cache_controller/L2 engine; lazy later streams excluded",
+            }
+            logger.info("PP_STREAM_IDENTITIES %s", json.dumps(receipt, sort_keys=True))
+        except Exception:
+            # Observation must not prevent the normal PP loop from starting.
+            logger.warning("PP_STREAM_IDENTITIES unavailable", exc_info=True)
+
+    def _pp_init_pd_async_options(self: Scheduler) -> None:
+        """Opt-in PD prefill options; with both off the loop is the stock one."""
+        from sglang.srt.disaggregation.utils import TransferBackend
+        from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+
+        parallel = get_parallel()
+        self._pp_pd_local_result_enabled = (
+            envs.SGLANG_PP_PD_LOCAL_RESULT.get()
+            and parallel.pp_size > 1
+            and not _is_npu
+            # Only the Mooncake sender skips aux on the earlier stages.
+            and self.transfer_backend == TransferBackend.MOONCAKE
+            and not self._pp_spec_relay
+            # Auxiliary sampling outputs reach the first stage only over the ring.
+            and self.tp_worker.model_runner.sampling_observer is None
+        )
+        self._pp_prefill_relay_before_d2h = (
+            envs.SGLANG_PP_PREFILL_RELAY_BEFORE_D2H.get()
+        )
+        if self._pp_prefill_relay_before_d2h and (
+            _is_npu or parallel.tp_size != 1 or parallel.pp_size < 2
+            or parallel.attn_dp_enabled or parallel.pp_async_batch_depth != 0
+            or self._pp_spec_relay
+            or envs.SGLANG_PP_HICACHE_COUNTS_PIGGYBACK.get()
+        ):
+            raise ValueError("early prefill relay requires TP1 PP>1, async depth0, "
+                             "no attention DP, spec relay, or counts piggyback")
+        logger.info("PP prefill relay before old-result D2H: %s",
+                    self._pp_prefill_relay_before_d2h)
+        self._pp_prefill_host_output_copy = (
+            envs.SGLANG_PP_PREFILL_HOST_OUTPUT_COPY.get()
+        )
+        if self._pp_prefill_host_output_copy and (
+            not str(self.device).startswith("cuda") or parallel.tp_size != 1
+            or parallel.pp_size < 2 or parallel.pp_async_batch_depth != 0
+            or self._pp_spec_relay
+        ):
+            raise ValueError("prefill host output copy requires CUDA TP1 PP>1, "
+                             "async depth0, no spec relay")
+        logger.info("PP prefill old-result host copy: %s",
+                    self._pp_prefill_host_output_copy)
+        tree_cache = self.tree_cache
+        self._pp_hicache_piggyback = (
+            envs.SGLANG_PP_HICACHE_COUNTS_PIGGYBACK.get()
+            and parallel.pp_size > 1
+            # The relay marker must not meet the DP work/control split.
+            and not parallel.attn_dp_enabled
+            and isinstance(tree_cache, UnifiedRadixCache)
+            and tree_cache.linker is None
+            and tree_cache.host_memory_mode != "buffer_only"
+        )
+        if self._pp_hicache_piggyback:
+            tree_cache.pp_counts_piggyback = True
+        lag_mode = os.environ.get("SGLANG_HICACHE_PP_LAGGED_DRAIN", "0")
+        self._pp_lagged_drain = lag_mode not in ("", "0")
+        if self._pp_lagged_drain:
+            unmet = [
+                name
+                for name, ok in (
+                    ("mode 1|all|backup", lag_mode in ("1", "all", "backup")),
+                    ("PP>1", parallel.pp_size > 1),
+                    ("TP1", parallel.tp_size == 1),
+                    ("no attention DP", not parallel.attn_dp_enabled),
+                    ("UnifiedRadixCache", isinstance(tree_cache, UnifiedRadixCache)),
+                    ("no cache linker", getattr(tree_cache, "linker", None) is None),
+                    ("host cache mode", getattr(tree_cache, "host_memory_mode", None) != "buffer_only"),
+                )
+                if not ok
+            ]
+            if unmet:
+                raise ValueError(f"SGLANG_HICACHE_PP_LAGGED_DRAIN={lag_mode} needs: {unmet}")
+            from sglang.srt.mem_cache.unified_radix_cache import PP_LAG_RELEASE_KEY
+
+            self._pp_lag_key = PP_LAG_RELEASE_KEY
+            tree_cache.enable_pp_lagged_drain("backup" if lag_mode == "backup" else "all")
+            logger.info(
+                "HICACHE_PP_LAGGED_DRAIN enabled mode=%s pp_rank=%d (engages at the first storage drain)",
+                lag_mode, parallel.pp_rank,
+            )
+        self._pp_prefetch_verdict_relay = (
+            envs.SGLANG_PREFETCH_VERDICT_RELAY.get()
+            and parallel.pp_size > 1
+            and not parallel.attn_dp_enabled
+            and isinstance(tree_cache, UnifiedRadixCache)
+        )
+        if self._pp_prefetch_verdict_relay:
+            tree_cache.prefetch_verdict_relay = True
+        logger.info(
+            "PP PD prefill: local result %s, HiCache counts piggyback %s, "
+            "prefetch verdict relay %s",
+            self._pp_pd_local_result_enabled,
+            self._pp_hicache_piggyback,
+            self._pp_prefetch_verdict_relay,
+        )
+
+    def _pp_prefill_output_d2h_sync(self: Scheduler, event) -> None:
+        # One direct wait scope, timed by the diagnostic helper in BOTH arms.
+        event.synchronize()
+
+    def _pp_pd_local_result(self: Scheduler, batch: ScheduleBatch) -> bool:
+        """Whether this PD prefill batch skips the output ring.
+
+        The last stage processes its own output and alone sends the sampled
+        token and draft state to decode; the earlier stages read no sampled
+        value, so they process a placeholder. Batches whose results feed a
+        consumer on every stage (logprobs, grammar, sampling mask, routed
+        experts) keep the ring.
+        """
+        return (
+            self._pp_pd_local_result_enabled
+            and batch.forward_mode == ForwardMode.EXTEND
+            and not batch.return_logprob
+            and not any(
+                req.grammar is not None
+                or req.return_sampling_mask
+                or req.return_routed_experts
+                for req in batch.reqs
+            )
+        )
+
+    def _pp_make_local_result(
+        self: Scheduler,
+        batch: ScheduleBatch,
+        mb_metadata: PPBatchMetadata,
+        mb_id: int,
+    ) -> Tuple[None, GenerationBatchResult, torch.Event]:
+        if not self.pp_group.is_last_rank:
+            # The last stage owns the draft state decode needs; this stage sends no aux.
+            batch.spec_info = None
+            batch_result = GenerationBatchResult(
+                logits_output=None,
+                pp_hidden_states_proxy_tensors=None,
+                # On the host, so reading it back never waits on the device.
+                next_token_ids=torch.zeros(len(batch.reqs), dtype=torch.int64),
+                can_run_cuda_graph=mb_metadata.can_run_cuda_graph,
+                fpm_timing=mb_metadata.fpm_timing,
+            )
+            # The caller synchronizes on it before processing: this mb's forward
+            # must have written its KV before it is checkpointed or sent. The
+            # ring's returned output used to imply that.
+            assert mb_metadata.forward_event is not None
+            return None, batch_result, mb_metadata.forward_event
+        ready_event, local_outputs = self._pp_local_outputs.pop(mb_id)
+        with self.copy_stream_ctx:
+            self.copy_stream.wait_stream(self.schedule_stream)
+            self.copy_stream.wait_event(ready_event)
+            batch_result = self._pp_prep_batch_result(
+                batch, mb_metadata, local_outputs
+            )
+            d2h_event = self.device_module.Event()
+            d2h_event.record(self.device_module.current_stream())
+        return None, batch_result, d2h_event
+
+    def _pp_take_relay_extras(self: Scheduler, reqs: List) -> List:
+        """Move relayed HiCache counts and prefetch verdicts to the cache."""
+        kept = []
+        for req in reqs:
+            if isinstance(req, PPHiCacheCounts):
+                self.tree_cache.pp_counts_in.extend(req.counts)
+            elif isinstance(req, PPPrefetchVerdicts):
+                # The previous iteration's admission consumed all of its verdicts;
+                # a leftover would bind a stale verdict to another request.
+                assert not self.tree_cache.pp_verdicts_in, "unconsumed prefetch verdicts"
+                self.tree_cache.pp_verdicts_in.extend(req.verdicts)
+            else:
+                kept.append(req)
+        return kept
 
     def process_bootstrapped_queue(self: Scheduler):
-        reqs = self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
+        # Under PP, only prefill_complete keeps optimistic prefill, which parks requests.
+        if get_disagg().disaggregation_decode_allocation_policy == "prefill_complete":
+            reqs = self.pop_bootstrapped_and_resolve_parked_pp()
+        else:
+            reqs = self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
         self.waiting_queue.join(reqs)
 
     def _pp_pd_get_prefill_transferred_ids(self: Scheduler) -> Dict[str, bool]:
@@ -716,8 +1084,14 @@ class SchedulerPPMixin:
         if self.pp_group.is_last_rank:
             if tmbs[next_first_rank_mb_id] is not None:
                 release_rids = transferred_rids
+                payload = release_rids
+                if self._pp_lagged_drain:
+                    mark = self.tree_cache.pp_lag_mark()
+                    if mark is not None:
+                        payload = dict(release_rids)
+                        payload[self._pp_lag_key] = mark
                 send_release_work = self._pp_send_pyobj_to_next_stage(
-                    release_rids, async_send=True
+                    payload, async_send=True
                 )
         # 4 (Release): send the release rids from non last rank to the next rank
         else:
@@ -726,6 +1100,12 @@ class SchedulerPPMixin:
                     release_rids, async_send=True
                 )
         return send_release_work, release_rids
+
+    def _pp_take_lag_mark(self: Scheduler, rids):
+        """PP0: pop the ring min off the release consensus before anything reads it."""
+        if isinstance(rids, dict) and self._pp_lag_key in rids:
+            self.tree_cache.pp_lag_note_mark(rids.pop(self._pp_lag_key))
+        return rids
 
     def _pp_record_comm_event(self: Scheduler) -> Optional[torch.Event]:
         """Mark the tail of the PP comm stream; None when not overlapping."""
@@ -792,9 +1172,15 @@ class SchedulerPPMixin:
         return next_pp_outputs, next_batch_result, d2h_event
 
     def _pp_send_reqs_to_next_stage(self: Scheduler, recv_reqs: List) -> List[P2PWork]:
-        return self._pp_send_pyobj_to_next_stage(
-            strip_mm_features_for_pp_relay(recv_reqs), async_send=True
-        )
+        payload = strip_mm_features_for_pp_relay(recv_reqs)
+        if self._pp_hicache_piggyback:
+            # This iteration's counts, taken on every rank so none accumulate.
+            payload.append(PPHiCacheCounts(self.tree_cache.pp_counts_out))
+            self.tree_cache.pp_counts_out = []
+        if self._pp_prefetch_verdict_relay:
+            payload.append(PPPrefetchVerdicts(self.tree_cache.pp_verdicts_out))
+            self.tree_cache.pp_verdicts_out = []
+        return self._pp_send_pyobj_to_next_stage(payload, async_send=True)
 
     def _pp_send_pyobj_to_next_stage(self: Scheduler, data, async_send: bool = False):
         p2p_work = []
@@ -1456,7 +1842,14 @@ class SchedulerPPMixin:
             target = mbs[next_first_rank_mb_id]
             if target is not None:
                 q_event, pp_outputs_to_send = last_rank_comm_queue.popleft()
-                if (
+                target_md = self.mb_metadata[next_first_rank_mb_id]
+                if target_md is not None and target_md.pd_local_result:
+                    # Processed on this stage from its own output; nothing to send.
+                    self._pp_local_outputs[next_first_rank_mb_id] = (
+                        q_event,
+                        pp_outputs_to_send,
+                    )
+                elif (
                     not target.forward_mode.is_prebuilt()
                     and not _pp_can_skip_output_comm(target)
                 ):
@@ -1536,6 +1929,12 @@ class SchedulerPPMixin:
             target = mbs[next_mb_id]
             if target is None or target.forward_mode.is_prebuilt():
                 return
+            target_md = mb_metadata[next_mb_id]
+            if target_md is not None and target_md.pd_local_result:
+                next_pp_outputs, batch_result, d2h_event = self._pp_make_local_result(
+                    target, target_md, next_mb_id
+                )
+                return
             if _pp_can_skip_output_comm(target):
                 next_pp_outputs, batch_result, d2h_event = (
                     self._pp_make_skip_output_result(target, mb_metadata[next_mb_id])
@@ -1565,7 +1964,15 @@ class SchedulerPPMixin:
                     target, mb_metadata[next_mb_id], next_pp_outputs
                 )
                 d2h_event = self.device_module.Event()
-                if (
+                # On odd ranks recv precedes send. Copy the old result here,
+                # before a later send queues the current forward's wait on the
+                # scheduler stream used by the CPU result processor.
+                async_prefill_output = (
+                    self._pp_prefill_host_output_copy
+                    and self.disaggregation_mode == DisaggregationMode.PREFILL
+                    and target.forward_mode.is_extend()
+                )
+                if async_prefill_output or (
                     batch_result.logits_output is not None
                     and batch_result.logits_output.sampling_mask_output is not None
                 ):
@@ -1573,6 +1980,12 @@ class SchedulerPPMixin:
                     batch_result.copy_to_cpu(
                         return_logprob=target.return_logprob,
                         return_hidden_states=False,
+                        fence_logprob_copy_devices=async_prefill_output,
+                        return_pd_prefill_draft=(
+                            async_prefill_output
+                            and self.disaggregation_mode == DisaggregationMode.PREFILL
+                            and self.spec_algorithm.is_eagle()
+                        ),
                     )
                 else:
                     d2h_event.record(self.device_module.current_stream())
@@ -1706,6 +2119,14 @@ class SchedulerPPMixin:
     ):
         with torch.profiler.record_function("run_batch"):
             with self.forward_stream_ctx:
+                if self._pp_fence_controller is not None:
+                    # Before this micro-batch's dependency waits (upstream proxy
+                    # recv): covers only earlier forwards on this stream.
+                    self._pp_fence_controller.record_forward_start(
+                        self.forward_stream.record_event()
+                    )
+                    # This forward may write rows freed by an unawaited write-back.
+                    self._pp_fence_controller.wait_wb_done(self.forward_stream)
                 self._pp_wait_forward_dependencies()
                 set_time_batch(
                     cur_batch.reqs,
@@ -1725,23 +2146,38 @@ class SchedulerPPMixin:
                     trace_only=True,
                     attrs={"pp_mb_id": mb_id},
                 )
+                pd_local_result = self._pp_pd_local_result(cur_batch)
                 mb_metadata[mb_id] = PPBatchMetadata(
                     can_run_cuda_graph=result.can_run_cuda_graph,
                     fwd_batch=_pp_snapshot_forward_batch(cur_batch),
                     verify_out_cache_loc=result.spec_verify_out_cache_loc,
                     fpm_timing=result.fpm_timing,
+                    pd_local_result=pd_local_result,
                 )
                 event = self.device_module.Event()
                 event.record(self.device_module.current_stream())
+                if pd_local_result:
+                    mb_metadata[mb_id].forward_event = event
                 if self.pp_group.is_last_rank:
+                    tensor_dict = self._pp_prepare_tensor_dict(result, cur_batch)
+                    ready_event = event
+                    if pd_local_result:
+                        # Held until this mb is processed, pp_loop_size - 1 iterations
+                        # on: copy out of buffers a later forward (a draft CUDA graph
+                        # replay) reuses.
+                        tensor_dict = {
+                            key: (
+                                value.clone()
+                                if isinstance(value, torch.Tensor)
+                                else value
+                            )
+                            for key, value in tensor_dict.items()
+                        }
+                        ready_event = self.device_module.Event()
+                        ready_event.record(self.device_module.current_stream())
                     # (last rank) buffer the outputs for async batch depth
                     last_rank_comm_queue.append(
-                        (
-                            event,
-                            PPProxyTensors(
-                                self._pp_prepare_tensor_dict(result, cur_batch)
-                            ),
-                        )
+                        (ready_event, PPProxyTensors(tensor_dict))
                     )
         return result, event
 

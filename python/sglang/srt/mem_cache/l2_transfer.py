@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import logging
+import os
+import time
 from contextlib import contextmanager
 from functools import cache
 from typing import Any, Callable, NamedTuple, Optional
@@ -9,6 +11,10 @@ import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.pool_host.base import shared_host_layout_domains
+from sglang.srt.mem_cache.pool_host.pagewise_l2 import (
+    pagewise_enabled,
+    pagewise_groups,
+)
 from sglang.srt.utils import get_device_module
 
 logger = logging.getLogger(__name__)
@@ -42,6 +48,37 @@ def make_timing_event_pair():
     timing_enabled = _timing_events_supported()
     kwargs = {"enable_timing": True} if timing_enabled else {}
     return device_module.Event(**kwargs), device_module.Event(**kwargs), timing_enabled
+
+
+_SUBMIT_TIMING = os.environ.get("SGLANG_HICACHE_L2_SUBMIT_TIMING", "0") == "1"
+_submit_stats: dict = {}
+_submit_logged = [time.monotonic()]
+
+
+def _record_submit(kind: str, seconds: float, transfers) -> None:
+    """SGLANG_HICACHE_L2_SUBMIT_TIMING=1: CPU time of each L2 submit (index prep plus
+    every copy and kernel launch), summarised every 30 s."""
+    tokens = sum(int(t.host_indices.numel()) for t in transfers)
+    st = _submit_stats.setdefault(kind, [])
+    st.append((seconds, tokens))
+    now = time.monotonic()
+    if now - _submit_logged[0] < 30.0:
+        return
+    _submit_logged[0] = now
+    parts = []
+    for k in sorted(_submit_stats):
+        v = sorted(x[0] for x in _submit_stats[k])
+        toks = sum(x[1] for x in _submit_stats[k])
+        parts.append(
+            f"{k} n={len(v)} mean={1e3 * sum(v) / len(v):.2f}ms "
+            f"p50={1e3 * v[len(v) // 2]:.2f}ms max={1e3 * v[-1]:.2f}ms tokens={toks}"
+        )
+    _submit_stats.clear()
+    logger.info(
+        "HiCache L2 submit timing (30 s, pagewise=%s): %s",
+        pagewise_enabled(),
+        "; ".join(parts),
+    )
 
 
 class L2Transfer(NamedTuple):
@@ -181,6 +218,13 @@ class L2TransferEngine:
                 )
 
     def submit_device_to_host(self, transfers: list[L2Transfer]) -> TransferCompletion:
+        t0 = time.perf_counter() if _SUBMIT_TIMING else 0.0
+        completion = self._submit_device_to_host(transfers)
+        if _SUBMIT_TIMING:
+            _record_submit("d2h", time.perf_counter() - t0, transfers)
+        return completion
+
+    def _submit_device_to_host(self, transfers: list[L2Transfer]) -> TransferCompletion:
         with self._submission(
             transfers, self.device_to_host_stream, "device_to_host"
         ) as (transfers, completion):
@@ -201,6 +245,86 @@ class L2TransferEngine:
         start_event=None,
         on_layer_done=None,
     ) -> TransferCompletion:
+        t0 = time.perf_counter() if _SUBMIT_TIMING else 0.0
+        completion = self._submit_host_to_device(
+            transfers,
+            transfer_layer_id_max=transfer_layer_id_max,
+            start_event=start_event,
+            on_layer_done=on_layer_done,
+        )
+        if _SUBMIT_TIMING:
+            _record_submit("h2d", time.perf_counter() - t0, transfers)
+        return completion
+
+    @staticmethod
+    def _local_layer(transfer, primary, layer_id):
+        local_layer_id = (
+            transfer.layer_mapper(layer_id)
+            if transfer.layer_mapper is not None
+            else layer_id
+        )
+        if local_layer_id is None or (
+            transfer is not primary
+            and transfer.layer_mapper is None
+            and layer_id >= transfer.host_pool.layer_num
+        ):
+            return None
+        return local_layer_id
+
+    def _load_pagewise(self, transfers, transfer_layer_id_max, on_layer_done) -> None:
+        """Layers in a few groups: each pool copies whole page runs of a group's
+        layers at once; the group's layer events follow its last copy."""
+        primary = transfers[0] if transfers else None
+        local = {
+            layer_id: [self._local_layer(t, primary, layer_id) for t in transfers]
+            for layer_id in range(transfer_layer_id_max)
+        }
+        active = [l for l in range(transfer_layer_id_max) if any(x is not None for x in local[l])]
+        groups = pagewise_groups()
+        size = -(-len(active) // groups) if active else 0
+        done = 0
+        for g in range(0, len(active), max(size, 1)):
+            group = active[g : g + size]
+            for i, transfer in enumerate(transfers):
+                ids = [local[l][i] for l in group if local[l][i] is not None]
+                if not ids:
+                    continue
+                pool = transfer.host_pool
+                ok = getattr(pool, "pagewise_load_ok", None)
+                if ok is not None and ok(self.io_backend):
+                    pool.load_to_device_layers_pagewise(
+                        transfer.device_pool,
+                        transfer.host_indices,
+                        transfer.device_indices,
+                        ids,
+                        is_draft=transfer.is_draft,
+                    )
+                else:
+                    for local_layer_id in ids:
+                        pool.load_to_device_per_layer_physical(
+                            transfer.device_pool,
+                            transfer.host_indices,
+                            transfer.device_indices,
+                            local_layer_id,
+                            self.io_backend,
+                            is_draft=transfer.is_draft,
+                        )
+            if on_layer_done is not None:
+                for layer_id in range(done, group[-1] + 1):
+                    on_layer_done(layer_id)
+            done = group[-1] + 1
+        if on_layer_done is not None:
+            for layer_id in range(done, transfer_layer_id_max):
+                on_layer_done(layer_id)
+
+    def _submit_host_to_device(
+        self,
+        transfers: list[L2Transfer],
+        *,
+        transfer_layer_id_max: int,
+        start_event=None,
+        on_layer_done=None,
+    ) -> TransferCompletion:
         stream = (
             device_module.current_stream()
             if self._h2d_on_current_stream
@@ -210,6 +334,9 @@ class L2TransferEngine:
             transfers,
             completion,
         ):
+            if pagewise_enabled():
+                self._load_pagewise(transfers, transfer_layer_id_max, on_layer_done)
+                return completion
             primary = transfers[0] if transfers else None
             delay_cycles = envs.SGLANG_TEST_HICACHE_H2D_DELAY_CYCLES.get()
             for layer_id in range(transfer_layer_id_max):

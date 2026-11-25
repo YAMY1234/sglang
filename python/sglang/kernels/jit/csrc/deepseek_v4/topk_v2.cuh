@@ -684,16 +684,28 @@ CLUSTER_TOPK_KERNEL void topk_persistent_cluster_kernel(const __grid_constant__ 
   }
 }
 
+/// Shared memory of topk_small_batch_cluster_kernel, allocated dynamically: the cluster state brings it to
+/// 52-56 KB, over the 48 KB of static shared memory a family target (sm_100f) allows.
+template <uint32_t kClusterSize>
+struct SmallBatchClusterSmem {
+  impl::MaxSmem<Register4::Smem, Streaming::Smem, typename impl::TopKCluster<kClusterSize>::Smem> smem;
+  int32_t s_topk_indices[kMaxTopK];
+};
+
 template <bool kPDL, TopKMode kMode, uint32_t kClusterSize, uint32_t kOccupancy>
 CLUSTER_TOPK_KERNEL void topk_small_batch_cluster_kernel(const __grid_constant__ TopKPagedParams params) {
-  device::enable_smem_spilling();
+  // No enable_smem_spilling(): ptxas rejects that pragma in a kernel with dynamic shared memory.
   constexpr bool kNeedStaging = kMode != TopKMode::INDICES;
   const auto bx = blockIdx.x;
   const auto by = blockIdx.y;
   auto problem = params.problem(bx);
-  __shared__ int32_t s_topk_indices[kMaxTopK];
   using Cluster = impl::TopKCluster<kClusterSize>;
-  __shared__ impl::MaxSmem<Register4::Smem, Streaming::Smem, typename Cluster::Smem> smem;
+  using Shared = SmallBatchClusterSmem<kClusterSize>;
+  static_assert(alignof(Shared) <= 16, "dynamic shared memory is 16-byte aligned");
+  extern __shared__ __align__(16) uint8_t small_batch_cluster_smem[];
+  auto& shared = *reinterpret_cast<Shared*>(small_batch_cluster_smem);
+  auto& smem = shared.smem;
+  int32_t* const s_topk_indices = shared.s_topk_indices;
 
   // randomly elect one worker rank to avoid workload imbalance
   const auto worker_rank = bx % kClusterSize;
@@ -749,13 +761,24 @@ CLUSTER_TOPK_KERNEL void topk_small_batch_cluster_kernel(const __grid_constant__
 
 // NOTE(nvpohanh): DCP-only. Splits a long local row of the per-rank candidate top-k (input of dcp_topk_merge) over
 // a cluster: a DCP decode batch has too few rows to fill the GPU.
+/// Shared memory of topk_candidates_cluster_kernel, allocated dynamically for the same reason (50-52 KB).
+template <uint32_t kClusterSize>
+struct CandidatesClusterSmem {
+  impl::MaxSmem<RaggedSmem, typename impl::TopKCluster<kClusterSize>::Smem> smem;
+  int32_t s_topk_indices[kMaxTopK];
+};
+
 template <bool kPDL, uint32_t kClusterSize>
 CLUSTER_TOPK_KERNEL void
 topk_candidates_cluster_kernel(const __grid_constant__ TopKCandidatesParams params, const uint32_t cluster_floor) {
-  device::enable_smem_spilling();
+  // No enable_smem_spilling(): ptxas rejects that pragma in a kernel with dynamic shared memory.
   using Cluster = impl::TopKCluster<kClusterSize>;
-  __shared__ impl::MaxSmem<RaggedSmem, typename Cluster::Smem> smem;
-  __shared__ int32_t s_topk_indices[kMaxTopK];
+  using Shared = CandidatesClusterSmem<kClusterSize>;
+  static_assert(alignof(Shared) <= 16, "dynamic shared memory is 16-byte aligned");
+  extern __shared__ __align__(16) uint8_t candidates_cluster_smem[];
+  auto& shared = *reinterpret_cast<Shared*>(candidates_cluster_smem);
+  auto& smem = shared.smem;
+  int32_t* const s_topk_indices = shared.s_topk_indices;
 
   const auto bx = blockIdx.x;
   const auto seq_len = static_cast<uint32_t>(params.seq_lens[bx]);
@@ -1301,13 +1324,15 @@ struct TopKKernel {
       if constexpr (kMaxCluster16BatchSize > 0) {
         if (batch_size <= kMaxCluster16BatchSize) {
           constexpr uint32_t kClusterSize = 16;
+          constexpr auto kSmemBytes = sizeof(SmallBatchClusterSmem<kClusterSize>);
           // Widths above 8 are non-portable; the launch is rejected without this.
           const auto kernel = topk_small_batch_cluster_kernel<kUsePDL, kMode, kClusterSize, 1>;
           const auto kernel_ptr = reinterpret_cast<const void*>(kernel);
           runtime::init_per_device(device, [kernel_ptr] {
             CHECK_CUDA(::cudaFuncSetAttribute(kernel_ptr, ::cudaFuncAttributeNonPortableClusterSizeAllowed, 1));
+            runtime::set_max_dynamic_smem(kernel_ptr, kSmemBytes);
           });
-          return LaunchKernel({batch_size, kClusterSize}, kBlockSize, device)
+          return LaunchKernel({batch_size, kClusterSize}, kBlockSize, device, kSmemBytes)
               .config({.use_pdl = kUsePDL, .cluster_dim = dim3{1, kClusterSize}})
               .launch(kernel, params);
         }
@@ -1316,9 +1341,12 @@ struct TopKKernel {
       if constexpr (kNumPersistentClusters > 0) {
         if (batch_size <= kNumPersistentClusters) {
           constexpr uint32_t kClusterSize = 8;
-          return LaunchKernel({batch_size, kClusterSize}, kBlockSize, device)
+          constexpr auto kSmemBytes = sizeof(SmallBatchClusterSmem<kClusterSize>);
+          const auto kernel = topk_small_batch_cluster_kernel<kUsePDL, kMode, kClusterSize, 2>;
+          runtime::init_per_device(device, [kernel] { runtime::set_max_dynamic_smem(kernel, kSmemBytes); });
+          return LaunchKernel({batch_size, kClusterSize}, kBlockSize, device, kSmemBytes)
               .config({.use_pdl = kUsePDL, .cluster_dim = dim3{1, kClusterSize}})
-              .launch(topk_small_batch_cluster_kernel<kUsePDL, kMode, kClusterSize, 2>, params);
+              .launch(kernel, params);
         } else {
           // TODO(perf): one C8 launch could also run two TopKCluster<4> halves per cluster when the
           // pool has many items (a per-call width bit from the plan). Measured (B300): C4 is
@@ -1820,9 +1848,12 @@ struct TopKKernel {
       RuntimeCheck(cluster_floor >= 0 && cluster_floor <= UINT32_MAX, "invalid cluster_floor");
       const auto floor = static_cast<uint32_t>(cluster_floor);
       const auto launch = [&]<uint32_t kClusterSize>() {
-        LaunchKernel({rows, kClusterSize}, kBlockSize, device_.unwrap())
+        constexpr auto kSmemBytes = sizeof(CandidatesClusterSmem<kClusterSize>);
+        const auto kernel = topk_candidates_cluster_kernel<kUsePDL, kClusterSize>;
+        runtime::init_per_device(device_.unwrap(), [kernel] { runtime::set_max_dynamic_smem(kernel, kSmemBytes); });
+        LaunchKernel({rows, kClusterSize}, kBlockSize, device_.unwrap(), kSmemBytes)
             .config({.use_pdl = kUsePDL, .cluster_dim = dim3{1, kClusterSize}})
-            .launch(topk_candidates_cluster_kernel<kUsePDL, kClusterSize>, params, floor);
+            .launch(kernel, params, floor);
       };
       switch (cluster_size) {
         case 2:

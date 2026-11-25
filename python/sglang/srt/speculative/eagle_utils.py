@@ -580,6 +580,11 @@ def _can_use_sparse_uno_tree_target_sampling(
     )
 
 
+def _verify_top_p_renorm_prob(probs: torch.Tensor, top_ps: torch.Tensor) -> torch.Tensor:
+    # Target verify opts in to the flag-gated parallel AIR kernel; other callers keep flashinfer.
+    return top_p_renorm_prob(probs, top_ps, parallel=True)
+
+
 def _apply_joint_top_k_top_p(
     probs: torch.Tensor,
     sampling_info: SamplingBatchInfo,
@@ -1075,7 +1080,7 @@ def eagle_sample(
             sampling_info,
             verify_input.draft_token_num,
             top_k_renorm_prob,
-            top_p_renorm_prob,
+            _verify_top_p_renorm_prob if top_p_renorm_prob is not None else None,
         )
         target_probs = target_probs.reshape(bs, verify_input.draft_token_num, -1)
         draft_probs = (

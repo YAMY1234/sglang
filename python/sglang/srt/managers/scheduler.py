@@ -28,6 +28,7 @@ from http import HTTPStatus
 from typing import (
     TYPE_CHECKING,
     Any,
+    Callable,
     Deque,
     Dict,
     List,
@@ -104,6 +105,7 @@ from sglang.srt.disaggregation.decode_kvcache_offload_manager import (
 from sglang.srt.disaggregation.encoder.receiver import create_mm_receiver
 from sglang.srt.disaggregation.kv_events import uses_dynamo_format
 from sglang.srt.disaggregation.mode import DisaggregationMode
+from sglang.srt.disaggregation.late_binding import LateBindingHandoff
 from sglang.srt.disaggregation.prefill import (
     PrefillBootstrapQueue,
     SchedulerDisaggregationPrefillMixin,
@@ -247,6 +249,7 @@ from sglang.srt.managers.schedule_batch import (
     retract_all,
 )
 from sglang.srt.managers.schedule_policy import (
+    CLIP_MAX_NEW_TOKENS,
     AddReqResult,
     PrefillAdder,
     SchedulePolicy,
@@ -340,8 +343,9 @@ from sglang.srt.managers.utils import (
 )
 from sglang.srt.mem_cache import kv_cache_builder
 from sglang.srt.mem_cache.allocator.page_interleave import page_interleave_shard_size
+from sglang.srt.mem_cache.base_prefix_cache import EvictParams
 from sglang.srt.mem_cache.common import checkpoint_kv_cache, storage_prefetch_end
-from sglang.srt.mem_cache.events import KvEventLoraNames
+from sglang.srt.mem_cache.events import PMICRO, KvEventLoraNames
 from sglang.srt.mem_cache.kv_weight_version_tracker import KvWeightVersionTracker
 from sglang.srt.mem_cache.static_kv_storage import StaticPoolShape, kv_storage_of
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
@@ -441,6 +445,9 @@ def _prewarm_hccl_group(device, group, device_module):
 TEST_RETRACT = envs.SGLANG_TEST_RETRACT.get()
 TEST_RETRACT_INTERVAL = envs.SGLANG_TEST_RETRACT_INTERVAL.get()
 TEST_RETRACT_NO_PREFILL_BS = envs.SGLANG_TEST_RETRACT_NO_PREFILL_BS.get()
+TEST_HICACHE_EVICT_DEVICE_BEFORE_PREFILL = (
+    envs.SGLANG_TEST_HICACHE_EVICT_DEVICE_BEFORE_PREFILL.get()
+)
 
 
 STEP_MAX_US = 2_000_000
@@ -484,6 +491,34 @@ def _accumulate_decode_moment(
 
 _is_npu = is_npu()
 _is_hip = is_hip()
+
+
+_SHORT_RESERVE = int(os.environ.get("SGLANG_PREFILL_SHORT_RESERVE_TOKENS", "0"))
+
+
+def _short_reserve_chunk_limit(chunked_req, waiting_queue, budget, page_size):
+    """Cap the resumed chunk to leave room for waiting requests that fit whole (queue order,
+    shorter than the chunk's remaining work), at most _SHORT_RESERVE tokens; None = no cap."""
+    if budget < 2 * page_size:
+        return None
+    remaining = len(chunked_req.full_untruncated_fill_ids) - chunked_req.prefix_len
+    room = min(_SHORT_RESERVE, budget - page_size)
+    reserved = 0
+    for req in waiting_queue:
+        work = SchedulePolicy._shortest_prefill_work(req)
+        charge = -(-work // page_size) * page_size
+        if work < remaining and reserved + charge <= room:
+            reserved += charge
+    if not reserved:
+        return None
+    return (budget - reserved) // page_size * page_size
+
+
+def _chunk_tail_hold(req, ceil_paged, start):
+    """KV the first-chunk check promised `req` past `start`: paged tokens plus clipped max_new."""
+    return ceil_paged(len(req.full_untruncated_fill_ids) - start) + min(
+        req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS
+    )
 
 
 class Scheduler(
@@ -676,6 +711,8 @@ class Scheduler(
                     storage.sub_pool_names(),
                     cache_controller.has_inflight_device_transfers,
                 )
+        if envs.SGLANG_ENABLE_HICACHE_WB_EVICT_RELAXED_FENCE.get():
+            self._pp_fence_controller = self._enable_wb_relaxed_fence()
         self.emit_metrics_constants()
         self.maybe_init_hccl_dp_prewarm()
 
@@ -1923,6 +1960,7 @@ class Scheduler(
                 (AttachHiCacheStorageReqInput, self.attach_hicache_storage_wrapped),
                 (DetachHiCacheStorageReqInput, self.detach_hicache_storage_wrapped),
                 (AbortReq, self.abort_request),
+                (LateBindingHandoff, self.handle_late_binding_handoff),
                 (OpenSessionReqInput, self.open_session),
                 (CloseSessionReqInput, self.close_session),
                 (ReleaseUocrDocReqInput, self.release_uocr_doc),
@@ -2107,6 +2145,36 @@ class Scheduler(
             self.metrics_reporter.start_scheduler_time_accounting()
             dispatch_event_loop(self)
 
+    def _enable_wb_relaxed_fence(self):
+        """The relaxed write_back eviction fence is argued only for this profile
+        (PD prefill PP loop with a PP comm stream); refuse it anywhere else."""
+        from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+
+        cache = self.tree_cache
+        checks = (
+            (
+                "UnifiedRadixCache with HiCache",
+                isinstance(cache, UnifiedRadixCache)
+                and cache.cache_controller is not None,
+            ),
+            ("pipeline-parallel-size > 1", get_parallel().pp_size > 1),
+            ("SGLANG_PP_COMM_OVERLAP=1", envs.SGLANG_PP_COMM_OVERLAP.get()),
+            (
+                "SGLANG_PP_SKIP_PURE_CHUNKED_OUTPUT_COMM=0",
+                not envs.SGLANG_PP_SKIP_PURE_CHUNKED_OUTPUT_COMM.get(),
+            ),
+        )
+        unmet = [name for name, ok in checks if not ok]
+        if not unmet:
+            unmet = cache.wb_relaxed_fence_unmet()
+        if unmet:
+            raise ValueError(
+                "SGLANG_ENABLE_HICACHE_WB_EVICT_RELAXED_FENCE=1 requires "
+                + ", ".join(unmet)
+            )
+        cache.enable_wb_relaxed_fence()
+        return cache.cache_controller
+
     def _apply_war_barrier(self):
         # WAR: keep later schedule_stream writes behind this forward's shared reads.
         # Clearing matters: a phase that skips the publish then falls back to coarse.
@@ -2264,12 +2332,17 @@ class Scheduler(
         for prev_batch, prev_result in self.result_queue:
             self.batch_result_processor.advance_grammar_fsm(prev_result, prev_batch)
 
-    def ingest_requests(self, stop_at_pause: bool = False) -> List:
+    def ingest_requests(
+        self,
+        stop_at_pause: bool = False,
+        take_relay_extras: Optional[Callable[[List], List]] = None,
+    ) -> List:
         """Receive and broadcast input, then dispatch queued requests in order.
 
         With stop_at_pause, retain the first pause and all following inputs
         until the caller reaches a scheduling boundary. Receiving and broadcasting
-        continue each pass; all ranks retain the same suffix.
+        continue each pass; all ranks retain the same suffix. take_relay_extras
+        removes non-request items a PP stage appended to its relay.
 
         The one place a new per-iteration input source belongs; the return
         value, held requests included, exists for the pipeline stages that
@@ -2288,8 +2361,27 @@ class Scheduler(
             and get_parallel().attn_cp_rank == 0
         ):
             local_reqs = self._poll_timeout_aborts()
+        late_binding = (
+            self.disagg_decode_prealloc_queue.late_binding
+            if self.disagg_decode_prealloc_queue is not None
+            else None
+        )
+        if late_binding is not None:
+            # Handoffs from other DP ranks ride the attn-TP work broadcast; kept
+            # buffered until a receive pass (not skipped) has carried them.
+            late_binding.arrivals.extend(late_binding.poll())
+            local_reqs = local_reqs + late_binding.arrivals
         recv_start_ns = time.monotonic_ns()
         received_reqs = self.request_receiver.recv_requests(local_reqs=local_reqs)
+        if take_relay_extras is not None:
+            received_reqs = take_relay_extras(received_reqs)
+        if late_binding is not None and late_binding.arrivals:
+            carried = {
+                r.recv_req.rid for r in received_reqs if isinstance(r, LateBindingHandoff)
+            }
+            late_binding.arrivals = [
+                r for r in late_binding.arrivals if r.recv_req.rid not in carried
+            ]
         self._deferred_input_requests.extend(received_reqs)
 
         num_requests_to_process = len(self._deferred_input_requests)
@@ -2694,6 +2786,44 @@ class Scheduler(
             get_shutting_down=lambda: self.gracefully_exit,
             on_peer_shutdown=self.handle_peer_shutdown,
             **self._dp_drain_column_callbacks(),
+            **self._late_binding_column_callbacks(),
+        )
+
+    def _late_binding_column_callbacks(self) -> dict:
+        """Decode late binding: gather each DP rank's load row with the MLP sync.
+        Present on every rank of a late-binding decode server, so widths agree
+        (init_disaggregation runs before this)."""
+        queue = getattr(self, "disagg_decode_prealloc_queue", None)
+        if queue is None or queue.late_binding is None:
+            return {}
+
+        def get_row():
+            return queue.late_binding.local_row(
+                queue.late_binding_committed(),
+                self.pool_stats_observer.get_pool_stats().full_token_usage,
+            )
+
+        return dict(
+            get_late_binding_row=get_row,
+            on_late_binding_rows=queue.late_binding.on_rows,
+        )
+
+    def handle_late_binding_handoff(self, handoff: LateBindingHandoff) -> None:
+        """Target side of a late-binding handoff: enqueue through the normal
+        generate path; the receiver then sends REBIND (see _create_receiver_and_enqueue)."""
+        queue = self.disagg_decode_prealloc_queue
+        if queue is None or queue.late_binding is None:
+            logger.error("Late binding: handoff %s on a rank without it", handoff.handoff_id)
+            return
+        queue.late_binding.admit(
+            handoff,
+            rid_present=lambda rid: any(
+                req.rid == rid
+                for request_list in self.request_lists().values()
+                for req in request_list
+            ),
+            enqueue=self.handle_generate_request,
+            abort=queue.queue.abort,
         )
 
     def _dp_drain_column_callbacks(self) -> dict:
@@ -3295,6 +3425,12 @@ class Scheduler(
                 token_indices_to_pool=recv_req.token_indices_to_pool,
             )
             req.tokenizer = self.tokenizer
+            if (
+                self.disagg_decode_prealloc_queue is not None
+                and self.disagg_decode_prealloc_queue.late_binding is not None
+            ):
+                # Late binding re-sends the original request to another DP rank.
+                req.late_binding_recv_req = recv_req
 
             if radix_native_session:
                 req.session_generation = self.tree_cache.ensure_session_generation(
@@ -4440,6 +4576,17 @@ class Scheduler(
             running_batch.batch_is_full = True
             return None, running_batch
 
+        # Runs before any waiting request is matched, so prefixes that finished
+        # requests released are matched in the host tier rather than on device.
+        if (
+            TEST_HICACHE_EVICT_DEVICE_BEFORE_PREFILL
+            and self.tree_cache.evictable_size()
+        ):
+            evicted = self.tree_cache.evict(
+                EvictParams(num_tokens=self.tree_cache.evictable_size())
+            ).num_tokens_evicted
+            logger.info("Test eviction before prefill: %d device tokens.", evicted)
+
         # Get priority queue
         self.waiting_queue.replace(
             self.policy.calc_priority(
@@ -4499,13 +4646,39 @@ class Scheduler(
 
         if self.chunked_req is not None:
             self.chunked_req.init_next_round_input()
-            adder.chunked_req_limit = self.policy.shortest_prefill_chunk_limit(
-                self.chunked_req,
-                self.waiting_queue,
-                adder.rem_chunk_tokens or 0,
-                self.page_size,
-            )
+            if _SHORT_RESERVE > 0 and get_schedule().schedule_policy == "fcfs":
+                # Shrink only when free KV covers the whole remaining request plus the reserve.
+                fits = adder.memory_budget.remaining_total >= _SHORT_RESERVE + (
+                    _chunk_tail_hold(
+                        self.chunked_req,
+                        adder.ceil_paged_tokens,
+                        self.chunked_req.prefix_len,
+                    )
+                )
+                adder.chunked_req_limit = (
+                    _short_reserve_chunk_limit(
+                        self.chunked_req,
+                        self.waiting_queue,
+                        adder.rem_chunk_tokens or 0,
+                        self.page_size,
+                    )
+                    if fits
+                    else None
+                )
+            else:
+                adder.chunked_req_limit = self.policy.shortest_prefill_chunk_limit(
+                    self.chunked_req,
+                    self.waiting_queue,
+                    adder.rem_chunk_tokens or 0,
+                    self.page_size,
+                )
             self.chunked_req = adder.add_chunked_req(self.chunked_req)
+            if _SHORT_RESERVE > 0 and self.chunked_req is not None:
+                # Stock admits nothing behind a non-final chunk, which keeps the KV its
+                # first-chunk check promised; hold that tail so shorts cannot take it.
+                adder.memory_budget.total_offset += _chunk_tail_hold(
+                    self.chunked_req, adder.ceil_paged_tokens, self.chunked_req.extend_end
+                )
 
         if self.enable_lora:
             running_reqs = running_batch.reqs
@@ -4609,6 +4782,25 @@ class Scheduler(
                 req.time_stats.observe_storage_staging_ready(staging_ready)
                 if not staging_ready:
                     continue
+            if (
+                _SHORT_RESERVE > 0
+                and self.chunked_req is not None
+                and adder.ceil_paged_tokens(
+                    len(req.full_untruncated_fill_ids)
+                    - req.prefix_len
+                    - req.host_hit_length
+                )
+                > (adder.rem_chunk_tokens or 0)
+            ):
+                # A chunk is in flight, so a request that cannot fit whole waits;
+                # later, shorter ones may still use the reserve.
+                req.kv.mamba_cow_src_index = None
+                req.kv.mamba_needs_clear = False
+                if req.kv.holds_mamba and not getattr(req, "session", None):
+                    kv_storage_of(
+                        self.req_to_token_pool, self.token_to_kv_pool_allocator
+                    ).release_state_slot(req)
+                continue
             res = adder.add_one_req(
                 req,
                 has_chunked_req=(self.chunked_req is not None),
@@ -4802,6 +4994,9 @@ class Scheduler(
         # Read at call time: a PD role switch rebuilds the PD queues.
         if self.disagg_prefill_bootstrap_queue is not None:
             lists[ListKind.PD_BOOTSTRAP] = self.disagg_prefill_bootstrap_queue.queue
+            lists[ListKind.PD_ROOM_WAITERS] = (
+                self.disagg_prefill_bootstrap_queue.room_waiters
+            )
         lists[ListKind.PD_SENDING] = self.disagg_prefill_transfer_queue
         if self.dllm_config is not None:
             # Its staging queue is the part of this queue the current round runs.
@@ -4834,11 +5029,27 @@ class Scheduler(
                 if r is not batch.chunked_req and r not in self.running_reqs
             )
 
+    def _pmicro_hoststat(self, batch: ScheduleBatch) -> None:
+        """p-micro v4: counters since the previous launch; iter = the 'Prefill batch [N]' counter."""
+        s = PMICRO
+        logger.info(
+            "PMICRO_HOSTSTAT iter=%d host_avail=%d d2h_subs=%d d2h_tokens=%d d2h_runs=%d rebacked=%d "
+            "kv_events=%d kv_blocks=%d kv_bytes=%d stat_us=%d",
+            batch.forward_iter, self.tree_cache.cache_controller.mem_pool_host.available_size(),
+            s["d2h_subs"], s["d2h_tokens"], s["d2h_runs"], s["rebacked"],
+            s["kv_events"], s["kv_blocks"], s["kv_bytes"], s["stat_ns"] // 1000,
+        )
+        for k in s:
+            if k != "on":
+                s[k] = 0
+
     def _on_step_launch(self, batch: ScheduleBatch) -> None:
         """The bookkeeping of every step launch, before its forward is issued."""
         self.metrics_reporter.record_scheduler_active(time.monotonic_ns())
         self.forward_ct += 1
         batch.forward_iter = self.forward_ct
+        if PMICRO["on"] and self.enable_hierarchical_cache:
+            self._pmicro_hoststat(batch)
         batch.launch_ts = time.monotonic()
         batch.after_idle_gap = self._sched_idled
         self._sched_idled = False
@@ -6127,6 +6338,12 @@ class Scheduler(
                 self._pending_chunked_abort_req = chunked_req
 
     def abort_request(self, recv_req: AbortReq):
+        if (
+            self.disagg_decode_prealloc_queue is not None
+            and self.disagg_decode_prealloc_queue.late_binding is not None
+        ):
+            # A request handed off right now is in no queue on either rank.
+            self.disagg_decode_prealloc_queue.late_binding.note_abort(recv_req)
         # Abort requests still waiting for encoder embeddings (EPD language-only)
         if self.mm_receiver is not None:
             self.mm_receiver.abort_waiting_requests(recv_req)

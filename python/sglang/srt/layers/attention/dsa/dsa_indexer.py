@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import os
 from typing import TYPE_CHECKING, Any, Dict, Optional, Tuple, Union
 
 import torch
@@ -110,6 +111,19 @@ def _decline_fused(reason: str) -> None:
     if reason not in _FUSED_DECLINE_LOGGED:
         _FUSED_DECLINE_LOGGED.add(reason)
         logger.info("gfx950 fused DSA indexer declined this call: %s", reason)
+
+
+_DRAFT_EXTEND_NATIVE_LOGGED: set = set()
+
+
+def _log_draft_extend_native_once(next_n: int) -> None:
+    if next_n not in _DRAFT_EXTEND_NATIVE_LOGGED:
+        _DRAFT_EXTEND_NATIVE_LOGGED.add(next_n)
+        logger.info(
+            "DSA draft extend: DeepGEMM paged MQA logits score %d rows per "
+            "request as one request (native next_n)",
+            next_n,
+        )
 
 
 _is_npu = is_npu()
@@ -283,6 +297,33 @@ def rotate_activation(x: torch.Tensor) -> torch.Tensor:
     return hadamard_transform(x, scale=hidden_size**-0.5)
 
 
+# Default-off. Balanced K-split schedule for the prefill logits kernel (bit-identical logits).
+_MQA_LOGITS_BALANCED = os.environ.get("SGLANG_DSA_MQA_LOGITS_BALANCED", "0") == "1"
+
+
+def _mqa_logits_balanced(q, kv, w, ks, ke):
+    import deep_gemm
+
+    if kv[1].dtype != torch.float32:  # MX / other scale layouts keep the stock call
+        return deep_gemm.fp8_mqa_logits(q, kv, w, ks, ke, clean_logits=False)
+    meta = deep_gemm.get_mqa_logits_metadata_legacy(ks, ke, kv[0].shape[0], q.shape[1])
+    return deep_gemm.fp8_fp4_mqa_logits_legacy(q, kv, w, ks, ke, False, 0, torch.float, meta)
+
+
+def warmup_mqa_logits_balanced(device, num_heads=32, head_dim=128):
+    # JIT-compile the scheduled variant at boot instead of on the first request.
+    rows, cols = 4096, 61440
+    q = torch.zeros(rows, num_heads, head_dim, device=device, dtype=torch.float8_e4m3fn)
+    kv = (
+        torch.zeros(cols, head_dim, device=device, dtype=torch.float8_e4m3fn),
+        torch.ones(cols, device=device, dtype=torch.float32),
+    )
+    ks = torch.zeros(rows, device=device, dtype=torch.int32)
+    ke = torch.full((rows,), cols, device=device, dtype=torch.int32)
+    w = torch.zeros(rows, num_heads, device=device, dtype=torch.float32)
+    _mqa_logits_balanced(q, kv, w, ks, ke)
+
+
 class Indexer(DSANPUIndexerMixin, BaseFusedOp):
     _MQA_LOGITS_BYTES_PER_ELEM = MQA_LOGITS_BYTES_PER_ELEM
     _MQA_LOGITS_STATIC_SKIP_ELEMS = MQA_LOGITS_STATIC_SKIP_ELEMS
@@ -362,6 +403,8 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         if _is_cuda:
             self.sm_count = resolve_num_sms()
             self.half_device_sm_count = ceil_align(self.sm_count // 2, 8)
+            if _MQA_LOGITS_BALANCED:
+                warmup_mqa_logits_balanced(torch.cuda.current_device(), self.n_heads, self.head_dim)
             pp_size = get_parallel().pp_size
             self.logits_with_pp_recv = (
                 pp_size > 1 and not get_parallel().pp_group.is_last_rank
@@ -1309,6 +1352,8 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         ke: torch.Tensor,
     ) -> torch.Tensor:
         q_padded, w_padded, _ = self._pad_heads_for_deep_gemm(q_fp8, weights)
+        if _MQA_LOGITS_BALANCED:
+            return _mqa_logits_balanced(q_padded, kv_fp8, w_padded, ks, ke)
         return resolve_fp8_mqa_logits_fn()(
             q_padded,
             kv_fp8,
@@ -1404,7 +1449,8 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         assert len(q_fp8.shape) == 3
         # attn_tp_size > 1 or MAX_LEN padding mode can leave padding in the
         # hidden states; q_offset is the real (unpadded) q length.
-        q_offset = sum(metadata.get_dsa_extend_len_cpu())
+        extend_lens = metadata.get_dsa_extend_len_cpu()
+        q_offset = sum(extend_lens)
 
         B = metadata.get_seqlens_int32().shape[0]
         next_n = q_offset // B if B > 0 else 0
@@ -1435,14 +1481,20 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 num_heads=self.n_heads,
             )
         ctx_2d = getattr(metadata, "paged_mqa_ctx_lens_2d", None)
+        native_draft_extend = (
+            forward_batch.forward_mode.is_draft_extend_v2()
+            and envs.SGLANG_OPT_DSA_DRAFT_EXTEND_NATIVE_MQA_LOGITS.get()
+        )
         use_dg_native = (
             not use_cute_dsl
             and _is_cuda
-            and forward_batch.forward_mode.is_target_verify()
+            and (forward_batch.forward_mode.is_target_verify() or native_draft_extend)
             and next_n >= 2
             and ctx_2d is not None
             and ctx_2d.shape == (B, next_n)
         )
+        if use_dg_native and native_draft_extend:
+            _log_draft_extend_native_once(next_n)
 
         if use_dg_native:
             seqlens_32_2d = ctx_2d
@@ -1562,19 +1614,52 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 get_paged_mqa_logits_metadata_fn=resolve_paged_mqa_logits_metadata_fn(),
             )
         elif use_dg_native:
-            logits = deepgemm_paged_mqa_logits_native(
-                _chunked_fp8_paged_mqa_logits,
-                q_fp8,
-                kv_cache_fp8,
-                weights,
-                seqlens_32_2d,
-                block_tables,
-                schedule_metadata,
-                max_seq_len,
-                q_offset=q_offset,
-                B=B,
-                next_n=next_n,
-            )
+            use_cap8 = False
+            if (
+                envs.SGLANG_DSA_DECODE_CAP8_LOGITS.get()
+                and dcp_size == 1
+                and getattr(metadata, "dcp_size", 1) == 1
+            ):
+                from sglang.kernels.ops.attention.dsa.paged_mqa_logits import (
+                    can_use_cutedsl_cap8,
+                    cutedsl_paged_mqa_logits_cap8,
+                )
+                from sglang.srt.runtime_context import get_platform
+
+                attn_metadata = metadata.attn_metadata
+                cap8_lengths = getattr(
+                    attn_metadata, "cap8_paged_mqa_context_lens", None
+                )
+                cap8_schedule = getattr(
+                    attn_metadata, "cap8_paged_mqa_schedule_metadata", None
+                )
+                use_cap8 = get_platform().is_sm100 and can_use_cutedsl_cap8(
+                    q_fp8, kv_cache_fp8, weights, cap8_lengths, cap8_schedule,
+                    block_tables, max_seq_len, B=B, next_n=next_n,
+                    q_offset=q_offset, extend_lens=extend_lens,
+                    graph_query_group_size=getattr(
+                        attn_metadata, "cap8_graph_query_group_size", None
+                    ),
+                )
+            if use_cap8:
+                logits = cutedsl_paged_mqa_logits_cap8(
+                    q_fp8, kv_cache_fp8, weights, cap8_lengths, block_tables,
+                    cap8_schedule, max_seq_len, B=B,
+                )
+            else:
+                logits = deepgemm_paged_mqa_logits_native(
+                    _chunked_fp8_paged_mqa_logits,
+                    q_fp8,
+                    kv_cache_fp8,
+                    weights,
+                    seqlens_32_2d,
+                    block_tables,
+                    schedule_metadata,
+                    max_seq_len,
+                    q_offset=q_offset,
+                    B=B,
+                    next_n=next_n,
+                )
         else:
             logits = deepgemm_paged_mqa_logits_split(
                 _chunked_fp8_paged_mqa_logits,

@@ -434,6 +434,10 @@ class Envs:
     # HiCache: GPU sleep cycles before each layer's host-to-device load, so a forward
     # that skips the per-layer load wait reads unloaded layers
     SGLANG_TEST_HICACHE_H2D_DELAY_CYCLES = EnvInt(0)
+    # HiCache, test only: before each prefill batch is formed, evict every unlocked
+    # device prefix, so later matches reload from the host tier (accuracy tests of
+    # its KV format). Never set it in a performance run.
+    SGLANG_TEST_HICACHE_EVICT_DEVICE_BEFORE_PREFILL = EnvBool(False)
 
     # ===================================================================
     # CI reporting: per-model metrics jsonl for nightly XPU dashboard
@@ -460,6 +464,8 @@ class Envs:
     SGLANG_PROFILE_WITH_STACK = EnvBool(True)
     SGLANG_PROFILE_RECORD_SHAPES = EnvBool(True)
     SGLANG_PROFILE_V2 = EnvBool(False)
+    # Capture-only: start/stop CUDA profiler in every scheduler process.
+    SGLANG_PROFILE_CUDA_ALL_RANKS = EnvBool(False)
     # profile_by_stage: do not start the decode-stage capture until a decode batch
     # reaches this many requests (0 = first decode batch). Lets a batch-size bench
     # capture steady-state full-admission decode steps instead of the ramp-up.
@@ -747,6 +753,12 @@ class Envs:
     # Run PP tensor communication on a dedicated stream so asynchronous sends
     # do not fence the next forward through the scheduler stream.
     SGLANG_PP_COMM_OVERLAP = EnvBool(False)
+    SGLANG_PP_STREAM_IDENTITY_LOG = EnvBool(False)
+    SGLANG_PP_COMM_STREAM_AVOID_SIDE_STREAMS = EnvBool(False)
+    # PD prefill: relay the current launch before waiting on an old result.
+    SGLANG_PP_PREFILL_RELAY_BEFORE_D2H = EnvBool(False)
+    # Snapshot old PD result host consumers on copy_stream before proxy fences.
+    SGLANG_PP_PREFILL_HOST_OUTPUT_COPY = EnvBool(False)
     # PP rank 0 posts its output recv only after its own forward. Enable it if PP
     # hangs or stalls on kernels that need every SM (e.g. flashinfer MLA).
     SGLANG_ENABLE_PP_OUTPUT_RECV_AFTER_FORWARD = EnvBool(False)
@@ -757,6 +769,25 @@ class Envs:
     SGLANG_DISAGG_PREFILL_POLL_TRANSFERS_WHILE_WAITING = EnvBool(False)
     # Opt-in: drain HiCache L3 events while a prefill forward result is pending.
     SGLANG_DISAGG_PREFILL_POLL_HICACHE_WHILE_WAITING = EnvBool(False)
+    # Opt-in, PP prefill: the first stage streams a request's finish once every
+    # stage's KV transfer succeeded; the PP release consensus still frees its KV.
+    SGLANG_OPT_DISAGG_PP_PREFILL_EARLY_FINISH = EnvBool(False)
+    # Opt-in, PP prefill (PD, Mooncake): no output ring. The last stage processes
+    # its own output and alone sends the first token and draft state to decode.
+    SGLANG_PP_PD_LOCAL_RESULT = EnvBool(False)
+    # Opt-in, PP prefill (PD): PP0's HiCache ready counts ride the request relay
+    # instead of a blocking PP0 -> PP1 -> ... send/recv chain.
+    SGLANG_PP_HICACHE_COUNTS_PIGGYBACK = EnvBool(False)
+    # Opt-in, L3 prefetch (cache mode): buffered timing events for the query,
+    # hit agreement, drain and admission checks, written as JSONL by a thread.
+    SGLANG_PREFETCH_TIMING = EnvBool(False)
+    SGLANG_PREFETCH_TIMING_DIR = EnvStr("/logs")
+    # Opt-in, L3 prefetch with the timeout policy: PP0 ends a prefetch whose own
+    # storage query found nothing; the stage MIN can only agree on zero.
+    SGLANG_PREFETCH_PP0_MISS_SHORTCUT = EnvBool(False)
+    # Opt-in, PP prefill: PP0's prefetch stop verdicts ride the request relay
+    # instead of a blocking PP0 -> PP1 -> ... send/recv chain.
+    SGLANG_PREFETCH_VERDICT_RELAY = EnvBool(False)
     # Override NVML Confidential Computing autodetection. None = autodetect.
     SGLANG_FORCE_CONFIDENTIAL_COMPUTE = EnvBool(None)
 
@@ -824,6 +855,9 @@ class Envs:
     # Under overlap, publish decode KV destinations one iteration later instead of
     # reading them back inline; False restores the inline publish.
     SGLANG_ENABLE_DISAGG_DECODE_DEFERRED_PUBLISH = EnvBool(True)
+    # Decode preallocation may admit a later request past one whose KV does not
+    # fit yet, at most this many times per waiting request; 0 keeps strict FIFO.
+    SGLANG_DISAGG_DECODE_PREALLOC_MAX_OVERTAKES = EnvInt(0)
 
     # ===================================================================
     # Distributed and model-parallel runtime
@@ -852,6 +886,10 @@ class Envs:
     # this long, logging an error. A pause that never resumes means work the
     # resume depends on is stuck behind a parked chunk. 0 disables it.
     SGLANG_GATED_TRANSFER_WATCHDOG_MS = EnvInt(1000)
+    # reduce_scatterv with equal per-rank sizes (every MAX_LEN-padded DP decode
+    # graph) issues one NCCL ReduceScatter instead of a grouped Reduce per rank;
+    # same sum in another order, so default off.
+    SGLANG_ENABLE_REDUCE_SCATTERV_EQUAL_FAST = EnvBool(False)
 
     # ===================================================================
     # Tool calling and native web search
@@ -877,6 +915,17 @@ class Envs:
     SGLANG_HICACHE_HF3FS_CONFIG_PATH = EnvStr(None)
     SGLANG_HICACHE_DECODE_OFFLOAD_STRIDE = EnvInt(None)
     SGLANG_HICACHE_SKIP_HOST_DUPLICATE_RECLAIM = EnvBool(False)
+    # PD prefill + write_back + PP + PP comm stream only (refused elsewhere at
+    # init): eviction backups (D2H) wait for earlier forwards, not the in-flight
+    # one. Upstream #49498 defaults it on; off here.
+    SGLANG_ENABLE_HICACHE_WB_EVICT_RELAXED_FENCE = EnvBool(False)
+    # p-micro v4 rig only: per-launch host / D2H / KV-event counters (PMICRO_HOSTSTAT lines).
+    SGLANG_PMICRO_HOSTSTATS = EnvBool(False)
+    # Batch KV event construction without changing the published payload.
+    SGLANG_HICACHE_BATCH_EVENTS = EnvBool(False)
+    # With batching: bigram KV-event token_ids pre-encoded as msgpack (byte-identical wire).
+    SGLANG_KV_EVENTS_RAW_TOKENS = EnvBool(False)
+    SGLANG_KV_EVENTS_RAW_TOKENS_VERIFY = EnvInt(0)
     SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR = EnvStr(None)
     # File-backend LRU eviction (opt-in; sizes accept SI/IEC suffixes, "0" disables).
     SGLANG_HICACHE_FILE_BACKEND_MAX_SIZE = EnvStr(None)
@@ -893,6 +942,44 @@ class Envs:
     # Buffer mode: store only the SWA window ending at each node (what a
     # prefetch ending there restores) instead of every SWA page.
     SGLANG_ENABLE_HICACHE_SWA_TAIL_ONLY_BACKUP = EnvBool(False)
+    # --hicache-host-kv-dtype nvfp4: also store DSA index keys as NVFP4 (0 keeps them FP8).
+    SGLANG_ENABLE_HICACHE_NVFP4_HOST_INDEXER = EnvBool(True)
+    # NVFP4 MLA host load: stage this many consecutive layers per page with one copy each (1 = per layer).
+    SGLANG_HICACHE_NVFP4_LOAD_GROUP = EnvInt(1)
+    # Byte-compare the grouped load against the per-layer path for this many loads (syncs; 0 = off).
+    SGLANG_HICACHE_NVFP4_LOAD_GROUP_VERIFY = EnvInt(0)
+    # P-only micro rig: requests to the fake KV sink (bootstrap_host 2.2.2.2) enter the prefix cache like any other.
+    SGLANG_DISAGG_FAKE_PREFIX_CACHE = EnvBool(False)
+    # Cache mode: write L3 when a host page is evicted, not at L2 admission; a page
+    # leaves the host pool only after its L3 write is acknowledged.
+    SGLANG_OPT_HICACHE_STORAGE_WRITE_BACK = EnvBool(False)
+    # Host-pool fraction one eviction shortfall writes to L3 ahead of need.
+    # Arbitrary; no evidence this is the right size.
+    SGLANG_HICACHE_STORAGE_WRITE_BACK_BATCH_FRACTION = EnvFloat(0.01)
+    # Seconds a write-back process waits at SIGTERM / exit for its L3 writes in
+    # flight before the final stats line; keep it inside the launcher's SIGKILL grace.
+    SGLANG_HICACHE_STORAGE_WRITE_BACK_DRAIN_TIMEOUT = EnvFloat(20.0)
+    # Write-back as a dirty-page cleaner (needs the Rust TreeCore): host copies are
+    # not pinned; a page storage lacks is "dirty" and only host-leaf eviction skips
+    # it. Fractions are of the host pool's pages, per rank.
+    SGLANG_HICACHE_STORAGE_WRITE_BACK_CLEANER = EnvBool(False)
+    # Begin writing the coldest dirty pages when unissued dirty pages exceed this.
+    SGLANG_HICACHE_STORAGE_WRITE_BACK_DIRTY_START_FRACTION = EnvFloat(0.5)
+    # Clean (or free) pages the cleaner aims to keep; below it is a floor breach.
+    SGLANG_HICACHE_STORAGE_WRITE_BACK_MIN_CLEAN_FRACTION = EnvFloat(0.3)
+    # Cap on cleaner writes ahead of eviction: written + in flight - host evicted.
+    SGLANG_HICACHE_STORAGE_WRITE_BACK_PREFETCH_BUDGET_FRACTION = EnvFloat(0.5)
+    # Cap on the cleaner's writes in flight per rank (each PP rank writes its own layers).
+    SGLANG_HICACHE_STORAGE_WRITE_BACK_MAX_INFLIGHT_FRACTION = EnvFloat(0.04)
+    # Pages per storage IO call (one NIXL transfer per service carries all of them).
+    SGLANG_HICACHE_STORAGE_BATCH_PAGES = EnvInt(128)
+    # Cache mode: write L3 from the coldest L2 pages ahead of eviction instead of at
+    # L2 admission, so the two tiers hold different pages. Python tree core only.
+    SGLANG_HICACHE_L3_WRITE_ON_HOST_EVICT = EnvBool(False)
+    # Fraction of the host pool kept free-or-already-in-L3 at the LRU tail. It must
+    # exceed (storage write latency) x (host eviction rate) / (host pool tokens);
+    # 0.05 leaves ~2x headroom for a ~1 s write and a 30M-token pool churning 1M tok/s.
+    SGLANG_HICACHE_L3_EVICT_WRITE_RESERVE_FRACTION = EnvFloat(0.05)
     SGLANG_HICACHE_NIXL_BACKEND_STORAGE_DIR = EnvStr(None)
     # Enable O_DIRECT when opening NIXL POSIX backend files (bypasses OS page cache).
     # Disable with SGLANG_HICACHE_NIXL_USE_DIRECT_IO=0 or via the
@@ -924,6 +1011,13 @@ class Envs:
     # synchronous all-layer Mooncake batch. Set to a positive value to split
     # larger transfers; 0 preserves the legacy single-batch behavior.
     SGLANG_MOONCAKE_MAX_TRANSFER_BATCH_INDICES = EnvInt(0)
+    # With SGLANG_MOONCAKE_CUSTOM_MEM_POOL=NVLINK (MNNVL), send every layer of a
+    # KV chunk as this many batch transfers instead of one per layer; 0 keeps
+    # one batch per layer.
+    SGLANG_MOONCAKE_NVLINK_LAYER_BATCHES = EnvInt(0)
+    # Log prefill transfer-worker timings (queue wait, send time, GB/s) every
+    # this many seconds; 0 disables.
+    SGLANG_LOG_MOONCAKE_TRANSFER_STATS_INTERVAL = EnvFloat(0.0)
     ENABLE_ASCEND_TRANSFER_WITH_MOONCAKE = EnvBool(False)
     ASCEND_NPU_PHY_ID = EnvInt(-1)
     SGLANG_MOONCAKE_SEND_AUX_TCP = EnvBool(False)
@@ -1309,6 +1403,31 @@ class Envs:
     # traffic with a small accuracy tradeoff and require FC2 reduce outside the
     # kernel.
     SGLANG_FLASHINFER_MEGAMOE_COMBINE_DTYPE = EnvStr("bf16")
+    # Run the NVFP4 W4A4 MegaMOE on a FlashInfer SM107 kernel under expert parallelism:
+    # "inference" (generic) or "genphase" (one cross-rank token exchange per layer).
+    # Needs at most 1024 tokens per rank and the BF16 combine; empty keeps the default.
+    SGLANG_FLASHINFER_MEGAMOE_SM107_VARIANT = EnvStr("")
+    # FlashInfer knobs for that SM107 kernel: a JSON object of overrides, "cache" or
+    # "auto"; empty keeps FlashInfer's configuration defaults.
+    SGLANG_FLASHINFER_MEGAMOE_SM107_KNOBS = EnvStr("")
+    # On that SM107 kernel, write only the live rows of the top-k reduce, and at
+    # decode and verify run the shared-expert add with the next layer's residual add
+    # and input RMSNorm in one kernel. Bitwise equal.
+    SGLANG_OPT_FLASHINFER_MEGAMOE_FUSED_EPILOGUE = EnvBool(False)
+    # End the SM107 inference kernel with one NVLink barrier instead of two
+    # (FlashInfer 0.7.3); outputs are unchanged. Every EP rank must set the same value.
+    SGLANG_OPT_FLASHINFER_MEGAMOE_SM107_SINGLE_TAIL_BARRIER = EnvBool(False)
+    # On that SM107 inference kernel (FlashInfer 0.7.3), send each route's dispatch
+    # metadata as a tagged word without a trailing fence or ready counter, and pull
+    # each row as its word lands. Bitwise equal; every EP rank must set the same value.
+    SGLANG_OPT_FLASHINFER_MEGAMOE_SM107_TAGGED_DISPATCH = EnvBool(False)
+    # On that SM107 inference kernel (FlashInfer 0.7.3), let each router push warp
+    # compute its routes' destination rows instead of waiting for a helper CTA's
+    # table. Bitwise equal; every EP rank must set the same value.
+    SGLANG_OPT_FLASHINFER_MEGAMOE_SM107_PER_CTA_PUSH_LAYOUT = EnvBool(False)
+    # On that SM107 inference kernel (FlashInfer 0.7.3), run the single-group router and
+    # the NVFP4 input staging as one launch. Routes and staged bytes are unchanged.
+    SGLANG_OPT_FLASHINFER_MEGAMOE_FUSED_ROUTE_QUANT = EnvBool(False)
     # Enable per-token FP32 activation scaling for serialized ModelOpt FP4 with
     # FlashInfer TRT-LLM or CuTe DSL v2 MoE.
     SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION = EnvBool(False)
@@ -1426,6 +1545,10 @@ class Envs:
     # ===================================================================
     SGLANG_ENABLE_JIT_DEEPGEMM = EnvBool(True)
     SGLANG_BATCH_INVARIANT_OPS_ENABLE_MM_FALLBACK_VARIANT = EnvBool(False)
+    # Send the BF16 GEMM shapes in unquant's _BF16_SPLITK_HEURISTIC_M_RANGES (GLM-5.2 at
+    # attention TP 1, measured on SM107) to split-K kernels; (M, N, K) in the SM107
+    # tuned-tactic table keep that route. Needs --bf16-gemm-backend cutedsl.
+    SGLANG_ENABLE_BF16_SPLITK_GEMM_HEURISTIC = EnvBool(False)
     SGLANG_DEEPGEMM_STANDARD_LAYOUT = EnvStr("auto")
     SGLANG_DEEPGEMM_MASKED_MEMORY_BUDGET_FRACTION = EnvFloat(0.25)
     # Cap the DeepGEMM masked grouped-GEMM per-expert padded capacity at
@@ -1591,6 +1714,10 @@ class Envs:
     SGLANG_FORCE_FUSED_OP_BACKEND = EnvStr(None)
     USE_TRITON_W8A8_FP8_KERNEL = EnvBool(False)
     SGLANG_MOE_PADDING = EnvBool(False)
+    # MLA decode, verify and draft extend: one Triton launch for the q_a and kv_a
+    # RMSNorms, which also sums fused_qkv_a's split-K partials when it splits K.
+    # Same math in another reduction order, so default off.
+    SGLANG_OPT_FUSED_MLA_QKV_A_NORM = EnvBool(False)
 
     # ===================================================================
     # Logits and log-probability processing
@@ -1610,6 +1737,13 @@ class Envs:
     # Deterministic inference and all-reduce
     # ===================================================================
     SGLANG_ENABLE_DETERMINISTIC_INFERENCE = EnvBool(False)
+    # Deterministic top-p renorm through the multi-CTA JIT kernel
+    # (kernels/ops/sampling/air_top_p_parallel.py), bitwise equal to flashinfer's
+    # deterministic AIR kernel; off until its bitwise GPU test passes on the target.
+    SGLANG_OPT_AIR_TOP_P_PARALLEL = EnvBool(False)
+    # If set (e.g. "10.0f"), the JIT build of that kernel must target exactly this; checked before
+    # the first build, so a worker never runs a build that was not validated.
+    SGLANG_AIR_TOP_P_REQUIRED_TARGET = EnvStr("")
     # Use 1-stage all-reduce kernel on AMD (deterministic, fixed accumulation order)
     # If not set: auto (enabled when --enable-deterministic-inference is on)
     # Set to 1: force enable (even without --enable-deterministic-inference)
@@ -1743,6 +1877,19 @@ class Envs:
     # than the graph saves (e.g. DeepEP MoE workspace captured at full dispatch
     # capacity).
     SGLANG_DISABLE_DRAFT_EXTEND_CUDA_GRAPH = EnvBool(False)
+    # Greedy topk=1 EAGLE drafts (decode steps and draft extend) take the token
+    # from per-rank vocab-shard argmax candidates exchanged by a small all-reduce
+    # instead of all-gathering the full logits. Bit-identical tokens; falls back
+    # to the gather when the TP all-reduce would go to NCCL or the LM head layout
+    # is not plain vocab-parallel.
+    SGLANG_SPEC_DRAFT_ARGMAX_EXCHANGE = EnvBool(False)
+    # Same exchange for the replicated --enable-dp-lm-head head on a pure-DP-attention
+    # decode node: the draft's LM head runs vocab-parallel over the DP ranks (their
+    # rows all-gathered, a row slice of the full weight per rank). Target untouched.
+    SGLANG_OPT_SPEC_DRAFT_TP_LM_HEAD = EnvBool(False)
+    # With it, gather those rows with the custom all-reduce's NVLink one-shot push
+    # (multicast plane) instead of NCCL; rows past its push slot keep NCCL.
+    SGLANG_OPT_SPEC_DRAFT_TP_LM_HEAD_PUSH_GATHER = EnvBool(False)
 
     # ===================================================================
     # Multimodal processing
@@ -2152,6 +2299,23 @@ class Envs:
     # DSA backend (GLM 5 and DeepSeek V3.2)
     # ===================================================================
     SGLANG_DSA_FUSE_TOPK = EnvBool(True)
+    SGLANG_DSA_TOPK_OVERFLOW_PREFIX = EnvBool(False)
+    SGLANG_DSA_TOPK_ACTIVATION_LOG = EnvBool(False)
+    # Bound the per-replay DSA metadata kernels (decode, target verify, draft
+    # extend) by a program budget that strides over each row's live kv blocks,
+    # instead of one program per 128 columns of the --context-length-wide table
+    # (CUDA, kpool 1, no KPool metadata fusion). Outputs are bit-identical.
+    # It also writes the MTP draft-decode metadata of every step backend in one
+    # launch (DeepseekSparseAttnMultiStepBackend).
+    SGLANG_DSA_BOUNDED_REPLAY_METADATA = EnvBool(False)
+    # Score each request's MTP draft-extend rows as one DeepGEMM paged-MQA request
+    # (q = [bs, next_n, H, D]), as target verify does, instead of one request per
+    # row, which rereads the index-K cache next_n times (SM100, DeepGEMM backend).
+    SGLANG_OPT_DSA_DRAFT_EXTEND_NATIVE_MQA_LOGITS = EnvBool(False)
+    # Experimental decode-shaped eight-query paged selector.
+    SGLANG_DSA_DECODE_GVR_TOPK = EnvBool(False)
+    # Experimental fixed-eight FP8 indexer score; other routes retain DeepGEMM.
+    SGLANG_DSA_DECODE_CAP8_LOGITS = EnvBool(False)
     SGLANG_DSA_TOPK_FLASHINFER_DETERMINISTIC = EnvBool(False)
     SGLANG_DSA_TOPK_FLASHINFER_TIE_BREAK = EnvStr(None)
     SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD = EnvInt(2048)

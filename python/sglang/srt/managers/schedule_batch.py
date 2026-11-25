@@ -1577,6 +1577,8 @@ class Req(ReqDllmMixin):
             req_pool_index=self.kv.req_pool_idx,
         )
         self.kv.retraction_backup = None
+        # Return the backup's pinned host blocks; the caching host allocator would keep them.
+        torch._C._host_emptyCache()
 
     def build_rebootstrap_payload(self) -> dict:
         """Build the prefill ``/generate`` payload that asks the original prefill

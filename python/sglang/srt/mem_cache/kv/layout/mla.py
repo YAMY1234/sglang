@@ -469,10 +469,18 @@ class MLAView(MLAKVView):
 
     # -- retraction copies, at physical ids --
 
+    def _retraction_chunk_rows(self):
+        # Pinned host blocks are rounded up to a power of two: fill one 8 MiB block per chunk.
+        buf = self.kv_buffer[0]
+        row_bytes = buf.element_size()
+        for d in buf.shape[1:]:
+            row_bytes *= d
+        return max(1, (8 << 20) // row_bytes)
+
     def get_cpu_copy(self, indices, mamba_indices=None, req_pool_index=None):
         current_platform.synchronize()
         kv_cache_cpu = []
-        chunk_size = self.cpu_offloading_chunk_size
+        chunk_size = self._retraction_chunk_rows()
         for layer_id in range(self.layer_num):
             kv_cache_cpu.append([])
             if self.kv_buffer[layer_id].shape[0] == 0:
@@ -489,7 +497,7 @@ class MLAView(MLAKVView):
         self, kv_cache_cpu, indices, mamba_indices=None, req_pool_index=None
     ):
         current_platform.synchronize()
-        chunk_size = self.cpu_offloading_chunk_size
+        chunk_size = self._retraction_chunk_rows()
         for layer_id in range(self.layer_num):
             if self.kv_buffer[layer_id].shape[0] == 0:
                 continue

@@ -27,6 +27,13 @@ from sglang.srt.mem_cache.pool_host.common import (
     get_allocator_from_storage,
     make_kernel_ptr_table,
 )
+from sglang.srt.mem_cache.pool_host.pagewise_l2 import (
+    chunk_pages,
+    copy_page_runs_to_stage,
+    copy_stage_to_host_pages,
+    layer_runs,
+    pagewise_enabled,
+)
 from sglang.srt.platforms import current_platform
 from sglang.srt.utils import is_cuda, is_hip, is_mps, is_npu, is_xpu
 
@@ -373,6 +380,92 @@ class DSAIndexerPoolHost(HostKVCache):
         else:
             raise ValueError(f"Unsupported IO backend: {io_backend}")
 
+    def pagewise_load_ok(self, io_backend) -> bool:
+        return (
+            io_backend == "direct"
+            and self.layout == "page_first_direct"
+            and not getattr(self, "_is_dummy", False)
+            and not self._is_device_layer_sharded(None)
+            and self._pagewise_row_bytes() is not None
+        )
+
+    def _pagewise_row_bytes(self):
+        """Bytes of one page-layer when host and device rows match, else None."""
+        buf = self.index_k_with_scale_buffer
+        if buf is None or not self.packed_device_index_buffers:
+            return None
+        row = buf.stride(1) * buf.element_size()
+        for dev in self.packed_device_index_buffers:
+            if not dev.is_contiguous() or dev.stride(0) * dev.element_size() != row:
+                return None
+        if len(self.packed_device_index_buffers) != buf.shape[1]:
+            return None
+        return row
+
+    @staticmethod
+    def _device_rows_u8(dev):
+        return dev.view(torch.uint8).view(dev.shape[0], -1)
+
+    def load_to_device_layers_pagewise(
+        self, device_pool, host_indices, device_indices, layer_ids, *, is_draft=False
+    ):
+        """load_to_device_per_layer for several layers: one copy entry per page per
+        run of consecutive host layers, then one device-side row copy per layer."""
+        ids = [
+            l for l in layer_ids if is_draft or self._is_device_layer_owned(device_pool, l)
+        ]
+        if not ids:
+            return
+        host_pages, device_pages = self._get_indexer_page_indices(
+            host_indices, device_indices
+        )
+        if host_pages.numel() == 0:
+            return
+        row = self._pagewise_row_bytes()
+        host_layers = [
+            self._draft_host_layer(l) if is_draft else self._host_layer_index(l)
+            for l in ids
+        ]
+        for first, nseg, _ in layer_runs(host_layers):
+            step = chunk_pages(nseg * row)
+            for start in range(0, host_pages.numel(), step):
+                pages = host_pages[start : start + step]
+                n = pages.numel()
+                stage = torch.empty(
+                    (n, nseg, row), dtype=torch.uint8, device=device_pages.device
+                )
+                copy_page_runs_to_stage(
+                    self.index_k_with_scale_buffer, pages, first, nseg, stage
+                )
+                dst_pages = device_pages[start : start + n]
+                for k in range(nseg):
+                    self._device_rows_u8(
+                        self.packed_device_index_buffers[first + k]
+                    ).index_copy_(0, dst_pages, stage[:, k])
+                del stage  # free before the next chunk's stage, so the peak stays one stage
+
+    def _backup_pagewise(self, host_indices, device_indices) -> None:
+        """Gather every layer of each page on the device, then copy whole pages."""
+        host_pages, device_pages = self._get_indexer_page_indices(
+            host_indices, device_indices
+        )
+        if host_pages.numel() == 0:
+            return
+        row = self._pagewise_row_bytes()
+        layers = len(self.packed_device_index_buffers)
+        step = chunk_pages(layers * row)
+        for start in range(0, host_pages.numel(), step):
+            pages = host_pages[start : start + step]
+            n = pages.numel()
+            src_pages = device_pages[start : start + n]
+            stage = torch.empty(
+                (n, layers, row), dtype=torch.uint8, device=src_pages.device
+            )
+            for j, dev in enumerate(self.packed_device_index_buffers):
+                stage[:, j].copy_(self._device_rows_u8(dev).index_select(0, src_pages))
+            copy_stage_to_host_pages(stage, self.index_k_with_scale_buffer, pages)
+            del stage
+
     def _backup_from_device_per_layer(
         self,
         device_pool,
@@ -436,6 +529,9 @@ class DSAIndexerPoolHost(HostKVCache):
         assert not getattr(self, "_is_dummy", False), (
             "backup on a dummy (non-src DSA) host pool"
         )
+        if pagewise_enabled() and self.pagewise_load_ok(io_backend):
+            self._backup_pagewise(host_indices, device_indices)
+            return
         if self._is_device_layer_sharded(device_pool):
             for layer_id in self._owned_device_layer_ids(device_pool):
                 self._backup_from_device_per_layer(

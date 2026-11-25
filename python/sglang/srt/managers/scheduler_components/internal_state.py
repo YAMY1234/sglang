@@ -7,8 +7,12 @@ time; it only reads it.
 from __future__ import annotations
 
 import logging
+import os
+import socket
+import time
 from typing import TYPE_CHECKING, Any, Callable, Dict, Optional
 
+from sglang.kernels.ops.sampling.air_top_p_parallel import air_top_p_worker_record
 from sglang.srt.environ import envs, exportable_env_vars
 from sglang.srt.managers.io_struct import (
     GetInternalStateReq,
@@ -17,7 +21,7 @@ from sglang.srt.managers.io_struct import (
     SetInternalStateReqOutput,
 )
 from sglang.srt.managers.scheduler_components.memory_usage import build_memory_usage
-from sglang.srt.runtime_context import get_context, get_exec, get_parallel
+from sglang.srt.runtime_context import get_context, get_device, get_exec, get_parallel
 from sglang.srt.server_args import compute_world_size, redact_server_args_secrets
 from sglang.srt.utils.msgspec_utils import msgspec_to_builtins
 
@@ -56,6 +60,7 @@ class SchedulerInternalStateController:
             self._add_step_times,
             self._add_rust_server,
             self._add_env_vars,
+            self._add_air_top_p,
         ):
             contribute(state)
         # A bound signal handler is not msgpack-serializable, and no reader
@@ -141,6 +146,32 @@ class SchedulerInternalStateController:
     def _add_env_vars(self, state: Dict[str, Any]) -> None:
         if envs.SGLANG_EXPOSE_OWN_ENV_VARS.get():
             state["env_vars"] = exportable_env_vars()
+
+    def _add_air_top_p(self, state: Dict[str, Any]) -> None:
+        # Read in this worker, so host / pid / GPU / sources bind to its own counters.
+        # Reads the device fallback counter (.item()) here, per query only.
+        # Only with the kernel's flag on: a role without it reports nothing extra.
+        if not envs.SGLANG_OPT_AIR_TOP_P_PARALLEL.get():
+            return
+        parallel = get_parallel()
+        record = {
+            "flag": envs.SGLANG_OPT_AIR_TOP_P_PARALLEL.get(),
+            "host": socket.gethostname(),
+            "pp_rank": parallel.pp_rank,
+            "tp_rank": parallel.tp_rank,
+            "attn_dp_rank": parallel.attn_dp_rank,
+            "attn_tp_rank": parallel.attn_tp_rank,
+        }
+        try:
+            record.update(air_top_p_worker_record(get_device().gpu_id), status="OK")
+        except Exception as error:
+            record.update(
+                status="ERROR",
+                error=f"{type(error).__name__}: {error}",
+                wall_time=time.time(),
+                pid=os.getpid(),
+            )
+        state["air_top_p"] = record
 
     # ------------------------------------------------------------------ update
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from typing import Optional
 
 import torch
@@ -17,6 +18,8 @@ from sglang.srt.utils import is_xpu
 
 from .candidate_table import CANDIDATE_BLOCK_SIZE
 from .utils import make_name
+
+logger = logging.getLogger(__name__)
 
 
 @cache_once
@@ -70,7 +73,7 @@ def _jit_topk_v2_module(deterministic: bool = False):
         ("topk_transform_kpool", f"{kernel}::transform_kpool"),
         ("topk_transform_kpool_ragged", f"{kernel}::transform_kpool_ragged"),
     ]
-    return load_jit(
+    module = load_jit(
         make_name("topk_v2"),
         *args,
         f"mode{mode}",
@@ -78,6 +81,10 @@ def _jit_topk_v2_module(deterministic: bool = False):
         cuda_files=["deepseek_v4/topk_v2.cuh"],
         cuda_wrappers=wrappers,
     )
+    logger.info(
+        "DSA top-k v2 JIT module loaded: mode %d, %s", mode, " ".join(extra_cuda_cflags)
+    )
+    return module
 
 
 @cache_once
