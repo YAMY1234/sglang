@@ -17,7 +17,6 @@ from sglang.kernels.ops.speculative.eagle import (
     prepare_verify_commit_outputs,
 )
 from sglang.kernels.ops.speculative.spec_tree import TreeMaskMode
-from sglang.srt.environ import envs
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
@@ -265,16 +264,13 @@ def accept_draft_tree(
     simulated_acc_len_rng: Optional[torch.Generator] = None,
     sparse_bonus_argmax: bool = False,
 ) -> VerifyAccept:
-    """The tree accept core of EAGLE and NGRAM: the runtime hooks' post-verify
-    under the NV mega runtime, eagle_sample otherwise."""
+    """The tree accept core of EAGLE and NGRAM: the runtime hooks' post-verify,
+    or eagle_sample for custom logit processors."""
     maybe_detect_nan(logits_output.next_token_logits, "verify: target model logits")
     maybe_detect_inf(logits_output.next_token_logits, "verify: target model logits")
     has_custom_logit_processor = batch.sampling_info.has_custom_logit_processor
     # The provider's sampling view carries no custom logit processors.
-    if (
-        envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get()
-        and not has_custom_logit_processor
-    ):
+    if not has_custom_logit_processor:
         # Without its forced length on the device, eagle_sample would leave the fused
         # chain for the tree kernels and draw the length on the host instead.
         simulated_accept_length = None

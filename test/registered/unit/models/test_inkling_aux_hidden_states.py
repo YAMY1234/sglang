@@ -9,7 +9,6 @@ import pytest
 import torch
 
 from sglang.srt.arg_groups.layernorm_sp_hook import validate_layernorm_sp
-from sglang.srt.environ import envs
 from sglang.srt.layers.logits_processor import (
     LogitsMetadata,
     LogitsProcessor,
@@ -139,7 +138,6 @@ def test_unbound_verify_keeps_full_vocab_with_master_on():
     )
     full_logits = torch.arange(6, dtype=torch.float32).reshape(2, 3)
     with (
-        envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.override(True),
         # DSpark and out-of-tree consumers never opt in to shard outputs. UNO's
         # explicit ``supports_sharded_verify=False`` binding has its own test.
         published_topology(),

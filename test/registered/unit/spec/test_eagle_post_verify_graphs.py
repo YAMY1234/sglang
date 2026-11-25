@@ -296,7 +296,6 @@ class TestPostVerifyGraphs(CustomTestCase):
             )
             graphs = _declining_graphs()
             with (
-                envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.override(True),
                 self.subTest(clears_c128=clears_c128),
                 self.assertRaises(_EagerSample),
             ):
@@ -572,7 +571,14 @@ class TestPostVerifyGraphsMatchEager(CustomTestCase):
             patch(
                 "sglang.srt.distributed.parallel_state.graph_capture", _graph_capture
             ),
-            patch.object(eagle_utils, "_fused_accept_enabled", return_value=fused),
+            # the tree kernels unless the fused chain accept is under test
+            (
+                nullcontext()
+                if fused
+                else patch.object(
+                    eagle_utils, "_chain_accept_applies", return_value=False
+                )
+            ),
             patch.object(
                 eagle_utils,
                 "verify_tree_greedy_func",
@@ -588,7 +594,7 @@ class TestPostVerifyGraphsMatchEager(CustomTestCase):
                     batch, verify_input, logits = _round(bs, generator)
                     logits_buf.copy_(logits)
                     with patch.object(
-                        eagle_utils, "_fused_accept_enabled", return_value=False
+                        eagle_utils, "_chain_accept_applies", return_value=False
                     ):
                         want = _eager(batch, verify_input, logits, reference_rng)
                     graphed = i % 3 != 2
@@ -837,8 +843,12 @@ class TestFusedAcceptMatchesUnfused(CustomTestCase):
                 for fused in (False, True):
                     torch.manual_seed(7)
                     torch.cuda.manual_seed_all(7)
-                    with patch.object(
-                        eagle_utils, "_fused_accept_enabled", return_value=fused
+                    with (
+                        nullcontext()
+                        if fused
+                        else patch.object(
+                            eagle_utils, "_chain_accept_applies", return_value=False
+                        )
                     ):
                         outputs.append(
                             _eager(

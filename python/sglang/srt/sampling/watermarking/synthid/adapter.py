@@ -7,7 +7,6 @@ import msgspec
 import torch
 
 from sglang.kernels.ops.sampling.synthid import MAX_CHAIN_WIDTH
-from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils.async_probe import sanitize_nan_logits
 from sglang.srt.utils.device import async_h2d, is_cuda
@@ -366,10 +365,11 @@ def check_server_args(cfg: ResolvingConfig) -> None:
             "--watermark-algorithm synthid is incompatible with "
             "--rl-on-policy-target: it changes the sampling distribution"
         )
-    if envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get():
+    # A megakernel provider's post-verify builds its sampling view before apply.
+    if cfg.enable_nvidia_megakernel:
         raise ValueError(
             "--watermark-algorithm synthid is not supported with "
-            "SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION"
+            "--enable-nvidia-megakernel"
         )
     if cfg.speculative_algorithm is None:
         return

@@ -2,7 +2,6 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
-from sglang.srt.environ import envs
 from sglang.srt.speculative import eagle_worker_common
 from sglang.srt.speculative.target_verify import TargetVerify
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -12,7 +11,7 @@ register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
 
 class TestNativeEagerVerify(CustomTestCase):
-    def test_master_selects_native_sampling_or_runtime_hooks(self):
+    def test_custom_processors_keep_native_sampling_and_others_use_runtime_hooks(self):
         # EAGLE passes its sparse and simulated-acceptance options; NGRAM the defaults.
         eagle_options = dict(
             uno_target_max_top_k=17,
@@ -20,9 +19,8 @@ class TestNativeEagerVerify(CustomTestCase):
             sparse_bonus_argmax=True,
         )
         for label, options in (("eagle", eagle_options), ("defaults", {})):
-            # A custom processor matters only with the switch on.
-            for enabled, custom in ((False, False), (True, False), (True, True)):
-                with self.subTest(options=label, enabled=enabled, custom=custom):
+            for custom in (False, True):
+                with self.subTest(options=label, custom=custom):
                     batch = SimpleNamespace(
                         sampling_info=SimpleNamespace(
                             has_custom_logit_processor=custom
@@ -59,9 +57,6 @@ class TestNativeEagerVerify(CustomTestCase):
                         patch.object(
                             eagle_worker_common, "make_post_verify_io", make_io
                         ),
-                        envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.override(
-                            enabled
-                        ),
                     ):
                         accept = eagle_worker_common.accept_draft_tree(
                             batch,
@@ -75,7 +70,7 @@ class TestNativeEagerVerify(CustomTestCase):
                         (accept.tokens, accept.accept_lens, accept.accept_index),
                         outputs,
                     )
-                    if enabled and not custom:
+                    if not custom:
                         sample.assert_not_called()
                         make_io.assert_called_once()
                         hooks.post_verify.assert_called_once_with(make_io.return_value)

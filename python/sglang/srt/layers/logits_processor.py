@@ -119,10 +119,6 @@ _UNQUANTIZED_LM_HEAD_METHODS = {
 _autotune_run_lm_head: Optional[bool] = None
 
 
-def _runtime_optimized_vocab_shards_enabled() -> bool:
-    return envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get()
-
-
 # Target-verify logits formats a graph runner captures for a sharded-verify processor.
 VERIFY_VOCAB_SHARDS = "vocab_shards"
 VERIFY_FULL_LOGITS = "full_logits"
@@ -558,8 +554,7 @@ class LogitsProcessor(nn.Module):
         self.defer_verify_gather = False
         self.defer_plain_gather = envs.SGLANG_OPT_DFLASH_DEFER_PLAIN_GATHER.get()
         self._sharded_verify_eligible = (
-            _runtime_optimized_vocab_shards_enabled()
-            and self.do_tensor_parallel_all_gather
+            self.do_tensor_parallel_all_gather
             and not self.use_attn_tp_group
             and not self.do_tensor_parallel_all_gather_dp_attn
             and not self.use_tp_lm_head_all_to_all
@@ -568,7 +563,7 @@ class LogitsProcessor(nn.Module):
         # A speculative worker must explicitly opt in after establishing that
         # its verify consumer understands ``next_token_logits_vocab_shard``.
         # UNO, DSpark, and out-of-tree consumers otherwise retain the stock
-        # full-vocabulary gather even when the runtime master switch is on.
+        # full-vocabulary gather.
         self.sharded_verify = False
         self._sharded_verify_temperature_keys = False
         self.final_logit_softcapping = getattr(

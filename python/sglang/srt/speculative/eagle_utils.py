@@ -85,10 +85,6 @@ _VocabShardView = getattr(_provider_spec, "VocabShardView", None)
 logger = logging.getLogger(__name__)
 
 
-def _fused_accept_enabled() -> bool:
-    return envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get()
-
-
 def per_step_draft_out_cache_loc(
     out_cache_loc: torch.Tensor,
     batch_size: int,
@@ -1355,7 +1351,7 @@ def _chain_accept_applies(
     This requires CUDA, a chain draft whose tree width is the accept width, an
     injected length (if any) already on the device, and no watermark.
     """
-    if not _fused_accept_enabled() or not logits.is_cuda or _is_hip or watermark:
+    if not logits.is_cuda or _is_hip or watermark:
         return False
     if verify_input.tree_topk != 1:
         return False

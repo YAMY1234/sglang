@@ -1075,14 +1075,11 @@ def bind_speculative_runtime_hooks(
 ) -> SpeculativeRuntimeHooks:
     """Resolve target-side speculative strategies once at the binding boundary.
 
-    The caller's stock strategies are returned by identity when the runtime master
-    switch is off or the built provider has no factory. Provider presence must agree
+    The caller's stock strategies are returned by identity when there is no built
+    provider or it has no factory. Provider presence must agree
     across ranks before any rank can call it. The provider may change the local key
     builder, but the runtime-owned verification runner cannot be replaced.
     """
-    if not envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get():
-        return defaults
-
     built = built_megakernel(model)
     factory = None if built is None else built.speculative_runtime_hooks
     megakernel_agree(

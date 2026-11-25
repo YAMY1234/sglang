@@ -15,7 +15,6 @@ import torch
 
 from sglang.kernels.plugin_kernels.nvidia import spec
 from sglang.kernels.plugin_kernels.nvidia.spec import Step
-from sglang.srt.environ import envs
 from sglang.srt.kernel_plugins.nvidia import binding as runtime
 from sglang.srt.kernel_plugins.nvidia import eagle_binding as eb
 from sglang.srt.kernel_plugins.nvidia import speculative_runtime
@@ -873,33 +872,12 @@ def _defaults() -> spec.SpeculativeRuntimeHooks:
 
 
 class TestSpeculativeRuntimeHooks(CustomTestCase):
-    def test_switch_off_returns_stock_identity_without_provider_work(self):
-        defaults = _defaults()
-        model = _model(
-            speculative_runtime_hooks=lambda _: (_ for _ in ()).throw(
-                AssertionError("factory must not run")
-            )
-        )
-        with (
-            envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.override(False),
-            patch.object(
-                runtime,
-                "built_megakernel",
-                side_effect=AssertionError("off must not inspect a provider"),
-            ),
-            patch.object(runtime, "megakernel_agree") as agree,
-        ):
-            selected = runtime.bind_speculative_runtime_hooks(model, defaults)
-        self.assertIs(selected, defaults)
-        agree.assert_not_called()
-
     def test_missing_provider_keeps_exact_defaults(self):
         defaults = _defaults()
         models = (torch.nn.Module(), _model())
         for model in models:
             with (
                 self.subTest(has_built=runtime.built_megakernel(model) is not None),
-                envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.override(True),
                 patch.object(runtime, "_gather_tp", return_value=[False]),
             ):
                 selected = runtime.bind_speculative_runtime_hooks(model, defaults)
@@ -920,10 +898,7 @@ class TestSpeculativeRuntimeHooks(CustomTestCase):
             )
 
         model = _model(speculative_runtime_hooks=factory)
-        with (
-            envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.override(True),
-            patch.object(runtime, "_gather_tp", return_value=[True]),
-        ):
+        with patch.object(runtime, "_gather_tp", return_value=[True]):
             selected = runtime.bind_speculative_runtime_hooks(model, defaults)
         self.assertIs(selected.post_verify.run, defaults.post_verify.run)
         self.assertIs(selected.post_verify.local_keys, custom_keys)

@@ -72,11 +72,11 @@ class VerifyWatermark(Protocol):
         """The logits to verify against and the sampling info to verify with.
 
         Callers accept with the returned sampling info, not the one passed in.
-        The NV mega runtime path (SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION)
-        builds the provider's ``VerifySamplingView`` from the sampling info
-        before any apply (``make_post_verify_io``), and a provider forces
-        through the bound object's ABI v2 methods instead of apply, so an
-        algorithm that changes the sampling info must refuse that path in its
+        The runtime post-verify path builds the provider's ``VerifySamplingView``
+        from the sampling info before any apply (``make_post_verify_io``), and a
+        provider bound under ``--enable-nvidia-megakernel`` forces through the
+        bound object's ABI v2 methods instead of apply, so an algorithm that
+        changes the sampling info must refuse the megakernel in its
         ``check_server_args``.
 
         ``custom_mask`` None means a chain draft: ``draft_tokens`` and
