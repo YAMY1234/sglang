@@ -1284,6 +1284,225 @@ __global__ __launch_bounds__(kSelectThreads) void fstk_select_kernel(const Selec
   }
 }
 
+// The t-th candidate of a row in sub-list order; off[v] is where sub-list v starts (n past the last).
+CUTLASS_DEVICE uint64_t select_gather(const uint64_t* row_keys, const uint32_t (&off)[kNumMathWarps], uint32_t cap, uint32_t t) {
+  uint32_t w = 0, start = 0;
+#pragma unroll
+  for (uint32_t v = 1; v < kNumMathWarps; ++v) {
+    if (t >= off[v]) w = v, start = off[v];
+  }
+  return row_keys[w * cap + (t - start)];
+}
+
+// Every lane of the calling warp gets the bin (of 256) holding the remaining-th largest key and the
+// count of keys in higher bins. Lane l scans bins [8 (31 - l), 8 (31 - l) + 7] from the top down.
+CUTLASS_DEVICE void warp_pick_bin(const uint32_t* hist, uint32_t remaining, uint32_t& bin, uint32_t& above) {
+  const uint32_t lane = threadIdx.x % 32;
+  const uint4 lo = reinterpret_cast<const uint4*>(hist)[(31 - lane) * 2];
+  const uint4 hi = reinterpret_cast<const uint4*>(hist)[(31 - lane) * 2 + 1];
+  const uint32_t v[8] = {hi.w, hi.z, hi.y, hi.x, lo.w, lo.z, lo.y, lo.x};
+  uint32_t lsum = 0;
+#pragma unroll
+  for (uint32_t b = 0; b < 8; ++b) lsum += v[b];
+  uint32_t incl = lsum;
+#pragma unroll
+  for (int o = 1; o < 32; o <<= 1) {
+    const uint32_t x = __shfl_up_sync(0xffffffffu, incl, o);
+    if (lane >= static_cast<uint32_t>(o)) incl += x;
+  }
+  uint32_t a = incl - lsum, b_sel = 0;
+  const bool mine = a < remaining and a + lsum >= remaining;
+  const uint32_t src = __ffs(__ballot_sync(0xffffffffu, mine)) - 1;
+  if (mine) {
+#pragma unroll
+    for (uint32_t b = 0; b < 8; ++b) {
+      if (a + v[b] >= remaining) {
+        b_sel = b;
+        break;
+      }
+      a += v[b];
+    }
+  }
+  bin = 8 * (31 - src) + 7 - __shfl_sync(0xffffffffu, b_sel, src);
+  above = __shfl_sync(0xffffffffu, a, src);
+}
+
+// Main select, one CTA per row, the same keys and radix steps as fstk_select_kernel with fewer
+// serial latencies: a row of at most kThreads x kItems keys stays in registers (or shared memory
+// with kSmemKeys) for the whole select, a longer row is re-read from global memory in chunks of
+// that size by every pass. Every warp scans the histogram itself, so a radix step costs one
+// barrier (histograms rotate over three buffers), and output positions come from a scan in
+// candidate order (sub-list 0 first) instead of atomics.
+template <uint32_t kThreads, uint32_t kItems, bool kSmemKeys>
+__global__ __launch_bounds__(kThreads) void fstk_select_fast_kernel(const SelectParams p) {
+  constexpr uint32_t kWarps = kThreads / 32;
+  constexpr uint32_t kChunk = kThreads * kItems;
+  static_assert(kThreads % 32 == 0 and kWarps <= 32 and kItems <= 32);
+  extern __shared__ __align__(16) uint8_t select_fast_smem[];
+  auto* s_keys = reinterpret_cast<uint64_t*>(select_fast_smem);
+  __shared__ __align__(16) uint32_t hist[3][256];
+  __shared__ uint64_t s_or[kWarps], s_and[kWarps];
+  __shared__ uint32_t s_cnt[kItems][kWarps];
+
+  const uint32_t tx = threadIdx.x;
+  const uint32_t lane = tx % 32, warp = tx / 32;
+  const uint32_t row = blockIdx.x;
+  const uint32_t len = static_cast<uint32_t>(max(p.lengths[row], 0));
+  const int32_t* table = p.page_table + static_cast<int64_t>(p.row_to_batch[row]) * p.page_table_stride;
+  int32_t* out = p.out + static_cast<uint64_t>(row) * p.topk;
+  const uint32_t page_mask = (1u << p.page_bits) - 1u;
+  const auto to_slot = [&](uint32_t idx) { return (table[idx >> p.page_bits] << p.page_bits) | (idx & page_mask); };
+  if (len <= p.topk) {
+    for (uint32_t t = tx; t < p.topk; t += kThreads) out[t] = t < len ? to_slot(t) : -1;
+    return;
+  }
+  // Sub-list sizes, computed by every warp (lane w: sub-list w); num_sub <= 8 needs three scan steps.
+  const uint32_t c = lane < p.num_sub ? static_cast<uint32_t>(p.cand_count[row * p.num_sub + lane]) : 0u;
+  const bool overflow = __any_sync(0xffffffffu, c > p.cand_sub_cap);
+  uint32_t incl = c;
+#pragma unroll
+  for (int o = 1; o < static_cast<int>(kNumMathWarps); o <<= 1) {
+    const uint32_t x = __shfl_up_sync(0xffffffffu, incl, o);
+    if (lane >= static_cast<uint32_t>(o)) incl += x;
+  }
+  const uint32_t n = __shfl_sync(0xffffffffu, incl, p.num_sub - 1);
+  if (overflow or n < p.topk) {
+    if (tx == 0) {
+      if (p.fallback != nullptr)
+        p.fallback[atomicAdd(p.num_fallback, 1)] = static_cast<int32_t>(row);
+      else if (p.stats != nullptr)
+        atomicAdd(p.stats + kStatUnrepaired, 1ull);
+    }
+    return;
+  }
+  uint32_t off[kNumMathWarps];
+#pragma unroll
+  for (uint32_t v = 0; v < kNumMathWarps; ++v) off[v] = __shfl_sync(0xffffffffu, incl - c, v);
+  const uint64_t* row_keys = p.cand_key + static_cast<uint64_t>(row) * p.num_sub * p.cand_sub_cap;
+  const bool resident = n <= kChunk;
+
+  // k[i] is key cb + i * kThreads + tx of the chunk at cb; the loads of a chunk are all in flight together.
+  uint64_t k[kItems];
+  const auto load_chunk = [&](uint32_t cb) {
+#pragma unroll
+    for (uint32_t i = 0; i < kItems; ++i) {
+      const uint32_t t = cb + i * kThreads + tx;
+      k[i] = t < n ? select_gather(row_keys, off, p.cand_sub_cap, t) : 0ull;
+    }
+  };
+  const auto fetch = [&](uint32_t cb) {
+    if (not resident) {
+      load_chunk(cb);
+    } else if constexpr (kSmemKeys) {
+#pragma unroll
+      for (uint32_t i = 0; i < kItems; ++i) k[i] = s_keys[i * kThreads + tx];
+    }
+  };
+
+  load_chunk(0);
+  if (kSmemKeys and resident) {
+#pragma unroll
+    for (uint32_t i = 0; i < kItems; ++i) s_keys[i * kThreads + tx] = k[i];
+  }
+  // Bits set in some key and clear in another: the radix steps start at the highest one.
+  uint64_t k_or = 0, k_and = ~0ull;
+#pragma unroll 1
+  for (uint32_t cb = 0; cb < n; cb += kChunk) {
+    if (cb > 0) load_chunk(cb);
+#pragma unroll
+    for (uint32_t i = 0; i < kItems; ++i) {
+      if (cb + i * kThreads + tx < n) k_or |= k[i], k_and &= k[i];
+    }
+  }
+#pragma unroll
+  for (int o = 16; o > 0; o >>= 1) {
+    k_or |= __shfl_xor_sync(0xffffffffu, k_or, o);
+    k_and &= __shfl_xor_sync(0xffffffffu, k_and, o);
+  }
+  if (lane == 0) s_or[warp] = k_or, s_and[warp] = k_and;
+  for (uint32_t b = tx; b < 2 * 256; b += kThreads) reinterpret_cast<uint32_t*>(hist)[b] = 0;
+  __syncthreads();
+  k_or = 0;
+  k_and = ~0ull;
+#pragma unroll
+  for (uint32_t w = 0; w < kWarps; ++w) k_or |= s_or[w], k_and &= s_and[w];
+  const int top = 63 - __clzll(k_or & ~k_and);  // >= 0: keys are unique and n > topk >= 1
+
+  uint64_t prefix = 0, prefix_mask = 0;
+  uint32_t remaining = p.topk, buf = 0;
+#pragma unroll 1
+  for (int hi = top; hi >= 0; hi -= 8) {
+    const int shift = max(hi - 7, 0);
+    const uint64_t dmask = (1ull << (hi - shift + 1)) - 1;
+    uint32_t* h = hist[buf];
+#pragma unroll 1
+    for (uint32_t cb = 0; cb < n; cb += kChunk) {
+      fetch(cb);
+#pragma unroll
+      for (uint32_t i = 0; i < kItems; ++i) {
+        const bool in = cb + i * kThreads + tx < n and (k[i] & prefix_mask) == prefix;
+        warp_hist_add(h, in, static_cast<uint32_t>((k[i] >> shift) & dmask));
+      }
+    }
+    __syncthreads();
+    // The buffer of the step after next: its readers (two steps back) all passed this barrier.
+    uint32_t* next2 = hist[buf == 0 ? 2 : buf - 1];
+    for (uint32_t b = tx; b < 256; b += kThreads) next2[b] = 0;
+    uint32_t bin, above;
+    warp_pick_bin(h, remaining, bin, above);
+    remaining -= above;
+    prefix |= static_cast<uint64_t>(bin) << shift;
+    prefix_mask |= dmask << shift;
+    const bool whole_bin = remaining == h[bin];
+    buf = buf == 2 ? 0 : buf + 1;
+    if (whole_bin) break;
+  }
+
+  // The keys >= prefix under the bits fixed so far are exactly the top-k (the last bin is taken
+  // whole); item i of warp w lands after items < i of all warps and item i of warps < w.
+  const uint32_t lanes_below = (1u << lane) - 1u;
+  uint32_t base = 0;
+#pragma unroll 1
+  for (uint32_t cb = 0; cb < n; cb += kChunk) {
+    fetch(cb);
+    uint32_t m[kItems], mine = 0;
+#pragma unroll
+    for (uint32_t i = 0; i < kItems; ++i) {
+      m[i] = __ballot_sync(0xffffffffu, cb + i * kThreads + tx < n and (k[i] & prefix_mask) >= prefix);
+      if (lane == i) mine = __popc(m[i]);
+    }
+    if (lane < kItems) s_cnt[lane][warp] = mine;
+    __syncthreads();
+    uint32_t tot = 0, before = 0;
+    if (lane < kItems) {
+#pragma unroll
+      for (uint32_t w = 0; w < kWarps; ++w) {
+        const uint32_t x = s_cnt[lane][w];
+        tot += x;
+        before += w < warp ? x : 0u;
+      }
+    }
+    uint32_t inc = tot;
+#pragma unroll
+    for (int o = 1; o < 32; o <<= 1) {
+      const uint32_t x = __shfl_up_sync(0xffffffffu, inc, o);
+      if (lane >= static_cast<uint32_t>(o)) inc += x;
+    }
+    const uint32_t item_base = base + inc - tot + before;
+    // Every page-table load before the first store (out may alias the table for the compiler).
+    int32_t slot[kItems];
+#pragma unroll
+    for (uint32_t i = 0; i < kItems; ++i) slot[i] = (m[i] >> lane) & 1u ? to_slot(~static_cast<uint32_t>(k[i])) : 0;
+#pragma unroll
+    for (uint32_t i = 0; i < kItems; ++i) {
+      const uint32_t ib = __shfl_sync(0xffffffffu, item_base, i);
+      if ((m[i] >> lane) & 1u) out[ib + __popc(m[i] & lanes_below)] = slot[i];
+    }
+    base += __shfl_sync(0xffffffffu, inc, 31);
+    if (cb + kChunk < n) __syncthreads();  // s_cnt is rewritten by the next chunk
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Device-side repair of rows whose threshold was above their k-th score
 // ---------------------------------------------------------------------------
@@ -1624,28 +1843,11 @@ struct FusedIndexerTopK {
       int64_t num_ctas,
       int64_t smem_keys) {
     using namespace sglang::host;
-    SelectParams p{};
-    p.cand_key = static_cast<const uint64_t*>(cand_key.data_ptr());
-    p.cand_count = static_cast<const int32_t*>(cand_count.data_ptr());
-    p.lengths = static_cast<const int32_t*>(lengths.data_ptr());
-    p.row_to_batch = static_cast<const int32_t*>(row_to_batch.data_ptr());
-    p.page_table = static_cast<const int32_t*>(page_table.data_ptr());
-    p.out = static_cast<int32_t*>(out.data_ptr());
-    p.fallback = opt_ptr<int32_t>(fallback);
-    p.num_fallback = opt_ptr<int32_t>(num_fallback);
+    SelectParams p = select_params(
+        cand_key, cand_count, lengths, row_to_batch, page_table, out, fallback, num_fallback, stats, page_size);
     p.row_list = opt_ptr<const int32_t>(row_list);
     p.num_list = opt_ptr<const int32_t>(num_list);
-    p.stats = opt_ptr<unsigned long long>(stats);
-    p.page_table_stride = page_table.stride(0);
-    p.num_rows = static_cast<uint32_t>(out.size(0));
-    p.topk = static_cast<uint32_t>(out.size(1));
-    p.num_sub = static_cast<uint32_t>(cand_key.size(1));
-    p.cand_sub_cap = static_cast<uint32_t>(cand_key.size(2));
-    RuntimeCheck(p.num_sub >= 1 and p.num_sub <= kNumMathWarps, "fstk: 1..8 candidate sub-lists");
-    RuntimeCheck((p.fallback == nullptr) == (p.num_fallback == nullptr), "fstk: fallback needs num_fallback");
     RuntimeCheck((p.row_list == nullptr) == (p.num_list == nullptr), "fstk: row_list needs num_list");
-    RuntimeCheck(page_size > 0 and (page_size & (page_size - 1)) == 0, "fstk: page_size must be a power of two");
-    p.page_bits = static_cast<uint32_t>(__builtin_ctzll(static_cast<unsigned long long>(page_size)));
     if (p.num_rows == 0) return;
     RuntimeCheck(smem_keys == kSelectMaxKeys or smem_keys == kSelectRepairKeys, "fstk: select smem_keys 8192 or 16384");
     p.smem_keys = static_cast<uint32_t>(smem_keys);
@@ -1657,6 +1859,81 @@ struct FusedIndexerTopK {
     });
     LaunchKernel(grid, kSelectThreads, device, smem)(fstk_select_kernel, p);
   }
+
+  // The main select (one CTA per row of out) by fstk_select_fast_kernel; variant picks the
+  // instantiation: 1 = 256 threads x 16 keys in registers, 2 = the same in shared memory,
+  // 3 = 512 x 8 in shared memory, 4 = 256 x 32 in shared memory.
+  static void select_fast(
+      tvm::ffi::TensorView cand_key,
+      tvm::ffi::TensorView cand_count,
+      tvm::ffi::TensorView lengths,
+      tvm::ffi::TensorView row_to_batch,
+      tvm::ffi::TensorView page_table,
+      tvm::ffi::TensorView out,
+      tvm::ffi::TensorView fallback,
+      tvm::ffi::TensorView num_fallback,
+      tvm::ffi::TensorView stats,
+      int64_t page_size,
+      int64_t variant) {
+    using namespace sglang::host;
+    const SelectParams p = select_params(
+        cand_key, cand_count, lengths, row_to_batch, page_table, out, fallback, num_fallback, stats, page_size);
+    if (p.num_rows == 0) return;
+    const DLDevice device = out.device();
+    switch (variant) {
+      case 1: return launch_select_fast<256, 16, false>(p, device);
+      case 2: return launch_select_fast<256, 16, true>(p, device);
+      case 3: return launch_select_fast<512, 8, true>(p, device);
+      case 4: return launch_select_fast<256, 32, true>(p, device);
+      default: RuntimeCheck(false, "fstk: select_fast variant 1..4, got ", variant);
+    }
+  }
+
+ private:
+  template <uint32_t kThreads, uint32_t kItems, bool kSmemKeys>
+  static void launch_select_fast(const SelectParams& p, DLDevice device) {
+    using namespace sglang::host;
+    constexpr size_t kSmem = kSmemKeys ? static_cast<size_t>(kThreads) * kItems * sizeof(uint64_t) : 0;
+    constexpr auto kernel = fstk_select_fast_kernel<kThreads, kItems, kSmemKeys>;
+    if constexpr (kSmem > 0) runtime::set_max_dynamic_smem_per_device<kernel>(device, kSmem);
+    LaunchKernel(p.num_rows, kThreads, device, kSmem)(kernel, p);
+  }
+
+  static SelectParams select_params(
+      tvm::ffi::TensorView cand_key,
+      tvm::ffi::TensorView cand_count,
+      tvm::ffi::TensorView lengths,
+      tvm::ffi::TensorView row_to_batch,
+      tvm::ffi::TensorView page_table,
+      tvm::ffi::TensorView out,
+      tvm::ffi::TensorView fallback,
+      tvm::ffi::TensorView num_fallback,
+      tvm::ffi::TensorView stats,
+      int64_t page_size) {
+    using namespace sglang::host;
+    SelectParams p{};
+    p.cand_key = static_cast<const uint64_t*>(cand_key.data_ptr());
+    p.cand_count = static_cast<const int32_t*>(cand_count.data_ptr());
+    p.lengths = static_cast<const int32_t*>(lengths.data_ptr());
+    p.row_to_batch = static_cast<const int32_t*>(row_to_batch.data_ptr());
+    p.page_table = static_cast<const int32_t*>(page_table.data_ptr());
+    p.out = static_cast<int32_t*>(out.data_ptr());
+    p.fallback = opt_ptr<int32_t>(fallback);
+    p.num_fallback = opt_ptr<int32_t>(num_fallback);
+    p.stats = opt_ptr<unsigned long long>(stats);
+    p.page_table_stride = page_table.stride(0);
+    p.num_rows = static_cast<uint32_t>(out.size(0));
+    p.topk = static_cast<uint32_t>(out.size(1));
+    p.num_sub = static_cast<uint32_t>(cand_key.size(1));
+    p.cand_sub_cap = static_cast<uint32_t>(cand_key.size(2));
+    RuntimeCheck(p.num_sub >= 1 and p.num_sub <= kNumMathWarps, "fstk: 1..8 candidate sub-lists");
+    RuntimeCheck((p.fallback == nullptr) == (p.num_fallback == nullptr), "fstk: fallback needs num_fallback");
+    RuntimeCheck(page_size > 0 and (page_size & (page_size - 1)) == 0, "fstk: page_size must be a power of two");
+    p.page_bits = static_cast<uint32_t>(__builtin_ctzll(static_cast<unsigned long long>(page_size)));
+    return p;
+  }
+
+ public:
 
   static void repair_prep(
       tvm::ffi::TensorView fallback,
