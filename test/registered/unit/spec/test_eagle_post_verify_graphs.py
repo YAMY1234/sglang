@@ -91,8 +91,10 @@ def _worker(*, switch, cuda=True, topk=1, dp_attention=False):
 
 def _verify_kwargs(worker):
     """What the worker's verify hands run_eagle_verify."""
+    # an idle batch: no requests, so the dense branch
+    batch = SimpleNamespace(forward_mode=ForwardMode.IDLE, reqs=[])
     with patch.object(eagle_worker_v2, "run_eagle_verify") as run_eagle_verify:
-        worker.verify(batch=None)
+        worker.verify(batch=batch)
     return run_eagle_verify.call_args.kwargs
 
 
@@ -414,10 +416,9 @@ class TestPostVerifyGraphs(CustomTestCase):
         self.assertTrue(torch.equal(torch.get_rng_state(), state))
 
     def test_compact_top_k_sampling_takes_only_batches_of_finite_top_k(self):
-        """With SGLANG_OPT_SPEC_COMPACT_VERIFY_SAMPLING a verify samples on the
-        top-k support when every request has a finite top-k within the compact
-        limit, in the post-verify graphs (keyed apart from the dense branch, whose
-        sampling differs) and the eager verify alike; without it nothing changes."""
+        """A verify samples on the top-k support when every request has a finite
+        top-k within the compact limit, in the post-verify graphs (keyed apart from
+        the dense branch, whose sampling differs) and the eager verify alike."""
 
         def batch(*top_ks):
             reqs = [
@@ -435,14 +436,11 @@ class TestPostVerifyGraphs(CustomTestCase):
 
         limit = SimpleNamespace(_SPARSE_TOP_K_LIMIT=128)
         with patch.dict("sys.modules", {"sglang.srt.speculative.uno_utils": limit}):
-            with patch.object(eagle_utils, "_COMPACT_VERIFY_SAMPLING", True):
-                self.assertEqual(compact_verify_max_top_k(batch(20, 64)), 64)
-                for dense in ((20, 1 << 30), (20, 1), (129,), ()):
-                    with self.subTest(top_ks=dense):
-                        self.assertIsNone(compact_verify_max_top_k(batch(*dense)))
-                self.assertEqual(verify_kwargs(batch(20)), (20, True))
-            self.assertIsNone(compact_verify_max_top_k(batch(20, 64)))
-            self.assertEqual(verify_kwargs(batch(20)), (None, False))
+            self.assertEqual(compact_verify_max_top_k(batch(20, 64)), 64)
+            for dense in ((20, 1 << 30), (20, 1), (129,), ()):
+                with self.subTest(top_ks=dense):
+                    self.assertIsNone(compact_verify_max_top_k(batch(*dense)))
+            self.assertEqual(verify_kwargs(batch(20)), (20, True))
 
         graphs = EaglePostVerifyGraphs(
             target_worker=_target_worker(),

@@ -1840,11 +1840,6 @@ class Envs:
     SGLANG_OPT_TRTLLM_MHA_CHAIN_VERIFY = EnvBool(
         SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
     )
-    # A verify whose requests all sample with a finite top-k within the compact limit
-    # samples on that support (eagle_sample's compact branch), graphed or eager.
-    SGLANG_OPT_SPEC_COMPACT_VERIFY_SAMPLING = EnvBool(
-        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
-    )
     # A sampled verify result (predict, accept_index, num_correct_drafts) is one int32
     # buffer, broadcast to the TP group once.
     SGLANG_OPT_SPEC_PACKED_VERIFY_BCAST = EnvBool(
@@ -2769,7 +2764,12 @@ class _DeprecatedEnv:
 # ad-hoc warnings. For a rename where the old name must keep working through a
 # descriptor, use EnvBoolWithAlias / EnvIntWithAlias instead. Once the
 # deprecation period ends, move the entry to REMOVED_ENVS.
-_DEPRECATED_ENVS: Dict[str, _DeprecatedEnv] = {}
+_DEPRECATED_ENVS: Dict[str, _DeprecatedEnv] = {
+    "SGLANG_OPT_SPEC_COMPACT_VERIFY_SAMPLING": _DeprecatedEnv(
+        note="A verify whose requests all have a finite top-k within the compact "
+        "limit always samples on that support; unset it."
+    ),
+}
 
 
 def _handle_deprecated_envs():
@@ -2825,7 +2825,7 @@ REMOVED_ENVS: Dict[str, str] = {
     "SGLANG_Q35MF_MKH_N3B": "use SGLANG_OPT_SPEC_VERIFY_REUSE_STAGED_INPUTS",
     "SGLANG_Q35MF_MKH_N3C": "use SGLANG_OPT_SPEC_POST_VERIFY_ONE_LAUNCH_LOAD",
     "SGLANG_Q35MF_EDGE_CHAIN_TREE": "use SGLANG_OPT_TRTLLM_MHA_CHAIN_VERIFY",
-    "SGLANG_Q35MF_EDGE_SPARSE_VERIFY_SAMPLING": "use SGLANG_OPT_SPEC_COMPACT_VERIFY_SAMPLING",
+    "SGLANG_Q35MF_EDGE_SPARSE_VERIFY_SAMPLING": "the path always runs now; unset it",
     "SGLANG_Q35MF_EDGE_PACKED_VERIFY_BCAST": "use SGLANG_OPT_SPEC_PACKED_VERIFY_BCAST",
     "SGLANG_Q35MF_EDGE_SHM_SYNC": "use SGLANG_OPT_SCHEDULER_SHM_SYNC",
     "SGLANG_Q35MF_EDGE_SHM_SYNC_MULTIHOST": "use SGLANG_OPT_SCHEDULER_SHM_SYNC_MULTIHOST",

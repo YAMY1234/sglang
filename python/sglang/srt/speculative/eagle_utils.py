@@ -70,7 +70,6 @@ _is_cuda = is_cuda()
 _is_hip = is_hip()
 _is_xpu = is_xpu()
 _is_cpu = is_cpu()
-_COMPACT_VERIFY_SAMPLING = envs.SGLANG_OPT_SPEC_COMPACT_VERIFY_SAMPLING.get()
 _PACKED_VERIFY_BCAST = envs.SGLANG_OPT_SPEC_PACKED_VERIFY_BCAST.get()
 
 # The binding defaults probe this explicit capability once instead of relying on
@@ -715,10 +714,9 @@ def _apply_joint_top_k_top_p(
 
 
 def compact_verify_max_top_k(batch: ScheduleBatch) -> Optional[int]:
-    """The support for eagle_sample's compact top-k branch under
-    SGLANG_OPT_SPEC_COMPACT_VERIFY_SAMPLING, or None for the dense branch: every
-    request must sample with a finite top-k within the compact limit."""
-    if not _COMPACT_VERIFY_SAMPLING or batch.forward_mode.is_idle():
+    """The support for eagle_sample's compact top-k branch, or None for the dense
+    branch: every request must sample with a finite top-k within the compact limit."""
+    if batch.forward_mode.is_idle():
         return None
     from sglang.srt.speculative.uno_utils import _SPARSE_TOP_K_LIMIT
 
