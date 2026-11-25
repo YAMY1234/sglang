@@ -8,6 +8,7 @@ import torch
 
 from sglang.srt.compilation.torch_compile_decoration import set_torch_compile_config
 from sglang.srt.environ import envs
+from sglang.srt.model_executor.runner.replay_prep_warmup import warm_replay_prep
 from sglang.srt.layers.attention.base_attn_backend import SharedReadEnds
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
@@ -43,6 +44,7 @@ from sglang.srt.model_executor.runner_backend_utils import (
 from sglang.srt.runtime_context import (
     get_exec,
     get_flags,
+    get_forward,
     get_parallel,
     get_spec,
 )
@@ -416,6 +418,12 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
 
         return is_bs_supported
 
+    def _run_capture_tail_hooks(self, out, forward_batch, num_tokens: int) -> None:
+        """The model runner's capture tail hooks, after the draft-extend forward of a
+        captured batch size (under the runner's own attention backend)."""
+        for capture_hook in self.model_runner.capture_tail_hooks:
+            capture_hook(self, out, forward_batch, num_tokens)
+
     def capture_one_shape(
         self,
         size: int,
@@ -527,14 +535,18 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             output_cache_loc_backup = forward_batch.out_cache_loc
             hidden_states_backup = forward_batch.spec_info.hidden_states
 
-            ret = self.model_runner.model.forward(
-                forward_batch.input_ids,
-                forward_batch.positions,
-                forward_batch,
-            )
+            with get_forward().scoped(
+                draft_argmax_only=self.eagle_worker.draft_extend_argmax_only
+            ):
+                ret = self.model_runner.model.forward(
+                    forward_batch.input_ids,
+                    forward_batch.positions,
+                    forward_batch,
+                )
 
             forward_batch.out_cache_loc = output_cache_loc_backup
             forward_batch.spec_info.hidden_states = hidden_states_backup
+            self._run_capture_tail_hooks(ret, forward_batch, num_tokens)
             return ret
 
         def run_once():
@@ -556,11 +568,14 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
                 global_num_tokens_cpu,
             )
             set_is_extend_in_batch(False)
-            return self.draft_runtime.run_draft_extend(
+            ret = self.draft_runtime.run_draft_extend(
                 runner=self,
                 forward_batch=forward_batch,
                 stock=run_stock,
             )
+            # A forward that read no metadata still joins a forked metadata branch.
+            self.draft_extend_attn_backend.join_forward_metadata()
+            return ret
 
         with forward_context(
             ForwardContext(attn_backend=self.draft_extend_attn_backend),
@@ -596,6 +611,48 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
                     capture_inputs=None,
                     post_warmup_hook=post_warmup_hook,
                 )
+            # The replay's draft-extend metadata prep at this batch size, once now
+            # (replay_prep_warmup)
+            if warm_replay_prep(
+                "draft extend",
+                bs,
+                lambda: self.draft_extend_attn_backend.init_forward_metadata_out_graph(
+                    self._replay_fb_view(forward_batch, bs=bs, raw_bs=bs, num_tokens=num_tokens)
+                ),
+            ):
+                self._warmed_replay_bs.add(bs)
+
+    def _replay_fb_view(self, forward_batch, *, bs: int, raw_bs: int, num_tokens: int):
+        """The ForwardBatch view the draft-extend replay metadata prep reads."""
+        from types import SimpleNamespace
+
+        buffers = self.buffers
+        seq_lens_sum = forward_batch.seq_lens_sum
+        if seq_lens_sum is not None:
+            seq_lens_sum = seq_lens_sum + (bs - raw_bs) * self.seq_len_fill_value
+        return SimpleNamespace(
+            batch_size=bs,
+            forward_mode=self.forward_mode,
+            ragged_verify_layout=None,
+            input_ids=getattr(forward_batch, "input_ids", None),
+            req_pool_indices=buffers.req_pool_indices,
+            seq_lens=buffers.seq_lens,
+            seq_lens_sum=seq_lens_sum,
+            # Mirror absence must survive replay (stale buffer defeats None-guards).
+            seq_lens_cpu=(
+                None if forward_batch.seq_lens_cpu is None else buffers.seq_lens_cpu
+            ),
+            max_seq_len_host=getattr(forward_batch, "max_seq_len_host", None),
+            encoder_lens=None,
+            out_cache_loc=buffers.out_cache_loc[:num_tokens],
+            out_cache_loc_virtual=forward_batch.out_cache_loc_virtual,
+            iteration_ids=forward_batch.iteration_ids,
+            iteration_cols=forward_batch.iteration_cols,
+            out_cache_loc_dsv4=getattr(forward_batch, "out_cache_loc_dsv4", None),
+            # Virtual input stays separate from the backend's physical buffer.
+            mamba_track_indices=track_indices(buffers.mamba_track_indices, bs),
+            spec_info=forward_batch.spec_info,
+        )
 
     def execute(self, forward_batch: ForwardBatch, select_index: torch.Tensor):
         assert forward_batch.out_cache_loc is not None
@@ -715,33 +772,8 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             forward_batch.spec_info.num_correct_drafts = buffers.num_correct_drafts[:bs]
             forward_batch.spec_info.num_accept_tokens = buffers.num_accept_tokens[:bs]
 
-        from types import SimpleNamespace
-
-        seq_lens_sum = forward_batch.seq_lens_sum
-        if seq_lens_sum is not None:
-            seq_lens_sum = seq_lens_sum + (bs - raw_bs) * self.seq_len_fill_value
-        fb_view = SimpleNamespace(
-            batch_size=bs,
-            forward_mode=self.forward_mode,
-            ragged_verify_layout=None,
-            input_ids=getattr(forward_batch, "input_ids", None),
-            req_pool_indices=buffers.req_pool_indices,
-            seq_lens=buffers.seq_lens,
-            seq_lens_sum=seq_lens_sum,
-            # Mirror absence must survive replay (stale buffer defeats None-guards).
-            seq_lens_cpu=(
-                None if forward_batch.seq_lens_cpu is None else buffers.seq_lens_cpu
-            ),
-            max_seq_len_host=getattr(forward_batch, "max_seq_len_host", None),
-            encoder_lens=None,
-            out_cache_loc=buffers.out_cache_loc[:num_tokens],
-            out_cache_loc_virtual=forward_batch.out_cache_loc_virtual,
-            iteration_ids=forward_batch.iteration_ids,
-            iteration_cols=forward_batch.iteration_cols,
-            out_cache_loc_dsv4=getattr(forward_batch, "out_cache_loc_dsv4", None),
-            # Virtual input stays separate from the backend's physical buffer.
-            mamba_track_indices=track_indices(buffers.mamba_track_indices, bs),
-            spec_info=forward_batch.spec_info,
+        fb_view = self._replay_fb_view(
+            forward_batch, bs=bs, raw_bs=raw_bs, num_tokens=num_tokens
         )
         self.draft_extend_attn_backend.init_forward_metadata_out_graph(fb_view)
 
@@ -774,9 +806,14 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         out = LogitsProcessorOutput(
             # None when the megakernel's draft_extend kept the logits
             next_token_logits=(
-                None
-                if out.next_token_logits is None
-                else out.next_token_logits[:raw_bs]
+                out.next_token_logits[:raw_bs]
+                if out.next_token_logits is not None
+                else None
+            ),
+            next_token_argmax_partials=(
+                out.next_token_argmax_partials[:raw_bs]
+                if out.next_token_argmax_partials is not None
+                else None
             ),
             # The unchanged megakernel batch consumes the graph-owned rows before
             # replay; every other path detaches the recurrent state from that buffer.

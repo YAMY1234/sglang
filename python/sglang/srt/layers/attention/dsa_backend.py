@@ -4,6 +4,7 @@ import logging
 from dataclasses import dataclass
 from typing import (
     TYPE_CHECKING,
+    Callable,
     Dict,
     List,
     Literal,
@@ -56,7 +57,10 @@ from sglang.srt.configs.model_config import (
     get_dsa_index_kpool,
 )
 from sglang.srt.environ import envs
-from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+from sglang.srt.layers.attention.base_attn_backend import (
+    AttentionBackend,
+    SharedReadEnds,
+)
 from sglang.srt.layers.attention.dsa.dsa_backend_kpool import (
     DeepseekSparseAttnBackendKPoolMixin,
     _KPoolForwardInputs,
@@ -76,6 +80,10 @@ from sglang.srt.layers.attention.dsa.dsa_dcp_sharded import (
     dcp_localize_compact,
     init_dcp_candidate_all_gather,
     init_dcp_topk_merge,
+)
+from sglang.srt.layers.attention.dsa.dsa_draft_metadata import (
+    draft_decode_metadata_writable,
+    write_draft_decode_metadata,
 )
 from sglang.srt.layers.attention.dsa.dsa_indexer_metadata import DSAIndexerMetadata
 from sglang.srt.layers.attention.dsa.dsa_metadata_manager import (
@@ -108,6 +116,7 @@ from sglang.srt.layers.attention.trtllm_mla_backend import (
     grow_multi_ctas_kv_counter_buffer_if_needed,
     make_persistent_multi_ctas_kv_counter_buffer,
 )
+from sglang.srt.layers.attention.verify_mask import VerifyMask, maybe_create_verify_mask
 from sglang.srt.layers.cp.base import get_cp_strategy
 from sglang.srt.layers.cp.utils import (
     cp_live_store_rows,
@@ -362,6 +371,12 @@ class DSAMetadata:
     # 2D context_lens used to build the schedule above; the indexer reuses it
     # as DG's `context_lens` arg so the broadcast doesn't rebuild per layer.
     paged_mqa_ctx_lens_2d: Optional[torch.Tensor] = None
+    # Separate one-query schedule for cap8: DG's [B,8] schedule is not its ABI.
+    cap8_paged_mqa_context_lens: Optional[torch.Tensor] = None
+    cap8_paged_mqa_schedule_metadata: Optional[torch.Tensor] = None
+    # Capture stores one length per token row; this records its request grouping.
+    # Eager metadata keeps per-request lengths and leaves this unset.
+    cap8_graph_query_group_size: Optional[int] = None
     # Precomputed once per forward batch and reused across layers: the
     # DeepSeek-V4 top-k v2 plan (cluster-threshold metadata) for the folded
     # decode top-k transform. None unless the SGL top-k v2 path is enabled.
@@ -569,6 +584,36 @@ def _validate_flashmla_sparse_q8_backend(
         )
 
 
+_replay_metadata_streams: dict = {}
+
+
+def _replay_metadata_side_stream() -> torch.cuda.Stream:
+    """The side stream forked from the current one at this point."""
+    main = torch.cuda.current_stream()
+    side = _replay_metadata_streams.get(main.device)
+    if side is None:
+        side = _replay_metadata_streams[main.device] = torch.cuda.Stream(
+            device=main.device
+        )
+    side.wait_stream(main)
+    return side
+
+
+def _run_on(side: torch.cuda.Stream, write: Callable[[], None]) -> torch.cuda.Event:
+    with torch.cuda.stream(side):
+        write()
+    ready = torch.cuda.Event()
+    ready.record(side)
+    return ready
+
+
+def _fork_replay_metadata(write: Callable[[], None]) -> torch.cuda.Event:
+    """Run ``write`` (replay-metadata device work) on a side stream forked from the
+    current one; return the event its readers wait on. Under capture this records a
+    parallel branch of the graph."""
+    return _run_on(_replay_metadata_side_stream(), write)
+
+
 class DeepseekSparseAttnBackend(
     DSAMetadataManagementMixin,
     DeepseekSparseAttnBackendKPoolMixin,
@@ -586,6 +631,15 @@ class DeepseekSparseAttnBackend(
     # init_cuda_graph_state sizes this for every backend, but only the TRT-LLM
     # branch of __init__ allocates one.
     _multi_ctas_kv_counter_buffer: Optional[torch.Tensor] = None
+    # The qlen x qlen chain mask of SGLANG_OPT_DSA_CHAIN_VERIFY_TREE (never read:
+    # sparse MLA masks the verify rows by position); None keeps the FULL_MASK build.
+    _verify_mask: Optional[VerifyMask] = None
+    # Event of the forked in-graph replay metadata (SGLANG_OPT_DSA_DE_META_IN_GRAPH)
+    # that the forward's first metadata reader waits on.
+    _replay_metadata_ready: Optional[torch.cuda.Event] = None
+    # SGLANG_OPT_DSA_META_FORK_LATE: the branch forked at the graph head whose kernels
+    # are enqueued at the first reader, so the graph front's nodes come first.
+    _pending_metadata: Optional[tuple] = None
 
     def _call_flash_mla_sparse_fwd(self, **kwargs):
         from sglang.kernels.ops.attention.flash_mla_interface import (
@@ -647,6 +701,10 @@ class DeepseekSparseAttnBackend(
             raise ValueError("DSA index kpool does not support --dcp-size > 1.")
         self._init_kpool_metadata_fusion()
         self.max_context_len = model_runner.model_config.context_len
+        self._is_draft_worker = model_runner.is_draft_worker
+        self._skip_prefill = skip_prefill
+        # (forward mode, bs) whose captured graph records the replay metadata.
+        self._metadata_recorded_in_graph: set = set()
         self._memory_saver_adapter = TorchMemorySaverAdapter.create(
             enable=get_exec().features.enable_memory_saver
             and envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH.get()
@@ -1071,8 +1129,17 @@ class DeepseekSparseAttnBackend(
         # TODO: SM90 supports DG-native next_n in {1,2} too — enable once
         # validated; for now DG-native is SM100+ only.
         next_n = self.speculative_num_draft_tokens
+        # Draft extend v2 extends every request by exactly next_n tokens; the row
+        # count check keeps this layout in step with the indexer's (B, next_n) gate.
+        # DCP-sharded index-K keeps its per-token draft-extend lens.
+        native_mode = forward_mode.is_target_verify() or (
+            forward_mode.is_draft_extend_v2()
+            and envs.SGLANG_OPT_DSA_DRAFT_EXTEND_NATIVE_MQA_LOGITS.get()
+            and not self.dsa_shards_index_k
+            and seqlens_expanded.numel() == batch_size * next_n
+        )
         dg_native_verify = (
-            forward_mode.is_target_verify()
+            native_mode
             and next_n
             and next_n >= 2
             and get_platform().is_sm100
@@ -1098,6 +1165,24 @@ class DeepseekSparseAttnBackend(
             ctx_lens.dtype
         )
 
+    def _build_cap8_paged_mqa_metadata(self, context_lens):
+        if (
+            not envs.SGLANG_DSA_DECODE_CAP8_LOGITS.get()
+            or context_lens is None
+            or context_lens.dim() != 2
+            or context_lens.shape[1] != 8
+            or self.dsa_shards_index_k
+            or self.dsa_index_kpool != 1
+        ):
+            return None, None
+        # Build once per forward, shared by all indexer layers. Per-query
+        # causal masking stays in the unchanged downstream expanded lengths.
+        lengths = context_lens[:, -1].contiguous()
+        schedule = resolve_paged_mqa_logits_metadata_fn()(
+            lengths[:, None], 64, resolve_num_sms()
+        )
+        return lengths, schedule
+
     def _refresh_paged_mqa_schedule_metadata(
         self,
         metadata: DSAMetadata,
@@ -1110,6 +1195,18 @@ class DeepseekSparseAttnBackend(
             object.__setattr__(metadata, "paged_mqa_schedule_metadata", new_schedule)
         else:
             metadata.paged_mqa_schedule_metadata.copy_(new_schedule)
+        if envs.SGLANG_DSA_DECODE_CAP8_LOGITS.get():
+            lengths, schedule = self._build_cap8_paged_mqa_metadata(seqlens_32_2d)
+            for name, value in (
+                ("cap8_paged_mqa_context_lens", lengths),
+                ("cap8_paged_mqa_schedule_metadata", schedule),
+            ):
+                if value is not None:
+                    current = getattr(metadata, name)
+                    if current is None:
+                        object.__setattr__(metadata, name, value)
+                    else:
+                        current.copy_(value)
 
     def _build_topk_v2_plan(
         self, seqlens_expanded: torch.Tensor
@@ -1138,7 +1235,16 @@ class DeepseekSparseAttnBackend(
             return
         from sglang.kernels.ops.attention.dsv4.topk import plan_topk_v2
 
-        metadata.topk_v2_plan.copy_(plan_topk_v2(metadata.dsa_seqlens_expanded))
+        seqlens = metadata.dsa_seqlens_expanded
+        if (
+            envs.SGLANG_OPT_DSA_TOPK_PLAN_IN_PLACE.get()
+            and metadata.topk_v2_plan.shape[0] == seqlens.shape[0] + 1
+        ):
+            # The planner writes nothing when the transform takes its small-batch
+            # kernel, which reads no plan; the copy then moved uninitialized bytes.
+            plan_topk_v2(seqlens, out=metadata.topk_v2_plan)
+            return
+        metadata.topk_v2_plan.copy_(plan_topk_v2(seqlens))
 
     def _get_fused_topk_page_table(self, topk_indices: torch.Tensor) -> torch.Tensor:
         if (
@@ -1164,6 +1270,7 @@ class DeepseekSparseAttnBackend(
 
         # Prefill addresses concatenated logical KV, but fused draft decode
         # consumes allocator-local physical slots. Leave prefill's input intact.
+        self._join_replay_metadata()
         metadata = self.forward_metadata
         page_table = metadata.page_table_1_flattened
         if page_table is None:
@@ -1231,6 +1338,17 @@ class DeepseekSparseAttnBackend(
         forward_batch: ForwardBatch,
         in_capture: bool = False,
     ):
+        key = (forward_batch.forward_mode, forward_batch.batch_size)
+        if not in_capture and key in self._metadata_recorded_in_graph:
+            # The captured graph rebuilds the device metadata from its static
+            # seq_lens / req_pool_indices; only the host-side state is left.
+            self.set_dsa_prefill_impl(forward_batch=None)
+            self.forward_metadata = self.decode_cuda_graph_metadata[key[1]]
+            return
+        if in_capture:
+            self._metadata_recorded_in_graph.discard(key)
+            self._replay_metadata_ready = None
+            self._pending_metadata = None
         seq_lens_cpu = (
             forward_batch.seq_lens.cpu() if in_capture else forward_batch.seq_lens_cpu
         )
@@ -1258,8 +1376,75 @@ class DeepseekSparseAttnBackend(
         """Refresh custom kernel state after eager or out-of-graph metadata setup."""
         pass
 
+    def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch) -> None:
+        bs = forward_batch.batch_size
+        max_bs = envs.SGLANG_OPT_SPEC_STEP_SEAMS_MAX_BS.get()
+        if (
+            not self._records_replay_metadata_in_graph(forward_batch.forward_mode)
+            or bs not in self.decode_cuda_graph_metadata
+            or 0 < max_bs < bs
+        ):
+            return
+
+        def write_metadata():
+            # The eager replay's device work, from the runner's static buffers.
+            self._apply_cuda_graph_metadata(
+                bs=bs,
+                req_pool_indices=forward_batch.req_pool_indices,
+                seq_lens=forward_batch.seq_lens,
+                seq_lens_cpu=None,
+                forward_mode=forward_batch.forward_mode,
+                spec_info=forward_batch.spec_info,
+                out_cache_loc=forward_batch.out_cache_loc,
+            )
+
+        if envs.SGLANG_OPT_DSA_META_FORK_LATE.get():
+            # Forked here (no dependency on the front), enqueued at the first reader.
+            self._pending_metadata = (_replay_metadata_side_stream(), write_metadata)
+            self._replay_metadata_ready = None
+        else:
+            self._replay_metadata_ready = _fork_replay_metadata(write_metadata)
+        if torch.cuda.is_current_stream_capturing():
+            self._metadata_recorded_in_graph.add((forward_batch.forward_mode, bs))
+
+    def _records_replay_metadata_in_graph(self, forward_mode: ForwardMode) -> bool:
+        """Whether this mode's graph records its replay metadata on a branch beside the
+        graph front (bounded grids: bs-only shapes): draft extend with
+        SGLANG_OPT_DSA_DE_META_IN_GRAPH, target verify with
+        SGLANG_OPT_DSA_TV_META_IN_GRAPH."""
+        if not self.dsa_meta_bounded or self.dsa_decode_impl == "flashmla_kv":
+            return False
+        if forward_mode.is_draft_extend_v2():
+            return envs.SGLANG_OPT_DSA_DE_META_IN_GRAPH.get()
+        if forward_mode.is_target_verify():
+            return envs.SGLANG_OPT_DSA_TV_META_IN_GRAPH.get()
+        return False
+
+    def shared_read_ends(self, fm: ForwardMode) -> SharedReadEnds:
+        # A forked verify metadata branch may read req_to_token after the graph-head
+        # marker; only a post-replay event covers it.
+        if fm.is_target_verify() and self._records_replay_metadata_in_graph(fm):
+            return SharedReadEnds.POST_REPLAY
+        return super().shared_read_ends(fm)
+
+    def join_forward_metadata(self) -> None:
+        self._join_replay_metadata()
+
+    def _join_replay_metadata(self) -> None:
+        """Order the current stream after the forked replay metadata; every reader
+        of forward_metadata calls this first."""
+        pending, self._pending_metadata = self._pending_metadata, None
+        if pending is not None:
+            self._replay_metadata_ready = _run_on(*pending)
+        ready = self._replay_metadata_ready
+        if ready is not None:
+            torch.cuda.current_stream().wait_event(ready)
+            self._replay_metadata_ready = None
+
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init the metadata for a forward pass."""
+        self._replay_metadata_ready = None
+        self._pending_metadata = None
         batch_size = forward_batch.batch_size
         device = forward_batch.seq_lens.device
 
@@ -1551,6 +1736,9 @@ class DeepseekSparseAttnBackend(
                 paged_mqa_ctx_lens_2d, 64, resolve_num_sms()
             )
 
+        cap8_lengths, cap8_schedule = self._build_cap8_paged_mqa_metadata(
+            paged_mqa_ctx_lens_2d
+        )
         metadata = DSAMetadata(
             page_size=self.physical_page_size,
             cache_seqlens_int32=cache_seqlens_int32,
@@ -1576,6 +1764,8 @@ class DeepseekSparseAttnBackend(
             ),
             paged_mqa_schedule_metadata=paged_mqa_schedule_metadata,
             paged_mqa_ctx_lens_2d=paged_mqa_ctx_lens_2d,
+            cap8_paged_mqa_context_lens=cap8_lengths,
+            cap8_paged_mqa_schedule_metadata=cap8_schedule,
             dsa_cache_seqlens_int32=dsa_cache_seqlens_int32,
             dsa_cu_seqlens_q=dsa_cu_seqlens_q,
             dsa_cu_seqlens_k=dsa_cu_seqlens_k,
@@ -1779,6 +1969,48 @@ class DeepseekSparseAttnBackend(
         # Sized by query rows, not requests: target verify captures
         # speculative_num_draft_tokens rows per request.
         self._ensure_multi_ctas_kv_counter_capacity(max(max_bs, max_num_tokens))
+        if envs.SGLANG_OPT_DSA_CHAIN_VERIFY_TREE.get():
+            self._verify_mask = maybe_create_verify_mask(
+                is_draft_runner=self._is_draft_worker,
+                skip_prefill=self._skip_prefill,
+                max_bs=max_bs,
+                max_context_len=self.max_context_len,
+                num_draft_tokens=self.speculative_num_draft_tokens,
+                device=self.device,
+                is_read=False,
+            )
+            self._warm_chain_verify_tree(max_bs)
+
+    def _warm_chain_verify_tree(self, max_bs: int) -> None:
+        """Load the chain-tree kernel of every graph batch size before serving (a PD
+        decode role runs no warm-up requests; a module first loaded mid-serving stalls
+        a rank while its peers spin). Dtypes as the verify passes them."""
+        from sglang.kernels.ops.speculative.eagle import build_chain_tree
+        from sglang.srt.model_executor.runner.replay_prep_warmup import warm_replay_prep
+
+        steps = get_spec().speculative_num_steps or 0
+        if self._verify_mask is None or self.topk != 1 or steps + 1 != (
+            self.speculative_num_draft_tokens or 0
+        ):
+            return
+        for bs in range(1, max_bs + 1):
+            ones = torch.ones((bs,), dtype=torch.int64, device=self.device)
+            warm_replay_prep(
+                "chain verify tree",
+                bs,
+                lambda: build_chain_tree(
+                    ones,
+                    torch.zeros((bs, steps), dtype=torch.int64, device=self.device),
+                    ones,
+                    self._verify_mask.buffer,
+                    req_pool_indices=torch.zeros_like(ones),
+                    req_to_token=self.req_to_token,
+                ),
+            )
+
+    @property
+    def verify_mask(self) -> Optional[VerifyMask]:
+        return self._verify_mask
 
     def _multi_ctas_kv_counter_for(self, num_query_rows: int) -> Optional[torch.Tensor]:
         # A prefill batch wider than TRTLLM_MLA_MAX_BATCH_SIZE takes a temporary;
@@ -1956,6 +2188,9 @@ class DeepseekSparseAttnBackend(
                 paged_mqa_ctx_lens_2d, 64, resolve_num_sms()
             )
 
+        cap8_lengths, cap8_schedule = self._build_cap8_paged_mqa_metadata(
+            paged_mqa_ctx_lens_2d
+        )
         metadata = DSAMetadata(
             page_size=self.physical_page_size,
             cache_seqlens_int32=cache_seqlens_int32,
@@ -1967,12 +2202,19 @@ class DeepseekSparseAttnBackend(
             flashmla_metadata=flashmla_metadata,
             paged_mqa_schedule_metadata=paged_mqa_schedule_metadata,
             paged_mqa_ctx_lens_2d=paged_mqa_ctx_lens_2d,
+            cap8_paged_mqa_context_lens=cap8_lengths,
+            cap8_paged_mqa_schedule_metadata=cap8_schedule,
             dsa_cache_seqlens_int32=dsa_cache_seqlens_int32,
             dsa_cu_seqlens_q=dsa_cu_seqlens_q,
             dsa_cu_seqlens_k=dsa_cu_seqlens_k,
             dsa_seqlens_expanded=seqlens_expanded,
             real_page_table=real_page_table,
             dsa_extend_seq_lens_list=dsa_extend_seq_lens_list,
+            cap8_graph_query_group_size=(
+                self.speculative_num_draft_tokens
+                if forward_mode.is_target_verify() or forward_mode.is_draft_extend_v2()
+                else None
+            ),
             topk_v2_plan=self._build_topk_v2_plan(seqlens_expanded),
         )
         metadata = self._init_kpool_metadata_capture(metadata, bs, forward_mode)
@@ -2156,19 +2398,25 @@ class DeepseekSparseAttnBackend(
             # selection, not by reshaping the page table here.
             max_seqlen_k = self._graph_page_table_width(metadata)
             total_extend_len = self.speculative_num_draft_tokens * bs
+            use_fused_metadata = (
+                (is_cuda() or _is_hip) and self.dsa_index_kpool <= 1
+            ) or self.experimental_kpool_metadata_fusion
 
             # See target-verify note: fill on-device to avoid the blocking
-            # pageable H2D from torch.tensor(list, device=cuda).
-            extend_seq_lens = torch.full(
-                (bs,),
-                self.speculative_num_draft_tokens,
-                dtype=torch.int32,
-                device=self.device,
+            # pageable H2D from torch.tensor(list, device=cuda). The bounded
+            # kernel takes the static length (max_extend_len) as a scalar.
+            extend_seq_lens = (
+                None
+                if use_fused_metadata and self.dsa_meta_bounded
+                else torch.full(
+                    (bs,),
+                    self.speculative_num_draft_tokens,
+                    dtype=torch.int32,
+                    device=self.device,
+                )
             )
 
-            if (
-                (is_cuda() or _is_hip) and self.dsa_index_kpool <= 1
-            ) or self.experimental_kpool_metadata_fusion:
+            if use_fused_metadata:
                 self._fused_draft_extend_metadata(
                     seq_lens=seq_lens,
                     extend_seq_lens=extend_seq_lens,
@@ -2368,6 +2616,7 @@ class DeepseekSparseAttnBackend(
     ) -> torch.Tensor:
 
         causal = not layer.is_cross_attention
+        self._join_replay_metadata()
         metadata = self.forward_metadata
         assert causal, "DSA is causal only"
 
@@ -4517,6 +4766,7 @@ class DeepseekSparseAttnBackend(
     def get_indexer_metadata(
         self, layer_id: int, forward_batch: ForwardBatch
     ) -> DSAIndexerMetadata:
+        self._join_replay_metadata()
         force_unfused = not self.use_fused_topk or (
             self.hisparse_coordinator is not None
             and (
@@ -4564,6 +4814,7 @@ class DeepseekSparseAttnBackend(
 
 
 class DeepseekSparseAttnMultiStepBackend:
+    _draft_decode_logged = False  # one log line per process
     # Per-step draft decode replays from precomputed GPU metadata; opt out so
     # decide_needs_cpu_seq_lens' OR over the backends stays False.
     needs_cpu_seq_lens: bool = False
@@ -4589,6 +4840,22 @@ class DeepseekSparseAttnMultiStepBackend:
                     seed_dsa_topk_from_draft_extend=seed_dsa_topk_from_draft_extend,
                 )
             )
+        self.draft_schedule_refresh_steps = self._draft_schedule_refresh_steps(
+            seed_dsa_topk_from_draft_extend
+        )
+        # bs -> draft_decode_metadata_writable; reset when that bs is captured.
+        self._draft_decode_writable: dict[int, bool] = {}
+
+    def _draft_schedule_refresh_steps(
+        self, seed_dsa_topk_from_draft_extend: bool
+    ) -> range:
+        # Steps that reuse the draft-extend indexer top-k never run the indexer,
+        # so their DeepGEMM paged-MQA schedule is never read.
+        if seed_dsa_topk_from_draft_extend:
+            return range(0)
+        # The precompute replay refreshes every step but the 3-way-copy ones.
+        first = 3 if self.speculative_num_steps > 3 else 0
+        return range(first, len(self.attn_backends))
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         for i in range(self.speculative_num_steps - 1):
@@ -4619,6 +4886,7 @@ class DeepseekSparseAttnMultiStepBackend:
                 self.attn_backends[i].init_forward_metadata_out_graph(
                     inner_fb, in_capture=True
                 )
+            self._draft_decode_writable.pop(forward_batch.batch_size, None)
             return
 
         self._init_forward_metadata_replay(forward_batch)
@@ -4629,6 +4897,29 @@ class DeepseekSparseAttnMultiStepBackend:
 
     def _init_forward_metadata_replay(self, forward_batch: ForwardBatch) -> None:
         bs = forward_batch.batch_size
+        writable = self._draft_decode_writable.get(bs)
+        if writable is None:
+            writable = draft_decode_metadata_writable(self.attn_backends, bs)
+            self._draft_decode_writable[bs] = writable
+            if not type(self)._draft_decode_logged:
+                type(self)._draft_decode_logged = True
+                logger.info(
+                    "DSA draft-decode replay metadata: %s (first decision at bs %d, "
+                    "%d step backends)",
+                    "one bounded launch" if writable else "precompute + copies",
+                    bs,
+                    len(self.attn_backends),
+                )
+        if writable:
+            write_draft_decode_metadata(
+                backends=self.attn_backends,
+                seq_lens=forward_batch.seq_lens,
+                req_pool_indices=forward_batch.req_pool_indices,
+                bs=bs,
+                schedule_refresh_steps=self.draft_schedule_refresh_steps,
+            )
+            return
+
         # Precompute metadata once (shared across all backends)
         precomputed = self.attn_backends[0]._precompute_replay_metadata(
             bs=bs,

@@ -2353,7 +2353,23 @@ def biased_grouped_topk_gpu(
             # Ungrouped sigmoid (num_expert_group == 1): use the unified Triton
             # router, which subsumes the jit grouped_topk.cuh kernel here.
             from sglang.kernels.ops.moe.moe_fused_gate import moe_fused_gate as jit_gate
+            from sglang.srt.layers.moe import route_quant_handoff
 
+            # A staged FlashInfer MegaMoE layer gets its NVFP4 input staging in the
+            # router's launch; same (weights, ids) as jit_gate's route_warp path.
+            fused = route_quant_handoff.try_route_stage_megamoe(
+                hidden_states,
+                gating_output,
+                correction_bias,
+                topk,
+                renormalize=renormalize,
+                routed_scaling_factor=routed_scaling_factor,
+                apply_routed_scaling_factor_on_output=bool(
+                    apply_routed_scaling_factor_on_output
+                ),
+            )
+            if fused is not None:
+                return fused
             return jit_gate(
                 gating_output,
                 correction_bias.to(torch.float32),

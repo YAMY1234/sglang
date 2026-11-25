@@ -15,6 +15,9 @@
 
 import faulthandler
 import logging
+import os
+import time
+import zlib
 import multiprocessing as mp
 import signal
 import threading
@@ -90,6 +93,9 @@ from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.srt.utils.watchdog import Watchdog
 
 logger = logging.getLogger(__name__)
+# Decode-side dispatch by the binding resource of each rank: max((requests + 1) / running cap, (tokens + new) / KV pool).
+_DOMINANT = os.environ.get("SGLANG_DP_DOMINANT_RESOURCE", "0") == "1"
+_TIMELINE_N = int(os.environ.get("SGLANG_D_REQ_TIMELINE", "0"))  # log 1 in N requests (crc32 of rid), 0 = off
 
 SCHEDULER_PIDS_ARG = "scheduler_pids"
 
@@ -123,6 +129,8 @@ class DPBudget:
         self.num_dp_ranks = num_dp_ranks
         self.total_requests = [0] * num_dp_ranks
         self.total_tokens = [0] * num_dp_ranks
+        self.max_tokens = [0] * num_dp_ranks
+        self.max_running = [0] * num_dp_ranks
         self.last_timestamp = [0.0] * num_dp_ranks
 
     def update_budget(self, loads):
@@ -135,9 +143,22 @@ class DPBudget:
                 load.num_running_reqs + load.num_waiting_reqs
             )
             self.total_tokens[load.dp_rank] = load.num_total_tokens
+            self.max_tokens[load.dp_rank] = load.max_total_num_tokens
+            self.max_running[load.dp_rank] = load.max_running_requests
 
     def dispatch(self, method: LoadBalanceMethod, estimated_tokens: int = 0):
-        if method == LoadBalanceMethod.TOTAL_REQUESTS:
+        if method == LoadBalanceMethod.TOTAL_REQUESTS and _DOMINANT and min(self.max_tokens) > 0 and min(self.max_running) > 0:
+            target_rank = min(
+                range(self.num_dp_ranks),
+                key=lambda i: (
+                    max(
+                        (self.total_requests[i] + 1) / self.max_running[i],
+                        (self.total_tokens[i] + estimated_tokens) / self.max_tokens[i],
+                    ),
+                    self.total_requests[i],
+                ),
+            )
+        elif method == LoadBalanceMethod.TOTAL_REQUESTS:
             target_rank = self.total_requests.index(min(self.total_requests))
         elif method == LoadBalanceMethod.TOTAL_TOKENS:
             # Use total_requests as a tie-breaker when total_tokens are equal
@@ -892,7 +913,19 @@ class DataParallelController:
     def total_requests_scheduler(self, req: Req):
         if self.maybe_external_dp_rank_routing(req):
             return
-        target_worker = self.dp_budget.dispatch(LoadBalanceMethod.TOTAL_REQUESTS)
+        estimated_tokens = 0
+        if _DOMINANT:
+            ids = req.input_ids if req.input_ids is not None else req.input_embeds
+            estimated_tokens = len(ids) if ids is not None else 0
+        b = self.dp_budget
+        if _TIMELINE_N and zlib.crc32(req.rid.encode()) % _TIMELINE_N == 0:
+            before = (list(b.total_requests), list(b.total_tokens))
+        target_worker = b.dispatch(LoadBalanceMethod.TOTAL_REQUESTS, estimated_tokens=estimated_tokens)
+        if _TIMELINE_N and zlib.crc32(req.rid.encode()) % _TIMELINE_N == 0:
+            logger.info(
+                "D_TIMELINE dispatch rid=%s t=%.4f rank=%d dominant=%d est=%d req=%s tok=%s",
+                req.rid, time.time(), target_worker, int(_DOMINANT), estimated_tokens, before[0], before[1],
+            )
         sock_send(self.workers[target_worker], req)
 
     def total_tokens_scheduler(self, req: Req):

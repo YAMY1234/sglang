@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from typing import Optional
 
 import torch
@@ -17,6 +18,8 @@ from sglang.srt.utils import is_xpu
 
 from .candidate_table import CANDIDATE_BLOCK_SIZE
 from .utils import make_name
+
+logger = logging.getLogger(__name__)
 
 
 @cache_once
@@ -59,6 +62,19 @@ def _jit_topk_v2_module(deterministic: bool = False):
             extra_cuda_cflags.append(
                 f"-DSGL_TOPK_V2_MAX_C{cluster_size}_OCC{occupancy}={max_active_clusters}"
             )
+    # Small-batch cluster-path floor (topk_v2.cuh SGL_TOPK_SB_FLOOR); 0: the stock build.
+    sb_tag = []
+    sb_floor = envs.SGLANG_TOPK_V2_SB_FLOOR.get()
+    if arch.cuda is not None and sb_floor:
+        assert 2048 <= sb_floor <= 16384, (
+            f"SGLANG_TOPK_V2_SB_FLOOR must be 0 or in [2048, 16384], got {sb_floor}"
+        )
+        sb_tag.append(f"sbfl{sb_floor}")
+        # own symbol namespace (topk_mode_<mode>_<tag>) for a non-stock build
+        extra_cuda_cflags += [
+            f"-DSGL_TOPK_SB_FLOOR={sb_floor}",
+            f"-DSGL_TOPK_NS_TAG=_{'_'.join(sb_tag)}",
+        ]
     args = make_cpp_args(arch.cuda is not None and arch.supports_pdl)
     kernel = f"TopKKernel<{args}>"
     wrappers = [
@@ -70,14 +86,19 @@ def _jit_topk_v2_module(deterministic: bool = False):
         ("topk_transform_kpool", f"{kernel}::transform_kpool"),
         ("topk_transform_kpool_ragged", f"{kernel}::transform_kpool_ragged"),
     ]
-    return load_jit(
+    module = load_jit(
         make_name("topk_v2"),
         *args,
         f"mode{mode}",
+        *sb_tag,
         extra_cuda_cflags=extra_cuda_cflags,
         cuda_files=["deepseek_v4/topk_v2.cuh"],
         cuda_wrappers=wrappers,
     )
+    logger.info(
+        "DSA top-k v2 JIT module loaded: mode %d, %s", mode, " ".join(extra_cuda_cflags)
+    )
+    return module
 
 
 @cache_once

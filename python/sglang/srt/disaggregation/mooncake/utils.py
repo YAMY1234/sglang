@@ -15,8 +15,11 @@
 
 import logging
 import os
-from typing import Any, Optional, Tuple
+import threading
+import time
+from typing import Any, List, Optional, Tuple
 
+import numpy as np
 import torch
 
 from sglang.srt.environ import envs
@@ -150,3 +153,56 @@ def check_mooncake_custom_mem_pool_enabled() -> Tuple[bool, Optional[str]]:
         custom_mem_pool_type = None
 
     return enable_custom_mem_pool, custom_mem_pool_type
+
+
+class TransferWorkerStats:
+    """Prefill transfer-worker timings of one process, logged every interval."""
+
+    def __init__(self, interval_s: float):
+        self._interval_s = interval_s
+        self._lock = threading.Lock()
+        self._window_start = time.monotonic()
+        self._samples: List[Tuple[float, float, float, int, int, int]] = []
+
+    def record(
+        self,
+        *,
+        queue_s: float,
+        event_s: float,
+        send_s: float,
+        kv_bytes: int,
+        pages: int,
+        runs: int,
+    ) -> None:
+        now = time.monotonic()
+        with self._lock:
+            self._samples.append((queue_s, event_s, send_s, kv_bytes, pages, runs))
+            if now - self._window_start < self._interval_s:
+                return
+            samples, span_s = self._samples, now - self._window_start
+            self._samples, self._window_start = [], now
+        logger.info(format_transfer_worker_stats(samples=samples, span_s=span_s))
+
+
+def format_transfer_worker_stats(
+    *, samples: List[Tuple[float, float, float, int, int, int]], span_s: float
+) -> str:
+    # Columns: queue, event and send seconds, KV bytes, pages, contiguous runs.
+    table = np.array(samples, dtype=np.float64).reshape(-1, 6)
+    queue_ms, event_ms, send_ms = (table[:, :3] * 1e3).T
+    gib = table[:, 3] / 2**30
+    gib_per_s = gib / np.maximum(table[:, 2], 1e-9)
+
+    def spread(values: np.ndarray) -> str:
+        p50, p90 = np.percentile(values, [50, 90])
+        return f"p50 {p50:.1f} p90 {p90:.1f} max {values.max():.1f}"
+
+    return (
+        f"Mooncake KV transfer worker, last {span_s:.0f}s: {len(table)} chunks, "
+        f"{gib.sum():.2f} GiB KV; queue ms {spread(queue_ms)}; "
+        f"event ms {spread(event_ms)}; send ms {spread(send_ms)}; "
+        f"GiB/s per chunk p50 {np.percentile(gib_per_s, 50):.2f} "
+        f"p90 {np.percentile(gib_per_s, 90):.2f}, "
+        f"overall {gib.sum() / max(table[:, 2].sum(), 1e-9):.2f}; "
+        f"pages per contiguous run {table[:, 4].sum() / max(table[:, 5].sum(), 1):.1f}"
+    )

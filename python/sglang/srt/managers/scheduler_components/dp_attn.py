@@ -64,6 +64,10 @@ MLP_SYNC_CARRIES_DRAIN_STATE = True
 # The drain-state value of a gathered row with no listener behind it: an
 # inactive slot, or a rank that hosts no listener.
 DRAIN_STATE_NO_LISTENER = 8
+# Fixed MLP-sync columns before the optional late-binding load row, and the
+# row an inactive slot decodes as (see late_binding.INACTIVE_LOAD_ROW).
+_MLP_SYNC_FIXED_COLUMNS = 13
+_LATE_BINDING_INACTIVE = (1 << 40, 1000, -1)
 
 
 def exchange_sync_rows(
@@ -175,6 +179,8 @@ class MLPSyncBatchInfo:
     is_shutting_down: bool = False
     # This rank's listener drain state (see DPDrainColumn).
     drain_state: int = 0
+    # Decode late binding load row (see LateBindingColumn); None adds no columns.
+    late_binding_row: Optional[tuple] = None
 
     # some gathered elements
     tp0_info_cpu: torch.Tensor = None
@@ -204,6 +210,7 @@ class MLPSyncBatchInfo:
                 self.attention_pairs,
                 int(self.is_shutting_down),
                 self.drain_state,
+                *(self.late_binding_row or ()),
             ],
             device=device,
             dtype=dtype,
@@ -225,6 +232,7 @@ class MLPSyncBatchInfo:
                 0,  # attention_pairs
                 0,  # is_shutting_down
                 DRAIN_STATE_NO_LISTENER,  # drain_state
+                *(() if self.late_binding_row is None else _LATE_BINDING_INACTIVE),
             ],
             device=device,
             dtype=dtype,
@@ -574,6 +582,20 @@ class DPDrainColumn:
         self.rows: Optional[list[int]] = None
 
 
+class LateBindingColumn:
+    """Carries each DP rank's decode late-binding load row (committed count, KV
+    usage permille, last handoff target) through the MLP-sync gather, appended
+    after the fixed columns only when the flag is on (identically on all ranks).
+    ``rows`` receives one row per DP rank whenever the gather produced metadata.
+    """
+
+    __slots__ = ("local", "rows")
+
+    def __init__(self, local: tuple) -> None:
+        self.local = local
+        self.rows: Optional[list[list[int]]] = None
+
+
 class DPShutdownVoteSent:
     """Whether a gather has carried this rank's own shutdown vote (the adapter is frozen)."""
 
@@ -596,6 +618,7 @@ def prepare_mlp_sync_batch_raw(
     sync_wait_carry: Optional[DPSyncWaitCarry] = None,
     shutdown_vote: Optional[DPShutdownVote] = None,
     drain_column: Optional[DPDrainColumn] = None,
+    late_binding_column: Optional[LateBindingColumn] = None,
 ):
     parallel = get_parallel()
     num_dp_ranks = parallel.num_dp_ranks
@@ -713,6 +736,9 @@ def prepare_mlp_sync_batch_raw(
         attention_pairs=_local_attention_pairs(local_batch),
         is_shutting_down=shutdown_vote is not None and shutdown_vote.local,
         drain_state=drain_column.local if drain_column is not None else 0,
+        late_binding_row=(
+            late_binding_column.local if late_binding_column is not None else None
+        ),
     )
 
     if num_dp_ranks == 1:
@@ -729,6 +755,10 @@ def prepare_mlp_sync_batch_raw(
         shutdown_vote.any = mlp_sync_info.any_shutting_down
     if drain_column is not None and metadata_ready:
         drain_column.rows = mlp_sync_info.tp0_info_cpu[:, 12].tolist()
+    if late_binding_column is not None and metadata_ready:
+        late_binding_column.rows = mlp_sync_info.tp0_info_cpu[
+            :, _MLP_SYNC_FIXED_COLUMNS:
+        ].tolist()
     if metadata_ready:
         mlp_sync_info.tbo_split_seq_index, mlp_sync_info.global_forward_mode = (
             tbo_preparer.compute_output(
@@ -814,6 +844,9 @@ class SchedulerDPAttnAdapter:
     # iteration (see DPDrainColumn).
     get_drain_state: Callable[[], int] = lambda: 0
     on_drain_rows: Optional[Callable[[list[int]], None]] = None
+    # Decode late binding: this rank's load row and the per-DP-rank rows.
+    get_late_binding_row: Optional[Callable[[], tuple]] = None
+    on_late_binding_rows: Optional[Callable[[list[list[int]]], None]] = None
     # Set once a gather carried this rank's own shutdown vote.
     shutdown_vote_sent: DPShutdownVoteSent = field(
         default_factory=DPShutdownVoteSent, init=False
@@ -850,6 +883,11 @@ class SchedulerDPAttnAdapter:
 
         shutdown_vote = DPShutdownVote(self.get_shutting_down())
         drain_column = DPDrainColumn(self.get_drain_state())
+        late_binding_column = (
+            LateBindingColumn(self.get_late_binding_row())
+            if self.get_late_binding_row is not None
+            else None
+        )
         batch = prepare_mlp_sync_batch_raw(
             local_batch,
             model_runner=self.model_runner,
@@ -863,9 +901,12 @@ class SchedulerDPAttnAdapter:
             sync_wait_carry=self.sync_wait_carry,
             shutdown_vote=shutdown_vote,
             drain_column=drain_column,
+            late_binding_column=late_binding_column,
         )
         if drain_column.rows is not None and self.on_drain_rows is not None:
             self.on_drain_rows(drain_column.rows)
+        if late_binding_column is not None and late_binding_column.rows is not None:
+            self.on_late_binding_rows(late_binding_column.rows)
         if shutdown_vote.local:
             self.shutdown_vote_sent.value = True
         if (

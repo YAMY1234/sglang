@@ -42,6 +42,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     merge_source_transfers,
 )
 from sglang.srt.mem_cache.l2_transfer import L2Transfer
+from sglang.srt.mem_cache.pool_host.pagewise_l2 import pagewise_enabled
 from sglang.srt.mem_cache.pool_host import HostPoolGroup, PoolEntry
 from sglang.srt.mem_cache.pool_host.base import uses_shared_host_layout
 from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
@@ -211,6 +212,11 @@ class PrefetchOperation(StorageOperation):
         self._lock = threading.Lock()
         self._terminated_flag = False
         self.storage_hit_count = 0
+        # This rank's own storage query result, set only once that query ran;
+        # None while unqueried, cancelled or failed (the default count is 0).
+        self.local_query_tokens: Optional[int] = None
+        # Ended early on PP0's own miss; the late agreed result still feeds accounting.
+        self.local_miss_terminated = False
         # KV pages the hit-time plan skips in front of the KV transfer: the
         # device trim, then the span head a component's block groups serve.
         self.prefetch_kv_page_offset = 0
@@ -1690,6 +1696,12 @@ class HybridCacheController(BaseHiCacheController):
             if host_indices.is_cuda:
                 host_indices = host_indices.cpu()
             return host_indices, device_indices
+        pagewise_ok = getattr(host_pool, "pagewise_load_ok", None)
+        if pagewise_enabled() and pagewise_ok is not None and pagewise_ok(self.io_backend):
+            # The page-wise path places rows with device-side indices: no blocking .cpu().
+            if host_indices.is_cuda:
+                host_indices = host_indices.cpu()
+            return host_indices, device_indices
         return self.move_indices(host_indices, device_indices)
 
     def move_hybrid_indices(
@@ -1983,9 +1995,9 @@ class HybridCacheController(BaseHiCacheController):
         if transfer.name == PoolName.MAMBA:
             return True
 
-        # Mooncake gives MHA draft and draft-SWA objects rank-specific keys.
-        # MLA/DeepSeek-V4 draft pools remain TP0-only.
-        if self.storage_backend_type == "mooncake" and transfer.name in (
+        # Mooncake's key layout (nixl_dram reuses it) gives MHA draft and draft-SWA
+        # objects rank-specific keys. MLA/DeepSeek-V4 draft pools remain TP0-only.
+        if self.storage_backend_type in ("mooncake", "nixl_dram") and transfer.name in (
             PoolName.DRAFT,
             PoolName.DRAFT_SWA,
         ):

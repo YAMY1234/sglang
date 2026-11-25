@@ -41,6 +41,7 @@ from sglang.srt.disaggregation.common.utils import (
     TransferKVChunk,
     bind_thread_to_device,
     build_dcp_token_transfer_plan,
+    concurrent_contiguous_runs,
     group_concurrent_contiguous,
     pack_int_lists,
     run_on_device,
@@ -48,6 +49,7 @@ from sglang.srt.disaggregation.common.utils import (
 )
 from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.disaggregation.mooncake.utils import (
+    TransferWorkerStats,
     _validate_efa_allocator_compatibility,
     check_mooncake_custom_mem_pool_enabled,
 )
@@ -266,6 +268,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
     supports_role_switch = True
     # Bootstrap thread defers the ABORT ack until the transfer worker drains.
     supports_deferred_decode_kv_release = True
+    # Set on prefill when SGLANG_LOG_MOONCAKE_TRANSFER_STATS_INTERVAL > 0.
+    transfer_stats: Optional[TransferWorkerStats] = None
 
     def __init__(
         self,
@@ -287,6 +291,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         self.max_transfer_batch_indices = (
             envs.SGLANG_MOONCAKE_MAX_TRANSFER_BATCH_INDICES.get()
         )
+        self.nvlink_layer_batches = envs.SGLANG_MOONCAKE_NVLINK_LAYER_BATCHES.get()
         self.enable_trace = get_observability().enable_trace
         # Set by teardown() to make worker threads exit (P<->D role switch).
         self._stopped = False
@@ -356,6 +361,10 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             self.enable_custom_mem_pool, self.custom_mem_pool_type = (
                 check_mooncake_custom_mem_pool_enabled()
             )
+            self._log_nvlink_layer_batches()
+            stats_interval_s = envs.SGLANG_LOG_MOONCAKE_TRANSFER_STATS_INTERVAL.get()
+            if stats_interval_s > 0:
+                self.transfer_stats = TransferWorkerStats(stats_interval_s)
             self._staging_ctx = PrefillStagingContext() if self.enable_staging else None
             if self.enable_staging:
                 self._init_staging_buffers(len(self.transfer_queues))
@@ -400,6 +409,22 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             if self.enable_staging:
                 self._init_staging_allocator()
             self.start_decode_thread()
+
+    def _log_nvlink_layer_batches(self) -> None:
+        if self.nvlink_layer_batches <= 0:
+            return
+        if self.custom_mem_pool_type == "NVLINK":
+            logger.info(
+                "Mooncake NVLink KV transfer: all layers of a chunk in %d batch "
+                "transfer(s) per destination",
+                self.nvlink_layer_batches,
+            )
+        else:
+            logger.warning(
+                "SGLANG_MOONCAKE_NVLINK_LAYER_BATCHES has no effect without "
+                "SGLANG_MOONCAKE_CUSTOM_MEM_POOL=NVLINK (got %s)",
+                self.custom_mem_pool_type,
+            )
 
     def init_engine(self):
         self.engine = get_mooncake_transfer_engine()
@@ -1179,19 +1204,6 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         even on a non-MLA backend, for K-only state buffers (e.g. MiniMax sparse
         index) whose per-layer list must not be half-split into K/V.
         """
-        # Host and device buffers may use different destination page spaces.
-        # Build both transfer plans once, then select per destination buffer.
-        prefill_kv_blocks, dst_kv_blocks = group_concurrent_contiguous(
-            prefill_data_indices, dst_data_indices
-        )
-        device_prefill_kv_blocks = device_dst_kv_blocks = None
-        if dst_device_data_indices is not None:
-            device_prefill_kv_blocks, device_dst_kv_blocks = (
-                group_concurrent_contiguous(
-                    prefill_data_indices, dst_device_data_indices
-                )
-            )
-
         layers_params = None
 
         # Skipped once registration has cleared this peer's layout.
@@ -1306,6 +1318,33 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             ]
         assert layers_params is not None
 
+        if (
+            self.enable_custom_mem_pool
+            and self.custom_mem_pool_type == "NVLINK"
+            and self.nvlink_layer_batches > 0
+            and dst_device_data_indices is None
+        ):
+            return self._send_layers_in_batches(
+                mooncake_session_id=mooncake_session_id,
+                layers_params=layers_params,
+                prefill_data_indices=prefill_data_indices,
+                dst_data_indices=dst_data_indices,
+                executor=executor,
+            )
+
+        # Host and device buffers may use different destination page spaces.
+        # Build both transfer plans once, then select per destination buffer.
+        prefill_kv_blocks, dst_kv_blocks = group_concurrent_contiguous(
+            prefill_data_indices, dst_data_indices
+        )
+        device_prefill_kv_blocks = device_dst_kv_blocks = None
+        if dst_device_data_indices is not None:
+            device_prefill_kv_blocks, device_dst_kv_blocks = (
+                group_concurrent_contiguous(
+                    prefill_data_indices, dst_device_data_indices
+                )
+            )
+
         def set_transfer_blocks(
             src_ptr: int, dst_ptr: int, item_len: int
         ) -> List[Tuple[int, int, int]]:
@@ -1414,6 +1453,52 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 if ret != 0:
                     return ret
             return 0
+
+    # One block per (layer, contiguous page run) of the chunk, built in NumPy and
+    # sent as nvlink_layer_batches parallel batch transfers instead of one per layer.
+    def _send_layers_in_batches(
+        self,
+        *,
+        mooncake_session_id: str,
+        layers_params: List[Tuple[int, int, int]],
+        prefill_data_indices: npt.NDArray[np.int32],
+        dst_data_indices: npt.NDArray[np.int32],
+        executor: concurrent.futures.ThreadPoolExecutor,
+    ) -> int:
+        src_starts, dst_starts, run_pages = concurrent_contiguous_runs(
+            prefill_data_indices, dst_data_indices
+        )
+        if not layers_params or run_pages.size == 0:
+            return 0
+        # One row per layer: (src_ptr, dst_ptr, item_len), item_len in bytes per page.
+        layers = np.array(layers_params, dtype=np.int64).reshape(-1, 3)
+        item_lens = layers[:, 2:3]
+        src_addrs = (layers[:, 0:1] + src_starts * item_lens).ravel()
+        dst_addrs = (layers[:, 1:2] + dst_starts * item_lens).ravel()
+        lengths = (run_pages * item_lens).ravel()
+        num_batches = min(self.nvlink_layer_batches, lengths.size)
+        if num_batches == 1:
+            return self.engine.batch_transfer_sync(
+                mooncake_session_id,
+                src_addrs.tolist(),
+                dst_addrs.tolist(),
+                lengths.tolist(),
+            )
+        futures = [
+            executor.submit(
+                self.engine.batch_transfer_sync,
+                mooncake_session_id,
+                src.tolist(),
+                dst.tolist(),
+                length.tolist(),
+            )
+            for src, dst, length in zip(
+                np.array_split(src_addrs, num_batches),
+                np.array_split(dst_addrs, num_batches),
+                np.array_split(lengths, num_batches),
+            )
+        ]
+        return self._await_transfer_futures(futures)
 
     def _validate_envelope_kv_layout(
         self,
@@ -2653,6 +2738,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 # _stopped alone can never wake a parked worker during a role switch.
                 if kv_chunk is None:
                     break
+                dequeue_time = time.perf_counter()
                 if self.enable_trace:
                     kv_chunk.trace_ctx.rebuild_thread_context()
                     kv_chunk.trace_ctx.trace_slice_start(
@@ -2685,6 +2771,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     kv_chunk.indices_event = None
                 if isinstance(kv_chunk.prefill_kv_indices, torch.Tensor):
                     kv_chunk.prefill_kv_indices = kv_chunk.prefill_kv_indices.numpy()
+                ready_time = time.perf_counter()
 
                 if (
                     kv_chunk.room not in self.request_status
@@ -2721,6 +2808,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 # When staging transfer is not yet ready (watermark/allocation pending),
                 # the chunk is re-enqueued and we break out of the req loop to retry later.
                 staging_deferred = False
+                sent_pages = sent_runs = 0
                 for req in reqs_to_be_processed:
                     start_ts = time.perf_counter()
                     if not req.is_dummy:
@@ -2910,6 +2998,17 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                             )
                             break
 
+                        if (
+                            self.transfer_stats is not None
+                            and not skip_kv
+                            and len(chunked_dst_kv_indice)
+                            == len(kv_chunk.prefill_kv_indices)
+                        ):
+                            sent_pages += len(kv_chunk.prefill_kv_indices)
+                            sent_runs += concurrent_contiguous_runs(
+                                kv_chunk.prefill_kv_indices, chunked_dst_kv_indice
+                            )[2].size
+
                         if kv_chunk.is_last_chunk:
                             if kv_chunk.state_indices and not skip_state:
                                 state_rc = self.maybe_send_extra(
@@ -2947,12 +3046,21 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                                     )
                                     break
 
-                            # Only the last chunk we need to send the aux data
-                            ret = self.send_aux(
-                                req,
-                                kv_chunk.prefill_aux_index,
-                                target_rank_registration_info.dst_aux_ptrs,
-                                target_rank_registration_info.dst_aux_item_lens,
+                            # Only the last chunk we need to send the aux data.
+                            # PD local result: only the last PP stage holds the
+                            # sampled token and draft state, so it alone writes
+                            # decode's aux slot; that write lands before its
+                            # Success, and decode waits for every stage's Success.
+                            ret = (
+                                0
+                                if envs.SGLANG_PP_PD_LOCAL_RESULT.get()
+                                and self.pp_rank != self.pp_size - 1
+                                else self.send_aux(
+                                    req,
+                                    kv_chunk.prefill_aux_index,
+                                    target_rank_registration_info.dst_aux_ptrs,
+                                    target_rank_registration_info.dst_aux_item_lens,
+                                )
                             )
                             if ret != 0:
                                 # The aux write targets decode's metadata
@@ -2986,6 +3094,16 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                             MooncakeRequestStage.MOONCAKE_WORKER_SEND_SESSION,
                             start_ts,
                         )
+
+                if self.transfer_stats is not None:
+                    self.transfer_stats.record(
+                        queue_s=dequeue_time - kv_chunk.enqueue_time,
+                        event_s=ready_time - dequeue_time,
+                        send_s=time.perf_counter() - ready_time,
+                        kv_bytes=sent_pages * sum(self.kv_args.kv_item_lens),
+                        pages=sent_pages,
+                        runs=sent_runs,
+                    )
 
                 if self.enable_trace:
                     kv_chunk.trace_ctx.trace_slice_end(
@@ -3287,6 +3405,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 trace_ctx=trace_ctx,
                 wait_event=wait_event,
                 indices_event=indices_event,
+                enqueue_time=time.perf_counter(),
             )
         )
 
@@ -3407,6 +3526,41 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             for layer_id in (staging_slots.get("slot_layer_ids") or [])
         )
 
+        # G4 interop shim (decode side): a prefill built before sglang#47638 parses a
+        # 20-frame registration with no dst_aux_item_lens frame at index 6 and reads
+        # the state pointers there; the extra frame shifts every later field
+        # (dst_tp_rank would be parsed from the packed state pointers). With
+        # SGLANG_G4_PD_LEGACY_REGISTRATION=1 the frame is left out for such peers.
+        legacy_registration = (
+            os.environ.get("SGLANG_G4_PD_LEGACY_REGISTRATION", "0") == "1"
+        )
+        if legacy_registration and self.customized_info_enabled:
+            raise RuntimeError(
+                "SGLANG_G4_PD_LEGACY_REGISTRATION=1 cannot carry customized-info "
+                "aux item lengths; unset SGLANG_DISAGG_CUSTOMIZED_INFO_MAX_BYTES"
+            )
+        if legacy_registration and not getattr(self, "_g4_legacy_logged", False):
+            self._g4_legacy_logged = True
+            logger.info(
+                "G4 legacy PD registration: sending the pre-#47638 20-frame "
+                "KV-args registration (no dst_aux_item_lens frame)"
+            )
+        aux_item_lens_frame = (
+            []
+            if legacy_registration
+            else [
+                # Always sent, empty unless customized-info transfer is enabled.
+                (
+                    struct.pack(
+                        f"{len(self.kv_args.aux_item_lens)}Q",
+                        *self.kv_args.aux_item_lens,
+                    )
+                    if self.customized_info_enabled
+                    else b""
+                )
+            ]
+        )
+
         return [
             "None".encode("ascii"),
             self.local_ip.encode("ascii"),
@@ -3414,14 +3568,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             session_id.encode("ascii"),
             packed_kv_data_ptrs,
             packed_aux_data_ptrs,
-            # Always sent, empty unless customized-info transfer is enabled.
-            (
-                struct.pack(
-                    f"{len(self.kv_args.aux_item_lens)}Q", *self.kv_args.aux_item_lens
-                )
-                if self.customized_info_enabled
-                else b""
-            ),
+            *aux_item_lens_frame,
             packed_state_data_ptrs,
             dst_tp_rank,
             dst_attn_tp_size,

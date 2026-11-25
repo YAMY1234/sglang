@@ -7,6 +7,69 @@ from collections.abc import Callable
 import torch
 
 
+def can_use_cutedsl_cap8(
+    q, kv, weights, context_lens, schedule, block_tables, max_seq_len,
+    *, B, next_n, q_offset, extend_lens, graph_query_group_size=None,
+) -> bool:
+    """Only the fixed-eight 32-head FP8 ABI; no tensor-value/host reads."""
+    return (
+        next_n == 8
+        and 0 < B <= 32
+        and q_offset == B * 8
+        and (
+            (
+                graph_query_group_size is None
+                and len(extend_lens) == B
+                and all(n == 8 for n in extend_lens)
+            )
+            or (
+                graph_query_group_size == 8
+                and len(extend_lens) == B * 8
+                and all(n == 1 for n in extend_lens)
+            )
+        )
+        and q.shape == (q_offset, 32, 128)
+        and q.dtype == torch.float8_e4m3fn
+        and q.is_contiguous()
+        and len(kv.shape) == 4
+        and kv.shape[1:] == (64, 1, 132)
+        and kv.dtype == torch.uint8
+        and kv.is_contiguous()
+        and weights.shape == (q_offset, 32)
+        and weights.dtype == torch.float32
+        and weights.is_contiguous()
+        and context_lens is not None
+        and context_lens.shape == (B,)
+        and context_lens.dtype == torch.int32
+        and context_lens.is_contiguous()
+        and schedule is not None
+        and len(schedule.shape) == 2
+        and schedule.shape[1] == 2
+        and schedule.dtype == torch.int32
+        and schedule.is_contiguous()
+        and 64 <= max_seq_len <= 1048704
+        and max_seq_len % 64 == 0
+        and block_tables.shape == (q_offset, max_seq_len // 64)
+        and block_tables.dtype == torch.int32
+        and block_tables.stride(1) == 1
+    )
+
+
+def cutedsl_paged_mqa_logits_cap8(
+    q, kv, weights, context_lens, block_tables, schedule, max_seq_len, *, B,
+):
+    from sglang.kernels.ops.attention.dsa.cutedsl_paged_mqa_logits import (
+        CuteDSLPagedMQALogitsRunner,
+    )
+
+    return CuteDSLPagedMQALogitsRunner.forward(
+        q.view(B, 8, 32, 128), kv, weights, context_lens,
+        block_tables[::8], schedule, max_seq_len,
+        num_epi_subtiles=1, pipeline_flags={"max_w_in_reg": 8},
+        block_table_strided=True,
+    )
+
+
 def _restore_row_stride(logits: torch.Tensor) -> torch.Tensor:
     """Undo PyTorch's DLPack stride normalization on single-row DeepGEMM logits.
 

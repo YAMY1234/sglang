@@ -48,6 +48,8 @@ from sglang.srt.mem_cache.hicache_key_scheme import (
 )
 from sglang.srt.mem_cache.kv.memory.views import KVLayoutView, MLAKVView
 from sglang.srt.mem_cache.l2_transfer import L2Transfer, L2TransferEngine
+from sglang.srt.mem_cache.events import PMICRO, pmicro_host_runs
+from sglang.srt.mem_cache.prefetch_timing import prefetch_timing
 from sglang.srt.mem_cache.utils import get_storage_hash_str
 from sglang.srt.runtime_context import get_memory, get_parallel
 from sglang.srt.utils import get_device_module
@@ -286,6 +288,9 @@ class PrefetchOperation(StorageOperation):
         self._terminated_flag = False
         self.storage_hit_count = 0
         self.start_time = time.monotonic()
+        # Same meaning as on the hybrid PrefetchOperation.
+        self.local_query_tokens: Optional[int] = None
+        self.local_miss_terminated = False
 
         super().__init__(None, token_ids, last_hash, prefix_keys=prefix_keys)
 
@@ -328,7 +333,71 @@ def check_dcp_l3_extra_pool(entry: Any, anchor: Any) -> None:
     )
 
 
+class WriteBackFenceStats:
+    """Relaxed write_back fence engagement for one scheduler: D2H submissions
+    behind the per-launch event vs the forward-stream fence, and scheduler time
+    inside write-ack waits. Logged per LOG_EVERY launches as window/cumulative."""
+
+    LOG_EVERY = 50
+    FIELDS = ("relaxed", "fenced", "relaxed_tok", "fenced_tok", "sync_ms")
+
+    def __init__(self):
+        self.cum = dict.fromkeys(self.FIELDS, 0)
+        self.win = dict.fromkeys(self.FIELDS, 0)
+        self.launches = 0
+
+    def _add(self, key: str, value) -> None:
+        self.cum[key] += value
+        self.win[key] += value
+
+    def note_submit(self, ops: List[CacheOperation], relaxed: bool) -> None:
+        if ops:
+            kind = "relaxed" if relaxed else "fenced"
+            self._add(kind, 1)
+            self._add(kind + "_tok", sum(len(op.device_indices) for op in ops))
+
+    def timed_sync(self, event) -> None:
+        start = time.perf_counter()
+        event.synchronize()
+        self._add("sync_ms", (time.perf_counter() - start) * 1e3)
+
+    def note_launch(self) -> Optional[str]:
+        self.launches += 1
+        if self.launches % self.LOG_EVERY:
+            return None
+        spec = {"sync_ms": ".1f"}
+        line = f"HiCache write_back fence: launches={self.launches} " + " ".join(
+            f"wb_{k}={self.win[k]:{spec.get(k, '')}}/{self.cum[k]:{spec.get(k, '')}}"
+            for k in self.FIELDS
+        )
+        self.win = dict.fromkeys(self.FIELDS, 0)
+        return line
+
+
 class HiCacheController:
+    # Relaxed write_back fence (SGLANG_ENABLE_HICACHE_WB_EVICT_RELAXED_FENCE):
+    # the latest PP launch's forward-start event and the engagement counters.
+    forward_start_event = None
+    wb_fence_stats: Optional[WriteBackFenceStats] = None
+    # SGLANG_HICACHE_ASYNC_WB_ACK: eviction write-back acks the CPU no longer waits
+    # for; streams that reuse freed device rows wait on the latest one instead.
+    async_wb_ack = False
+    launch_seq = 0
+    last_wb_done_event = None
+    deferred_wb_acks: list = []
+
+    def wait_wb_done(self, stream) -> None:
+        """GPU-side order: stream's later work runs after every submitted write-back."""
+        if self.async_wb_ack and self.last_wb_done_event is not None:
+            stream.wait_event(self.last_wb_done_event)
+
+    def _wait_wb_done_h2d(self) -> None:
+        if not self.async_wb_ack:
+            return
+        self.wait_wb_done(self.l2_transfer_engine.host_to_device_stream)
+        if getattr(self.l2_transfer_engine, "_h2d_on_current_stream", False):
+            self.wait_wb_done(torch.cuda.current_stream())
+
     def __init__(
         self,
         token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
@@ -691,6 +760,7 @@ class HiCacheController:
                     "npu_memcache",
                     "eic",
                     "nixl",
+                    "nixl_dram",
                     "simm",
                     "mori",
                     "tensorcast",
@@ -991,6 +1061,7 @@ class HiCacheController:
             or self.load_queue
             or self.ack_write_queue
             or self.ack_load_queue
+            or self.deferred_wb_acks
         )
 
     def write(
@@ -1014,15 +1085,37 @@ class HiCacheController:
         self.start_writing()
         return host_indices
 
-    def start_writing(self) -> None:
+    def record_forward_start(self, event) -> None:
+        """Take the event recorded on the forward stream before a PP launch's
+        dependency waits and kernels: it covers every earlier forward on this
+        rank, not this launch."""
+        self.forward_start_event = event
+        self.launch_seq += 1
+        if self.wb_fence_stats is not None:
+            line = self.wb_fence_stats.note_launch()
+            if line is not None:
+                logger.info(line)
+
+    def start_writing(self, fence_event=None) -> None:
+        """Submit the queued D2H writes behind the forward stream, or only behind
+        ``fence_event``. Pass the event only if no forward launched after it can
+        still write the queued sources."""
         if len(self.write_queue) == 0:
             return
 
         op = CacheOperation.merge_ops(self.write_queue)
+        if PMICRO["on"]:
+            t0 = time.perf_counter_ns()
+            PMICRO["d2h_subs"] += 1
+            PMICRO["d2h_tokens"] += len(op.host_indices)
+            PMICRO["d2h_runs"] += pmicro_host_runs(op.host_indices, self.page_size)
+            PMICRO["stat_ns"] += time.perf_counter_ns() - t0
         host_indices, device_indices, pool_transfers = self._move_write_operation(op)
         self.write_queue.clear()
 
-        if self.write_fence_stream is not None:
+        if fence_event is not None:
+            self.l2_transfer_engine.device_to_host_stream.wait_event(fence_event)
+        elif self.write_fence_stream is not None:
             # The copy may read KV a forward is still writing: under overlap
             # scheduling a finished request is cached while the next forward
             # writes its last token, and an evicted SWA page can belong to an
@@ -1175,6 +1268,8 @@ class HiCacheController:
             self.l2_transfer_engine.host_to_device_stream.wait_stream(
                 self.load_fence_stream
             )
+        # Load destinations may be rows whose write-back the CPU did not wait for.
+        self._wait_wb_done_h2d()
 
         completion = self.l2_transfer_engine.submit_host_to_device(
             self._l2_load_transfers(host_indices, device_indices, pool_transfers),
@@ -1474,12 +1569,17 @@ class HiCacheController:
         """
         Manage prefetching operations from storage backend to host memory.
         """
+        timing = prefetch_timing(lambda: get_parallel().pp_rank)
         while (not self.storage_stop_event.is_set()) or not self.prefetch_queue.empty():
             try:
                 operation = self.prefetch_queue.get(block=True, timeout=1)
                 if operation is None:
                     continue
                 self._on_prefetch_dequeue(operation)
+                if timing is not None:
+                    timing.record("dequeue", operation.request_id,
+                                  queued_s=time.monotonic() - operation.start_time)
+                query_start = time.monotonic()
                 try:
                     if operation.is_terminated():
                         hash_value, storage_hit_count = [], 0
@@ -1487,16 +1587,27 @@ class HiCacheController:
                         hash_value, storage_hit_count = self._storage_hit_query(
                             operation
                         )
+                        # Only a query that ran is evidence; the default count is not.
+                        operation.local_query_tokens = storage_hit_count
                 except Exception:
                     logger.exception(
                         "HiCache storage query failed for request %s",
                         operation.request_id,
                     )
                     hash_value, storage_hit_count = [], 0
+                if timing is not None:
+                    timing.record("query", operation.request_id,
+                                  dur_s=time.monotonic() - query_start,
+                                  local_tokens=operation.local_query_tokens)
 
+                min_start = time.monotonic()
                 storage_hit_count = self._sync_prefetch_hit_query(
                     operation, storage_hit_count
                 )
+                if timing is not None:
+                    timing.record("min", operation.request_id,
+                                  dur_s=time.monotonic() - min_start,
+                                  agreed_tokens=storage_hit_count)
 
                 # Record the TP-synced hit count; the scheduler thread decides
                 # at drain time whether to revoke (below threshold) or allocate.

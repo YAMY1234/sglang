@@ -560,5 +560,9 @@ POSITIONAL_FIELD_ORDER = (
     "uocr_doc_page_window",
     "uocr_max_page_tokens",
     "enable_fp4_indexer",
+    "hicache_host_kv_dtype",
+    "disaggregation_decode_late_binding",
+    "disaggregation_decode_late_binding_threshold",
+    "disaggregation_decode_late_binding_ack_timeout",
 )
 # fmt: on

@@ -885,6 +885,42 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
         )
         return self._fill_evict_result(binding_result, DriveHostEvictionResult())
 
+    # ---- Storage write-back dirty pages (Rust only) ----
+
+    def supports_host_dirty(self) -> bool:
+        """Whether this extension build tracks dirty host pages."""
+        return hasattr(self._binding, "plan_host_eviction")
+
+    def mark_host_dirty(self, node_ids: list[NodeId]) -> int:
+        """Storage lacks these Full host values: host-leaf eviction skips them."""
+        return self._binding.mark_host_dirty(node_ids)
+
+    def mark_host_clean(self, node_ids: list[NodeId]) -> int:
+        return self._binding.mark_host_clean(node_ids)
+
+    def clear_host_dirty(self) -> int:
+        return self._binding.clear_host_dirty()
+
+    def is_host_dirty(self, node_id: NodeId) -> bool:
+        return self._binding.is_host_dirty(node_id)
+
+    def host_dirty_tokens(self) -> tuple[int, int]:
+        """(dirty Full host tokens, dirty tokens a coexisting-copy reclaim freed)."""
+        return self._binding.host_dirty_tokens()
+
+    def plan_host_eviction(
+        self, max_dirty_tokens: int, released: list[NodeId]
+    ) -> list[tuple[NodeId, int, bool]]:
+        """Host-leaf eviction order, as ``(node_id, tokens, dirty)``, if dirty
+        nodes were clean and ``released`` host locks dropped; read-only."""
+        return self._binding.plan_host_eviction(max_dirty_tokens, released)
+    def peek_host_eviction_candidates(
+        self, component_type: ComponentType, num_tokens: int
+    ) -> list[tuple[NodeId, int, Optional[list[str]]]]:
+        raise NotImplementedError(
+            "SGLANG_HICACHE_L3_WRITE_ON_HOST_EVICT needs the python tree core"
+        )
+
     def evict_excess_path_states(
         self,
         tail_node_id: NodeId,

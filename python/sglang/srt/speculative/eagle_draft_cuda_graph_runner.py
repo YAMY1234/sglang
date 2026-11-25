@@ -8,6 +8,7 @@ import torch
 
 from sglang.srt.compilation.torch_compile_decoration import set_torch_compile_config
 from sglang.srt.environ import envs
+from sglang.srt.model_executor.runner.replay_prep_warmup import warm_replay_prep
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
     deployment_attn_dp_size,
@@ -330,6 +331,31 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
         # where the glue graph saves latency; draft metadata is cheaper and
         # already amortised over speculative_num_steps.
         self._metadata_glue = None
+        self._prep_one_copy = envs.SGLANG_OPT_SPEC_DRAFT_PREP_ONE_COPY.get()
+
+    @staticmethod
+    def _copy_prep_in_one_launch(
+        copy_dsts: list,
+        copy_srcs: list,
+        *,
+        hidden: Optional[tuple],
+        seed: Optional[tuple],
+    ) -> bool:
+        """SGLANG_OPT_SPEC_DRAFT_PREP_ONE_COPY: the replay inputs, the hidden state and
+        the DSA top-k seed in one small-copy launch (bit copies, int32 / int64
+        widened as foreach would); False leaves every copy to the caller."""
+        from sglang.kernels.ops.memory.small_copy import try_small_copy
+
+        if not copy_dsts or not copy_dsts[0].is_cuda:
+            return False
+        dsts, srcs = list(copy_dsts), list(copy_srcs)
+        for pair in (hidden, seed):
+            if pair is not None:
+                dsts.append(pair[0])
+                srcs.append(pair[1])
+        # Arbitrary bound (a bs-16 hidden state is 98,304 elements); larger inputs
+        # keep the memcpy.
+        return try_small_copy(dsts, srcs, max_numel=1 << 17)
 
     def _replay_graph(self, shape_key, forward_batch):
         with self.model_context():
@@ -406,6 +432,25 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
     # -----------------------------------------------------------------
     # Capture (per-shape)
     # -----------------------------------------------------------------
+    def _run_capture_tail_hooks(self, out, forward_batch, num_tokens: int) -> None:
+        """The model runner's capture tail hooks, after the draft forwards of a captured
+        batch size. The draft steps ran under the per-step attention backends, which
+        share the draft's KV pool (checked here when a hook exists); a hook that reads
+        the running backend sees the first."""
+        hooks = self.model_runner.capture_tail_hooks
+        if not hooks:
+            return
+        backends = self.draft_attn_backend.attn_backends
+        pool = getattr(backends[0], "token_to_kv_pool", None)
+        if any(getattr(b, "token_to_kv_pool", None) is not pool for b in backends):
+            raise RuntimeError(
+                "the draft's per-step attention backends do not share one KV pool; "
+                "the capture tail hooks check the running backend's"
+            )
+        with forward_context(ForwardContext(attn_backend=backends[0])):
+            for capture_hook in hooks:
+                capture_hook(self, out, forward_batch, num_tokens)
+
     def capture_one_shape(
         self,
         size: int,
@@ -539,6 +584,7 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             forward_batch.spec_info.hidden_states = hidden_states_backup
             forward_batch.spec_info.dsa_topk_indices = dsa_topk_indices_backup
             forward_batch.positions.sub_(self.eagle_worker.speculative_num_steps - 1)
+            self._run_capture_tail_hooks(ret, forward_batch, num_tokens)
             return ret
 
         def run_once():
@@ -595,6 +641,15 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
                     capture_inputs=None,
                     post_warmup_hook=post_warmup_hook,
                 )
+            # The replay's draft metadata prep at this batch size, once now (replay_prep_warmup)
+            if warm_replay_prep(
+                "draft decode",
+                num_seqs,
+                lambda: self.draft_attn_backend.init_forward_metadata_out_graph(
+                    SimpleNamespace(**vars(forward_batch), num_padding=0)
+                ),
+            ):
+                self._warmed_replay_bs.add(num_seqs)
 
     def _postprocess_output_to_raw_bs(self, out, raw_bs):
         parent_list, top_scores_index, draft_tokens, draft_probs = (
@@ -705,7 +760,23 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
         ):
             copy_dsts.append(buffers.bootstrap_room_ids_int[:raw_bs])
             copy_srcs.append(forward_batch.bootstrap_room_ids_int)
-        _grouped_foreach_copy_(copy_dsts, copy_srcs)
+        hidden_src = forward_batch.spec_info.hidden_states
+        copy_hidden = (
+            buffers.hidden_states is not None
+            and hidden_src is not None
+            and not _same_storage(hidden_src, buffers.hidden_states)
+        )
+        seed = forward_batch.spec_info.dsa_topk_indices
+        copy_seed = buffers.dsa_seed_topk is not None and seed is not None
+        if self._prep_one_copy and self._copy_prep_in_one_launch(
+            copy_dsts,
+            copy_srcs,
+            hidden=(buffers.hidden_states[:raw_bs], hidden_src) if copy_hidden else None,
+            seed=(buffers.dsa_seed_topk[:raw_bs], seed) if copy_seed else None,
+        ):
+            copy_hidden = copy_seed = False
+        else:
+            _grouped_foreach_copy_(copy_dsts, copy_srcs)
 
         # hidden_states is large + contiguous: copy_() uses the cudaMemcpyAsync
         # DMA engine; foreach would force the ~3x slower compute-kernel copy.
@@ -714,19 +785,12 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             and forward_batch.spec_info.draft_probs is not None
         ):
             buffers.draft_probs[:raw_bs].copy_(forward_batch.spec_info.draft_probs)
-        if (
-            buffers.hidden_states is not None
-            and forward_batch.spec_info.hidden_states is not None
-            and not _same_storage(
-                forward_batch.spec_info.hidden_states, buffers.hidden_states
-            )
-        ):
-            buffers.hidden_states[:raw_bs].copy_(forward_batch.spec_info.hidden_states)
+        if copy_hidden:
+            buffers.hidden_states[:raw_bs].copy_(hidden_src)
         if buffers.dsa_seed_topk is not None:
-            seed = forward_batch.spec_info.dsa_topk_indices
-            if seed is not None:
+            if copy_seed:
                 buffers.dsa_seed_topk[:raw_bs].copy_(seed)
-            else:
+            elif seed is None:
                 buffers.dsa_seed_topk[:raw_bs].zero_()
         # Only rejection sampling reads temperatures (renorm_draft_probs); skip
         # the copy otherwise to keep the non-RS path free of extra work.

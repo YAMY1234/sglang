@@ -5083,13 +5083,23 @@ class MLATokenToKVPool(KVCache, MLAKVView):
         for kv_cache in self.kv_buffer:
             kv_cache[tgt_loc_flat] = kv_cache[src_loc_flat]
 
+    def _retraction_chunk_rows(self):
+        if not envs.SGLANG_OPT_RETRACTION_PINNED_CHUNKS.get():
+            return self.cpu_offloading_chunk_size
+        # Pinned host blocks are rounded up to a power of two: fill one 8 MiB block per chunk.
+        buf = self.kv_buffer[0]
+        row_bytes = buf.element_size()
+        for d in buf.shape[1:]:
+            row_bytes *= d
+        return max(1, (8 << 20) // row_bytes)
+
     def get_cpu_copy(self, indices, mamba_indices=None, req_pool_index=None):
         indices = maybe_dcp_kernel_indices(
             indices, self._write_loc_dcp_span, get_parallel().attn_dcp_rank
         )
         current_platform.synchronize()
         kv_cache_cpu = []
-        chunk_size = self.cpu_offloading_chunk_size
+        chunk_size = self._retraction_chunk_rows()
         for layer_id in range(self.layer_num):
             kv_cache_cpu.append([])
             if self.kv_buffer[layer_id].shape[0] == 0:
@@ -5110,7 +5120,7 @@ class MLATokenToKVPool(KVCache, MLAKVView):
             indices, self._write_loc_dcp_span, get_parallel().attn_dcp_rank
         )
         current_platform.synchronize()
-        chunk_size = self.cpu_offloading_chunk_size
+        chunk_size = self._retraction_chunk_rows()
         for layer_id in range(self.layer_num):
             if self.kv_buffer[layer_id].shape[0] == 0:
                 continue
