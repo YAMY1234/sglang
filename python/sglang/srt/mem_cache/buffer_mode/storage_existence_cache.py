@@ -43,6 +43,11 @@ from sglang.srt.mem_cache.hicache_storage import PoolHitPolicy
 # roughly 32M tokens at page size 64.
 HICACHE_EXISTENCE_CACHE_MAX_ENTRIES = 512 * 1024
 
+# What last renewed a belief (its entry's value; diagnostics only): a storage
+# write ack, an L3 fill, or hit-query evidence. Indexes BELIEF_SOURCES.
+BELIEF_WRITE, BELIEF_FILL, BELIEF_QUERY = 0, 1, 2
+BELIEF_SOURCES = ("write", "fill", "query")
+
 
 class PoolExistenceBeliefs:
     """One pool's LRU of page hashes believed stored, plus its refcounted
@@ -50,17 +55,17 @@ class PoolExistenceBeliefs:
 
     def __init__(self, max_entries: int = HICACHE_EXISTENCE_CACHE_MAX_ENTRIES):
         self.max_entries = max_entries
-        self._entries: OrderedDict[str, None] = OrderedDict()
+        self._entries: OrderedDict[str, int] = OrderedDict()
         # The generation before the last rotate(): still believed, but a lookup
         # does not renew it; only a new write (add) does.
-        self._old: dict[str, None] = {}
+        self._old: dict[str, int] = {}
         self._inflight: dict[str, int] = {}
 
-    def add(self, hashes: Iterable[str]) -> None:
+    def add(self, hashes: Iterable[str], source: int = BELIEF_WRITE) -> None:
         entries = self._entries
         move_to_end = entries.move_to_end
         for h in hashes:
-            entries[h] = None
+            entries[h] = source
             move_to_end(h)
         pop_oldest = entries.popitem
         for _ in range(len(entries) - self.max_entries):
@@ -97,6 +102,30 @@ class PoolExistenceBeliefs:
             elif h not in inflight and h not in old:
                 return False
         return True
+
+    def tally_sources(
+        self, hashes: Sequence[str], counts: dict[str, int], prefix: str
+    ) -> None:
+        """Diagnostics: count covered ``hashes`` into ``counts[prefix + name]`` by
+        their belief's source (BELIEF_SOURCES) and generation (new_gen / old_gen);
+        a page covered only by its in-flight write counts as inflight."""
+        get_new, get_old = self._entries.get, self._old.get
+        by_source = [0] * len(BELIEF_SOURCES)
+        old_gen = inflight = 0
+        for h in hashes:
+            source = get_new(h)
+            if source is None:
+                source = get_old(h)
+                if source is None:
+                    inflight += 1
+                    continue
+                old_gen += 1
+            by_source[source] += 1
+        for name, n in zip(BELIEF_SOURCES, by_source):
+            counts[prefix + name] += n
+        counts[prefix + "new_gen"] += len(hashes) - old_gen - inflight
+        counts[prefix + "old_gen"] += old_gen
+        counts[prefix + "inflight"] += inflight
 
     def track_inflight(self, hashes: Iterable[str]) -> None:
         """One ref per page hash at its D2H launch (several launched writes
@@ -198,7 +227,7 @@ class ChainPagesPolicy(PoolBeliefPolicy):
     def heal_from_query(self, beliefs, chain, keys, hit_pages, *, evidence, renew=True):
         beliefs.invalidate_beyond(chain, hit_pages)
         if evidence and renew:
-            beliefs.add(chain[:hit_pages])
+            beliefs.add(chain[:hit_pages], BELIEF_QUERY)
 
 
 class TrailingWindowPolicy(PoolBeliefPolicy):

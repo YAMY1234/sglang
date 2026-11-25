@@ -45,6 +45,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     InsertResult,
     MatchPrefixParams,
 )
+from sglang.srt.mem_cache.buffer_mode.storage_existence_cache import BELIEF_FILL
 from sglang.srt.mem_cache.hicache_storage import (
     PoolHitPolicy,
     PoolName,
@@ -1693,12 +1694,12 @@ class BufferModePipeline:
         # staged prefetch is later dropped): KV-derived sidecars came with the
         # staged pages, other pools with the keys their transfer carries.
         beliefs = cache.storage_existence_cache
-        beliefs.pool(PoolName.KV).add(staged.hash_values)
+        beliefs.pool(PoolName.KV).add(staged.hash_values, BELIEF_FILL)
         for transfer in aux_xfers:
             if transfer.indices_from_pool == PoolName.KV:
-                beliefs.pool(transfer.name).add(staged.hash_values)
+                beliefs.pool(transfer.name).add(staged.hash_values, BELIEF_FILL)
             elif transfer.keys:
-                beliefs.pool(transfer.name).add(transfer.keys)
+                beliefs.pool(transfer.name).add(transfer.keys, BELIEF_FILL)
         self.staged_prefetches[request] = staged
         cache.prefetch_loaded_tokens_by_reqid[request] = staged.num_tokens
         cache.prefetch_loaded_storage_start_by_reqid[request] = operation.storage_start

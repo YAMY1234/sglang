@@ -60,6 +60,7 @@ from sglang.srt.mem_cache.buffer_mode.pipeline import (
     validate_buffer_only_stack,
 )
 from sglang.srt.mem_cache.buffer_mode.storage_existence_cache import (
+    BELIEF_FILL,
     PoolBeliefPolicy,
     StorageExistenceCache,
     default_belief_policy,
@@ -474,6 +475,14 @@ class UnifiedRadixCache(BasePrefixCache):
             "wb_walk_us": 0,
             "wb_issued_tokens": 0,
             "wb_clean_tokens": 0,
+            # Diagnostics: KV pages of the clean tail by what last renewed their belief and its
+            # generation (inflight: covered only by a write not yet acked).
+            "wb_clean_pages_write": 0,
+            "wb_clean_pages_fill": 0,
+            "wb_clean_pages_query": 0,
+            "wb_clean_pages_new_gen": 0,
+            "wb_clean_pages_old_gen": 0,
+            "wb_clean_pages_inflight": 0,
             "wb_unbacked_tokens": 0,
             # Host evictions past the tail the walk knows is in storage: pages that left L2 without an L3 copy.
             "wb_evict_uncovered_tokens": 0,
@@ -3132,6 +3141,9 @@ class UnifiedRadixCache(BasePrefixCache):
                 )
                 if spec is not None and self._storage_backup_is_covered(spec):
                     clean += num_tokens
+                    beliefs.pool(PoolName.KV).tally_sources(
+                        hash_value, stats, "wb_clean_pages_"
+                    )
                     continue
             operation_id = self.write_backup_storage(node_id)
             if operation_id is None:
@@ -3822,7 +3834,7 @@ class UnifiedRadixCache(BasePrefixCache):
 
         # The rank-synced fetch proves L3 presence even if the host insert is dropped.
         self.storage_existence_cache.pool(PoolName.KV).add(
-            hash_value[: completed_tokens // self.page_size]
+            hash_value[: completed_tokens // self.page_size], BELIEF_FILL
         )
 
         if insert_result.host_insert_dropped:
