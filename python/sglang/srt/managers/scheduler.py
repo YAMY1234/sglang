@@ -5891,10 +5891,15 @@ class Scheduler(
         with self.copy_stream_ctx:
             if not self.enable_async_d2h_copy:
                 copy_fn()
-            elif batch.return_hidden_states or batch.spec_algorithm.is_dspark():
-                # Hidden states and the DSpark accept lengths are views of CUDA
-                # graph buffers that the next replay rewrites; only a copy queued
-                # right behind this forward reads them in time.
+            elif (
+                batch.return_hidden_states
+                or batch.spec_algorithm.is_dspark()
+                or batch_result.outputs_in_graph_buffers
+            ):
+                # Hidden states, the DSpark accept lengths and the EAGLE post-verify
+                # outputs are views of CUDA graph buffers that a later replay
+                # rewrites; only a copy queued right behind this forward reads them
+                # in time.
                 copy_fn()
             else:
                 batch_result.copy_done = self.async_d2h_worker.submit(copy_fn)

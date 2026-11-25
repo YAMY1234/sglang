@@ -202,6 +202,8 @@ class GenerationBatchResult:
     accept_index: Optional[torch.Tensor] = None
     # The optional fourth item is the prepared draft-extend layout.
     prepared_draft_extend_inputs: Optional[tuple] = None
+    # next_token_ids and accept_lens are views of post-verify CUDA graph buffers.
+    outputs_in_graph_buffers: bool = False
 
     # Refs the worker wants scheduler to keep alive for the same 2-iter window
     # as batch_record_buf. Used for cross-stream tensor lifetime (e.g. a spec

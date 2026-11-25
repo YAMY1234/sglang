@@ -1657,10 +1657,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
             self.target_worker, supports_sharded_verify=self.topk == 1
         )
         # not in __init__, which the standalone and frozen-KV workers do not run
-        if (
-            self._draft_worker is not None
-            and envs.SGLANG_ENABLE_EAGLE_POST_VERIFY_CUDA_GRAPH.get()
-        ):
+        if self._draft_worker is not None:
             self._init_post_verify_graphs()
 
     def _init_post_verify_graphs(self) -> None:

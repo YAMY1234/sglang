@@ -1,7 +1,7 @@
-"""SGLang's post-verify graphs (SGLANG_ENABLE_EAGLE_POST_VERIFY_CUDA_GRAPH).
+"""SGLang's post-verify graphs.
 
-On CPU: the switch alone turns them on for every verify of a setup they can run,
-only batches a graph can reproduce take them, a KV pool with c128 draft states never
+On CPU: they are on for every verify of a setup they can run, only batches a graph
+can reproduce (up to the batch-size cap) take them, a KV pool with c128 draft states never
 reaches them, and with them on the graphs and the eager verify draw the forced
 acceptance lengths from one rank-identical stream; without them the eager verify
 draws from the global CPU RNG as before. On a GPU, at batch sizes up to 64:
@@ -62,10 +62,9 @@ def _target_worker():
     )
 
 
-def _worker(*, switch, cuda=True, topk=1, dp_attention=False):
-    """An EAGLE worker after init_attention_backends, with
-    SGLANG_ENABLE_EAGLE_POST_VERIFY_CUDA_GRAPH set to switch, on a CUDA host with a
-    chain draft and no DP attention unless the arguments say otherwise."""
+def _worker(*, cuda=True, topk=1, dp_attention=False):
+    """An EAGLE worker after init_attention_backends, on a CUDA host with a chain
+    draft and no DP attention unless the arguments say otherwise."""
     worker = eagle_worker_v2.EAGLEWorkerV2.__new__(eagle_worker_v2.EAGLEWorkerV2)
     worker.__dict__.update(
         topk=topk,
@@ -81,7 +80,6 @@ def _worker(*, switch, cuda=True, topk=1, dp_attention=False):
     )
     parallel = SimpleNamespace(attn_dp_enabled=dp_attention)
     with (
-        envs.SGLANG_ENABLE_EAGLE_POST_VERIFY_CUDA_GRAPH.override(switch),
         patch.object(eagle_worker_v2, "_is_cuda", cuda),
         patch.object(eagle_worker_v2, "get_parallel", return_value=parallel),
     ):
@@ -258,21 +256,18 @@ def _run_eagle_verify(hooks, graphs, *, kvcache=None, idle=False):
 
 
 class TestPostVerifyGraphs(CustomTestCase):
-    def test_the_switch_turns_the_post_verify_graphs_on_for_every_verify(self):
-        """Off, the default, the verify samples and commits eagerly as before; on,
-        every verify hands its batch to SGLang's post-verify graphs. A setup they
+    def test_every_verify_of_a_setup_they_can_run_takes_the_post_verify_graphs(self):
+        """Every verify hands its batch to SGLang's post-verify graphs. A setup they
         cannot run keeps them off, and the forced lengths on the global RNG: no CUDA,
         a tree draft, or DP attention, whose ranks would capture at different times."""
-        off = _worker(switch=False)
-        self.assertIsNone(off._post_verify_graphs)
-        self.assertIsNone(_verify_kwargs(off)["post_verify_graphs"])
-        on = _worker(switch=True)
+        on = _worker()
         self.assertIsInstance(on._post_verify_graphs, EaglePostVerifyGraphs)
         self.assertIs(_verify_kwargs(on)["post_verify_graphs"], on._post_verify_graphs)
         for setup in (dict(cuda=False), dict(topk=2), dict(dp_attention=True)):
             with self.subTest(**setup):
-                worker = _worker(switch=True, **setup)
+                worker = _worker(**setup)
                 self.assertIsNone(worker._post_verify_graphs)
+                self.assertIsNone(_verify_kwargs(worker)["post_verify_graphs"])
                 self.assertIsNone(worker._simulated_acc_len_rng)
 
     def test_a_kv_pool_that_clears_c128_draft_states_keeps_the_eager_verify(self):
@@ -332,12 +327,12 @@ class TestPostVerifyGraphs(CustomTestCase):
                 has_grammar=False,
                 hisparse_coordinator=None,
                 return_logprob=False,
+                seq_lens=torch.zeros(1),
             )
             for name, value in changes.items():
                 (info if name in info else fields)[name] = value
             batch = SimpleNamespace(
                 forward_mode=ForwardMode.TARGET_VERIFY,
-                seq_lens=torch.zeros(1),
                 sampling_info=SimpleNamespace(**info),
                 mamba_track_indices=None,
                 **fields,
@@ -347,9 +342,12 @@ class TestPostVerifyGraphs(CustomTestCase):
             )
             return graphs._key(batch, verify_input, logits_output, can_run_cuda_graph)
 
+        cap = eagle_post_verify_graphs._MAX_POST_VERIFY_BS
         self.assertIsNotNone(key())
+        self.assertIsNotNone(key(seq_lens=torch.zeros(cap)))
         for change in (
             dict(can_run_cuda_graph=False),
+            dict(seq_lens=torch.zeros(cap + 1)),
             dict(topk=2),
             dict(has_grammar=True),
             dict(hisparse_coordinator=object()),
@@ -370,7 +368,7 @@ class TestPostVerifyGraphs(CustomTestCase):
         the global CPU RNG exactly as before."""
 
         def lengths(paths, global_seed):
-            worker = _worker(switch=True)
+            worker = _worker()
             rng = worker._simulated_acc_len_rng
             self.assertIs(_verify_kwargs(worker)["simulated_acc_len_rng"], rng)
             graphs = worker._post_verify_graphs._graphs
@@ -400,9 +398,7 @@ class TestPostVerifyGraphs(CustomTestCase):
         server_seeded = simulated_acc_len_generator(11)
         self.assertEqual(all_graph, [_eager_length(server_seeded) for _ in range(48)])
 
-        self.assertIsNone(
-            _verify_kwargs(_worker(switch=False))["simulated_acc_len_rng"]
-        )
+        self.assertIsNone(_verify_kwargs(_worker(cuda=False))["simulated_acc_len_rng"])
         torch.manual_seed(3)
         drawn = [_eager_length(None) for _ in range(32)]
         state = torch.get_rng_state()
@@ -427,7 +423,7 @@ class TestPostVerifyGraphs(CustomTestCase):
             return SimpleNamespace(forward_mode=ForwardMode.TARGET_VERIFY, reqs=reqs)
 
         def verify_kwargs(verify_batch):
-            worker = _worker(switch=True)
+            worker = _worker()
             with patch.object(eagle_worker_v2, "run_eagle_verify") as run:
                 worker.verify(batch=verify_batch)
             kwargs = run.call_args.kwargs
@@ -508,16 +504,15 @@ class TestPostVerifyGraphs(CustomTestCase):
         self.assertEqual(offset, buffer.numel())
 
     def test_one_launch_load_stages_what_the_per_dtype_copies_stage(self):
-        """With SGLANG_OPT_SPEC_POST_VERIFY_ONE_LAUNCH_LOAD a round's inputs and its forced length go to
-        one copy plan; without it, or when the plan refuses the layout, the
-        per-dtype copies stage the same values."""
+        """A round's inputs and its forced length go to one copy plan; when the plan
+        refuses the layout, the per-dtype copies stage the same values."""
         inputs = {
             "draft_tokens": torch.arange(14),
             "seq_lens": torch.tensor([17, 40]),
             "temperatures": torch.rand(2, 1),
         }
         sim_len = torch.tensor([3])
-        for plan_mode in ("off", "accepts", "refuses"):
+        for plan_mode in ("accepts", "refuses"):
             calls = []
 
             def plan(dsts, srcs, accepts=plan_mode == "accepts"):
@@ -528,12 +523,10 @@ class TestPostVerifyGraphs(CustomTestCase):
 
             staged = {name: torch.zeros_like(src) for name, src in inputs.items()}
             staged["sim_accept_len"] = torch.zeros(1, dtype=torch.int64)
-            slot = SimpleNamespace(
-                staged=staged, load_plan=None if plan_mode == "off" else plan
-            )
+            slot = SimpleNamespace(staged=staged, load_plan=plan)
             eagle_post_verify_graphs._PostVerifyGraphs._load(slot, inputs, sim_len)
             with self.subTest(plan=plan_mode):
-                self.assertEqual(calls, [] if plan_mode == "off" else [4])
+                self.assertEqual(calls, [4])
                 for name, src in inputs.items():
                     self.assertTrue(torch.equal(staged[name], src), name)
                 self.assertEqual(int(staged["sim_accept_len"]), 3)
@@ -573,6 +566,10 @@ class TestPostVerifyGraphsMatchEager(CustomTestCase):
                 "sglang.srt.distributed.parallel_state.graph_capture", _graph_capture
             ),
             patch.object(eagle_utils, "_fused_accept_enabled", return_value=fused),
+            # graph every tested batch size, past the serving cap too
+            patch.object(
+                eagle_post_verify_graphs, "_MAX_POST_VERIFY_BS", max(BATCH_SIZES)
+            ),
             patch.object(
                 eagle_utils,
                 "verify_tree_greedy_func",
@@ -639,11 +636,6 @@ class TestPostVerifyGraphsMatchEager(CustomTestCase):
 
     def test_forced_acceptance(self):
         self._check(sim_acc_len=4.8)
-
-    def test_forced_acceptance_with_one_launch_load(self):
-        # SGLANG_OPT_SPEC_POST_VERIFY_ONE_LAUNCH_LOAD: inputs and the pinned forced length in one launch
-        with patch.object(eagle_post_verify_graphs, "_ONE_LAUNCH_LOAD", True):
-            self._check(sim_acc_len=4.8)
 
     def test_fused_accept_greedy(self):
         self._check(sim_acc_len=-1.0, fused=True)

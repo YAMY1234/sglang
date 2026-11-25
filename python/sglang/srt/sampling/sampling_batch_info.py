@@ -9,7 +9,6 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional
 import torch
 
 from sglang.srt.constrained.base_grammar_backend import BaseGrammarObject
-from sglang.srt.environ import envs
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_exec, get_parallel, get_schedule, get_spec
 from sglang.srt.sampling.custom_logit_processor import (
@@ -227,7 +226,6 @@ def _fast_copy_enabled() -> bool:
     # Preserve the original EAGLE runtime policy without the resource-pool dependency.
     return (
         current_platform.is_cuda()
-        and envs.SGLANG_ENABLE_EAGLE_POST_VERIFY_CUDA_GRAPH.get()
         and (get_spec().speculative_algorithm or "").upper() == "EAGLE"
         and (get_spec().speculative_eagle_topk or 1) == 1
         and not get_schedule().disable_overlap_schedule

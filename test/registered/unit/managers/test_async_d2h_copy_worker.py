@@ -156,8 +156,8 @@ class TestConfidentialComputeStaging(CustomTestCase):
 class TestSchedulerReadbackRouting(CustomTestCase):
     """Every readback path must wait for the forward: a copy issued too early reads
     the zeros the source held before it. Under CC only plain batches take the
-    worker; hidden-state and DSpark batches stay inline, since they read CUDA
-    graph buffers that the next replay rewrites."""
+    worker; hidden-state, DSpark and EAGLE post-verify graph batches stay inline,
+    since they read CUDA graph buffers that a later replay rewrites."""
 
     def setUp(self):
         is_confidential_compute.cache_clear()
@@ -165,7 +165,7 @@ class TestSchedulerReadbackRouting(CustomTestCase):
         self.worker = AsyncD2HCopyWorker(torch.cuda)
         self.addCleanup(self.worker.shutdown)
 
-    def _readback(self, cc: bool, hidden: bool, dspark: bool):
+    def _readback(self, cc: bool, hidden: bool, dspark: bool, graph: bool):
         from sglang.srt.managers.scheduler import Scheduler
         from sglang.srt.managers.utils import GenerationBatchResult
         from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -179,7 +179,7 @@ class TestSchedulerReadbackRouting(CustomTestCase):
             async_d2h_worker=self.worker if cc else None,
         )
         # Distinct per case, so a reused host block cannot pass a stale value.
-        value = 7 + cc + hidden + 2 * dspark
+        value = 7 + cc + hidden + 2 * dspark + 4 * graph
         with torch.cuda.stream(forward_stream):
             ids = _late_source(value, numel=1 << 24)  # 128 MiB: the copy takes a while
             logits = SimpleNamespace(
@@ -188,7 +188,10 @@ class TestSchedulerReadbackRouting(CustomTestCase):
                 auxiliary_device_output=None,
             )
             result = GenerationBatchResult(
-                logits_output=logits, next_token_ids=ids, copy_done=torch.cuda.Event()
+                logits_output=logits,
+                next_token_ids=ids,
+                copy_done=torch.cuda.Event(),
+                outputs_in_graph_buffers=graph,
             )
         algorithm = SpeculativeAlgorithm.DSPARK if dspark else SpeculativeAlgorithm.NONE
         batch = SimpleNamespace(
@@ -202,15 +205,16 @@ class TestSchedulerReadbackRouting(CustomTestCase):
 
     def test_readback_lands_after_the_forward(self):
         cases = {
-            "off-inline": (False, False, False),
-            "cc-worker": (True, False, False),
-            "cc-hidden-states-inline": (True, True, False),
-            "cc-dspark-inline": (True, False, True),
+            "off-inline": (False, False, False, False),
+            "cc-worker": (True, False, False, False),
+            "cc-hidden-states-inline": (True, True, False, False),
+            "cc-dspark-inline": (True, False, True, False),
+            "cc-post-verify-graph-inline": (True, False, False, True),
         }
-        for name, (cc, hidden, dspark) in cases.items():
+        for name, (cc, hidden, dspark, graph) in cases.items():
             with self.subTest(name):
-                result, hidden_states, value = self._readback(cc, hidden, dspark)
-                offloaded = cc and not (hidden or dspark)
+                result, hidden_states, value = self._readback(cc, hidden, dspark, graph)
+                offloaded = cc and not (hidden or dspark or graph)
                 self.assertEqual(isinstance(result.copy_done, HostCopyDone), offloaded)
                 for host in (result.next_token_ids, hidden_states):
                     if host is None:

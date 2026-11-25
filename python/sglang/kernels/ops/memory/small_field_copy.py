@@ -14,7 +14,6 @@ from typing import TYPE_CHECKING, List, Optional
 import torch
 
 from sglang.kernels.jit.utils import cache_once, load_jit
-from sglang.srt.environ import envs
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
@@ -24,9 +23,9 @@ _ENTRIES = 7
 _RAW_KIND = {1: 0, 2: 1, 4: 2, 8: 3}
 # (dst dtype, src dtype) -> width-cast kind
 _CAST_KIND = {(torch.int64, torch.int32): 4, (torch.int32, torch.int64): 5}
-# The 16-byte launch with a block per field (SGLANG_OPT_SMALL_FIELD_COPY_VECTORIZED), else the
-# per-element launch, its bitwise reference; read once, fixed per process.
-_VEC = envs.SGLANG_OPT_SMALL_FIELD_COPY_VECTORIZED.get()
+# The 16-byte launch with a block per field; the per-element launch is its bitwise
+# reference in tests.
+_VEC = True
 
 
 @cache_once

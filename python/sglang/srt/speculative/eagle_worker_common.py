@@ -990,6 +990,7 @@ def run_eagle_verify(
             kv_weight_version_record=forward_batch_output.kv_weight_version_record,
             extra_keep_alive_refs=[verify_forward_batch],
             prepared_draft_extend_inputs=post[5],
+            outputs_in_graph_buffers=True,
         )
 
     accept = accept_draft_tree(

@@ -1,8 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
-"""SGLang's post-verify CUDA graphs for the EAGLE verify
-(SGLANG_ENABLE_EAGLE_POST_VERIFY_CUDA_GRAPH): sampling and acceptance, the commit
-outputs and, on a side stream, the mamba state commit, for every batch a graph can
-reproduce; any other batch runs SGLang's eager path.
+"""SGLang's post-verify CUDA graphs for the EAGLE verify: sampling and acceptance,
+the commit outputs and, on a side stream, the mamba state commit, for every batch a
+graph can reproduce; any other batch runs SGLang's eager path.
 
 The side-stream commit may run after the scheduler reused a finished request's
 row, so it writes the verify forward's slots, staged with the round's inputs."""
@@ -17,7 +16,6 @@ import torch
 
 from sglang.kernels.ops.memory.small_field_copy import SmallFieldCopyPlan
 from sglang.srt.configs.hybrid_arch import mambaish_config
-from sglang.srt.environ import envs
 from sglang.srt.layers.attention.mamba.mamba2_metadata import ForwardStateSlots
 from sglang.srt.sampling.sampling_batch_info import adjusts_logits
 from sglang.srt.speculative.eagle_worker_common import (
@@ -35,8 +33,9 @@ _NUM_WARMUP = 2
 # Arbitrary bound on post-verify graph sets (key x verify logits buffer); a batch
 # past it runs SGLang's eager path.
 _MAX_POST_VERIFY_STATES = 64
-# SGLANG_OPT_SPEC_POST_VERIFY_ONE_LAUNCH_LOAD: a round's inputs and its forced length staged in one launch.
-_ONE_LAUNCH_LOAD = envs.SGLANG_OPT_SPEC_POST_VERIFY_ONE_LAUNCH_LOAD.get()
+# Graphs are captured during serving, one per exact batch size; past this size the
+# captures stall serving for no measured gain, so a larger batch runs eagerly.
+_MAX_POST_VERIFY_BS = 16
 
 
 class EaglePostVerifyGraphs:
@@ -130,6 +129,7 @@ class EaglePostVerifyGraphs:
         info = batch.sampling_info
         if (
             not can_run_cuda_graph
+            or len(batch.seq_lens) > _MAX_POST_VERIFY_BS
             or batch.forward_mode.is_idle()
             or verify_input.topk != 1
             or batch.hisparse_coordinator is not None
@@ -356,9 +356,7 @@ class _PostVerifyGraphs:
                 )
             slot = state.slots[turn] = make_slot(staged)
             slot.staged, slot.graph, slot.commit_graph = staged, None, None
-            slot.load_plan = (
-                SmallFieldCopyPlan(allow_pinned_src=True) if _ONE_LAUNCH_LOAD else None
-            )
+            slot.load_plan = SmallFieldCopyPlan(allow_pinned_src=True)
         self._load(slot, inputs, sim_len)
         if sim_len is not None:
             self._record_sim_done(sim_turn)
@@ -386,14 +384,13 @@ class _PostVerifyGraphs:
     @staticmethod
     def _load(slot: SimpleNamespace, inputs: dict, sim_len) -> None:
         staged = slot.staged
-        if slot.load_plan is not None:
-            dsts, srcs = [staged[name] for name in inputs], list(inputs.values())
-            if sim_len is not None:
-                dsts.append(staged["sim_accept_len"])
-                srcs.append(sim_len)
-            # one launch for the round's inputs and the pinned host draw
-            if slot.load_plan(dsts, srcs):
-                return
+        dsts, srcs = [staged[name] for name in inputs], list(inputs.values())
+        if sim_len is not None:
+            dsts.append(staged["sim_accept_len"])
+            srcs.append(sim_len)
+        # one launch for the round's inputs and the pinned host draw
+        if slot.load_plan(dsts, srcs):
+            return
         # One multi-tensor copy per dtype; one copy per input costs ~4 us of GPU time.
         groups: dict = {}
         for name, src in inputs.items():

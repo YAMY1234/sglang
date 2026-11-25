@@ -1808,31 +1808,16 @@ class Envs:
     # into a small CUDA graph, collapsing its host dispatch cost to one launch.
     # Experimental; auto-falls back to eager if the backend's prep is not capturable.
     SGLANG_ENABLE_METADATA_GLUE_GRAPH = EnvBool(False)
-    # Experimental: capture the EAGLE verify's sampling, acceptance and state commit
-    # in CUDA graphs (speculative/eagle_post_verify_graphs.py).
-    SGLANG_ENABLE_EAGLE_POST_VERIFY_CUDA_GRAPH = EnvBool(
-        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
-    )
     # Let an unchanged top-k-1 EAGLE round read the previous round's top-1 and hidden
     # rows where the draft-extend graph left them instead of relaying copies.
     SGLANG_OPT_SPEC_RELAY_IN_PLACE = EnvBool(
         SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
     )
     # Runtime optimizations that follow SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.
-    # The fused small-field copy gives each field its own blocks and moves aligned fields in 16 B units.
-    SGLANG_OPT_SMALL_FIELD_COPY_VECTORIZED = EnvBool(
-        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
-    )
     # Verify input staging, bit-identical: reuse last round's mamba track indices while their
     # inputs are unchanged, and skip the replay-time input_ids / positions copies that the
     # same-stream pre-planned load_batch already made.
     SGLANG_OPT_SPEC_VERIFY_REUSE_STAGED_INPUTS = EnvBool(
-        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
-    )
-    # The post-verify graphs' per-round input load as one small_field_copy launch that also
-    # reads the injected acceptance length from its pinned host slot (bit-identical); needs
-    # SGLANG_ENABLE_EAGLE_POST_VERIFY_CUDA_GRAPH.
-    SGLANG_OPT_SPEC_POST_VERIFY_ONE_LAUNCH_LOAD = EnvBool(
         SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
     )
     # A topk-1 chain against TRT-LLM MHA, which masks the draft window itself, is built
@@ -2769,7 +2754,19 @@ class _DeprecatedEnv:
 # ad-hoc warnings. For a rename where the old name must keep working through a
 # descriptor, use EnvBoolWithAlias / EnvIntWithAlias instead. Once the
 # deprecation period ends, move the entry to REMOVED_ENVS.
-_DEPRECATED_ENVS: Dict[str, _DeprecatedEnv] = {}
+_DEPRECATED_ENVS: Dict[str, _DeprecatedEnv] = {
+    "SGLANG_ENABLE_EAGLE_POST_VERIFY_CUDA_GRAPH": _DeprecatedEnv(
+        note="The EAGLE post-verify CUDA graphs always run for the batches they "
+        "can reproduce; unset it."
+    ),
+    "SGLANG_OPT_SMALL_FIELD_COPY_VECTORIZED": _DeprecatedEnv(
+        note="The fused small-field copy always uses its vectorized launch; unset it."
+    ),
+    "SGLANG_OPT_SPEC_POST_VERIFY_ONE_LAUNCH_LOAD": _DeprecatedEnv(
+        note="The post-verify graphs always load a round's inputs in one launch; "
+        "unset it."
+    ),
+}
 
 
 def _handle_deprecated_envs():
@@ -2821,9 +2818,9 @@ REMOVED_ENVS: Dict[str, str] = {
     "SGLANG_K3_FLYDSL_SOURCE": "use SGLANG_USE_HIP_K3_FLYDSL_SOURCE",
     "SGLANG_AITER_MLA_DCP_DECODE_BACKEND": "use SGLANG_AITER_MLA_DECODE_BACKEND",
     "SGLANG_EPLB_ROCM_P2P_BATCH_CHUNK_SIZE": "use SGLANG_EPLB_P2P_BATCH_CHUNK_SIZE",
-    "SGLANG_Q35MF_BK_VEC_COPY": "use SGLANG_OPT_SMALL_FIELD_COPY_VECTORIZED",
+    "SGLANG_Q35MF_BK_VEC_COPY": "the vectorized copy always runs now; unset it",
     "SGLANG_Q35MF_MKH_N3B": "use SGLANG_OPT_SPEC_VERIFY_REUSE_STAGED_INPUTS",
-    "SGLANG_Q35MF_MKH_N3C": "use SGLANG_OPT_SPEC_POST_VERIFY_ONE_LAUNCH_LOAD",
+    "SGLANG_Q35MF_MKH_N3C": "the one-launch load always runs now; unset it",
     "SGLANG_Q35MF_EDGE_CHAIN_TREE": "use SGLANG_OPT_TRTLLM_MHA_CHAIN_VERIFY",
     "SGLANG_Q35MF_EDGE_SPARSE_VERIFY_SAMPLING": "use SGLANG_OPT_SPEC_COMPACT_VERIFY_SAMPLING",
     "SGLANG_Q35MF_EDGE_PACKED_VERIFY_BCAST": "use SGLANG_OPT_SPEC_PACKED_VERIFY_BCAST",
