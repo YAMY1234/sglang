@@ -655,7 +655,7 @@ class TestDeferredDestinationPublish(CustomTestCase):
     def test_staging_readback_preserves_payload_and_waits_for_both_events(self):
         payloads = []
         original_empty, original_copy = torch.empty, torch.Tensor.copy_
-        for master, staging in ((False, True), (True, False), (True, True)):
+        for staging in (False, True):
             receiver = _PollingReceiver()
             receiver.require_staging = True
             entry = self._decode_req(receiver)
@@ -689,7 +689,6 @@ class TestDeferredDestinationPublish(CustomTestCase):
                 return original_copy(host, device)
 
             with (
-                envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.override(master),
                 patch(
                     "sglang.srt.disaggregation.decode.torch.cuda.is_available",
                     return_value=True,
@@ -717,9 +716,7 @@ class TestDeferredDestinationPublish(CustomTestCase):
                 receiver.send_metadata.assert_not_called()
                 forward_done.query.return_value = True
                 transfer.publish_pending_metadata()
-                self.assertEqual(
-                    receiver.send_metadata.call_count, int(not (master and staging))
-                )
+                self.assertEqual(receiver.send_metadata.call_count, int(not staging))
                 readback_done.query.return_value = True
                 transfer.publish_pending_metadata()
             receiver.send_metadata.assert_called_once()
@@ -734,7 +731,6 @@ class TestDeferredDestinationPublish(CustomTestCase):
             )
             self.assertIsNone(entry.pending_metadata)
         self.assertEqual(payloads[0], payloads[1])
-        self.assertEqual(payloads[1], payloads[2])
         self.assertEqual(
             payloads[1], ([4, 5, 6], 0, [[[101]]], {"decode_prefix_len": 0})
         )
@@ -906,8 +902,11 @@ class TestAdmissionOverlap(CustomTestCase):
             disaggregation_decode_enable_radix_cache=False,
         )
         with patch("sglang.srt.disaggregation.decode.get_disagg", return_value=disagg):
+            # the PD decode kill switch turns the overlapped admission off
             for enabled in (False, True):
-                with envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.override(enabled):
+                with envs.SGLANG_ENABLE_NV_MEGA_PDDEC_RUNTIME_OPTIMIZATION.override(
+                    enabled
+                ):
                     scope = (
                         SchedulerDisaggregationDecodeMixin._nonblocking_admit_in_scope
                     )

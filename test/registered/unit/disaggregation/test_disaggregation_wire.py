@@ -143,13 +143,9 @@ class TestBatchStagingReservations(CustomTestCase):
         )
         batch = SimpleNamespace(reqs=[req])
         run = SchedulerDisaggregationPrefillMixin.maybe_prefetch_staging_for_batch
-        with envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.override(True):
-            run(scheduler, batch)
-            prefetch.assert_called_once_with(7, upto_tokens=33)
+        run(scheduler, batch)
+        prefetch.assert_called_once_with(7, upto_tokens=33)
         prefetch.reset_mock()
-        with envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.override(False):
-            run(scheduler, batch)
-            prefetch.assert_called_once_with(7)
         del manager._prefetch_staging_reqs
         run(scheduler, batch)
 
@@ -186,7 +182,6 @@ class TestBatchStagingReservations(CustomTestCase):
         batch = SimpleNamespace(reqs=[req])
         socket = Mock()
         with (
-            envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.override(True),
             get_context().override_server_args(chunked_prefill_size=32),
             patch("zmq.Context.instance") as context,
         ):

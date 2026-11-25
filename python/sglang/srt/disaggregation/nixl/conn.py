@@ -3579,9 +3579,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         # chunk. Internally a no-op when staging is disabled or no peer
         # in this room needs heterogeneous-TP staging.
         if self.enable_staging and self.kv_buffer_tensors is not None:
-            upto_tokens = None
-            if envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get():
-                upto_tokens = index_slice.stop * self.kv_buffer_tensors["page_size"]
+            upto_tokens = index_slice.stop * self.kv_buffer_tensors["page_size"]
             self._prefetch_staging_reqs(bootstrap_room, upto_tokens=upto_tokens)
 
         # Shard by destination (mirror mooncake): same dst endpoint(s) -> same

@@ -1863,7 +1863,8 @@ class Envs:
     SGLANG_OPT_SCHEDULER_SHM_SYNC_LEADER_TCP = EnvBool(
         SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
     )
-    # PD decode optimizations follow the shared switch unless explicitly disabled.
+    # Kill switch for the PD decode admission fast paths (deferred preallocation,
+    # admission overlapped with the in-flight forward); on by default.
     SGLANG_ENABLE_NV_MEGA_PDDEC_RUNTIME_OPTIMIZATION = EnvBool(True)
     # Reuse the resolved CPU sequence lengths for FlashInfer draft planning,
     # avoiding a second blocking readback after generating the same indptr.

@@ -1095,6 +1095,8 @@ class TestDecodePrebuilt(unittest.TestCase):
 
     def test_overlap_waits_for_forward_before_processing_prebuilt(self):
         scheduler = self._new_scheduler(enable_overlap=True)
+        # EAGLE admits without waiting (_nonblocking_admit_in_scope); this is the other path.
+        scheduler.spec_algorithm.is_eagle.return_value = False
         move([MagicMock(rid="request", owner_list=None)], scheduler.waiting_queue)
 
         call_order = []

@@ -687,18 +687,16 @@ class SchedulerDisaggregationPrefillMixin:
         prefetch = getattr(kv_mgr, "_prefetch_staging_reqs", None)
         if prefetch is None:
             return
-        lazy = envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get()
         for req in batch.reqs:
             if (
-                lazy
-                and req.pending_bootstrap
+                req.pending_bootstrap
                 and bootstrap_queue.transfer_backend == TransferBackend.NIXL
             ):
                 # NIXL reserves at send time if the decode prefix arrives after forward.
                 continue
             room = req.bootstrap_room
             if room is not None and room in kv_mgr.transfer_infos:
-                if lazy and req.extend_end is not None:
+                if req.extend_end is not None:
                     upto_tokens = max(0, req.extend_end - req.disagg_decode_prefix_len)
                     prefetch(room, upto_tokens=upto_tokens)
                 else:
