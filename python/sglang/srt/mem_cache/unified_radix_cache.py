@@ -4301,6 +4301,7 @@ class UnifiedRadixCache(BasePrefixCache):
                 D=operation.storage_start + hit if hit else None,
                 requested_tokens=requested, hit_tokens=hit, revoked=revoked,
                 anchor_hash=operation.last_hash,
+                first_query_hash=chain[0] if chain else None,
                 query_end_hash=chain[-1] if chain else None,
                 checkpoint_hash=chain[hit_pages - 1] if hit_pages else None,
                 pool_hit_pages=dict(operation.query_pool_hit_pages or {}),
@@ -4317,10 +4318,11 @@ class UnifiedRadixCache(BasePrefixCache):
             and self.pp_rank == 0
         ):
             stats["lookups_logged"] += 1
+            chain = operation.all_hash_values or operation.hash_value
             # Diagnostics: per-pool boundaries tell a missing page from a missing state.
             logger.info(
                 "HiCache L3 lookup: rid=%s anchor=%s storage_start=%d requested=%d "
-                "hit=%d pool_hit_pages=%s restorable=%s",
+                "hit=%d pool_hit_pages=%s restorable=%s first_query_hash=%s",
                 operation.request_id,
                 "root" if operation.last_hash is None else "node",
                 operation.storage_start,
@@ -4328,6 +4330,7 @@ class UnifiedRadixCache(BasePrefixCache):
                 hit,
                 {str(k): v for k, v in (operation.query_pool_hit_pages or {}).items()},
                 (operation.pool_storage_result.restorable_prefix_pages or [])[-3:],
+                chain[0] if chain else None,
             )
         if self._l3_trace is not None and requested >= 8192:
             self._l3_trace_lookup(operation, kv_pages)
