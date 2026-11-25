@@ -626,6 +626,20 @@ class UnifiedTreeCoreInterface(ABC):
             f"{type(self).__name__} does not implement SGLANG_MAMBA_PATH_CAP_COUNTS_HOST"
         )
 
+    def set_mamba_backup_internal_state(self, enabled: bool) -> None:
+        """Make write_back device eviction back up an internal node's device-only
+        Mamba state even when its Full KV is already on host (HiCache init)."""
+        raise NotImplementedError(
+            f"{type(self).__name__} does not implement SGLANG_MAMBA_BACKUP_INTERNAL_STATE"
+        )
+
+    def mamba_internal_state_counts(self) -> tuple[int, int]:
+        """(dropped, backed up) device-only internal Mamba states whose Full KV
+        was on host when write_back device eviction freed them."""
+        raise NotImplementedError(
+            f"{type(self).__name__} does not count internal Mamba state evictions"
+        )
+
     @abstractmethod
     def insert_host(
         self,

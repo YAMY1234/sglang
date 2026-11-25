@@ -227,6 +227,9 @@ class UnifiedRadixCache(BasePrefixCache):
     # set by _init_mamba_demote_watch.
     _mamba_demote_watch = False
     _mamba_backup_before_demote = False
+    # The tree core's internal Mamba state drop/backup counts reach
+    # mamba_retention_counts; set by _init_mamba_internal_state_watch.
+    _mamba_internal_state_watch = False
     # Nodes whose device-only Mamba state was copied to host before their demote;
     # a later load-back of one counts in demote_copy_restores.
     _demote_copied_nodes: Optional[set[NodeId]] = None
@@ -889,6 +892,7 @@ class UnifiedRadixCache(BasePrefixCache):
             )
         self._init_mamba_path_cap_counts_host()
         self._init_mamba_demote_watch()
+        self._init_mamba_internal_state_watch()
         self._storage_write_back = StorageWriteBack.create(self)
         # Pre-seed the logical dropped-tokens series.
         if self.metrics_collector is not None and self.cache_controller is not None:
@@ -983,6 +987,36 @@ class UnifiedRadixCache(BasePrefixCache):
         }
         self._demote_copied_nodes = set()
         logger.info("Mamba demote watch on, back up before demote %s", backup)
+
+    def _init_mamba_internal_state_watch(self) -> None:
+        """Count the device evictions of internal Mamba states whose Full KV is
+        already on host under write_back: dropped, or copied to host first
+        (SGLANG_MAMBA_BACKUP_INTERNAL_STATE)."""
+        backup = envs.SGLANG_MAMBA_BACKUP_INTERNAL_STATE.get()
+        if (
+            not self.is_mamba_enabled
+            or self.cache_controller is None
+            or self.host_memory_mode == "buffer_only"
+        ):
+            if backup:
+                logger.info(
+                    "SGLANG_MAMBA_BACKUP_INTERNAL_STATE ignored: it needs a Mamba "
+                    "tree with a HiCache host tier in cache mode"
+                )
+            return
+        self.tree_core.set_mamba_backup_internal_state(backup)
+        self._mamba_internal_state_watch = True
+        self.mamba_retention_counts = self.mamba_retention_counts or {}
+        self.refresh_mamba_retention_counts()
+        logger.info("Mamba internal state backup before device eviction %s", backup)
+
+    def refresh_mamba_retention_counts(self) -> None:
+        """Copy the tree core's internal Mamba state counts into mamba_retention_counts."""
+        if not self._mamba_internal_state_watch:
+            return
+        drops, backups = self.tree_core.mamba_internal_state_counts()
+        self.mamba_retention_counts["mamba_internal_state_drops"] = drops
+        self.mamba_retention_counts["mamba_internal_state_backups"] = backups
 
     def _count_mamba_load_back_refusal(self, req, reason: str) -> None:
         """A refused load-back of a request that matched a host-only Mamba state."""

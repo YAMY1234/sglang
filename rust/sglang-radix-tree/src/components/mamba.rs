@@ -446,6 +446,25 @@ impl<K: ChildKeyType> TreeComponent<K> for MambaComponent {
                     .evict_device_pending_node = Some(node_id);
                 break 'step None;
             }
+            if tree_core.enable_hicache
+                && tree_core.is_write_back
+                && !node.has_host_value(MAMBA)
+                && node.backuped()
+            {
+                // Full KV is already on host, so the backup copies the state only.
+                // A node pending under another write's ack keeps the drop.
+                if tree_core.mamba_backup_internal_state
+                    && node.has_device_value(FULL)
+                    && node.write_through_pending_id.is_none()
+                {
+                    let node_id = node.id;
+                    let state = tree_core.component_state_mut(MAMBA);
+                    state.evict_device_pending_node = Some(node_id);
+                    state.evict_device_pending_state_only = true;
+                    break 'step None;
+                }
+                tree_core.mamba_internal_state_drops += 1;
+            }
             // Other policies and already-backed states need no I/O.
             tree_core.evict_component_and_detach_lru_(
                 x,

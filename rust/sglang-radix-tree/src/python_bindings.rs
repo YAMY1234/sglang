@@ -2168,6 +2168,14 @@ macro_rules! tree_core_methods {
                 py.detach(|| self.core().set_mamba_path_cap_counts_host(enabled));
             }
 
+            fn set_mamba_backup_internal_state(&self, py: Python<'_>, enabled: bool) {
+                py.detach(|| self.core().set_mamba_backup_internal_state(enabled));
+            }
+
+            fn mamba_internal_state_counts(&self, py: Python<'_>) -> (u64, u64) {
+                self.core_attached(py).mamba_internal_state_counts()
+            }
+
             /// The current write-back (vs write-through) policy.
             fn is_write_back(&self, py: Python<'_>) -> bool {
                 self.core_attached(py).is_write_back()
@@ -3608,6 +3616,19 @@ macro_rules! tree_core_binding {
                     self.inner.set_mamba_path_cap_counts_host(py, enabled);
                     Ok(())
                 })
+            }
+
+            /// Back up internal device-only Mamba states whose Full KV is on host; decided at HiCache init.
+            fn set_mamba_backup_internal_state(&self, py: Python<'_>, enabled: bool) -> PyResult<()> {
+                catch_native_panic(|| {
+                    self.inner.set_mamba_backup_internal_state(py, enabled);
+                    Ok(())
+                })
+            }
+
+            /// (dropped, backed up) internal device-only Mamba states with Full KV on host.
+            fn mamba_internal_state_counts(&self, py: Python<'_>) -> PyResult<(u64, u64)> {
+                catch_native_panic(|| Ok(self.inner.mamba_internal_state_counts(py)))
             }
 
             /// Set the write-through backup hit threshold; decided at HiCache init.

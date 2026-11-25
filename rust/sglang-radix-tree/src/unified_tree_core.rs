@@ -517,6 +517,8 @@ pub struct ComponentState {
     pub(crate) evict_device_pending_node: Option<NodeId>,
     /// SWA host capacity needed for the pending victim's complete backup window.
     pub(crate) evict_device_pending_num_tokens: usize,
+    /// The pending Mamba victim's Full KV was already on host: its backup copies the state only.
+    pub(crate) evict_device_pending_state_only: bool,
     /// Token budget for the current eviction walk.
     pub(crate) evict_device_request_cnt: usize,
 }
@@ -664,6 +666,12 @@ pub struct UnifiedTreeCore<K: ChildKeyType> {
     /// The per-path Mamba cap also counts host copies and frees the host
     /// copies of the states it caps (opt-in, decided at HiCache init).
     pub(crate) mamba_path_cap_counts_host: bool,
+    /// Write-back device eviction copies an internal node's device-only Mamba state to
+    /// host even when its Full KV is already there (opt-in, decided at HiCache init).
+    pub(crate) mamba_backup_internal_state: bool,
+    /// Such states freed by device eviction without (drops) or after (backups) a host copy.
+    pub(crate) mamba_internal_state_drops: u64,
+    pub(crate) mamba_internal_state_backups: u64,
 
     /// Per-component monotonic sources for lock-segment UUIDs.
     pub(crate) component_uuid_counters: [i64; NUM_COMPONENT_TYPES],
@@ -857,6 +865,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         state.evict_device_cursor = None;
         state.evict_device_pending_node = None;
         state.evict_device_pending_num_tokens = 0;
+        state.evict_device_pending_state_only = false;
     }
 
     /// Finish the component's device-eviction bookkeeping; panics if no walk
@@ -871,6 +880,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         state.evict_device_cursor = None;
         state.evict_device_pending_node = None;
         state.evict_device_pending_num_tokens = 0;
+        state.evict_device_pending_state_only = false;
     }
 
     /// Add newly evictable device tokens to the component's evictable size.
@@ -1001,6 +1011,9 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             namespaced_event_hashes: HashMap::new(),
             write_through_threshold: params.write_through_threshold,
             mamba_path_cap_counts_host: false,
+            mamba_backup_internal_state: false,
+            mamba_internal_state_drops: 0,
+            mamba_internal_state_backups: 0,
             component_uuid_counters: COMPONENT_UUID_INITIAL_VALUES,
             device: params.device,
             empty_device_indices: Tensor::empty([0], (Kind::Int64, params.device)),
@@ -2766,6 +2779,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         );
         state.evict_device_pending_node = None;
         state.evict_device_pending_num_tokens = 0;
+        let state_only = std::mem::take(&mut state.evict_device_pending_state_only);
         let mut result = EvictionStepResult::default();
         // Host eviction or a caller's intervening mutation may have removed
         // the node, pinned its state, or changed the component's LRU.
@@ -2791,6 +2805,14 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             // changed; an internal-state finish must never demote Full KV.
             self.component_state_mut(component_type).evict_device_cursor = Some(node_idx);
             return result;
+        }
+        if state_only {
+            // A failed Mamba-only backup (no host slot) leaves the state device-only.
+            if self.arena.has_host_value(node_idx, MAMBA) {
+                self.mamba_internal_state_backups += 1;
+            } else {
+                self.mamba_internal_state_drops += 1;
+            }
         }
         assert!(self.tracked_unbacked_tokens.is_none());
         self.tracked_unbacked_tokens = Some(0);
@@ -3874,6 +3896,19 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
     /// Make the per-path Mamba cap count and free host copies; decided at HiCache init.
     pub fn set_mamba_path_cap_counts_host(&mut self, enabled: bool) {
         self.mamba_path_cap_counts_host = enabled;
+    }
+
+    /// Back up internal device-only Mamba states whose Full KV is on host; decided at HiCache init.
+    pub fn set_mamba_backup_internal_state(&mut self, enabled: bool) {
+        self.mamba_backup_internal_state = enabled;
+    }
+
+    /// (dropped, backed up) internal device-only Mamba states with Full KV on host.
+    pub fn mamba_internal_state_counts(&self) -> (u64, u64) {
+        (
+            self.mamba_internal_state_drops,
+            self.mamba_internal_state_backups,
+        )
     }
 
     pub fn enable_storage(&self) -> bool {

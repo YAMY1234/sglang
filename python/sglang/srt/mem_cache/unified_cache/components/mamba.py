@@ -476,6 +476,21 @@ class MambaComponent(TreeComponent):
             # Keep the state live until the controller has attempted its host
             # backup. Session cursors advance after the resumed tombstone.
             return InternalStateBackup(node_id=x.id, num_tokens=1)
+        if (
+            self.tree_core.enable_hicache
+            and self.tree_core.is_write_back
+            and cd.host_value is None
+            and x.backuped
+        ):
+            # Full KV is already on host, so the backup copies the state only.
+            # A node pending under another write's ack keeps the drop.
+            if (
+                self.tree_core.mamba_backup_internal_state
+                and x.component_data[BASE_COMPONENT_TYPE].value is not None
+                and x.write_through_pending_id is None
+            ):
+                return InternalStateBackup(node_id=x.id, num_tokens=1, state_only=True)
+            self.tree_core.mamba_internal_state_drops += 1
         self.tree_core._evict_component_and_detach_lru(
             x,
             self,

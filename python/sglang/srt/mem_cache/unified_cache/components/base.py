@@ -91,6 +91,8 @@ class InternalStateBackup:
     node_id: NodeId
     # Host capacity required by the backup, in this component's pool units.
     num_tokens: int
+    # Mamba: Full KV is already on host, so the backup copies the state only.
+    state_only: bool = False
 
 
 @dataclasses.dataclass(frozen=True)

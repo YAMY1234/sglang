@@ -1070,6 +1070,9 @@ class Envs:
     SGLANG_HICACHE_MAMBA_BACKUP_BEFORE_DEMOTE = EnvBool(False)
     # Count those demotes (dropped or copied states) in the "HiCache host usage" line.
     SGLANG_LOG_MAMBA_DEMOTE_DROPS = EnvBool(False)
+    # write_back: a device-only Mamba state on an internal node whose KV is already
+    # on host is copied to host before its device eviction; 0 (default) drops it.
+    SGLANG_MAMBA_BACKUP_INTERNAL_STATE = EnvBool(False)
     # Mid-prefill chunk Mamba states donated to the radix tree: all (default),
     # none, or last (only the chunk after which one chunk of input remains).
     SGLANG_MAMBA_CHUNK_CKPT = EnvStr("all")
