@@ -89,6 +89,7 @@ from sglang.srt.speculative.dflash_draft_l2_prefetch import (
 )
 from sglang.srt.speculative.dflash_draft_ring import (
     DFlashDraftKVRing,
+    dflash_tail_lens,
     draft_kv_ring_enabled,
     draft_kv_ring_rows_per_req,
     draft_kv_ring_window_left,
@@ -557,6 +558,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         self.use_compact_draft_cache = self.draft_window_size is not None
         self.device = target_worker.device
         self.draft_kv_ring: Optional[DFlashDraftKVRing] = None
+        self._pp_tail_span: Optional[int] = None
 
         self._warned_sampling_fallback = False
         self._warned_lilicorr_eager = False
@@ -1068,6 +1070,18 @@ class DFlashWorkerV2(BaseSpecWorker):
             mem_pool=pool.maybe_get_custom_mem_pool(),
         )
         self.draft_model_runner.draft_kv_ring = self.draft_kv_ring
+        # SGLANG_DFLASH_PP_TAIL_AUX: every PP stage trims its aux captures to the
+        # span it derived from the draft config; it must be this ring's.
+        target = self.target_worker.model_runner.model
+        target = getattr(target, "language_model", None) or target
+        self._pp_tail_span = getattr(
+            getattr(target, "model", None), "dflash_pp_tail_span", None
+        )
+        if self._pp_tail_span is not None and self._pp_tail_span != self.draft_kv_ring.span:
+            raise ValueError(
+                "SGLANG_DFLASH_PP_TAIL_AUX: the stages trim aux rows to span "
+                f"{self._pp_tail_span}, but the draft KV ring keeps {self.draft_kv_ring.span}."
+            )
         set_draft_kv_ring(self.draft_kv_ring)
         if get_parallel().tp_rank == 0:
             logger.info(
@@ -3654,10 +3668,34 @@ class DFlashWorkerV2(BaseSpecWorker):
             device = next_token_ids.device
             # Enqueue metadata copies without waiting for the target prefill's
             # outstanding GPU work; the same stream orders their consumers.
-            ctx_lens = async_h2d(batch.extend_lens, dtype=torch.int32, device=device)
-            draft_seq_lens = async_h2d(
-                batch.prefix_lens, dtype=torch.int32, device=device
+            # SGLANG_DFLASH_PP_TAIL_AUX: the stages captured only each request's last
+            # min(extend, span) rows; materialize exactly those positions.
+            tail_lens = (
+                dflash_tail_lens(batch.extend_lens, self._pp_tail_span)
+                if self._pp_tail_span is not None
+                else None
             )
+            if tail_lens is not None and int(
+                logits_output.hidden_states.shape[0]
+            ) != sum(tail_lens):
+                tail_lens = None  # this batch captured every row
+            if tail_lens is None:
+                ctx_lens = async_h2d(
+                    batch.extend_lens, dtype=torch.int32, device=device
+                )
+                draft_seq_lens = async_h2d(
+                    batch.prefix_lens, dtype=torch.int32, device=device
+                )
+            else:
+                ctx_lens = async_h2d(tail_lens, dtype=torch.int32, device=device)
+                draft_seq_lens = async_h2d(
+                    [
+                        p + e - k
+                        for p, e, k in zip(batch.prefix_lens, batch.extend_lens, tail_lens)
+                    ],
+                    dtype=torch.int32,
+                    device=device,
+                )
 
             if batch.out_cache_loc is None:
                 raise RuntimeError(
@@ -3667,7 +3705,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 self.model_runner.prefill_attention_backend_str,
                 draft_seq_lens,
                 ctx_lens,
-                int(sum(batch.extend_lens)),
+                int(sum(batch.extend_lens if tail_lens is None else tail_lens)),
             )
             if self.draft_kv_ring is not None:
                 self.draft_kv_ring.record_floors(batch.reqs, batch.prefix_lens)
@@ -3692,6 +3730,11 @@ class DFlashWorkerV2(BaseSpecWorker):
                         ctx_lens,
                     )
                     if self.corrector is not None
+                    # No transfer carries the corrector's window (decode cold-starts it).
+                    and not (
+                        tail_lens is not None
+                        and get_disagg().disaggregation_mode == "prefill"
+                    )
                     else None
                 ),
             )

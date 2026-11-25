@@ -126,7 +126,11 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalDataItem,
     MultimodalInputs,
 )
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+from sglang.srt.model_executor.forward_batch_info import (
+    ForwardBatch,
+    ForwardMode,
+    PPProxyTensors,
+)
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
     is_in_breakable_cuda_graph,
@@ -3632,6 +3636,8 @@ class KimiK3LinearModel(nn.Module):
         self.config = config
         self.pp_group = get_parallel().pp_group
         self.dspark_layers_to_capture: Optional[list[int]] = None
+        # SGLANG_DFLASH_PP_TAIL_AUX: the draft KV ring span the captures are trimmed to.
+        self.dflash_pp_tail_span: Optional[int] = None
         self._dp_attention = is_dp_attention_enabled()
         # Whether K3's SP collective is enabled on this rank, which the layers'
         # stage declarations depend on: settled once, before any is built.
@@ -3784,16 +3790,23 @@ class KimiK3LinearModel(nn.Module):
         # final norm's, after the last layer). The bank's is the mixture the
         # next read would form, captured after the layer.
         captures_at_input = self.attn_bank is None
+        tail_idx = self._dflash_pp_tail_index(forward_batch, captures_at_input)
         if (
             self.dspark_layers_to_capture is not None
             and not self.pp_group.is_first_rank
         ):
             if "dspark_hidden_states" in pp_proxy_tensors.tensors:
-                aux_hidden_states.append(pp_proxy_tensors["dspark_hidden_states"])
+                inherited = pp_proxy_tensors["dspark_hidden_states"]
+                if tail_idx is not None and inherited.shape[0] != tail_idx.numel():
+                    raise RuntimeError(
+                        "SGLANG_DFLASH_PP_TAIL_AUX: the previous stage sent "
+                        f"{inherited.shape[0]} aux rows, this stage keeps {tail_idx.numel()}."
+                    )
+                aux_hidden_states.append(inherited)
             if self.start_layer - 1 in captures and not captures_at_input:
                 aux_hidden_states.append(
                     self._dspark_capture_stream(
-                        self.start_layer - 1, hidden_states, forward_batch
+                        self.start_layer - 1, hidden_states, forward_batch, tail_idx
                     )
                 )
         for i in range(self.start_layer, self.end_layer):
@@ -3815,7 +3828,9 @@ class KimiK3LinearModel(nn.Module):
                 and (i + 1 < self.end_layer or self.pp_group.is_last_rank)
             ):
                 aux_hidden_states.append(
-                    self._dspark_capture_stream(i, hidden_states, forward_batch)
+                    self._dspark_capture_stream(
+                        i, hidden_states, forward_batch, tail_idx
+                    )
                 )
         k3_sp_rs_overlap.check_consumed()
 
@@ -3875,11 +3890,36 @@ class KimiK3LinearModel(nn.Module):
             self.dspark_layers_to_capture is not None and self.pp_group.world_size == 1
         )
 
+    def _dflash_pp_tail_index(
+        self, forward_batch: ForwardBatch, captures_at_input: bool
+    ) -> Optional[torch.Tensor]:
+        """SGLANG_DFLASH_PP_TAIL_AUX: request-major indices of the rows the draft KV
+        ring keeps (the last min(extend, span) of each request), or None to capture
+        every row. Every stage decides from the same batch state."""
+        span = self.dflash_pp_tail_span
+        if (
+            span is None
+            or not self.dspark_layers_to_capture
+            or captures_at_input
+            or forward_batch.forward_mode != ForwardMode.EXTEND
+            or forward_batch.return_logprob
+            or forward_batch.extend_seq_lens_cpu is None
+            or get_is_capture_mode()
+        ):
+            return None
+        from sglang.srt.speculative.dflash_draft_ring import dflash_tail_index
+
+        idx = dflash_tail_index(forward_batch.extend_seq_lens_cpu, span)
+        return torch.from_numpy(idx).to(
+            forward_batch.positions.device, non_blocking=True
+        )
+
     def _dspark_capture_stream(
         self,
         layer_idx: int,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
+        tail_idx: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Stream value after `layer_idx` on the bank path: the pre-norm
         mixture its next consumer would compute (next layer's attention side;
@@ -3898,9 +3938,20 @@ class KimiK3LinearModel(nn.Module):
             nvb = _cdiv(self.end_layer, self.config.attn_res_block_size)
         bank = self.attn_bank.require()
         rows = _bank_rows(bank, hidden_states)
+        block_residual = (
+            bank.block_residual if rows is None else bank.block_residual[rows]
+        )
+        if tail_idx is not None:
+            if rows is not None:
+                raise RuntimeError(
+                    "SGLANG_DFLASH_PP_TAIL_AUX needs an unsharded attention-residual bank."
+                )
+            # Only the rows the draft KV ring keeps ride the PP proxy.
+            hidden_states = hidden_states.index_select(0, tail_idx)
+            block_residual = block_residual.index_select(0, tail_idx)
         mixed = aggregate_stream(
             hidden_states,
-            bank.block_residual if rows is None else bank.block_residual[rows],
+            block_residual,
             nvb,
             score_proj,
             score_norm,
@@ -4013,6 +4064,9 @@ class KimiK3LinearForCausalLM(nn.Module):
         # DFLASH target_layer_ids name layer outputs, which is what the DSPARK
         # taps already capture here, so reuse them without the usual +1 shift.
         self.set_dspark_layers_to_capture(layer_ids)
+
+    def set_dflash_pp_tail_span(self, span: int) -> None:
+        self.model.dflash_pp_tail_span = int(span)
 
     @torch.no_grad()
     def forward(
@@ -4621,6 +4675,10 @@ class KimiK3ForConditionalGeneration(nn.Module):
                 "DFLASH layer capture is not available in encoder-only mode"
             )
         self.language_model.set_dflash_layers_to_capture(layer_ids)
+
+    def set_dflash_pp_tail_span(self, span: int) -> None:
+        if self.language_model is not None:
+            self.language_model.set_dflash_pp_tail_span(span)
 
     def set_dspark_layers_to_capture(self, layer_ids: list[int]) -> None:
         if self.language_model is None:

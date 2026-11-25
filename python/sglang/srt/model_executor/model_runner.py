@@ -888,6 +888,35 @@ class ModelRunner:
 
             enable_batch_invariant_mode()
 
+    def _maybe_set_dflash_pp_tail_span(self) -> None:
+        """SGLANG_DFLASH_PP_TAIL_AUX: a pipelined DFLASH target captures only the rows
+        its drafting stage's KV ring keeps; every stage derives the span from the draft config."""
+        aux = self.spec_aux_config
+        if (
+            self.is_draft_worker
+            or not aux.dflash_use_aux_hidden_state
+            or aux.is_dspark
+            or self.pp_group.world_size == 1
+            or aux.draft_model_config is None
+            or not hasattr(self.model, "set_dflash_pp_tail_span")
+        ):
+            return
+        from sglang.srt.speculative.dflash_draft_ring import dflash_pp_tail_span
+
+        span = dflash_pp_tail_span(
+            aux.draft_model_config.hf_config,
+            num_draft_tokens=get_spec().speculative_num_draft_tokens,
+        )
+        if span is None:
+            return
+        self.model.set_dflash_pp_tail_span(span)
+        logger.info(
+            "SGLANG_DFLASH_PP_TAIL_AUX: PP stage %d captures the last min(extend, %d) "
+            "aux rows of each request.",
+            self.pp_group.rank_in_group,
+            span,
+        )
+
     def get_pp_proxy_dspark_hidden_size(self) -> int:
         # Graph recapture reaches this outside the draft PP scope, so read the
         # runner's own PP group.
@@ -1158,6 +1187,7 @@ class ModelRunner:
             dflash_target_layer_ids=self.spec_aux_config.dflash_target_layer_ids,
             is_dspark=self.spec_aux_config.is_dspark,
         )
+        self._maybe_set_dflash_pp_tail_span()
         # Resolve before building: backends read the pair off the runner while
         # they construct (the FlashInfer KV-access check).
         resolved = resolve_attention_backend_strs(model_runner=self)

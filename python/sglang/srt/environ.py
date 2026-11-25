@@ -2004,6 +2004,9 @@ class Envs:
     # window + verify-block rows instead of one row per target slot. On by default;
     # resolved at startup to off for drafts or backends it does not fit.
     SGLANG_DFLASH_DRAFT_KV_RING = EnvBool(True)
+    # Pipelined DFLASH prefill: every stage captures (and sends on the PP proxy) only the aux rows
+    # the draft KV ring keeps, the last min(extend, ring span) of each request; needs the ring.
+    SGLANG_DFLASH_PP_TAIL_AUX = EnvBool(False)
     # Under DCP, give every rank the whole draft KV ring and attend its own TP
     # heads locally (no DCP exchange in the draft). Needs the ring and a DCP-1 prefill.
     SGLANG_K31_DRAFT_NO_DCP = EnvBool(False)

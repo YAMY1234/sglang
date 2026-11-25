@@ -12,6 +12,8 @@ from sglang.kernels.ops.attention.mla_window_indices import mla_window_sparse_in
 from sglang.srt.speculative.dflash_draft_ring import (
     DFlashDraftKVRing,
     DraftKVRingStaging,
+    dflash_tail_index,
+    dflash_tail_lens,
     draft_kv_ring_pool_rows,
     draft_kv_ring_rows_per_req,
     draft_kv_ring_unsupported_reason,
@@ -106,6 +108,94 @@ def test_extend_keeps_only_the_readable_tail():
     assert bool(kept[-ring.span :].all())
     assert first[kept].unique().numel() == ring.span
     assert bool((second != 0).all())
+
+
+def _req_stub(rid, slot):
+    return type("R", (), {"rid": rid, "kv": type("K", (), {"req_pool_idx": slot})})()
+
+
+def _materialize(ring, pool, slots, prefix, extend, caps, tail):
+    """One extend's draft KV rows: every stage's aux captures, concatenated on the
+    drafting stage, mapped per row (as fc + kv_a are) into the ring."""
+    ends = [p + e for p, e in zip(prefix, extend)]
+    rows = dflash_tail_lens(extend, ring.span) if tail else list(extend)
+    positions = torch.cat(
+        [torch.arange(e - n, e) for e, n in zip(ends, rows)]
+    )
+    if tail:  # each PP stage keeps only these rows of its capture
+        idx = torch.from_numpy(dflash_tail_index(extend, ring.span))
+        caps = [c.index_select(0, idx) for c in caps]
+    x = torch.cat(caps, dim=-1)
+    locs = ring.extend_locs(
+        req_pool_indices=torch.tensor(slots),
+        positions=positions,
+        extend_lens=torch.tensor(rows),
+        seq_ends=torch.tensor(ends),
+    )
+    width = pool.shape[1]
+    pool[locs] = x[:, :width] * 0.5 - x[:, width : 2 * width] + positions[:, None]
+    return x
+
+
+def test_pp_tail_aux_keeps_ring_and_transfer_rows():
+    """SGLANG_DFLASH_PP_TAIL_AUX: capturing only each request's last
+    min(extend, span) aux rows on every PP stage leaves the drafting stage's ring
+    and its PD transfer rows exactly as capturing every row does: long and short
+    extends, a prefix hit, an extend of exactly span, and a chunked request whose
+    last chunk is shorter than span."""
+    torch.manual_seed(0)
+    width, ncap = 16, 6
+    full_ring, tail_ring = _ring(1, 8, "cpu"), _ring(1, 8, "cpu")
+    span = full_ring.span
+    rows = 1 + 8 * full_ring.rows_per_req
+    full = torch.zeros(rows, width, dtype=torch.float64)
+    tail = torch.zeros_like(full)
+    chunks = [
+        ([1, 4, 2, 6], [0, 9000, 0, 0], [3 * span + 17, span // 3, span, 16384]),
+        ([6], [16384], [span // 2]),
+    ]
+    for slots, prefix, extend in chunks:
+        for ring in (full_ring, tail_ring):
+            ring.record_floors([_req_stub(f"r{s}", s) for s in slots], prefix)
+        caps = [
+            torch.randn(sum(extend), 2 * width, dtype=torch.float64)
+            for _ in range(ncap)
+        ]
+        _materialize(full_ring, full, slots, prefix, extend, caps, tail=False)
+        x = _materialize(tail_ring, tail, slots, prefix, extend, caps, tail=True)
+        assert x.shape[0] == sum(min(e, span) for e in extend)
+        assert torch.equal(full[1:], tail[1:])
+    for slot, seq_len in [
+        (1, 3 * span + 17),
+        (4, 9000 + span // 3),
+        (2, span),
+        (6, 16384 + span // 2),
+    ]:
+        t = torch.from_numpy(full_ring.transfer_rows(slot, seq_len)).long()
+        assert torch.equal(
+            torch.from_numpy(tail_ring.transfer_rows(slot, seq_len)).long(), t
+        )
+        assert torch.equal(full[t], tail[t])
+    # The logits processor's last row of each request is the last tail row.
+    ext = chunks[0][2]
+    last_tail = torch.cumsum(torch.tensor(dflash_tail_lens(ext, span)), 0) - 1
+    idx = torch.from_numpy(dflash_tail_index(ext, span))
+    assert torch.equal(idx[last_tail], torch.cumsum(torch.tensor(ext), 0) - 1)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_pp_tail_aux_projection_rows_match():
+    """The drafting stage's fc on the tail rows alone gives the rows it gives in
+    the full extend (bf16 GEMM, the projector's 6 x 7168 -> 7168 shape class)."""
+    torch.manual_seed(0)
+    extend = [9000, 400, 6000]
+    span = 1031
+    x = torch.randn(sum(extend), 6 * 1024, dtype=torch.bfloat16, device="cuda")
+    fc = torch.nn.Linear(6 * 1024, 1024, bias=False).to("cuda", torch.bfloat16)
+    idx = torch.from_numpy(dflash_tail_index(extend, span)).cuda()
+    full = fc(x).index_select(0, idx)
+    tail = fc(x.index_select(0, idx))
+    torch.testing.assert_close(tail, full, rtol=1.6e-2, atol=1e-2)
 
 
 @pytest.mark.parametrize("seq_len", [5000, 300])

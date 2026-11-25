@@ -454,6 +454,12 @@ class LogitsMetadata:
         )
 
 
+def _aux_rows(aux_hidden_states: AuxHiddenStates) -> int:
+    if isinstance(aux_hidden_states, torch.Tensor):
+        return int(aux_hidden_states.shape[0])
+    return int(aux_hidden_states[0].shape[0]) if len(aux_hidden_states) else 0
+
+
 class LogitsProcessor(nn.Module):
     def __init__(
         self,
@@ -724,7 +730,15 @@ class LogitsProcessor(nn.Module):
             pruned_states = hidden_states[last_index]
             if hidden_states_before_norm is not None:
                 pruned_states_before_norm = hidden_states_before_norm[last_index]
-            if aux_hidden_states is not None:
+            if (
+                aux_hidden_states is not None
+                and logits_metadata.capture_hidden_mode.is_full()
+                and _aux_rows(aux_hidden_states) < int(hidden_states.shape[0])
+            ):
+                # SGLANG_DFLASH_PP_TAIL_AUX: only the draft ring's tail rows were
+                # captured; FULL capture returns them unpruned, so skip the pruning.
+                pass
+            elif aux_hidden_states is not None:
                 aux_pruned_states = (
                     aux_hidden_states[last_index]
                     if isinstance(aux_hidden_states, torch.Tensor)

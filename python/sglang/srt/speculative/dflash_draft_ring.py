@@ -150,6 +150,36 @@ def dspark_draft_kv_ring_rows_per_req(
     return (-(-span // page_size) + 2) * page_size
 
 
+def dflash_tail_lens(extend_lens, span: int) -> List[int]:
+    """Rows of each request's extend that its draft KV ring keeps: the last
+    ``min(extend, span)`` (DFlashDraftKVRing.extend_locs sends the rest to the sink)."""
+    return [min(int(e), int(span)) for e in extend_lens]
+
+
+def dflash_tail_index(extend_lens, span: int) -> np.ndarray:
+    """Request-major indices of those rows within one extend's tokens."""
+    parts, base = [], 0
+    for e in extend_lens:
+        e = int(e)
+        k = min(e, int(span))
+        parts.append(np.arange(base + e - k, base + e, dtype=np.int64))
+        base += e
+    return np.concatenate(parts) if parts else np.zeros(0, dtype=np.int64)
+
+
+def dflash_pp_tail_span(draft_hf_config, *, num_draft_tokens: int) -> Optional[int]:
+    """The ring span a pipelined DFLASH prefill trims its captured aux rows to
+    (SGLANG_DFLASH_PP_TAIL_AUX), or None when the trim is off. A DCP-1 ring, as on a
+    TP-1 PD prefill; the drafting stage checks it against its ring."""
+    if not envs.SGLANG_DFLASH_PP_TAIL_AUX.get() or not draft_kv_ring_enabled():
+        return None
+    return draft_kv_ring_rows_per_req(
+        window_left=draft_kv_ring_window_left(draft_hf_config),
+        block_size=int(num_draft_tokens),
+        dcp_size=1,
+    )
+
+
 def draft_kv_ring_geometry(
     spec_algorithm, draft_hf_config, *, block_size: int, dcp_size: int, page_size: int
 ) -> Tuple[int, int]:
