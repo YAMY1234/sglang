@@ -16,8 +16,9 @@ from dataclasses import dataclass
 import torch
 import triton
 import triton.language as tl
-from flashinfer import top_k as _flashinfer_top_k
 from torch import Tensor
+
+from sglang.kernels.ops.sampling.topk import radix_topk
 
 
 @dataclass(frozen=True)
@@ -527,12 +528,8 @@ def build_uno_tree_proposal(
 
     candidate_shape = (batch_size, num_depths, candidate_top_k)
     flat_logits = draft_logits.contiguous().view(batch_size * num_depths, vocab_size)
-    flat_top_values, flat_top_token_ids = _flashinfer_top_k(
-        flat_logits,
-        candidate_top_k,
-        sorted=True,
-        deterministic=False,
-    )
+    # Radix select, not SM10x's default clusters kernel (see uno_utils' compact support).
+    flat_top_values, flat_top_token_ids = radix_topk(flat_logits, candidate_top_k)
     top_values = flat_top_values.view(candidate_shape)
     top_token_ids = buffer("top_token_ids", candidate_shape, torch.long)
     top_token_ids.copy_(flat_top_token_ids.view(candidate_shape))
