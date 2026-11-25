@@ -52,7 +52,13 @@ from sglang.srt.mem_cache.deepseek_v4_compress_state import CompressStatePool
 from sglang.srt.mem_cache.device_pool_info import DevicePoolInfo
 from sglang.srt.mem_cache.hicache_storage import PoolName
 from sglang.srt.mem_cache.memory_pool import KVCache
-from sglang.srt.runtime_context import get_exec, get_platform, get_spec
+from sglang.srt.runtime_context import (
+    get_disagg,
+    get_exec,
+    get_platform,
+    get_server_args,
+    get_spec,
+)
 from sglang.srt.utils import ceil_div, is_gfx95_supported, is_hip
 
 logger = logging.getLogger(__name__)
@@ -1340,6 +1346,9 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             swa_storage,
             self.needs_paged_swa_allocator,
         )
+        self.swa_e4m3: Optional[List[torch.Tensor]] = None
+        if envs.SGLANG_OPT_DSV41_SWA_E4M3_COPY.get() and not is_draft_worker:
+            self._init_swa_e4m3_copy(device)
         self.full_size = full_size
         self.kv_source_layers = list(kv_source_layers)
         self.sources_by_ratio = collect_sources_by_ratio(
@@ -2172,6 +2181,66 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         """Regions outside the compressed-KV layout that HiCache mirrors too."""
         return ()
 
+    def _init_swa_e4m3_copy(self, device: str) -> None:
+        """One (pages, rows per page, 512) uint8 copy per paged V4.1 fp8 SWA layer; see
+        SGLANG_OPT_DSV41_SWA_E4M3_COPY."""
+        why = None
+        if (
+            self.swa_kv_pool is None
+            or self.request_window is not None
+            or self.swa_req_ring_size is not None
+            or self.uniform_fp8
+            or self.kv_layout.encoding is not KVLayout.V41
+            or not self.kv_layout.is_interleaved
+            or _is_hip
+        ):
+            why = "needs the paged, interleaved V4.1 fp8 SWA pool (CUDA)"
+        elif get_disagg().disaggregation_mode == "decode":
+            why = "PD decode receives SWA rows without the store kernels"
+        elif get_server_args().enable_hierarchical_cache:
+            why = "HiCache loads SWA rows back without the store kernels"
+        if why is not None:
+            logger.warning("SGLANG_OPT_DSV41_SWA_E4M3_COPY is off: %s", why)
+            return
+        bytes_per_token = self.kv_layout.bytes_per_token
+        copies = []
+        with (
+            torch.cuda.use_mem_pool(self.custom_mem_pool)
+            if self.custom_mem_pool
+            else nullcontext()
+        ):
+            for buf in self.swa_kv_pool.kv_buffer:
+                assert buf.ndim == 2 and buf.shape[1] % bytes_per_token == 0
+                copies.append(
+                    torch.zeros(
+                        (buf.shape[0], buf.shape[1] // bytes_per_token, 512),
+                        dtype=torch.uint8,
+                        device=device,
+                    )
+                )
+        self.swa_e4m3 = copies
+        logger.info(
+            "DSV4 SWA e4m3 copy: %d layers x %s, %.2f GB",
+            len(copies),
+            tuple(copies[0].shape),
+            sum(c.numel() for c in copies) / 1e9,
+        )
+
+    def get_swa_e4m3_buffer(self, layer_id: int) -> Optional[torch.Tensor]:
+        """The layer's SWA e4m3 copy as the decode reads it, (pages, page_size, 1, 512) with the
+        SWA cache's rows per page; None when SGLANG_OPT_DSV41_SWA_E4M3_COPY is off."""
+        if self.swa_e4m3 is None:
+            return None
+        copy = self.swa_e4m3[self._swa_local_layer_id(layer_id)]
+        return copy[:, : self.swa_kv_pool.page_size].unsqueeze(2)
+
+    def _swa_e4m3_store_target(self, layer_id: int) -> Optional[torch.Tensor]:
+        return (
+            None
+            if self.swa_e4m3 is None
+            else self.swa_e4m3[self._swa_local_layer_id(layer_id)]
+        )
+
     def get_swa_raw_buffer(self, layer_id: int) -> torch.Tensor:
         if self.request_window is not None:
             return self.request_window.buffer(self._swa_local_layer_id(layer_id))
@@ -2384,6 +2453,10 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         swa_loc: torch.Tensor,
         cache_k: torch.Tensor,
     ) -> None:
+        assert self.swa_e4m3 is None, (
+            "SGLANG_OPT_DSV41_SWA_E4M3_COPY: the SWA rows are written by the fused norm/RoPE "
+            "store kernels only"
+        )
         return fused_store_cache(
             input=cache_k,
             cache=self.get_swa_raw_buffer(layer_id),
@@ -2428,6 +2501,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             page_size=self.swa_page_size,
             layout=self.kv_layout,
             q=q,
+            e4m3_cache=self._swa_e4m3_store_target(layer_id),
         )
 
     def set_swa_key_buffer_radix_fused_qkv_norm(
@@ -2460,6 +2534,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             self.get_swa_raw_buffer(layer_id),
             self.swa_page_size,
             self.kv_layout,
+            e4m3_cache=self._swa_e4m3_store_target(layer_id),
         )
 
     def set_unified_key_buffer_radix_fused_norm_rope(

@@ -676,6 +676,12 @@ class Envs:
     # MegaAttention reads fork the attention mix's side stream at the read (beside the q/kv
     # projections) instead of deferring it to the attention core. Scheduling only.
     SGLANG_OPT_DSV41_ATTN_STATS_FORK_AT_READ = EnvBool(False)
+    # V4.1 fp8 SWA cache: keep a second copy of every paged SWA row dequantized and rounded to
+    # e4m3 (written by the SWA store kernels), which FlashMLA's fp8 decode reads instead of
+    # dequantizing the window in every verify row of every step. Same attention outputs;
+    # costs 512 B per SWA slot per layer. Not with PD decode or HiCache (rows they land in the
+    # SWA pool have no e4m3 copy).
+    SGLANG_OPT_DSV41_SWA_E4M3_COPY = EnvBool(False)
     # DSpark draft forward: the bonus-into-block-ids write and the positions / cache-loc
     # column slices in one Triton launch instead of three torch copies. Same values.
     SGLANG_OPT_DSPARK_FUSED_DRAFT_INPUTS = EnvBool(False)

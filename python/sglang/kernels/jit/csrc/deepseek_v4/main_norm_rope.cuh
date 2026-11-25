@@ -285,6 +285,8 @@ struct FusedKNormRopeFlashMLAParams {
   int64_t q_stride_batch = 0;
   int64_t q_stride_head = 0;
   uint32_t num_q_heads = 0;
+  // V4.1 fp8 layout: also store each row's e4m3 copy here ((npages, kPageBytes / 528, 512) uint8), or nullptr
+  uint8_t* __restrict__ e4m3cache = nullptr;
 };
 
 // The V4.1 K RoPE with its fma pinned, so the two K kernels below round it the same way.
@@ -405,7 +407,11 @@ SGL_DEVICE void k_norm_rope_flashmla_row(const FusedKNormRopeFlashMLAParams& par
       rounded = cast<fp32x2_t>(cast<Packed>(v41_rope_pair(x_real, x_imag, freq_real, freq_imag)));
     }
     const float v[2] = {rounded.x, rounded.y};
-    return deepseek_v4::v41::store_row<kLayout>(row.data, row.scale, tx, v);
+    uint8_t* e4m3_row = nullptr;
+    if constexpr (kLayout == deepseek_v4::KVLayout::V41_NEW) {   // the interleaved V4.1 fp8 rows FlashMLA reads
+      if (params.e4m3cache != nullptr) e4m3_row = Paged::e4m3_row(params.e4m3cache, out_loc);
+    }
+    return deepseek_v4::v41::store_row<kLayout>(row.data, row.scale, tx, v, e4m3_row);
   }
 
   const auto value_ptr = row.data;
@@ -706,7 +712,11 @@ __global__ __launch_bounds__(kFusedKV41WarpsPerCTA* device::kWarpThreads) void f
   if (out_loc < 0) return;
   PDLTriggerSecondary<kUsePDL>();
   const auto row = Paged::row(params.kvcache, out_loc);
-  deepseek_v4::v41::store_row<kLayout>(row.data, row.scale, lane_id, v);
+  uint8_t* e4m3_row = nullptr;
+  if constexpr (kLayout == deepseek_v4::KVLayout::V41_NEW) {   // the interleaved V4.1 fp8 rows FlashMLA reads
+    if (params.e4m3cache != nullptr) e4m3_row = Paged::e4m3_row(params.e4m3cache, out_loc);
+  }
+  deepseek_v4::v41::store_row<kLayout>(row.data, row.scale, lane_id, v, e4m3_row);
 }
 
 template <
@@ -742,6 +752,20 @@ struct FusedKNormRopeFlashMLAKernel {
     forward_impl<false>(kv, kv_weight, freqs_cis, positions, out_loc, kvcache, eps, nullptr);
   }
 
+  /// `forward` that also stores each V4.1 fp8 row's e4m3 copy at `e4m3cache` (a device address; see
+  /// `FusedKNormRopeFlashMLAParams::e4m3cache`).
+  static void forward_e4m3(
+      const tvm::ffi::TensorView kv,
+      const tvm::ffi::TensorView kv_weight,
+      const tvm::ffi::TensorView freqs_cis,
+      const tvm::ffi::TensorView positions,
+      const tvm::ffi::TensorView out_loc,
+      const tvm::ffi::TensorView kvcache,
+      float eps,
+      int64_t e4m3cache) {
+    forward_impl<false>(kv, kv_weight, freqs_cis, positions, out_loc, kvcache, eps, nullptr, e4m3cache);
+  }
+
   /// `forward` with the same tokens' query heads `q` (B, H, kHeadDim) roped in place (ROCm).
   static void forward_with_q(
       const tvm::ffi::TensorView kv,
@@ -765,7 +789,8 @@ struct FusedKNormRopeFlashMLAKernel {
       const tvm::ffi::TensorView out_loc,
       const tvm::ffi::TensorView kvcache,
       float eps,
-      const tvm::ffi::TensorView* q) {
+      const tvm::ffi::TensorView* q,
+      int64_t e4m3cache = 0) {
     using namespace host;
 
     auto B = SymbolicSize{"batch_size"};
@@ -814,6 +839,7 @@ struct FusedKNormRopeFlashMLAKernel {
         .batch_size = batch_size,
         .eps = eps,
     };
+    params.e4m3cache = reinterpret_cast<uint8_t*>(e4m3cache);
     if constexpr (kRopeQ) {
       auto H = SymbolicSize{"num_q_heads"};
       TensorMatcher({B, H, kHeadDim})  //
@@ -876,6 +902,25 @@ struct FusedQKVNormFlashMLAKernel {
       const tvm::ffi::TensorView y,
       const tvm::ffi::TensorView q,
       const tvm::ffi::TensorView sf) {
+    forward_e4m3(kv, kv_weight, freqs_cis, positions, out_loc, kvcache, eps, q_lora, q_weight, q_eps, y, q, sf, 0);
+  }
+
+  /// `forward` that also stores each V4.1 fp8 K row's e4m3 copy at `e4m3cache` (a device address, 0: none).
+  static void forward_e4m3(
+      const tvm::ffi::TensorView kv,
+      const tvm::ffi::TensorView kv_weight,
+      const tvm::ffi::TensorView freqs_cis,
+      const tvm::ffi::TensorView positions,
+      const tvm::ffi::TensorView out_loc,
+      const tvm::ffi::TensorView kvcache,
+      float eps,
+      const tvm::ffi::TensorView q_lora,
+      const tvm::ffi::TensorView q_weight,
+      float q_eps,
+      const tvm::ffi::TensorView y,
+      const tvm::ffi::TensorView q,
+      const tvm::ffi::TensorView sf,
+      int64_t e4m3cache) {
     using namespace host;
 
     auto B = SymbolicSize{"batch_size"};
@@ -900,7 +945,7 @@ struct FusedQKVNormFlashMLAKernel {
     RuntimeCheck(batch_size < kFusedKV41MinTokens && rows > 0, "fused q/kv norm: decode-sized batches only");
     RuntimeCheck(q_lora.stride(0) % 8 == 0, "q_lora rows are read as 16-byte packs");
     RuntimeCheck(sf.size(0) == int64_t(kQNormGroups) * div_ceil(rows, 128u) * 128, "scale buffer size");
-    const auto params = FusedKNormRopeFlashMLAParams{
+    auto params = FusedKNormRopeFlashMLAParams{
         .kv = kv.data_ptr(),
         .kv_weight = kv_weight.data_ptr(),
         .freqs_cis = static_cast<const float*>(freqs_cis.data_ptr()),
@@ -911,6 +956,7 @@ struct FusedQKVNormFlashMLAKernel {
         .batch_size = batch_size,
         .eps = eps,
     };
+    params.e4m3cache = reinterpret_cast<uint8_t*>(e4m3cache);
     const auto q_params = QNormMxfp8Params{
         .x = static_cast<const bf16_t*>(q_lora.data_ptr()),
         .weight = static_cast<const bf16_t*>(q_weight.data_ptr()),

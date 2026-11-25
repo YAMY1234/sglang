@@ -4507,6 +4507,24 @@ class DeepseekV4AttnBackend(
             return cached
         return self._swa_loc_int32(out_cache_loc)
 
+    def _swa_e4m3_for_decode(self, token_to_kv_pool, layer_id: int):
+        """The SWA e4m3 copy for FlashMLA's fp8 decode (SGLANG_OPT_DSV41_SWA_E4M3_COPY), or None."""
+        copy = token_to_kv_pool.get_swa_e4m3_buffer(layer_id)
+        if copy is None:
+            return None
+        from sglang.kernels.ops.attention.flash_mla_interface import (
+            mega_decode_takes_kv_e4m3,
+        )
+
+        if not mega_decode_takes_kv_e4m3():
+            raise RuntimeError(
+                "SGLANG_OPT_DSV41_SWA_E4M3_COPY needs a FlashMLA whose fp8 decode takes kv_e4m3"
+            )
+        if not getattr(self, "_swa_e4m3_logged", False):
+            self._swa_e4m3_logged = True
+            logger.info("MegaAttention decode: SWA rows from the e4m3 copy (no SWA dequant)")
+        return copy
+
     def store_cache(
         self, layer_id: int, swa_k: torch.Tensor, forward_batch: ForwardBatch
     ) -> None:
@@ -4719,6 +4737,7 @@ class DeepseekV4AttnBackend(
                     q_head_scale=getattr(layer, "mega_q_head_scale", None)
                     if q.dtype == torch.float8_e4m3fn
                     else None,
+                    swa_k_cache_e4m3=self._swa_e4m3_for_decode(token_to_kv_pool, layer_id),
                 )
 
             if (

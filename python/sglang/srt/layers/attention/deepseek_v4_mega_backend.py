@@ -168,6 +168,7 @@ class DeepseekV4MegaAttnBackend(DeepseekV4AttnBackend):
         extra_indices: Optional[torch.Tensor],
         extra_topk_lengths: Optional[torch.Tensor],
         q_head_scale: Optional[torch.Tensor] = None,
+        swa_k_cache_e4m3: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         from sglang.kernels.ops.attention import flash_mla_interface
 
@@ -185,6 +186,7 @@ class DeepseekV4MegaAttnBackend(DeepseekV4AttnBackend):
             extra_topk_length=extra_topk_lengths,
             use_legacy=not self._swa_interleaved,
             q_head_scale=q_head_scale,
+            kv_e4m3=swa_k_cache_e4m3 if q_head_scale is not None else None,
         )
         return data, scale
 

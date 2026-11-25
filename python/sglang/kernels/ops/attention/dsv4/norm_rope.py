@@ -98,6 +98,7 @@ def _jit_main_k_norm_rope_flashmla_module(
         cuda_files=["deepseek_v4/main_norm_rope.cuh"],
         cuda_wrappers=[
             ("forward", f"FusedKNormRopeFlashMLAKernel<{args}>::forward"),
+            ("forward_e4m3", f"FusedKNormRopeFlashMLAKernel<{args}>::forward_e4m3"),
         ],
     )
 
@@ -120,6 +121,7 @@ def _jit_fused_qkv_norm_flashmla_module(
         cuda_files=["deepseek_v4/main_norm_rope.cuh"],
         cuda_wrappers=[
             ("forward", f"FusedQKVNormFlashMLAKernel<{args}>::forward"),
+            ("forward_e4m3", f"FusedQKVNormFlashMLAKernel<{args}>::forward_e4m3"),
         ],
     )
 
@@ -349,9 +351,14 @@ def fused_k_norm_rope_flashmla(
     page_size: int,
     layout: Union[KVLayout, str] = KVLayout.V4,
     q: Optional[torch.Tensor] = None,
+    e4m3_cache: Optional[torch.Tensor] = None,
 ) -> None:
     """RMSNorm + RoPE ``kv`` and write it into the ``layout`` paged FlashMLA
-    cache at ``out_loc``."""
+    cache at ``out_loc``. ``e4m3_cache`` (V4.1 fp8 layout, CUDA): also write each
+    row dequantized and rounded to e4m3 there, (pages, rows per page, 512) uint8."""
+    assert e4m3_cache is None or (
+        not _is_xpu and q is None
+    ), "the e4m3 copy is written by the CUDA K kernel only"
     layout = KVLayout.parse(layout)
     freqs_real = torch.view_as_real(freqs_cis).flatten(-2)
     head_dim = kv.shape[-1]
@@ -374,7 +381,13 @@ def fused_k_norm_rope_flashmla(
         module = _jit_main_k_norm_rope_flashmla_module(
             kv.dtype, head_dim, rope_dim, page_size, layout
         )
-        module.forward(kv, kv_weight, freqs_real, positions, out_loc, kvcache, eps)
+        if e4m3_cache is not None:
+            module.forward_e4m3(
+                kv, kv_weight, freqs_real, positions, out_loc, kvcache, eps,
+                e4m3_cache.data_ptr(),
+            )
+        else:
+            module.forward(kv, kv_weight, freqs_real, positions, out_loc, kvcache, eps)
 
 
 def fused_qkv_norm_flashmla(
@@ -390,6 +403,7 @@ def fused_qkv_norm_flashmla(
     kvcache: torch.Tensor,
     page_size: int,
     layout: Union[KVLayout, str],
+    e4m3_cache: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """``fused_k_norm_rope_flashmla`` (V4.1 layouts, < 2048 tokens) and
     ``rmsnorm_mxfp8(q_lora, q_weight, q_eps)`` in one launch; returns the latter's
@@ -403,8 +417,14 @@ def fused_qkv_norm_flashmla(
     module = _jit_fused_qkv_norm_flashmla_module(
         kv.dtype, kv.shape[-1], freqs_real.shape[-1], page_size, layout
     )
-    module.forward(
-        kv, kv_weight, freqs_real, positions, out_loc, kvcache, eps,
-        q_lora, q_weight, q_eps, y, q, s,
-    )
+    if e4m3_cache is not None:
+        module.forward_e4m3(
+            kv, kv_weight, freqs_real, positions, out_loc, kvcache, eps,
+            q_lora, q_weight, q_eps, y, q, s, e4m3_cache.data_ptr(),
+        )
+    else:
+        module.forward(
+            kv, kv_weight, freqs_real, positions, out_loc, kvcache, eps,
+            q_lora, q_weight, q_eps, y, q, s,
+        )
     return y, q, s

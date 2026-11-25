@@ -149,6 +149,13 @@ struct PagedKV {
     uint8_t* page = cache + page_of(loc) * kPageBytes;
     return {page + slot_of(loc) * kDataStride, page + kScaleBase + slot_of(loc) * kScaleStride};
   }
+  /// Token `loc`'s 512 B row in an e4m3 copy of this cache with the same rows per page
+  /// (kPageBytes / kBytesPerToken): see store_row_fp8's `e4m3_row`.
+  template <typename LocT>
+  SGL_DEVICE static uint8_t* e4m3_row(uint8_t* copy, LocT loc) {
+    static_assert(Traits::kInterleaved && kPageBytes % Traits::kBytesPerToken == 0);
+    return copy + (page_of(loc) * (kPageBytes / Traits::kBytesPerToken) + slot_of(loc)) * 512;
+  }
 };
 
 namespace v41 {
@@ -172,8 +179,12 @@ SGL_DEVICE float vec_amax(const float (&v)[kVecSize]) {
 /// `scale_row` its 16 scale bytes. Scale `2^ceil(log2(max(amax / 448, 1e-4)))` stored as the
 /// ue8m0 byte, payload `e4m3(x / scale)` rounded to nearest even (|x / scale| <= 448, so it
 /// never saturates).
+/// `e4m3_row` (optional): also store the row dequantized and rounded once, e4m3(payload x scale) round to
+/// nearest even and saturating, the values FlashMLA's fp8 decode dequantizes it to; the decode reads that copy
+/// of the SWA window instead of dequantizing it in every verify row of every step.
 template <uint32_t kVecSize>
-SGL_DEVICE void store_row_fp8(uint8_t* data_row, uint8_t* scale_row, uint32_t tx, const float (&v)[kVecSize]) {
+SGL_DEVICE void store_row_fp8(
+    uint8_t* data_row, uint8_t* scale_row, uint32_t tx, const float (&v)[kVecSize], uint8_t* e4m3_row = nullptr) {
   using namespace device;
   constexpr uint32_t kTileLanes = KVLayoutTraits<KVLayout::V41>::kTileSize / kVecSize;
   static_assert(kVecSize % 2 == 0 && kTileLanes >= 1 && (kTileLanes & (kTileLanes - 1)) == 0);
@@ -199,6 +210,19 @@ SGL_DEVICE void store_row_fp8(uint8_t* data_row, uint8_t* scale_row, uint32_t tx
   out.store(data_row, tx);
   // Every lane of the tile holds the exponent; they all store the same byte.
   scale_row[tx / kTileLanes] = static_cast<uint8_t>(exponent);
+#ifndef USE_ROCM
+  if (e4m3_row != nullptr) {
+    // payload x 2^(exponent - 127) is exact in fp32 (exponent >= 114), so this is the single RN of the exact value
+    const float scale = __uint_as_float(static_cast<uint32_t>(exponent) << 23);
+    AlignedVector<fp8x2_e4m3_t, kVecSize / 2> copy;
+#pragma unroll
+    for (uint32_t i = 0; i < kVecSize / 2; ++i) {
+      const float2 p = static_cast<float2>(out[i]);
+      copy[i] = fp8x2_e4m3_t{fp32x2_t{fminf(fmaxf(p.x * scale, -448.0f), 448.0f), fminf(fmaxf(p.y * scale, -448.0f), 448.0f)}};
+    }
+    copy.store(e4m3_row, tx);
+  }
+#endif
 }
 
 /// V4.1 fp4 row: one e4m3 scale per 16-element tile. `data_row` is the token's 256 B,
@@ -240,10 +264,11 @@ SGL_DEVICE void store_row_fp4(uint8_t* data_row, uint8_t* scale_row, uint32_t tx
 /// Dispatch on the layout for a 512-wide row held as `kVecSize` consecutive fp32 per thread.
 /// V4 has no row helper here: its writers keep their nope / RoPE split code.
 template <KVLayout kLayout, uint32_t kVecSize>
-SGL_DEVICE void store_row(uint8_t* data_row, uint8_t* scale_row, uint32_t tx, const float (&v)[kVecSize]) {
+SGL_DEVICE void store_row(
+    uint8_t* data_row, uint8_t* scale_row, uint32_t tx, const float (&v)[kVecSize], uint8_t* e4m3_row = nullptr) {
   static_assert(kLayout != KVLayout::V4, "V4 rows are written by the caller");
   if constexpr (kv_encoding(kLayout) == KVLayout::V41) {
-    store_row_fp8(data_row, scale_row, tx, v);
+    store_row_fp8(data_row, scale_row, tx, v, e4m3_row);
   } else if constexpr (kLayout == KVLayout::UNIFORM_FP8) {
     device::AlignedVector<fp8x2_e4m3_t, kVecSize / 2> out;
 #pragma unroll

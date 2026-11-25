@@ -267,9 +267,11 @@ def flash_mla_mega_decode(
     rms_norm_eps: float = 0.0,
     use_legacy: bool = True,
     q_head_scale: Optional[torch.Tensor] = None,
+    kv_e4m3: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """MegaAttention decode over a paged cache: (out_fp8, out_sf, lse). An E4M3 ``q``
-    with ``q_head_scale`` (fp32 [heads], q = Q / scale) runs FlashMLA's fp8 decode."""
+    with ``q_head_scale`` (fp32 [heads], q = Q / scale) runs FlashMLA's fp8 decode, which
+    reads the SWA rows from ``kv_e4m3`` when given (see mega_decode_takes_kv_e4m3)."""
     if q_head_scale is not None:
         return _mega_decode_fp8_q(
             q,
@@ -287,6 +289,7 @@ def flash_mla_mega_decode(
             rms_norm_eps,
             use_legacy,
             q_head_scale,
+            kv_e4m3,
         )
     return _mega.decode(
         token_positions=positions,
@@ -326,6 +329,16 @@ _TAKES_Q_HEAD_SCALE: Optional[bool] = None
 
 
 @lru_cache(maxsize=1)
+def mega_decode_takes_kv_e4m3() -> bool:
+    """Whether the installed FlashMLA's fp8 decode op takes ``kv_e4m3`` (an e4m3 copy of
+    the SWA cache it reads instead of dequantizing it)."""
+    from flash_mla._loader import get_ops
+
+    op = get_ops(False).fused_norm_rope_attn_rope_cast_decode
+    return any(a.name == "kv_e4m3" for a in op.default._schema.arguments)
+
+
+@lru_cache(maxsize=1)
 def mega_prefill_takes_q_head_scale() -> bool:
     """Whether the installed FlashMLA's prefill op takes ``q_head_scale`` (an E4M3 q with
     static per-head scales, over the e4m3 kv workspace)."""
@@ -352,8 +365,10 @@ def _mega_decode_fp8_q(
     rms_norm_eps,
     use_legacy,
     q_head_scale,
+    kv_e4m3=None,
 ):
     # The op directly: the installed wheel's Python wrapper may predate q_head_scale.
+    # kv_e4m3: `kv` dequantized and rounded to e4m3 once (SGLANG_OPT_DSV41_SWA_E4M3_COPY).
     from flash_mla._loader import get_ops
 
     global _FP8_Q_LOGGED
@@ -389,4 +404,5 @@ def _mega_decode_fp8_q(
         p["round_sf"],
         p["use_packed_ue8m0"],
         q_head_scale,
+        *(() if kv_e4m3 is None else (kv_e4m3,)),
     )
