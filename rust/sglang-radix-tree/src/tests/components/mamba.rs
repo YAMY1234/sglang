@@ -1262,6 +1262,201 @@ fn internal_mamba_resume_ignores_a_removed_node_and_repairs_the_cursor() {
     tc.sanity_check(&[], &[]);
 }
 
+// An internal node whose Full KV is on host but whose Mamba state is device-only, at
+// the Mamba LRU tail. `via_split` is the fork point: a request diverging inside a
+// node whose Full KV is on host splits off a backed prefix with no state, then
+// donates its state there, which write_back does not back up at insert.
+fn backed_internal_state_fixture(
+    via_split: bool,
+    backup: bool,
+) -> (UnifiedTreeCore<Vec<i64>>, NodeId, NodeId) {
+    let (mut tc, internal, leaf) = if via_split {
+        let mut tc = mamba_core(/* page_size = */ 1);
+        tc.set_hicache_enabled();
+        tc.is_write_back = true;
+        tc.insert(&insert_params_mamba(&vec![1, 2], &[10, 11], Some(8)));
+        let old = tc
+            .match_prefix(&match_params(&vec![1, 2]))
+            .best_match_node_id;
+        let (full, mut transfers) = tc.build_backup_spec(old).unwrap();
+        transfers.get_mut(&MAMBA).unwrap()[0].host_indices = Some(Tensor::from_slice(&[80i64]));
+        tc.commit_backup(old, &full + 100, transfers).unwrap();
+        tc.mark_write_through_pending(vec![old], old).unwrap();
+        tc.finish_write_through(vec![old], old).unwrap();
+        tc.insert(&insert_params_mamba(&vec![1, 3], &[10, 12], Some(9)));
+        let fork_idx = tc.arena.node(tc.arena.resolve(old).unwrap()).parent();
+        let fork = tc.arena.node(fork_idx).id;
+        assert!(tc.arena.node(fork_idx).backuped());
+        assert!(!tc.arena.has_device_value(fork_idx, MAMBA));
+        tc.insert(&insert_params_mamba(&vec![1], &[10], Some(7)));
+        let matched = tc.match_prefix(&match_params(&vec![1]));
+        assert_eq!(matched.best_match_node_id, fork);
+        for key in [vec![1, 2], vec![1, 3]] {
+            tc.match_prefix(&match_params(&key));
+        }
+        (tc, fork, old)
+    } else {
+        let (mut tc, parent, leaf) = internal_write_back_fixture();
+        tc.commit_backup(parent, Tensor::from_slice(&[110i64]), HashMap::new())
+            .unwrap();
+        tc.mark_write_through_pending(vec![parent], parent).unwrap();
+        tc.finish_write_through(vec![parent], parent).unwrap();
+        (tc, parent, leaf)
+    };
+    tc.set_mamba_backup_internal_state(backup);
+    let node = tc.arena.node(tc.arena.resolve(internal).unwrap());
+    assert!(!node.is_leaf() && node.backuped() && node.has_device_value(FULL));
+    assert!(node.device_value(MAMBA).equal(&Tensor::from_slice(&[7i64])));
+    assert!(!node.has_host_value(MAMBA));
+    (tc, internal, leaf)
+}
+
+// Full KV stays on both tiers; the state left the device, to `host_state` or nowhere.
+fn assert_internal_state_evicted(
+    tc: &UnifiedTreeCore<Vec<i64>>,
+    internal: NodeId,
+    host_state: Option<i64>,
+) {
+    let node = tc.arena.node(tc.arena.resolve(internal).unwrap());
+    assert!(node.device_value(FULL).equal(&Tensor::from_slice(&[10i64])));
+    assert!(node.host_value(FULL).equal(&Tensor::from_slice(&[110i64])));
+    assert!(!node.has_device_value(MAMBA));
+    assert_eq!(
+        node.try_host_value(MAMBA).map(|value| value.int64_value(&[0])),
+        host_state
+    );
+}
+
+#[test]
+fn internal_state_with_full_kv_on_host_is_dropped_and_counted_by_default() {
+    for via_split in [false, true] {
+        let (mut tc, internal, leaf) = backed_internal_state_fixture(via_split, false);
+        tc.evict_device_start(MAMBA, 2);
+        let (next, step) = tc.evict_device_next_node(MAMBA, &HashMap::new());
+        assert_eq!(next, None);
+        assert_eq!(step.mamba_backup_node_id, None);
+        assert_eq!(step.tracker, HashMap::from([(MAMBA, 1)]));
+        assert!(step.device_frees[&MAMBA][0].equal(&Tensor::from_slice(&[7i64])));
+        assert!(step.host_frees.is_empty());
+        assert_eq!(tc.mamba_internal_state_counts(), (1, 0));
+        assert_internal_state_evicted(&tc, internal, None);
+        let (next, _) = tc.evict_device_next_node(MAMBA, &HashMap::from([(MAMBA, 1)]));
+        assert_eq!(next, Some(leaf));
+        tc.evict_device_end(MAMBA);
+        tc.sanity_check(&[], &[]);
+    }
+}
+
+#[test]
+fn internal_state_with_full_kv_on_host_is_backed_up_before_its_device_free() {
+    for via_split in [false, true] {
+        let (mut tc, internal, leaf) = backed_internal_state_fixture(via_split, true);
+        tc.evict_device_start(MAMBA, 2);
+        let (next, step) = tc.evict_device_next_node(MAMBA, &HashMap::new());
+        assert_eq!(next, None);
+        assert_eq!(step.mamba_backup_node_id, Some(internal));
+        assert!(step.tracker.is_empty() && step.device_frees.is_empty());
+        assert!(step.host_frees.is_empty());
+        assert_eq!(tc.mamba_internal_state_counts(), (0, 0));
+        // The controller's copy carries no Full KV.
+        let (full, mut transfers) = tc.build_backup_spec(internal).unwrap();
+        assert_eq!(full.numel(), 0);
+        assert_eq!(transfers.len(), 1);
+        assert!(
+            transfers[&MAMBA][0]
+                .device_indices
+                .as_ref()
+                .unwrap()
+                .equal(&Tensor::from_slice(&[7i64]))
+        );
+        transfers.get_mut(&MAMBA).unwrap()[0].host_indices = Some(Tensor::from_slice(&[70i64]));
+        tc.commit_backup(internal, full, transfers).unwrap();
+        tc.mark_write_through_pending(vec![internal], internal)
+            .unwrap();
+        tc.finish_write_through(vec![internal], internal).unwrap();
+        let step = tc.finish_mamba_state_eviction(internal);
+        assert_eq!(step.tracker, HashMap::from([(MAMBA, 1)]));
+        assert_eq!(step.device_frees.len(), 1);
+        assert!(step.device_frees[&MAMBA][0].equal(&Tensor::from_slice(&[7i64])));
+        assert!(step.host_frees.is_empty());
+        assert_eq!(tc.mamba_internal_state_counts(), (0, 1));
+        assert_internal_state_evicted(&tc, internal, Some(70));
+        let matched = tc.match_prefix(&match_params(&vec![1]));
+        assert_eq!(matched.mamba_host_hit_length, 1);
+        let (next, step) = tc.evict_device_next_node(MAMBA, &HashMap::from([(MAMBA, 1)]));
+        assert_eq!(next, Some(leaf));
+        assert!(step.mamba_backup_node_id.is_none());
+        tc.evict_device_end(MAMBA);
+        tc.sanity_check(&[], &[]);
+    }
+}
+
+#[test]
+fn internal_state_backup_without_a_host_slot_falls_back_to_the_drop() {
+    for via_split in [false, true] {
+        let (mut tc, internal, leaf) = backed_internal_state_fixture(via_split, true);
+        tc.evict_device_start(MAMBA, 2);
+        let (_, step) = tc.evict_device_next_node(MAMBA, &HashMap::new());
+        assert_eq!(step.mamba_backup_node_id, Some(internal));
+        // A full host Mamba pool: the controller commits nothing.
+        let step = tc.finish_mamba_state_eviction(internal);
+        assert_eq!(step.tracker, HashMap::from([(MAMBA, 1)]));
+        assert!(step.device_frees[&MAMBA][0].equal(&Tensor::from_slice(&[7i64])));
+        assert!(step.host_frees.is_empty());
+        assert_eq!(tc.mamba_internal_state_counts(), (1, 0));
+        assert_internal_state_evicted(&tc, internal, None);
+        let (next, _) = tc.evict_device_next_node(MAMBA, &HashMap::from([(MAMBA, 1)]));
+        assert_eq!(next, Some(leaf));
+        tc.evict_device_end(MAMBA);
+        tc.sanity_check(&[], &[]);
+    }
+}
+
+#[test]
+fn internal_state_pending_under_another_write_keeps_the_drop() {
+    let (mut tc, internal, leaf) = backed_internal_state_fixture(true, true);
+    let idx = tc.arena.resolve(internal).unwrap();
+    // A backup here would claim a second ack for a node already pending under one.
+    tc.arena.node_mut(idx).write_through_pending_id = Some(leaf);
+    tc.evict_device_start(MAMBA, 2);
+    let (next, step) = tc.evict_device_next_node(MAMBA, &HashMap::new());
+    assert_eq!(next, None);
+    assert_eq!(step.mamba_backup_node_id, None);
+    assert_eq!(step.tracker, HashMap::from([(MAMBA, 1)]));
+    assert_eq!(tc.mamba_internal_state_counts(), (1, 0));
+    tc.evict_device_end(MAMBA);
+    tc.arena.node_mut(idx).write_through_pending_id = None;
+    tc.sanity_check(&[], &[]);
+}
+
+#[test]
+fn backed_leaf_state_is_left_to_the_leaf_eviction_path() {
+    for backup in [false, true] {
+        let mut tc = mamba_core(/* page_size = */ 1);
+        tc.set_hicache_enabled();
+        tc.is_write_back = true;
+        tc.set_mamba_backup_internal_state(backup);
+        tc.insert(&insert_params_mamba(&vec![1], &[10], Some(7)));
+        let leaf = tc.match_prefix(&match_params(&vec![1])).best_match_node_id;
+        tc.commit_backup(leaf, Tensor::from_slice(&[110i64]), HashMap::new())
+            .unwrap();
+        tc.mark_write_through_pending(vec![leaf], leaf).unwrap();
+        tc.finish_write_through(vec![leaf], leaf).unwrap();
+        tc.evict_device_start(MAMBA, 1);
+        let (next, step) = tc.evict_device_next_node(MAMBA, &HashMap::new());
+        assert_eq!(next, Some(leaf));
+        assert_eq!(step.mamba_backup_node_id, None);
+        assert!(step.tracker.is_empty() && step.device_frees.is_empty());
+        assert!(
+            tc.arena
+                .has_device_value(tc.arena.resolve(leaf).unwrap(), MAMBA)
+        );
+        tc.evict_device_end(MAMBA);
+        assert_eq!(tc.mamba_internal_state_counts(), (0, 0));
+        tc.sanity_check(&[], &[]);
+    }
+}
+
 #[test]
 #[should_panic(expected = "Mamba device eviction not started")]
 fn device_walk_requires_a_start() {

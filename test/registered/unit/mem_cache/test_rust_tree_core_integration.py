@@ -4684,6 +4684,133 @@ def test_internal_mamba_write_back_preserves_state_until_ack(backend, backup):
     core.sanity_check([], [])
 
 
+@pytest.mark.parametrize("backend", ["python", "rust"])
+@pytest.mark.parametrize("backup", ["off", "success", "failed"])
+def test_internal_mamba_state_with_full_kv_on_host_is_copied_state_only(
+    backend, backup
+):
+    """A fork-point state on a node whose Full KV is already on host is copied to
+    host alone and freed after the ack (SGLANG_MAMBA_BACKUP_INTERNAL_STATE);
+    otherwise, or if the copy fails, it is dropped. Both outcomes are counted."""
+    from collections import defaultdict
+
+    from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
+    from sglang.srt.mem_cache.unified_cache.components.full import FullComponent
+    from sglang.srt.mem_cache.unified_cache.components.mamba import MambaComponent
+    from sglang.srt.mem_cache.unified_cache.unified_tree_core import UnifiedTreeCore
+    from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+
+    cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
+    cache.enable_session_radix_cache = False
+    cache.token_to_kv_pool_allocator = None
+    params = CacheInitParams(
+        disable=False,
+        req_to_token_pool=Mock(spec=HybridReqToTokenPool),
+        token_to_kv_pool_allocator=None,
+        page_size=1,
+        tree_components=(ComponentType.FULL, ComponentType.MAMBA),
+    )
+    with get_context().override_server_args(
+        _mamba_cache_chunk_size=256, mamba_max_states_per_path=-1
+    ):
+        cache.components = {
+            ComponentType.FULL: FullComponent(cache, params),
+            ComponentType.MAMBA: MambaComponent(cache, params),
+        }
+        core = (
+            RustUnifiedTreeCore(params)
+            if backend == "rust"
+            else UnifiedTreeCore(params, cache.components)
+        )
+    cache.tree_core = core
+    for component in cache.components.values():
+        component.tree_core = core
+    core.set_hicache_enabled()
+    core.is_write_back = True
+    cache.is_mamba_enabled = True
+    cache.host_memory_mode = "cache"
+    cache.buffer_pipeline = None
+    cache.cache_controller = SimpleNamespace(write_policy="write_back")
+    cache.ongoing_write_through = {}
+    cache._build_backup_sidecar = Mock(return_value=[])
+    host_pool = Mock()
+    host_pool.available_size.return_value = 1
+    cache.components[ComponentType.MAMBA]._mamba_pool_host = host_pool
+    cache.host_pool_group = Mock()
+    cache.host_pool_group.get_pool.return_value = host_pool
+    with envs.SGLANG_MAMBA_BACKUP_INTERNAL_STATE.override(backup != "off"):
+        cache._init_mamba_internal_state_watch()
+    # A request diverging inside a node whose Full KV is on host splits off a
+    # backed prefix with no state, then donates its fork state to that prefix.
+    _mamba_insert(core, [1, 2], [10, 11], 8)
+    suffix = core.match_prefix(MatchPrefixParams(key=_key([1, 2]))).best_match_node
+    _complete_backup(core, suffix, full_offset=100, aux_offset=72)
+    _mamba_insert(core, [1, 3], [10, 12], 9)
+    _mamba_insert(core, [1], [10], 7)
+    fork = core.match_prefix(MatchPrefixParams(key=_key([1]))).best_match_node
+    assert fork != suffix and core.is_backuped(fork)
+    for key in ([1, 2], [1, 3]):
+        core.match_prefix(MatchPrefixParams(key=_key(key)))
+    events = []
+
+    def write(node_id, values, transfers, sidecars):
+        assert node_id == fork and values.numel() == 0 and sidecars == []
+        assert list(transfers) == [ComponentType.MAMBA]
+        (state,) = transfers[ComponentType.MAMBA]
+        assert state.device_indices.tolist() == [7]
+        events.append("write")
+        if backup == "failed":
+            return None
+        state.host_indices = torch.tensor([70], dtype=torch.int64)
+        return values
+
+    def acknowledge(write_back):
+        assert write_back and fork in cache.ongoing_write_through
+        state = core.get_component_device_value(fork, ComponentType.MAMBA)
+        assert state.tolist() == [7]
+        events.append("ack")
+        core.finish_write_through([fork], ack_id=fork)
+        cache.ongoing_write_through.clear()
+
+    def free_values(device_frees, host_frees):
+        assert not host_frees
+        assert [t.tolist() for t in device_frees.pop(ComponentType.MAMBA)] == [[7]]
+        assert not device_frees
+        events.append("free")
+
+    cache.evict_host = Mock()
+    cache._execute_kv_backup = write
+    cache.writing_check = acknowledge
+    cache._free_values = free_values
+    tracker = defaultdict(int)
+    core.evict_device_start(ComponentType.MAMBA, 1)
+    try:
+        assert cache._evict_device_next_node(ComponentType.MAMBA, tracker) == (
+            None,
+            True,
+        )
+    finally:
+        core.evict_device_end(ComponentType.MAMBA)
+    copied = backup == "success"
+    expected = {
+        "off": ["free"],
+        "success": ["write", "ack", "free"],
+        "failed": ["write", "free"],
+    }
+    assert events == expected[backup]
+    cache.evict_host.assert_not_called()
+    assert tracker[ComponentType.MAMBA] == 1 and tracker[ComponentType.FULL] == 0
+    assert core.get_component_device_value(fork, ComponentType.FULL).tolist() == [10]
+    assert core.get_component_device_value(fork, ComponentType.MAMBA) is None
+    assert core.component_has_host_value_only(fork, ComponentType.MAMBA) == copied
+    cache.refresh_mamba_retention_counts()
+    assert cache.mamba_retention_counts == {
+        "mamba_internal_state_drops": int(not copied),
+        "mamba_internal_state_backups": int(copied),
+    }
+    core.sanity_check([], [])
+
+
 def test_mamba_path_cap_evicts_excess_states_through_the_adapter():
     from collections import defaultdict
 
