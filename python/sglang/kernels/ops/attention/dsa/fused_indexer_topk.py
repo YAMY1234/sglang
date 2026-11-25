@@ -31,8 +31,8 @@ DEFAULT_LAYOUT = 5  # measured fastest for the filter pass (VR, 11-20)
 MATH_WARPS = 8  # candidate sub-lists per row in layouts 0-4: one per math warp of the row's CTA
 SUB_LISTS = 4  # layout 5 (the fused path): one per warp of the row's warpgroup
 SELECT_KEYS, SELECT_REPAIR_KEYS = 8192, 16384  # select kernel shared-memory capacity, in keys
-# Main select: 0 = fstk_select_kernel, 1-4 = fstk_select_fast_kernel instantiations (see select_fast).
-DEFAULT_SELECT = 0
+# Main select by fstk_select_fast_kernel (same selected set as fstk_select_kernel, which the repair keeps).
+FAST_SELECT = True
 # Device counters (int64) of fused_indexer_topk; see Stat in the kernel.
 STAT_CALLS, STAT_REPAIR_ROWS, STAT_MAX_REPAIR, STAT_COMPACTIONS, STAT_UNREPAIRED, STAT_REPAIR_CALLS = range(6)
 NUM_STATS = 8
@@ -237,7 +237,7 @@ def fused_indexer_topk(
     stats: Optional[torch.Tensor] = None,
     cuh_path: Optional[str] = None,
     serving: bool = False,
-    select: Optional[int] = None,
+    fast_select: Optional[bool] = None,
 ) -> FusedTopKResult:
     """Exact top-k of every packed row, written to ``out``; no host sync.
 
@@ -291,10 +291,9 @@ def fused_indexer_topk(
     if dst is None:
         dst = torch.empty(rows, topk, device=dev, dtype=torch.int32)
     repair_rows = ws.take((rows,), torch.int32, dev)
-    select = DEFAULT_SELECT if select is None else select
-    if select:
+    if FAST_SELECT if fast_select is None else fast_select:
         jit.select_fast(cand_key, cand_count, lengths, row_to_batch, page_table, dst,
-                        repair_rows, num_repair, st, page_size, select)
+                        repair_rows, num_repair, st, page_size)
     else:
         jit.select(cand_key, cand_count, lengths, row_to_batch, page_table, dst,
                    repair_rows, num_repair, i32, i32, st, page_size, sms, SELECT_KEYS)
