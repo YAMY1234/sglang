@@ -28,6 +28,8 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
 )
 from sglang.srt.mem_cache.buffer_mode.storage_existence_cache import (
+    BELIEF_FILL,
+    BELIEF_QUERY,
     StorageExistenceCache,
 )
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
@@ -721,6 +723,136 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheStorageFixtures):
         beliefs.add(["a"])
         beliefs.invalidate_beyond(["a", "b"], 0)
         self.assertFalse(beliefs.contains("a") or beliefs.contains("b"))
+
+    def test_hicache_l3_belief_sources_follow_the_latest_renewal(self):
+        """A belief keeps what last renewed it across a rotation; the tally splits
+        covered pages by that source and by generation, in-flight-only pages apart."""
+        beliefs = StorageExistenceCache().pool(PoolName.KV)
+        beliefs.add(["a"], BELIEF_FILL)
+        beliefs.add(["b", "c"])
+        beliefs.rotate()
+        beliefs.add(["c"], BELIEF_QUERY)
+        beliefs.track_inflight(["d"])
+        pages = ["a", "b", "c", "d"]
+        self.assertTrue(beliefs.covered(pages))
+        counts = dict.fromkeys(
+            ("write", "fill", "query", "new_gen", "old_gen", "inflight"), 0
+        )
+        beliefs.tally_sources(pages, counts, "")
+        self.assertEqual(
+            counts,
+            dict(write=1, fill=1, query=1, new_gen=1, old_gen=2, inflight=1),
+        )
+        beliefs.rotate()
+        self.assertEqual([beliefs.contains(h) for h in "abc"], [False, False, True])
+        beliefs.tally_sources(["c"], counts, "")
+        self.assertEqual((counts["query"], counts["old_gen"]), (2, 3))
+
+    def test_hicache_l3_query_evidence_keeps_pages_clean_only_while_it_renews(self):
+        """The store's exists does not refresh its LRU, so with
+        SGLANG_HICACHE_L3_BELIEF_QUERY_RENEW=0 query evidence no longer keeps a page
+        believed: the write-behind walk re-writes it, and the ack of that write (a
+        store still holding the page answers EXISTS, a successful put) renews it."""
+        self._require_host_only_l3_fixture()
+        ps = self.cfg.page_size
+        # A rank-agreed hit query found the coldest host page in L3.
+        query = SimpleNamespace(
+            deadline_expired=False,
+            all_hash_values=["h1000"],
+            query_pool_hit_pages={PoolName.KV: 1},
+            storage_hit_count=ps,
+            pool_transfers=[],
+        )
+        for renew in (True, False):
+            with self.subTest(renew=renew):
+                with envs.SGLANG_HICACHE_L3_BELIEF_QUERY_RENEW.override(renew):
+                    cache, pool = self._host_only_l3_fixture()
+                for i in range(1, 8):
+                    self._insert_host_page(cache, pool, 1000 * i)
+                cache._invalidate_absent_from_hit_query(query)
+                beliefs = cache.storage_existence_cache.pool(PoolName.KV)
+                self.assertEqual(beliefs.covered(["h1000"]), renew)
+                for _ in range(4):
+                    cache._write_behind_host_tail()
+                writes = cache.cache_controller.write_storage
+                written = [call.args[2] for call in writes.call_args_list]
+                stats = cache.prefetch_outcome_stats_snapshot()
+                renewed = (
+                    stats["belief_query_renew_pages"],
+                    stats["belief_query_renew_suppressed_pages"],
+                )
+                if renew:
+                    self.assertEqual(written, [["h2000"], ["h3000"]])
+                    self.assertEqual(renewed, (1, 0))
+                    self.assertEqual(
+                        (
+                            stats["wb_clean_pages_query"],
+                            stats["wb_clean_pages_write"],
+                            stats["wb_clean_pages_new_gen"],
+                        ),
+                        (1, 0, 1),
+                    )
+                    continue
+                self.assertEqual(written, [["h1000"], ["h2000"], ["h3000"]])
+                self.assertEqual(renewed, (0, 1))
+                self.assertEqual(stats["wb_clean_pages_query"], 0)
+                controller = cache.cache_controller
+                controller.ack_backup_queue = Queue()
+                for operation_id, keys in zip(
+                    list(cache._write_behind_inflight), written
+                ):
+                    controller.ack_backup_queue.put(
+                        SimpleNamespace(
+                            id=operation_id,
+                            hash_value=keys,
+                            pool_transfers=[],
+                            completed_tokens=ps,
+                        )
+                    )
+                cache._drain_storage_control_queues_impl(
+                    n_storage_hit=0,
+                    n_ack_prefetch=0,
+                    n_backup=len(written),
+                    n_release=0,
+                    extra_release_counts={},
+                    log_metrics=False,
+                )
+                self.assertTrue(beliefs.covered(["h1000"]))
+                # The next walk finds the whole tail clean through the write acks.
+                for _ in range(4):
+                    cache._write_behind_host_tail()
+                self.assertEqual(writes.call_count, len(written))
+                self.assertEqual(cache._l3_tier_stats["wb_clean_pages_write"], 3)
+
+    def test_hicache_l3_lookup_records_first_query_hash(self):
+        """The ledger's storage_lookup row and the sampled lookup log name the first
+        page queried after the anchor, joining a lookup to that page's history."""
+        self._require_host_only_l3_fixture()
+        cache, _ = self._host_only_l3_fixture()
+        cache._l3_lifetime_ledger = mock.Mock()
+        operation = SimpleNamespace(
+            stats_requested_tokens=8192,
+            deadline_expired=False,
+            storage_hit_count=cache.page_size,
+            query_pool_hit_pages={PoolName.KV: 1},
+            all_hash_values=["first", "second"],
+            hash_value=["first"],
+            request_id="lookup",
+            id=7,
+            last_hash="anchor",
+            storage_start=4096,
+            stats_tree_kv_tokens=0,
+            pool_storage_result=SimpleNamespace(restorable_prefix_pages=[]),
+        )
+        with (
+            envs.SGLANG_HICACHE_L3_LOOKUP_LOG_N.override(1),
+            self.assertLogs("sglang.srt.mem_cache.unified_radix_cache", "INFO") as logs,
+        ):
+            cache._account_prefetch_outcome(operation, revoked=False)
+        event = cache._l3_lifetime_ledger.emit.call_args
+        self.assertEqual(event.args[0], "storage_lookup")
+        self.assertEqual(event.kwargs["first_query_hash"], "first")
+        self.assertIn("first_query_hash=first", logs.output[-1])
 
     def _write_on_host_evict_final_fields(self, final):
         with self.assertLogs(
