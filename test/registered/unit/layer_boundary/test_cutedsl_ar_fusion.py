@@ -579,31 +579,27 @@ def test_retargeted_profiles_cover_capacity_and_pass_flashinfer_validation(
 
 
 @pytest.mark.parametrize(
-    ("enabled", "tp_size", "hidden_size", "top_k", "ep_size", "tuned"),
+    ("tp_size", "hidden_size", "top_k", "ep_size", "tuned"),
     [
-        (True, 8, 4096, 10, 8, True),
-        (False, 8, 4096, 10, 8, False),
-        (True, 16, 4096, 10, 8, False),
-        (True, 8, 8192, 10, 8, False),
-        (True, 8, 4096, 8, 8, False),
-        (True, 8, 4096, 10, 1, False),
+        (8, 4096, 10, 8, True),
+        (16, 4096, 10, 8, False),
+        (8, 8192, 10, 8, False),
+        (8, 4096, 8, 8, False),
+        (8, 4096, 10, 1, False),
     ],
 )
-def test_ep_shape_profile_uses_runtime_tuning_only_at_its_capability_boundary(
-    enabled, tp_size, hidden_size, top_k, ep_size, tuned
+def test_ep_shape_profile_uses_its_tuning_only_at_its_shape(
+    tp_size, hidden_size, top_k, ep_size, tuned
 ):
     from flashinfer.comm.mnnvl_cutedsl import ProtocolKind
 
     module = "sglang.srt.layers.flashinfer_mnnvl_cutedsl"
-    with (
-        envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.override(enabled),
-        patch(
-            f"{module}.get_parallel", return_value=SimpleNamespace(moe_ep_size=ep_size)
-        ) as get_parallel,
-    ):
+    with patch(
+        f"{module}.get_parallel", return_value=SimpleNamespace(moe_ep_size=ep_size)
+    ) as get_parallel:
         profile = _retargeted_config(tp_size, hidden_size, top_k).profiles[0]
 
-    expect_ep_probe = enabled and (tp_size, hidden_size, top_k) == (8, 4096, 10)
+    expect_ep_probe = (tp_size, hidden_size, top_k) == (8, 4096, 10)
     assert get_parallel.called is expect_ep_probe
 
     assert profile.finalize_routes.upper_bounds[2] == (1024 if tuned else 703)

@@ -9,7 +9,6 @@ from typing import TYPE_CHECKING
 import torch
 import torch.distributed as dist
 
-from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_parallel, get_spec
 
 if TYPE_CHECKING:
@@ -232,11 +231,8 @@ def _retargeted_config(tp_size: int, hidden_size: int, top_k: int):
             tp_size,
         )
 
-    ep_shape_tuning = (
-        envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get()
-        and (tp_size, hidden_size, top_k) == (8, 4096, 10)
-        and get_parallel().moe_ep_size > 1
-    )
+    tuned_shape = (tp_size, hidden_size, top_k) == (8, 4096, 10)
+    ep_shape_tuning = tuned_shape and get_parallel().moe_ep_size > 1
 
     def bt_preset(preset):
         if not ep_shape_tuning:
