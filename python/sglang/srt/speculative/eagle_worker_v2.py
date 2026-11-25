@@ -1669,6 +1669,11 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 "draft (topk 1) and no DP attention"
             )
             return
+        # On a PD decode server they have faulted (illegal memory access after a capture
+        # mid-serving, capped or not, with or without staging); it verifies eagerly.
+        if get_disagg().disaggregation_mode == "decode":
+            logger.info("The EAGLE post-verify graphs are off on a PD decode server")
+            return
         # one stream of forced acceptance lengths, from which the post-verify
         # graphs and the eager verify both draw; the global CPU RNG otherwise
         self._simulated_acc_len_rng = simulated_acc_len_generator(

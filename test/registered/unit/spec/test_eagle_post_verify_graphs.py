@@ -62,9 +62,9 @@ def _target_worker():
     )
 
 
-def _worker(*, cuda=True, topk=1, dp_attention=False):
+def _worker(*, cuda=True, topk=1, dp_attention=False, pd_decode=False):
     """An EAGLE worker after init_attention_backends, on a CUDA host with a chain
-    draft and no DP attention unless the arguments say otherwise."""
+    draft, no DP attention and no PD decode role unless the arguments say otherwise."""
     worker = eagle_worker_v2.EAGLEWorkerV2.__new__(eagle_worker_v2.EAGLEWorkerV2)
     worker.__dict__.update(
         topk=topk,
@@ -79,9 +79,11 @@ def _worker(*, cuda=True, topk=1, dp_attention=False):
         device="cpu",
     )
     parallel = SimpleNamespace(attn_dp_enabled=dp_attention)
+    disagg = SimpleNamespace(disaggregation_mode="decode" if pd_decode else "null")
     with (
         patch.object(eagle_worker_v2, "_is_cuda", cuda),
         patch.object(eagle_worker_v2, "get_parallel", return_value=parallel),
+        patch.object(eagle_worker_v2, "get_disagg", return_value=disagg),
     ):
         worker.init_attention_backends()
     return worker
@@ -259,11 +261,17 @@ class TestPostVerifyGraphs(CustomTestCase):
     def test_every_verify_of_a_setup_they_can_run_takes_the_post_verify_graphs(self):
         """Every verify hands its batch to SGLang's post-verify graphs. A setup they
         cannot run keeps them off, and the forced lengths on the global RNG: no CUDA,
-        a tree draft, or DP attention, whose ranks would capture at different times."""
+        a tree draft, DP attention, whose ranks would capture at different times, or a
+        PD decode server."""
         on = _worker()
         self.assertIsInstance(on._post_verify_graphs, EaglePostVerifyGraphs)
         self.assertIs(_verify_kwargs(on)["post_verify_graphs"], on._post_verify_graphs)
-        for setup in (dict(cuda=False), dict(topk=2), dict(dp_attention=True)):
+        for setup in (
+            dict(cuda=False),
+            dict(topk=2),
+            dict(dp_attention=True),
+            dict(pd_decode=True),
+        ):
             with self.subTest(**setup):
                 worker = _worker(**setup)
                 self.assertIsNone(worker._post_verify_graphs)
