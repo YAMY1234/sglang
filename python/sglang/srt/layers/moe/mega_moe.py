@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import functools
 import logging
+import os
 from contextlib import contextmanager, nullcontext
 from typing import TYPE_CHECKING, NamedTuple, Optional
 
@@ -104,6 +105,88 @@ def _configure_mega_moe_deep_gemm_num_sms(deep_gemm):
         deep_gemm.set_num_sms(current_num_sms)
 
 
+@functools.lru_cache(maxsize=1)
+def _log_fp4_acts_build_once(dg) -> None:
+    logger.info(
+        "MegaMoE fp8xfp4 runs through %s (%s), DG_MEGA_MOE_ACT_DTYPE=%s",
+        dg.__name__,
+        dg.__file__,
+        os.environ.get("DG_MEGA_MOE_ACT_DTYPE"),
+    )
+
+
+@functools.lru_cache(maxsize=1)
+def _log_tile_by_ep_average_once() -> None:
+    logger.info("MegaMoE FP4-act tiles sized by the EP-average batch on a light rank")
+
+
+def _mega_moe_dg(mma_type: str):
+    """The DeepGEMM build that runs this MegaMoE kind's buffer and kernel."""
+    if mma_type == "fp8xfp4" and envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_FP4_ACTS.get():
+        # Read by the build at buffer creation and at every launch; DG_MEGA_MOE_ACT_DTYPE=fp8 keeps FP8 activations
+        os.environ.setdefault("DG_MEGA_MOE_ACT_DTYPE", "mxfp4")
+        import deep_gemm_fp4acts
+
+        _log_fp4_acts_build_once(deep_gemm_fp4acts)
+        _maybe_enable_fp4_acts_pdl(deep_gemm_fp4acts)
+        return deep_gemm_fp4acts
+    import deep_gemm
+
+    return deep_gemm
+
+
+@functools.lru_cache(maxsize=None)
+def _maybe_enable_fp4_acts_pdl(dg) -> None:
+    # update_deep_gemm_config enables PDL on deep_gemm only; the FP4-act build is a separate extension.
+    if envs.SGLANG_OPT_DEEPGEMM_FP4_ACTS_PDL.get() and hasattr(dg, "set_pdl"):
+        dg.set_pdl(True)
+    logger.info(
+        "MegaMoE FP4-act build PDL: %s",
+        dg.get_pdl() if hasattr(dg, "get_pdl") else "n/a",
+    )
+
+
+def _get_block_m_for_mega_moe(
+    buf, num_tokens: int, global_num_tokens: Optional[int]
+) -> int:
+    import deep_gemm
+
+    dg = _mega_moe_dg(buf.mma_type)
+    if dg is not deep_gemm:
+        # The FP4-act build picks its tiles from DG_MEGA_MOE_ACT_DTYPE; it has no global-tokens hint.
+        return dg.get_block_m_for_mega_moe(
+            buf.group.size(),
+            buf.num_experts,
+            buf.num_max_tokens_per_rank,
+            _mega_moe_tiling_tokens(buf, num_tokens, global_num_tokens),
+            buf.num_topk,
+            buf.mma_type,
+        )
+    return deep_gemm.get_block_m_for_mega_moe(
+        num_ranks=buf.group.size(),
+        num_experts=buf.num_experts,
+        num_max_tokens_per_rank=buf.num_max_tokens_per_rank,
+        num_tokens=num_tokens,
+        num_topk=buf.num_topk,
+        mma_type=buf.mma_type,
+        global_num_tokens=global_num_tokens,
+    )
+
+
+def _mega_moe_tiling_tokens(
+    buf, num_tokens: int, global_num_tokens: Optional[int]
+) -> int:
+    """Tokens per rank the FP4-act build sizes its tiles for: at least the EP average.
+
+    Every rank's experts receive tokens from all EP ranks, so a light or idle rank
+    tiling for its own rows runs the busy ranks' tokens on tiny tiles.
+    """
+    if not envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_TILE_BY_EP_AVERAGE.get() or not global_num_tokens:
+        return num_tokens
+    average = -(-global_num_tokens // buf.group.size())
+    return min(max(num_tokens, average), buf.num_max_tokens_per_rank)
+
+
 def check_mega_moe_shapes(hidden: int, intermediate: int, mma_type: str) -> None:
     # SGLang's pre-dispatch requires 16-byte input SF rows (hidden % 512).
     # The pinned DeepGEMM FP8/FP4 path copies intermediate scales separately
@@ -137,10 +220,11 @@ def _get_mega_moe_symm_buffer(
     mma_type: str,
     activation: str = "swiglu",
 ) -> SymmBuffer:
-    import deep_gemm
+    deep_gemm = _mega_moe_dg(mma_type)
 
     with _configure_mega_moe_deep_gemm_num_sms(deep_gemm):
         key = (
+            deep_gemm.__name__,
             id(group),
             num_max_tokens_per_rank,
             num_experts,
@@ -358,8 +442,6 @@ def mega_moe_input_target(
         and _mega_moe_mma_type(moe.experts) == "fp8xfp4"
     ):
         return None
-    import deep_gemm
-
     buf = _mega_moe_buffer(moe)
     num_tokens = hidden_states.shape[0]
     x = buf.x[:num_tokens]
@@ -368,14 +450,8 @@ def mega_moe_input_target(
     routed_sf = buf.x_sf[:num_tokens]
     if not routed_sf.is_contiguous():
         return None
-    shared_block_m = deep_gemm.get_block_m_for_mega_moe(
-        num_ranks=buf.group.size(),
-        num_experts=buf.num_experts,
-        num_max_tokens_per_rank=buf.num_max_tokens_per_rank,
-        num_tokens=num_tokens,
-        num_topk=buf.num_topk,
-        mma_type=buf.mma_type,
-        global_num_tokens=_mega_moe_global_tokens_hint(buf),
+    shared_block_m = _get_block_m_for_mega_moe(
+        buf, num_tokens, _mega_moe_global_tokens_hint(buf)
     )
     return MegaMoeInput(
         buf,
@@ -616,16 +692,9 @@ def run_mega_routed_experts(
     else:
         shared_block_m = 0
         if shared_l1_weights is not None:
-            shared_block_m = deep_gemm.get_block_m_for_mega_moe(
-                num_ranks=buf.group.size(),
-                num_experts=buf.num_experts,
-                # DeepGEMM rounds the requested capacity up for its buffer.
-                num_max_tokens_per_rank=buf.num_max_tokens_per_rank,
-                # Match the non-null output allocation passed to DeepGEMM.
-                num_tokens=max(num_tokens, 1),
-                num_topk=buf.num_topk,
-                mma_type=buf.mma_type,
-                global_num_tokens=global_num_tokens,
+            # Match the non-null output allocation passed to DeepGEMM.
+            shared_block_m = _get_block_m_for_mega_moe(
+                buf, max(num_tokens, 1), global_num_tokens
             )
         if not (
             routing_in_buffer
@@ -648,8 +717,14 @@ def run_mega_routed_experts(
                 topk_weight_scale=routed_scaling_factor,
             )
 
-    if global_num_tokens is not None:
+    kernel_dg = _mega_moe_dg(buf.mma_type)
+    if global_num_tokens is not None and kernel_dg is deep_gemm:
         mega_kwargs["global_num_tokens"] = global_num_tokens
+    elif kernel_dg is not deep_gemm:
+        tiling_tokens = _mega_moe_tiling_tokens(buf, num_tokens, global_num_tokens)
+        if tiling_tokens != num_tokens:
+            _log_tile_by_ep_average_once()
+            mega_kwargs["num_expected_tokens_per_rank"] = tiling_tokens
     if eplb_load_row is not None:
         mega_kwargs["cumulative_local_expert_recv_stats"] = eplb_load_row
 
@@ -660,8 +735,8 @@ def run_mega_routed_experts(
         dtype=torch.bfloat16,
         device=hidden_states.device,
     )
-    with _configure_mega_moe_deep_gemm_num_sms(deep_gemm):
-        deep_gemm.fp8_fp4_mega_moe(
+    with _configure_mega_moe_deep_gemm_num_sms(kernel_dg):
+        kernel_dg.fp8_fp4_mega_moe(
             y,
             experts.mega_l1_weights,
             experts.mega_l2_weights,
@@ -786,7 +861,8 @@ def build_mega_moe_experts_weights(experts) -> None:
     localize = _is_mega_moe_localization_enabled()
     mega_l1, mega_l2 = w13_interleaved, w2
     if localize:
-        import deep_gemm
+        # The build that runs the kernel localizes: it recognizes only its own localized memory
+        deep_gemm = _mega_moe_dg(mma_type)
 
         # (domains, experts, N / domains, K) for the kernel; the parameters get the
         # expert-major view of the same memory.
@@ -834,7 +910,8 @@ def build_mega_moe_shared_weights(
         (down_proj.weight.data, _transform_mega_moe_shared_sf(down_proj)),
     )
     if _is_mega_moe_localization_enabled():
-        import deep_gemm
+        # The fused shared expert runs inside the fp8xfp4 kernel; localize with its build
+        deep_gemm = _mega_moe_dg("fp8xfp4")
 
         l1 = (deep_gemm.localize(l1[0]), l1[1])
         l2 = (deep_gemm.localize(l2[0]), l2[1])

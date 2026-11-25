@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, NamedTuple, Optional
 import msgspec
 import torch
 
+from sglang.kernels.ops.memory.small_copy import write_host_ints
 from sglang.kernels.ops.speculative.dspark.dspark_draft_model import (
     MarkovGreedyStep,
 )
@@ -18,6 +19,7 @@ from sglang.srt.lora.layers import unwrap_lora_layer
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
+    _kernel_writes_metadata,
     enable_num_token_non_padded,
 )
 from sglang.srt.model_executor.forward_mode import CaptureHiddenMode, ForwardMode
@@ -52,6 +54,10 @@ def _make_num_token_non_padded(
 ) -> Optional[torch.Tensor]:
     if not enable_num_token_non_padded():
         return None
+    if _kernel_writes_metadata(device):
+        out = torch.empty(1, dtype=torch.int32, device=device)
+        write_host_ints((out,), ((num_tokens,),))
+        return out.view(())
     return torch.tensor(
         num_tokens,
         dtype=torch.int32,
@@ -617,10 +623,22 @@ class DraftBlockProposer:
         verify_cache_loc_2d = verify_window.verify_cache_loc_2d
 
         draft_block_ids = self.draft_block_ids_view(bs=bs, device=prefix_lens.device)
-        if not anchor_prepared:
-            draft_block_ids[:, 0].copy_(draft_input.bonus_tokens.view(-1))
-        draft_positions = positions_2d[:, :query_token_num].reshape(-1)
-        draft_cache_loc = verify_cache_loc_2d[:, :query_token_num].reshape(-1)
+        if envs.SGLANG_OPT_DSPARK_FUSED_DRAFT_INPUTS.get() and prefix_lens.is_cuda:
+            from sglang.kernels.ops.speculative.dspark.draft_inputs import draft_inputs
+
+            draft_positions, draft_cache_loc = draft_inputs(
+                draft_input.bonus_tokens.view(-1),
+                draft_block_ids,
+                positions_2d,
+                verify_cache_loc_2d,
+                query_token_num,
+                write_bonus=not anchor_prepared,
+            )
+        else:
+            if not anchor_prepared:
+                draft_block_ids[:, 0].copy_(draft_input.bonus_tokens.view(-1))
+            draft_positions = positions_2d[:, :query_token_num].reshape(-1)
+            draft_cache_loc = verify_cache_loc_2d[:, :query_token_num].reshape(-1)
 
         draft_owns_embed = envs.SGLANG_DSPARK_EMBED_IN_GRAPH.get() and hasattr(
             self.draft_model, "forward_embed"
@@ -654,8 +672,13 @@ class DraftBlockProposer:
             spec_algorithm=SpeculativeAlgorithm.DSPARK,
             spec_info=self._draft_block_spec_info,
             capture_hidden_mode=CaptureHiddenMode.NULL,
-            global_num_token_non_padded=_make_num_token_non_padded(
-                draft_num_tokens, device
+            # _fill_dp_moe_sync_metadata's kernel write sets it when it runs.
+            global_num_token_non_padded=(
+                None
+                if _kernel_writes_metadata(device)
+                and self._dp_moe_sync
+                and batch.global_num_tokens is not None
+                else _make_num_token_non_padded(draft_num_tokens, device)
             ),
             global_num_token_non_padded_cpu=draft_num_tokens,
         )
@@ -748,12 +771,28 @@ class DraftBlockProposer:
             )
         forward_batch.original_global_num_tokens_cpu = batch.global_num_tokens
         num_tokens = forward_batch.input_ids.numel()
-        num_token_non_padded = _make_num_token_non_padded(num_tokens, device)
-        if num_token_non_padded is not None:
-            forward_batch.global_num_token_non_padded = num_token_non_padded
         forward_batch.global_num_token_non_padded_cpu = num_tokens
         forward_batch.global_num_tokens_cpu = gnt
         forward_batch.global_num_tokens_for_logprob_cpu = gnt_logprob
+        if _kernel_writes_metadata(device):
+            # One kernel writes all three; pinned copies would each take a copy-engine trip.
+            dsts = [
+                torch.empty(len(gnt), dtype=torch.int64, device=device),
+                torch.empty(len(gnt_logprob), dtype=torch.int64, device=device),
+            ]
+            values = [gnt, gnt_logprob]
+            if enable_num_token_non_padded():
+                dsts.append(torch.empty(1, dtype=torch.int32, device=device))
+                values.append((num_tokens,))
+            write_host_ints(tuple(dsts), tuple(tuple(v) for v in values))
+            forward_batch.global_num_tokens_gpu = dsts[0]
+            forward_batch.global_num_tokens_for_logprob_gpu = dsts[1]
+            if len(dsts) == 3:
+                forward_batch.global_num_token_non_padded = dsts[2].view(())
+            return
+        num_token_non_padded = _make_num_token_non_padded(num_tokens, device)
+        if num_token_non_padded is not None:
+            forward_batch.global_num_token_non_padded = num_token_non_padded
         pin_memory = is_pin_memory_available(device)
         forward_batch.global_num_tokens_gpu = torch.tensor(
             gnt, dtype=torch.int64, pin_memory=pin_memory

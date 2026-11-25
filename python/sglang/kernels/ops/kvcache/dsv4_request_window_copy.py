@@ -3,6 +3,8 @@
 import triton
 import triton.language as tl
 
+from sglang.srt.environ import envs
+
 
 @triton.jit
 def _row_offset(loc, col, PAGE, DATA, DATA_STRIDE, SCALE_BASE, SCALE_STRIDE):
@@ -120,7 +122,82 @@ def _commit_packed_rows(
         tl.store(tags + target, position)
 
 
+@triton.jit
+def _commit_packed_rows_tiled(
+    src,
+    dst,
+    tags,
+    src_loc,
+    req,
+    pos,
+    keep,
+    num_rows,
+    SRC_STRIDE: tl.constexpr,
+    DST_STRIDE: tl.constexpr,
+    PAGE: tl.constexpr,
+    CAPACITY: tl.constexpr,
+    DATA: tl.constexpr,
+    SCALE: tl.constexpr,
+    DATA_STRIDE: tl.constexpr,
+    SCALE_BASE: tl.constexpr,
+    SCALE_STRIDE: tl.constexpr,
+    ROWS: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    # _commit_packed_rows over a tile of ROWS rows per program: most rows are
+    # discarded, and one program per row made the launch the cost.
+    row = tl.program_id(0) * ROWS + tl.arange(0, ROWS)
+    live = row < num_rows
+    kept = live & (tl.load(keep + row, mask=live, other=0) != 0)
+    source = tl.load(src_loc + row, mask=kept, other=0).to(tl.int64)
+    position = tl.load(pos + row, mask=kept, other=0).to(tl.int64)
+    target = (
+        tl.load(req + row, mask=kept, other=0).to(tl.int64) * CAPACITY
+        + position % CAPACITY
+    )
+    col = tl.arange(0, BLOCK)
+    source_offset = _row_offset(
+        source[:, None], col[None, :], PAGE, DATA, DATA_STRIDE, SCALE_BASE, SCALE_STRIDE
+    )
+    target_offset = _row_offset(
+        target[:, None], col[None, :], PAGE, DATA, DATA_STRIDE, SCALE_BASE, SCALE_STRIDE
+    )
+    m = kept[:, None] & (col[None, :] < DATA + SCALE)
+    value = tl.load(
+        src + (source // PAGE * SRC_STRIDE)[:, None] + source_offset, mask=m, other=0
+    )
+    tl.store(dst + (target // PAGE * DST_STRIDE)[:, None] + target_offset, value, mask=m)
+    tl.store(tags + target, position, mask=kept)
+
+
+# Arbitrary; few enough rows that a tile of bytes stays in registers.
+_COMMIT_TILE_ROWS = 8
+
+
 def commit_packed_rows(src, dst, tags, window, *, page_size, capacity, layout):
+    num_rows = window.write_loc.numel()
+    if envs.SGLANG_OPT_DSV41_WINDOW_COMMIT_TILED.get() and num_rows:
+        _commit_packed_rows_tiled[(triton.cdiv(num_rows, _COMMIT_TILE_ROWS),)](
+            src,
+            dst,
+            tags,
+            window.write_loc,
+            window.req,
+            window.pos,
+            window.commit_mask,
+            num_rows,
+            src.stride(0),
+            dst.stride(0),
+            page_size,
+            capacity,
+            layout.data_bytes,
+            layout.scale_bytes,
+            *layout.row_addressing(page_size),
+            _COMMIT_TILE_ROWS,
+            triton.next_power_of_2(layout.bytes_per_token),
+            num_warps=4,
+        )
+        return
     _commit_packed_rows[(window.write_loc.numel(),)](
         src,
         dst,

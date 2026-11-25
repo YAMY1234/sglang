@@ -3361,6 +3361,8 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 StateType.SWA_RING,
                 StateType.DSV4_REQUEST_STATE,
                 StateType.REQUEST_ROW,
+                StateType.DSV41_TAIL_SWA,
+                StateType.DSV41_TAIL_DRAFT_AUX,
             ):
                 # QSA state is whole on every rank, so it pairs by state TP.
                 src_tp_size = (

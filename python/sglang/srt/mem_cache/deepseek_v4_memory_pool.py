@@ -19,6 +19,7 @@ import torch
 
 from sglang.kernels.ops.attention.dsv4 import (
     fused_k_norm_rope_flashmla,
+    fused_qkv_norm_flashmla,
     fused_store_cache,
 )
 from sglang.kernels.ops.attention.dsv4.kv_layout import (
@@ -1668,7 +1669,10 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         assert ratio in (4, 128), f"unsupported compression ratio: {ratio}"
         return self._unified_page_views(self.unified_kv_pool.kv_buffer_rope, ratio)
 
-    def get_state_buf_infos(self) -> Tuple[List[int], List[int], List[int]]:
+    def get_state_buf_infos(
+        self, swa_layer_end: Optional[int] = None
+    ) -> Tuple[List[int], List[int], List[int]]:
+        """``swa_layer_end`` keeps only the SWA of the layers before it."""
         data_ptrs: List[int] = []
         data_lens: List[int] = []
         item_lens: List[int] = []
@@ -1682,7 +1686,10 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         )
         if swa_pool is not None:
             physical_pages_per_logical_page = self.swa_page_size // swa_pool.page_size
-            for buf in swa_pool.kv_buffer:
+            buffers = swa_pool.kv_buffer
+            if swa_layer_end is not None:
+                buffers = buffers[: max(0, swa_layer_end - self._stage_start)]
+            for buf in buffers:
                 assert buf.ndim == 2, f"expected 2D buffer, got {buf.ndim}D"
                 data_ptrs.append(buf.data_ptr())
                 data_lens.append(buf.nbytes)
@@ -2421,6 +2428,38 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             page_size=self.swa_page_size,
             layout=self.kv_layout,
             q=q,
+        )
+
+    def set_swa_key_buffer_radix_fused_qkv_norm(
+        self,
+        layer_id: int,
+        swa_loc: torch.Tensor,
+        kv: torch.Tensor,
+        kv_weight: torch.Tensor,
+        eps: float,
+        freqs_cis: torch.Tensor,
+        positions: torch.Tensor,
+        q_lora: torch.Tensor,
+        q_weight: torch.Tensor,
+        q_eps: float,
+    ):
+        """``set_swa_key_buffer_radix_fused_norm_rope`` plus ``rmsnorm_mxfp8(q_lora)``
+        in one launch; None where that kernel does not apply."""
+        if self.uniform_fp8 or self.kv_layout is KVLayout.V4 or kv.shape[0] >= 2048:
+            return None
+        return fused_qkv_norm_flashmla(
+            q_lora,
+            q_weight,
+            q_eps,
+            kv,
+            kv_weight,
+            eps,
+            freqs_cis,
+            positions,
+            swa_loc,
+            self.get_swa_raw_buffer(layer_id),
+            self.swa_page_size,
+            self.kv_layout,
         )
 
     def set_unified_key_buffer_radix_fused_norm_rope(

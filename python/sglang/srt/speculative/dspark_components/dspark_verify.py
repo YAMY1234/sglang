@@ -6,6 +6,7 @@ from typing import Optional
 import msgspec
 import torch
 
+from sglang.kernels.ops.activation.softcap import cast_to_float32_logits
 from sglang.kernels.ops.embeddings.engram_hash import engram_commit_history
 from sglang.kernels.ops.sampling import argmax as sampling_argmax
 from sglang.kernels.ops.speculative.dspark.blockwise_rejection import (
@@ -28,6 +29,8 @@ from sglang.kernels.ops.speculative.dspark.dspark_verify_window import (
     build_ring_commit_inject_layout,
     scatter_compact_to_strided_into,
 )
+from sglang.kernels.ops.speculative.dspark.forced_rows import fill_forced_rows
+from sglang.kernels.ops.speculative.dspark.inverse_cdf import InverseCdfCounters
 from sglang.kernels.ops.speculative.dspark.sharded_accept_hip import (
     accept_sampling_sharded,
 )
@@ -103,6 +106,47 @@ def verify_logits_adjustments_are_noop(sampling_info) -> bool:
     if getattr(sampling_info, "logit_bias", None) is not None:
         return False
     return True
+
+
+_forced_row_fill_logged = False
+
+
+def _log_forced_row_fill_once() -> None:
+    global _forced_row_fill_logged
+    if not _forced_row_fill_logged:
+        _forced_row_fill_logged = True
+        logger.info("DSpark forced verify rows: one-hot fill of the forced rows only.")
+
+
+def force_verify_rows(
+    next_token_logits: torch.Tensor, forced_tokens: torch.Tensor, vocab_start: int = 0
+) -> None:
+    """Make every verify row with a forced token (>= 0) pick exactly that token.
+
+    forced_tokens is [bs, verify width], one entry per verify row in row order.
+    A forced row's logits become one-hot (0 at the token, -inf elsewhere), so the
+    unchanged accept takes the draft that equals it and draws it as the bonus
+    under any temperature; the other rows keep their logits. vocab_start offsets
+    the token into logits that hold one vocab shard.
+    """
+    if (
+        envs.SGLANG_OPT_DSPARK_FORCED_ROW_FILL.get()
+        and next_token_logits.is_cuda
+        and next_token_logits.stride(1) == 1
+        and forced_tokens.dim() == 2
+        and forced_tokens.numel() <= next_token_logits.shape[0]
+    ):
+        _log_forced_row_fill_once()
+        fill_forced_rows(next_token_logits, forced_tokens, vocab_start)
+        return
+    rows = forced_tokens.reshape(-1) - vocab_start
+    logits = next_token_logits[: rows.shape[0]]
+    forced = (forced_tokens.reshape(-1) >= 0).unsqueeze(1)
+    here = forced & ((rows >= 0) & (rows < logits.shape[1])).unsqueeze(1)
+    index = rows.clamp(0, logits.shape[1] - 1).unsqueeze(1)
+    logits.masked_fill_(forced, float("-inf"))
+    kept = logits.gather(1, index)
+    logits.scatter_(1, index, torch.where(here, torch.zeros_like(kept), kept))
 
 
 class TargetVerifyResult(msgspec.Struct, frozen=True):
@@ -190,15 +234,17 @@ class TargetVerifyExecutor:
         prefix_lens: torch.Tensor,
         draft_tokens: torch.Tensor,
         simulate_bonus_sampling_info=None,
+        forced_rows: Optional[torch.Tensor] = None,
     ) -> AcceptOuts:
         """Produce the per-request accept outcome after target verify.
 
         Folded path: the accept/finalize/out-token kernels already ran inside
         the target-verify cuda graph (DsparkVerifyEpilogue); read its buffers.
         Eager path: run them here. Both apply the SGLANG_SIMULATE_ACC_LEN
-        override drawn by begin_simulated_step.
+        override drawn by begin_simulated_step, except to ``forced_rows``.
         """
         if folded_accept:
+            assert forced_rows is None, "forced verify rows take the eager accept"
             return self.verify_epilogue.read_accept(bs)
 
         correct_len, bonus, cap_trim_lens = accept_draft_tokens(
@@ -235,6 +281,23 @@ class TargetVerifyExecutor:
             target_logits=target_logits,
             simulate_bonus_sampling_info=simulate_bonus_sampling_info,
             simulated_bonus_seed=self._simulated_bonus_seed,
+            forced_rows=forced_rows,
+        )
+
+    def accepts_blockwise(self, *, sampling_info, draft_block: DraftBlockResult) -> bool:
+        """Whether accept_draft_tokens would take the block-wise rejection on every
+        row: a sampled batch without greedy rows, off the draft vocab shards."""
+        return (
+            sampling_info is not None
+            and not sampling_info.is_any_greedy
+            and not _accepts_on_shards(
+                draft_block, sampling_info, self._block_verification
+            )
+            and _blockwise_rejection_applies(
+                sampling_info=sampling_info,
+                rejection_noise=self._rejection_noise,
+                block_verification=self._block_verification,
+            )
         )
 
     def begin_simulated_step(self) -> None:
@@ -348,6 +411,8 @@ class TargetVerifyExecutor:
         )
 
         if sampling_info is not None:
+            if not verify_logits_adjustments_are_noop(sampling_info):
+                widen_verify_logits(result.logits_output)
             apply_dflash_verify_logits_adjustments(
                 next_token_logits=result.logits_output.next_token_logits,
                 sampling_info=sampling_info,
@@ -604,8 +669,12 @@ class DsparkVerifyEpilogue:
         accept_tail_max_bs: int = 0,
         deferred_draft_kv: Optional[DeferredDraftKVStore] = None,
         post_fold: bool = False,
+        fold_accept: bool = True,
     ) -> None:
         self.max_bs = int(max_bs)
+        # False (SGLANG_OPT_DSV41_DSPARK_DP_ACCEPT_GRAPH): static verify graphs only
+        # record their buffers; the accept and commits run in the sampling-accept graph.
+        self.folds_accept = bool(fold_accept)
         # SGLANG_OPT_DSV41_DSPARK_POST_FOLD: static graphs also scatter new seq lens
         # and the bonus into the FutureMap's slots; built at the first warmup.
         self._post_fold = bool(post_fold)
@@ -748,6 +817,8 @@ class DsparkVerifyEpilogue:
         )
         if capturing:
             self.static_io[bs] = io
+        if not self.folds_accept:
+            return
         committed_engram = self.run_static(
             io, accept=self._accept_static_greedy, gate=self.inject_gate_buf
         )
@@ -755,10 +826,17 @@ class DsparkVerifyEpilogue:
             self.folds_engram_commit = True
 
     def run_static(
-        self, io: StaticVerifyIO, *, accept, gate: torch.Tensor, kv_projected=False
+        self,
+        io: StaticVerifyIO,
+        *,
+        accept,
+        gate: torch.Tensor,
+        kv_projected=False,
+        projected_kvs=None,
     ) -> bool:
         """Run ``accept`` into the accept buffers, then the commits gated by ``gate``;
-        returns whether the engram history was committed."""
+        returns whether the engram history was committed. ``projected_kvs``: joins and
+        returns the draft KV projection a side stream ran beside the accept."""
         bs = io.candidates.shape[0]
         verify_lens = self.verify_lens_buf[:bs]
         folds = self.folds_commit
@@ -790,6 +868,16 @@ class DsparkVerifyEpilogue:
         ):
             deferred_draft_kv.stage(
                 cache_loc=cache_loc,
+                positions=io.positions,
+                commit_lens=gated_commit_lens,
+                state_slot=state_slot,
+            )
+            return committed_engram
+        if projected_kvs is not None:
+            self.commit_ctx.kv_injector.store_projected(
+                kvs=projected_kvs(),
+                cache_loc=cache_loc,
+                cache_loc_2d=cache_loc.view(bs, self.stride),
                 positions=io.positions,
                 commit_lens=gated_commit_lens,
                 state_slot=state_slot,
@@ -1123,14 +1211,22 @@ def build_accept_outs(
     target_logits: Optional[torch.Tensor] = None,
     simulate_bonus_sampling_info=None,
     simulated_bonus_seed: Optional[int] = None,
+    forced_rows: Optional[torch.Tensor] = None,
     out: Optional[AcceptOuts] = None,
     block_accept_lens_out: Optional[torch.Tensor] = None,
 ) -> AcceptOuts:
     """``out``: static buffers (the in-graph accept's) to copy the results into;
     ``block_accept_lens_out`` (with ``out``) gets commit_lens + cap_trim_lens.
-    ``simulated_bonus_seed`` (with ``simulate_bonus_sampling_info``) seeds the bonus."""
+    ``simulated_bonus_seed`` (with ``simulate_bonus_sampling_info``) seeds the bonus.
+
+    ``forced_rows`` ([bs] bool): requests whose verify rows carry forced tokens
+    (SGLANG_DSV41_FUSED_TAIL feeds prompt tokens through them). They keep the
+    served accept under SGLANG_SIMULATE_ACC_LEN: their scheduler assumes every
+    forced row is accepted, so a simulated length would commit the wrong tokens.
+    """
     bs = correct_len.shape[0]
     if simulated_correct_len is not None:
+        served_correct_len, served_bonus = correct_len, bonus
         # The accept runs as served; only its length is replaced.
         correct_len = simulated_correct_len.repeat(bs).to(correct_len.dtype)
         if simulate_bonus_sampling_info is not None:
@@ -1153,6 +1249,11 @@ def build_accept_outs(
                 .argmax(dim=-1)
                 .to(bonus.dtype)
                 .view_as(bonus)
+            )
+        if forced_rows is not None:
+            correct_len = torch.where(forced_rows, served_correct_len, correct_len)
+            bonus = torch.where(
+                forced_rows.view(-1, *([1] * (bonus.dim() - 1))), served_bonus, bonus
             )
     tp_sync.sync(sync_site, correct_len)
     tp_sync.sync(sync_site, bonus)
@@ -1225,6 +1326,15 @@ def sample_simulated_bonus(
             rows_per_request=verify_num_draft_tokens,
         )
     return bonus.to(greedy_bonus.dtype).view_as(greedy_bonus)
+
+
+def widen_verify_logits(logits_output: LogitsProcessorOutput) -> None:
+    """Replace a verify's BF16/FP16 logits by the FP32 copy the stock verify returns."""
+    logits = logits_output.next_token_logits
+    if logits.dtype == torch.float32:
+        return
+    out = torch.empty(logits.shape, dtype=torch.float32, device=logits.device)
+    logits_output.next_token_logits = cast_to_float32_logits(logits, out)
 
 
 def _simulated_rows(correct_len: torch.Tensor, rows_per_request: int) -> torch.Tensor:
@@ -1329,6 +1439,15 @@ def accept_draft_tokens(
             verify_num_draft_tokens=verify_num_draft_tokens,
             cutoff_verify_lens=cutoff_verify_lens,
         )
+    blockwise = not _accepts_on_shards(
+        draft_block, sampling_info, block_verification
+    ) and _blockwise_rejection_applies(
+        sampling_info=sampling_info,
+        rejection_noise=rejection_noise,
+        block_verification=block_verification,
+    )
+    if envs.SGLANG_OPT_DSPARK_INVERSE_CDF_SAMPLING.get():
+        InverseCdfCounters.note(inverse=blockwise, requests=candidates.shape[0])
     if _accepts_on_shards(draft_block, sampling_info, block_verification):
         # Block-wise rejection scans the whole draft vocab. This kernel is the
         # same chain rule and reads the draft logits on the local shard.

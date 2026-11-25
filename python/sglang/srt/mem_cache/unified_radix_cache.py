@@ -7,6 +7,7 @@ import threading
 import time
 import zlib
 from array import array
+from collections import deque
 from contextlib import ExitStack, nullcontext
 from dataclasses import replace
 from http import HTTPStatus
@@ -180,6 +181,7 @@ COMPONENT_REGISTRY: dict[str, type[TreeComponent]] = {
 
 
 logger = logging.getLogger(__name__)
+
 device_module = get_device_module()
 
 
@@ -375,6 +377,8 @@ class UnifiedRadixCache(BasePrefixCache):
         # constructs the pipeline collaborator (None = cache mode).
         self.host_memory_mode = "cache"
         self.buffer_pipeline: Optional[BufferModePipeline] = None
+        # write_back eviction copies ordered on the forward stream instead of by a host wait.
+        self.device_ordered_write_back = False
         # Session of the insert whose actions are being applied (see ``insert``).
         self.insert_session_id: Optional[str] = None
         # Write-side dedupe: beliefs about what storage already holds, so
@@ -499,6 +503,7 @@ class UnifiedRadixCache(BasePrefixCache):
         # Reset Controller.
         self.session.slots.clear()
         self.ongoing_write_through: dict[int, _OngoingWriteThrough] = {}
+        self._fenced_write_acks: deque[HiCacheAck] = deque()
         self.ongoing_load_back: dict[
             int, _OngoingLoadBack | list[_OngoingLoadBack]
         ] = {}
@@ -631,6 +636,7 @@ class UnifiedRadixCache(BasePrefixCache):
             self.cache_controller is not None
             and self.cache_controller.write_policy == "write_back"
         )
+        self.device_ordered_write_back = self._resolve_device_ordered_write_back()
         # Pre-seed the logical dropped-tokens series.
         if self.metrics_collector is not None and self.cache_controller is not None:
             reasons = ["host_pressure"]
@@ -1331,7 +1337,10 @@ class UnifiedRadixCache(BasePrefixCache):
         """Wait once for the queued copies, then demote the nodes in order."""
         if not node_ids:
             return
-        self.writing_check(write_back=True)
+        if self._can_fence_write_back_on_streams():
+            self._fence_write_back_on_streams()
+        else:
+            self.writing_check(write_back=True)
         for node_id in node_ids:
             self._demote(node_id, tracker)
         node_ids.clear()
@@ -1568,7 +1577,17 @@ class UnifiedRadixCache(BasePrefixCache):
         # A finished request hands its component state (mamba) to the tree
         # instead of forking it, and the tree frees what the request still held.
         is_finished = req.finished()
-        token_ids = req.full_untruncated_fill_ids[:up_to]
+        # Tail checkpoint: one capped key over the fill ids (no full-length
+        # slices) and, below, only the new span's tree indices.
+        tail_ckpt = (
+            envs.SGLANG_OPT_CACHE_TAIL_CHECKPOINT.get() and not self.tree_core.is_eagle
+        )
+        if tail_ckpt:
+            token_ids = req.full_untruncated_fill_ids
+            n_tokens = min(up_to, len(token_ids))
+        else:
+            token_ids = req.full_untruncated_fill_ids[:up_to]
+            n_tokens = len(token_ids)
 
         if self.disable:
             if is_finished:
@@ -1577,7 +1596,7 @@ class UnifiedRadixCache(BasePrefixCache):
             return
 
         kv_indices_orig = self.req_to_token_pool.req_to_token[
-            req.kv.req_pool_idx, : len(token_ids)
+            req.kv.req_pool_idx, :n_tokens
         ]
 
         # components prepare insert data + return effective cache_len
@@ -1588,12 +1607,12 @@ class UnifiedRadixCache(BasePrefixCache):
             session_id=req.session_id,
             rotation_base=req.kv_rotation_base,
         )
-        effective_cache_len = len(token_ids)
+        effective_cache_len = n_tokens
         for comp in self._components_tuple:
             cl = comp.prepare_for_caching_req(
                 req=req,
                 insert_params=insert_params,
-                token_ids_len=len(token_ids),
+                token_ids_len=n_tokens,
                 is_finished=is_finished,
             )
             if cl is not None:
@@ -1603,9 +1622,10 @@ class UnifiedRadixCache(BasePrefixCache):
             effective_cache_len = comp.floor_cache_len(effective_cache_len)
 
         radix_key = RadixKey(
-            token_ids[:effective_cache_len],
+            token_ids if tail_ckpt else token_ids[:effective_cache_len],
             req.extra_key,
             is_bigram=self.tree_core.is_eagle,
+            limit=effective_cache_len if tail_ckpt else None,
             cache_salt=req.cache_salt,
         )
 
@@ -1630,8 +1650,25 @@ class UnifiedRadixCache(BasePrefixCache):
 
         kv_indices = kv_indices_orig[:effective_cache_len]
 
-        radix_key = radix_key.page_aligned(self.page_size)
+        if tail_ckpt:
+            radix_key.limit = len(radix_key) // self.page_size * self.page_size
+        else:
+            radix_key = radix_key.page_aligned(self.page_size)
         page_aligned_len = len(radix_key)
+        if (
+            is_finished
+            and page_aligned_len <= req.kv.cache_protected_len
+            and not self.enable_session_radix_cache
+            and envs.SGLANG_OPT_CACHE_SKIP_NOOP_FINISH_INSERT.get()
+        ):
+            # The tree already holds (and this request locks) every page the
+            # insert would key: a PD prefill's release after its prefill-end
+            # checkpoint. Skip the full-path walk; release frees the tail.
+            for comp in self._components_tuple:
+                comp.cleanup_after_caching_req(
+                    req, is_finished=True, insert_params=insert_params
+                )
+            return
         values = kv_indices[:page_aligned_len].to(dtype=torch.int64, copy=True)
 
         insert_params.key = radix_key
@@ -1699,7 +1736,13 @@ class UnifiedRadixCache(BasePrefixCache):
         # With PD decode radix caching, SWA matching can stop short of the inserted path.
         # Repoint from that path to protect all tree-owned KV.
         new_last_node = result.last_device_node
-        new_indices = self.path_device_indices(new_last_node)
+        new_indices = None
+        if tail_ckpt:
+            new_indices = self._tail_device_indices(
+                req, new_last_node, page_aligned_len
+            )
+        if new_indices is None:
+            new_indices = self.path_device_indices(new_last_node)
         new_prefix_len = result.prefix_len
         assert req.kv.cache_protected_len <= len(new_indices) + self.page_size - 1, (
             f"{req.kv.cache_protected_len=}, {len(new_indices)=}, {page_aligned_len=}"
@@ -2945,6 +2988,26 @@ class UnifiedRadixCache(BasePrefixCache):
             return staged.matched_len, staged.matched_len + staged.num_tokens
         return None
 
+    # Drops a tree lock: every rank must release the same hold in the same order.
+    @rank_consensus(same_params=True)
+    def release_prefetch_hold(self, request: CacheRequestHandle, prefix_len: int) -> None:
+        if self.linker is not None and self.linker.load_mode == "prefetch":
+            self.linker.release_hold(request, admitted=True, prefix_len=prefix_len)
+
+    # Locks tree nodes and may queue lookups: every rank walks the same queue.
+    @rank_consensus
+    def protect_queued_prefixes(
+        self, reqs: list[Req], depth_override: Optional[int] = None
+    ) -> None:
+        if self.linker is not None and self.linker.load_mode == "prefetch":
+            self.linker.protect_queue(reqs, depth_override=depth_override)
+
+    @rank_consensus(same_params=["req.rid"], same_results=True)
+    def requery_prefetch_after_device_loss(self, req: Req) -> bool:
+        if self.linker is None or self.linker.load_mode != "prefetch":
+            return False
+        return self.linker.requery_after_device_loss(req)
+
     @rank_consensus(same_params=True, same_results=True)
     def check_prefetch_progress(self, request: CacheRequestHandle) -> bool:
         if self.linker is not None and self.linker.load_mode == "prefetch":
@@ -4179,6 +4242,8 @@ class UnifiedRadixCache(BasePrefixCache):
         cc = self.cache_controller
         if cc is None:
             return
+        if self._fenced_write_acks:
+            self._log_fenced_write_acks()
 
         if write_back:
             # Blocking: submit what is still queued, then wait for every ack.
@@ -4214,6 +4279,69 @@ class UnifiedRadixCache(BasePrefixCache):
                 self._finish_write_through_ack(ack_id)
             self._log_write_ack_metrics(ack)
             finish_count -= 1
+
+    def _resolve_device_ordered_write_back(self) -> bool:
+        if not envs.SGLANG_OPT_HICACHE_DEVICE_ORDERED_WRITE_BACK.get():
+            return False
+        reason = None
+        if not self.is_write_back:
+            reason = "the write policy is not write_back"
+        elif get_memory().enable_unified_memory:
+            reason = "the unified memory pool moves and zeroes pages outside stream order"
+        elif get_memory().enable_hisparse:
+            reason = "HiSparse reads the host pool outside stream order"
+        elif get_disagg().disaggregation_mode == "decode":
+            reason = "PD decode writes freed slots from KV transfers"
+        if reason is not None:
+            logger.warning(
+                "SGLANG_OPT_HICACHE_DEVICE_ORDERED_WRITE_BACK ignored: %s.", reason
+            )
+            return False
+        logger.info(
+            "HiCache write_back: eviction copies are fenced on the forward stream, "
+            "the scheduler does not wait for them (SGLANG_OPT_HICACHE_DEVICE_ORDERED_WRITE_BACK)."
+        )
+        return True
+
+    def _can_fence_write_back_on_streams(self) -> bool:
+        # Freed slots must only be rewritten in current/forward/load stream
+        # order, and host pages must not be read by the CPU before their copy lands.
+        cc = self.cache_controller
+        return (
+            self.device_ordered_write_back
+            and cc is not None
+            and cc.write_fence_stream is not None
+            and cc.load_fence_stream is cc.write_fence_stream
+            and not self.enable_storage
+            and self.buffer_pipeline is None
+            and self.linker is None
+        )
+
+    def _fence_write_back_on_streams(self) -> None:
+        """Submit queued write-backs and order the forward stream (and through it
+        the load stream) behind them instead of blocking the host on the copies."""
+        cc = self.cache_controller
+        cc.start_writing()
+        # Without overlap the forward and state copies run on the current stream.
+        current_stream = (
+            None if cc.forward_on_fence_stream else device_module.current_stream()
+        )
+        for ack in cc.ack_write_queue:
+            if current_stream is not None:
+                current_stream.wait_event(ack.finish_event)
+            cc.write_fence_stream.wait_event(ack.finish_event)
+            for ack_id in ack.node_ids:
+                if ack_id in self.ongoing_write_through:
+                    self._finish_write_through_ack(ack_id)
+            self._fenced_write_acks.append(ack)
+        cc.ack_write_queue.clear()
+        assert len(self.ongoing_write_through) == 0
+        self._log_fenced_write_acks()
+
+    def _log_fenced_write_acks(self) -> None:
+        acks = self._fenced_write_acks
+        while acks and acks[0].finish_event.query():
+            self._log_write_ack_metrics(acks.popleft())
 
     def _log_write_ack_metrics(self, ack: HiCacheAck) -> None:
         """Record D->H backup volume and duration for a completed write ack."""
@@ -4880,6 +5008,38 @@ class UnifiedRadixCache(BasePrefixCache):
                 path = torch.cat([path, tail])
         assert len(path) >= req.prefix_len, (req.rid, len(path), req.prefix_len)
         return path[: req.prefix_len]
+
+    def _tail_device_indices(self, req: Req, new_last_node, total_len: int):
+        """A [total_len]-long index view whose [cache_protected_len, total_len)
+        span holds the tree's indices of the new span, read from new_last_node
+        up to the request's protected node only; None if that node is not an
+        ancestor at exactly cache_protected_len (callers then read the path)."""
+        old = req.last_node
+        p0 = req.kv.cache_protected_len
+        if old is None or p0 <= 0 or total_len < p0:
+            return None
+        core = self.tree_core
+        # The ancestor check needs the native core's node accessors; other
+        # core flavors read the full path.
+        if not hasattr(core, "inspect_get_parent_node_id"):
+            return None
+        node, span = new_last_node, 0
+        while node != old:
+            span += core.inspect_get_node_key_length(node)
+            if span > total_len - p0:
+                return None
+            node = core.inspect_get_parent_node_id(node)
+            if node is None:
+                return None
+        if span != total_len - p0:
+            return None
+        tail = core.collect_full_device_indices(new_last_node, old)
+        # Only [p0:] is read below; the head rows are the request's own,
+        # identical to the tree's for the protected prefix.
+        head = self.req_to_token_pool.req_to_token[req.kv.req_pool_idx, :p0].to(
+            dtype=tail.dtype
+        )
+        return torch.cat([head, tail])
 
     def path_device_indices(self, node: NodeId) -> torch.Tensor:
         return self.tree_core.collect_full_device_indices(node, self.root_node_handle())

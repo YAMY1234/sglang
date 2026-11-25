@@ -27,6 +27,7 @@ from sglang.kernels.ops.attention.dsv4.topk import (
     plan_topk_v2,
     topk_transform_paged_v2,
 )
+from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_platform
 from sglang.srt.utils.device import async_h2d
 
@@ -168,12 +169,21 @@ def _index_q_and_weights(
     """fp4 index queries ``[rows, heads, 64]`` int8 with ``[rows, heads]`` packed
     ue8m0 scales, and fp32 head weights ``[rows, heads]``."""
     rows, heads = x.shape[0], indexer.n_local_heads
+    hoisted, indexer.hoisted_head_weights = indexer.hoisted_head_weights, None
     q, _ = indexer.wq_b(q_lora)
+    if (
+        hoisted is not None
+        and hoisted[0].data_ptr() == x.data_ptr()
+        and hoisted[0].shape == x.shape
+    ):
+        head_weights = hoisted[1]
+    else:
+        head_weights = indexer.head_weights_raw(x)
     q_fp4, q_sf, weights = index_q_rope_pack_weights(
         q.view(rows, heads, indexer.index_head_dim),
         torch.view_as_real(freqs_cis).flatten(-2),
         positions,
-        indexer.head_weights_raw(x),
+        head_weights,
         indexer.head_weight_scale,
     )
     return q_fp4.view(rows, heads, 64), q_sf.view(rows, heads), weights
@@ -214,6 +224,17 @@ def prefill_k_slots(
 ) -> torch.Tensor:
     """[columns] int64 index-K pool slot of each flattened-K column: request by
     request, the compressed positions visible at its newest token."""
+    if envs.SGLANG_OPT_DSV4_FUSED_ATTN_METADATA.get() and req_to_token.is_cuda:
+        from sglang.kernels.ops.attention.dsv4.fused_attn_metadata import (
+            prefill_k_slots_fused,
+        )
+
+        return prefill_k_slots_fused(
+            req_to_token=req_to_token,
+            req_pool_indices=req_pool_indices,
+            seq_lens_cpu=seq_lens_cpu,
+            ratio=ratio,
+        )
     device = req_pool_indices.device
     lens_per_request = [s // ratio for s in seq_lens_cpu]
     columns = sum(lens_per_request)

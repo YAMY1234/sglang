@@ -14,7 +14,10 @@ class EngramPlacement:
 class EngramReplication:
     NONE = "none"
     PER_NODE = "per_node"
-    ALL = (NONE, PER_NODE)
+    NODE_SHARED = "node_shared"
+    ALL = (NONE, PER_NODE, NODE_SHARED)
+    # The whole table in one host mapping that every rank on the node reads.
+    WHOLE_TABLE = (PER_NODE, NODE_SHARED)
 
 
 class EngramLookup:
@@ -63,10 +66,10 @@ class EngramConfig:
                 "placement 'gpu'."
             )
         if (
-            config.replication == EngramReplication.PER_NODE
+            config.replication in EngramReplication.WHOLE_TABLE
             and config.placement != EngramPlacement.CPU
         ):
             raise ValueError(
-                "--engram-config: replication 'per_node' needs placement 'cpu'."
+                f"--engram-config: replication {config.replication!r} needs placement 'cpu'."
             )
         return config

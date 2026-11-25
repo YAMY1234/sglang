@@ -55,8 +55,10 @@ def fused_engram_gate(
     clamp_value: float,
     input_ids: Optional[torch.Tensor] = None,
     image_token_id: Optional[int] = None,
+    out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """Rows whose ``input_ids`` entry is ``image_token_id`` keep ``x`` unchanged."""
+    """Rows whose ``input_ids`` entry is ``image_token_id`` keep ``x`` unchanged. ``out`` may be ``x``: each program
+    loads its whole row before storing it."""
     assert x.ndim == 3 and kv.ndim == 2
     t, hc, d = x.shape
     assert kv.shape == (t, (hc + 1) * d)
@@ -71,7 +73,8 @@ def fused_engram_gate(
     assert all(
         a.dtype in (torch.bfloat16, torch.float32) for a in (x, kv, q_weight, k_weight)
     )
-    out = torch.empty_like(x)
+    if out is None:
+        out = torch.empty_like(x)
     if t:
         _engram_gate_kernel[(t * hc,)](
             x,

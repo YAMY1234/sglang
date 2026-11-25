@@ -25,21 +25,26 @@ Prefetch publishes complete KV before admission and recomputes failed reads.
 
 from __future__ import annotations
 
+import collections
+import itertools
 import logging
+import math
 import time
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Sequence
-from concurrent.futures import Future
+from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, NamedTuple, Optional
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.base_prefix_cache import (
     CacheRequestHandle,
     DecLockRefParams,
     InsertParams,
+    MatchPrefixParams,
     MatchResult,
 )
 from sglang.srt.mem_cache.hicache_storage import (
@@ -47,6 +52,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolTransfer,
 )
 from sglang.srt.mem_cache.radix_cache import RadixKey
+from sglang.srt.mem_cache.storage.lease_refresh import StorageLeaseRefresher
 from sglang.srt.mem_cache.unified_cache.components import (
     ComponentType,
     ExternalLinkerLoadPhase,
@@ -188,6 +194,13 @@ class UnifiedCacheLinker(ABC):
         """Read all layers; the future completes after all device writes stop."""
         return None
 
+    def lease_refresh_fns(
+        self,
+    ) -> Optional[tuple[Callable[[list[str]], list[str]], Callable[[list[str]], list[int]]]]:
+        """(page hashes -> object keys, keys -> existence results that renew their
+        leases), or None when the store has no leases or another rank renews them."""
+        return None
+
     @abstractmethod
     def lookup(self, rid: str, transfers: list[PoolTransfer]) -> list[int]:
         """Return every prefix length (in pages) that is fully restorable.
@@ -273,6 +286,27 @@ class _ExternalCachePrefetch:
     discard: bool = False
 
 
+@dataclass
+class _PendingLookup:
+    """A queued request's store lookup running off the scheduler thread."""
+
+    key: RadixKey
+    hashes: list[str]
+    start: int
+    anchor_node_id: NodeId
+    anchor_lock: DecLockRefParams
+    future: Future[list[int]]
+    timeout_s: float = 0.0
+    wait_started: float | None = None
+    kind: str = "enq"
+
+
+class _PrefetchHold(NamedTuple):
+    node_id: NodeId
+    lock: DecLockRefParams
+    tokens: int
+
+
 class _PendingOffload(NamedTuple):
     lock_node_id: NodeId
     lock_params: DecLockRefParams
@@ -320,6 +354,146 @@ class UnifiedCacheLinkerWrapper:
         # rid -> what match found, consumed by the next init_load_back.
         self.hit_markers: dict[str, ExternalCacheHitMarker] = {}
         self.prefetches: dict[CacheRequestHandle, _ExternalCachePrefetch] = {}
+        # Store lookups in flight on worker threads, in submission order.
+        self.lookups: dict[CacheRequestHandle, _PendingLookup] = {}
+        self._draining_lookups = False
+        lookup_threads = envs.SGLANG_EXTERNAL_LINKER_ASYNC_LOOKUP_THREADS.get()
+        self._lookup_executor = (
+            ThreadPoolExecutor(lookup_threads, thread_name_prefix="linker-lookup")
+            if self.load_mode == "prefetch" and lookup_threads > 0
+            else None
+        )
+        # Published prefetches still locked for their waiting request.
+        self.holds: dict[CacheRequestHandle, _PrefetchHold] = {}
+        self.held_tokens = 0
+        hold_fraction = envs.SGLANG_EXTERNAL_LINKER_PREFETCH_HOLD_FRACTION.get()
+        self.hold_cap_tokens = (
+            int(hold_fraction * cache.token_to_kv_pool_allocator.size_full)
+            if self.load_mode == "prefetch" and hold_fraction > 0
+            else 0
+        )
+        load_fraction = envs.SGLANG_EXTERNAL_LINKER_LOAD_FRACTION.get()
+        self.load_cap_tokens = (
+            int(load_fraction * cache.token_to_kv_pool_allocator.size_full)
+            if self.load_mode == "prefetch" and load_fraction > 0
+            else 0
+        )
+        # Queued requests' device prefixes locked until admission, head of the queue first.
+        qlock_fraction = envs.SGLANG_EXTERNAL_LINKER_QUEUE_LOCK_FRACTION.get()
+        self.qlock_cap_tokens = (
+            int(qlock_fraction * cache.token_to_kv_pool_allocator.size_full)
+            if self.load_mode == "prefetch" and qlock_fraction > 0
+            else 0
+        )
+        self.qlock_seconds = envs.SGLANG_EXTERNAL_LINKER_QUEUE_LOCK_SECONDS.get()
+        self.qlocks: dict[CacheRequestHandle, _PrefetchHold] = {}
+        self.qlocked_tokens = 0
+        # Queued requests whose device match was empty when the walk reached them.
+        self._qlock_empty: set[CacheRequestHandle] = set()
+        # Queued requests whose look-ahead re-query waits for load-cap room: device tokens.
+        self._qlock_short: dict[CacheRequestHandle, int] = {}
+        # (time, new tokens) of the admissions over the last 30 s: the window's prefill rate.
+        self._admit_times: collections.deque[tuple[float, int]] = collections.deque()
+        # Queued request -> its input tokens, for the new tokens it brings at admission.
+        self._input_len: dict[CacheRequestHandle, int] = {}
+        self._qlock_stats = dict.fromkeys(
+            (
+                "locked",
+                "lookahead_requeries",
+                "lookahead_deferred",
+                "released_admitted",
+                "released_other",
+            ),
+            0,
+        )
+        self._qlock_peak = [0, 0]  # window depth (requests), locked tokens; per log line
+        # Published prefetches left unheld (over the cap or not resident): their end.
+        self.unheld: dict[CacheRequestHandle, int] = {}
+        self._hold_stats = dict.fromkeys(
+            (
+                "held",
+                "over_cap",
+                "not_resident",
+                "admitted",
+                "released",
+                "unheld_kept",
+                "unheld_evicted",
+                "unheld_evicted_tokens",
+            ),
+            0,
+        )
+        self._hold_next_log = 0.0
+        # Queued request -> the prefix its enqueue-time lookup left on device
+        # (device match plus the accepted load); a shorter match at admission re-queries.
+        self.requery_on_device_loss = (
+            self.load_mode == "prefetch"
+            and envs.SGLANG_EXTERNAL_LINKER_REQUERY_ON_DEVICE_LOSS.get()
+        )
+        self.match_targets: dict[CacheRequestHandle, int] = {}
+        # Renews the L3 leases of device-served prefixes (SGLANG_EXTERNAL_LINKER_LEASE_REFRESH_*).
+        self._lease_refresher: Optional[StorageLeaseRefresher] = None
+        lease_interval = envs.SGLANG_EXTERNAL_LINKER_LEASE_REFRESH_INTERVAL.get()
+        lease_fns = (
+            cache_linker.lease_refresh_fns()
+            if lease_interval > 0 and self.load_mode == "prefetch"
+            else None
+        )
+        if lease_fns is not None:
+            build_keys, renew = lease_fns
+            self._lease_refresher = StorageLeaseRefresher(
+                build_keys=build_keys,
+                renew=renew,
+                interval_s=lease_interval,
+                max_keys_per_s=envs.SGLANG_EXTERNAL_LINKER_LEASE_REFRESH_MAX_KEYS_PER_S.get(),
+            )
+            logger.info(
+                "External linker L3 lease refresh on: every %.0f s per chain, at most %d keys/s",
+                lease_interval,
+                envs.SGLANG_EXTERNAL_LINKER_LEASE_REFRESH_MAX_KEYS_PER_S.get(),
+            )
+            self._lease_refresher.start()
+        # The look-ahead re-query loads a deferred request once the window reaches it.
+        self.qlock_defer_far = (
+            bool(self.qlock_cap_tokens)
+            and self.requery_on_device_loss
+            and envs.SGLANG_EXTERNAL_LINKER_QUEUE_LOCK_DEFER_FAR_LOADS.get()
+        )
+        # The last queue walk's window, and whether requests queued behind it.
+        self._window: set[CacheRequestHandle] = set()
+        self._window_full = False
+        self.log_lookup_stats = envs.SGLANG_EXTERNAL_LINKER_LOOKUP_STATS.get()
+        self._lookup_stats = dict.fromkeys(
+            (
+                "issued",
+                "skipped_no_hash",
+                "zero_restorable",
+                "requeried",
+                "load_capped",
+                "deferred_far",
+            ),
+            0,
+        )
+        # Re-queries wait for the next event-loop boundary, so no load starts
+        # inside the admission loop after the batch budget was taken.
+        self._pending_requeries: dict[CacheRequestHandle, Req] = {}
+        # Device tokens held by in-flight loads plus holds, at their peak since the last log line.
+        self._occupied_peak = 0
+        self._lookup_next_log = 0.0
+        # Re-queried request -> when its re-query started; waits until publication (s).
+        self._requery_started: dict[CacheRequestHandle, float] = {}
+        self._requery_waits: list[float] = []
+        # (rid, seconds waited, outcome) per re-query since the last log line, for joins with client exports.
+        self._requery_records: list[tuple[str, float, str]] = []
+        # Lookup kind ("enq" at enqueue, "rq" for a re-query) -> seconds per phase since the last log line.
+        self._lookup_kind = "enq"
+        self._phase_s = {k: dict.fromkeys(("n", "match", "keys", "rpc", "load"), 0.0) for k in ("enq", "rq")}
+        if self.hold_cap_tokens:
+            logger.info(
+                "External linker prefetch holds on: up to %d tokens (%.2f of the "
+                "Full device pool) stay locked until admission",
+                self.hold_cap_tokens,
+                hold_fraction,
+            )
         # Requests loading in the batch being built, then its counter index once
         # the batch starts; finish_loads consumes both after its forward.
         self.inflight_load_rids: list[str] = []
@@ -408,11 +582,25 @@ class UnifiedCacheLinkerWrapper:
         for previous in self.prefetches:
             if previous.rid == request.rid and previous != request:
                 self._cancel_prefetch(previous)
-        if self.cache.disable or request in self.prefetches:
+        for previous in [lk for lk in self.lookups if lk.rid == request.rid]:
+            if previous != request:
+                self._cancel_lookup(previous)
+        for previous in [h for h in self.holds if h.rid == request.rid]:
+            if previous != request:
+                self.release_hold(previous, admitted=False)
+        if self.qlock_cap_tokens:
+            self._input_len[request] = len(req.origin_input_ids)
+        if self.cache.disable or request in self.prefetches or request in self.lookups:
             return
+        timed = self.log_lookup_stats
+        kind = self._lookup_kind
+        t0 = time.perf_counter() if timed else 0.0
         req.init_next_round_input(self.cache, cow_mamba=False)
+        t1 = time.perf_counter() if timed else 0.0
         if is_virtual_node(req.last_node) or req.positional_embed_overrides is not None:
             return
+        if self._lease_refresher is not None:
+            self._refresh_leases(req.last_node)
         page = self.cache.page_size
         key = RadixKey(
             req.full_untruncated_fill_ids,
@@ -422,8 +610,13 @@ class UnifiedCacheLinkerWrapper:
             limit=req._compute_max_prefix_len(len(req.full_untruncated_fill_ids)),
         ).page_aligned(page)
         start = req.prefix_len
+        if self.requery_on_device_loss:
+            self.match_targets[request] = start
         last_hash = self.cache.get_last_hash_value(req.last_node)
-        if len(key) <= start or (start and last_hash is None):
+        if len(key) <= start:
+            return
+        if start and last_hash is None:
+            self._lookup_stats["skipped_no_hash"] += 1
             return
         hashes = get_storage_hash_str(key[start:], last_hash, page_size=page)
         lookups = [
@@ -432,25 +625,139 @@ class UnifiedCacheLinkerWrapper:
         ]
         if any(t is None for t in lookups):
             return
+        if timed:
+            phase = self._phase_s[kind]
+            phase["n"] += 1
+            phase["match"] += t1 - t0
+            phase["keys"] += time.perf_counter() - t1
+        timeout_s = (
+            self.cache.prefetch_timeout_base
+            + len(hashes) * self.cache.prefetch_timeout_per_page
+        )
+        self._lookup_stats["issued"] += 1
+        self._log_lookup_stats()
+        if self._lookup_executor is not None:
+            # The anchor stays locked while the lookup runs, as for a load.
+            self.lookups[request] = _PendingLookup(
+                key,
+                hashes,
+                start,
+                req.last_node,
+                self.cache.inc_lock_ref(req.last_node).to_dec_params(),
+                self._lookup_executor.submit(
+                    self._timed_lookup, kind if timed else None, req.rid, lookups
+                ),
+                timeout_s=timeout_s,
+                kind=kind,
+            )
+            return
         try:
-            # TODO: Run storage lookup asynchronously to avoid blocking scheduling.
-            restorable = self.cache_linker.lookup(req.rid, lookups)
+            restorable = self._timed_lookup(kind if timed else None, req.rid, lookups)
         except Exception:
             logger.warning("External linker prefetch lookup failed", exc_info=True)
             restorable = []
+        anchor_lock = self.cache.inc_lock_ref(req.last_node).to_dec_params()
+        t2 = time.perf_counter() if timed else 0.0
+        self._start_prefetch_load(
+            request,
+            key,
+            hashes,
+            start,
+            req.last_node,
+            anchor_lock,
+            restorable,
+            timeout_s,
+            kind=kind,
+        )
+        if timed:
+            self._phase_s[kind]["load"] += time.perf_counter() - t2
+
+    def _refresh_leases(self, node: NodeId) -> None:
+        """Queue the device-matched path's stale pages for an L3 lease renewal.
+
+        A device hit never reaches L3, so its pages keep the lease of their
+        write and go first when the pool evicts; a later restore needs every
+        page after the device boundary, so one evicted old page voids it.
+        """
+        refresher = self._lease_refresher
+        tree = self.cache.tree_core
+        if tree.is_root(node):
+            return
+        t0 = time.perf_counter_ns()
+        path = [info.node_id for info in tree.collect_path_info([node])[0]]
+        start, stamp = refresher.stale_start(path)
+        renewed, page_hashes = [], []
+        for node_id in path[start:]:
+            hashes = tree.get_hash_values(node_id)
+            if not hashes:
+                # Not offloaded yet: no L3 objects here or below.
+                break
+            renewed.append(node_id)
+            page_hashes.extend(hashes)
+        if page_hashes:
+            refresher.submit(renewed, stamp, page_hashes)
+        refresher.stats["host_calls"] += 1
+        refresher.stats["host_ns"] += time.perf_counter_ns() - t0
+
+    def _timed_lookup(self, kind, rid, lookups):
+        """The store lookup; with ``kind``, its time joins that kind's RPC phase (any thread)."""
+        if kind is None:
+            return self.cache_linker.lookup(rid, lookups)
+        t0 = time.perf_counter()
+        try:
+            return self.cache_linker.lookup(rid, lookups)
+        finally:
+            self._phase_s[kind]["rpc"] += time.perf_counter() - t0
+
+    def _start_prefetch_load(
+        self,
+        request: CacheRequestHandle,
+        key: RadixKey,
+        hashes: list[str],
+        start: int,
+        anchor_node_id: NodeId,
+        anchor_lock: DecLockRefParams,
+        restorable: list[int],
+        timeout_s: float,
+        *,
+        kind: str,
+    ) -> None:
+        """Agree on the restorable prefix across ranks and queue its load."""
+        page = self.cache.page_size
         pages = self._sync_restorable_prefix(
             restorable, num_pages=len(hashes), device_hit_pages=0
         )
         if not pages:
+            self._lookup_stats["zero_restorable"] += 1
+            self.cache.dec_lock_ref(anchor_node_id, anchor_lock)
             return
         end = start + pages * page
+        if request in self.match_targets:
+            self.match_targets[request] = end
+        if kind == "enq" and self._beyond_window(request):
+            # The target stays, so the look-ahead re-query loads it in the window.
+            self._lookup_stats["deferred_far"] += 1
+            self.cache.dec_lock_ref(anchor_node_id, anchor_lock)
+            return
+        cap = self._load_cap()
+        if cap:
+            # In-flight private slots (plus holds, under a shared cap) stay under the
+            # cap, except that one load may always run; a refused load keeps its
+            # target at `end`, so the admission re-query retries it.
+            occupied = self.prefetch_size(PoolName.KV)
+            if not self.load_cap_tokens:
+                occupied += self.held_tokens
+            if occupied and occupied + pages * page > cap:
+                self._lookup_stats["load_capped"] += 1
+                self.cache.dec_lock_ref(anchor_node_id, anchor_lock)
+                return
+            self._occupied_peak = max(self._occupied_peak, occupied + pages * page)
         state = _ExternalCachePrefetch(
             key[:end],
-            req.last_node,
-            self.cache.inc_lock_ref(req.last_node).to_dec_params(),
+            anchor_node_id,
+            anchor_lock,
             [],
-            timeout_s=self.cache.prefetch_timeout_base
-            + len(hashes) * self.cache.prefetch_timeout_per_page,
+            timeout_s=timeout_s,
         )
         self.prefetches[request] = state
         try:
@@ -471,9 +778,21 @@ class UnifiedCacheLinkerWrapper:
         self.cache._all_reduce_attn_groups(accepted, torch.distributed.ReduceOp.MIN)
         if not accepted.item():
             self._cancel_prefetch(request)
-            self.check_prefetch_events()
+            # A lookup drain is inside check_prefetch_events, which settles the
+            # cancelled read right after it; re-entering would rerun the drain.
+            if not self._draining_lookups:
+                self.check_prefetch_events(drain_lookups=False)
+
+    def _load_cap(self) -> int:
+        """Tokens loads may hold in flight: their own cap, else the hold cap they share."""
+        return self.load_cap_tokens or self.hold_cap_tokens
+
+    def has_pending_prefetch(self) -> bool:
+        return bool(self.prefetches or self.lookups)
 
     def check_prefetch_progress(self, request: CacheRequestHandle) -> bool:
+        if request in self.lookups:
+            return self._check_lookup_progress(request)
         state = self.prefetches.get(request)
         if state is None or state.discard:
             return True
@@ -494,11 +813,168 @@ class UnifiedCacheLinkerWrapper:
                 return False
         # Consume any fully completed read before stopping. Running reads keep
         # their private slots until every rank has stopped writing to them.
-        self.check_prefetch_events()
+        # Admission polls this: start no new load here.
+        self.check_prefetch_events(drain_lookups=False)
         self._cancel_prefetch(request)
         return True
 
+    def _check_lookup_progress(self, request: CacheRequestHandle) -> bool:
+        """Admission poll while the request's lookup runs, under the stop
+        policy of a running load."""
+        lookup = self.lookups[request]
+        policy = self.cache.prefetch_stop_policy
+        if policy == "wait_complete":
+            return False
+        if policy == "timeout":
+            now = time.perf_counter()
+            expired = torch.tensor(
+                lookup.wait_started is not None
+                and now - lookup.wait_started > lookup.timeout_s,
+                dtype=torch.int,
+            )
+            self.cache._all_reduce_attn_groups(expired, torch.distributed.ReduceOp.MAX)
+            if not expired.item():
+                if lookup.wait_started is None:
+                    lookup.wait_started = now
+                return False
+        self._cancel_lookup(request)
+        return True
+
+    def requery_after_device_loss(self, req: Req) -> bool:
+        """Look up again the prefix ``req`` lost on device since its last lookup.
+
+        True while the re-query waits for the next event-loop boundary, where
+        its lookup starts; the request then waits on that lookup and its load.
+        """
+        request = req.cache_request_handle
+        target = self.match_targets.get(request)
+        if (
+            target is None
+            or req.prefix_len >= target
+            or request in self.prefetches
+            or request in self.lookups
+            or request in self.holds
+        ):
+            return False
+        if request in self._pending_requeries:
+            return True
+        self._lookup_stats["requeried"] += 1
+        self._pending_requeries[request] = req
+        if self.log_lookup_stats:
+            self._requery_started[request] = time.perf_counter()
+        return True
+
+    def _start_pending_requeries(self) -> None:
+        """At the event-loop boundary: look up again the requests admission deferred."""
+        pending, self._pending_requeries = self._pending_requeries, {}
+        self._lookup_kind = "rq"
+        try:
+            for request, req in pending.items():
+                self.prefetch(req)
+                if request not in self.prefetches and request not in self.lookups:
+                    started = self._requery_started.pop(request, None)
+                    if started is not None:
+                        self._requery_records.append(
+                            (request.rid, time.perf_counter() - started, "none")
+                        )
+        finally:
+            self._lookup_kind = "enq"
+
+    def _log_lookup_stats(self) -> None:
+        now = time.monotonic()
+        if not self.log_lookup_stats or now < self._lookup_next_log:
+            return
+        self._lookup_next_log = now + 60.0
+        waits = sorted(self._requery_waits)
+        self._requery_waits.clear()
+        p50, p90 = (
+            (waits[len(waits) // 2], waits[len(waits) * 9 // 10])
+            if waits
+            else (0.0, 0.0)
+        )
+        phases = []
+        for kind, phase in self._phase_s.items():
+            n = phase["n"]
+            phases.append(
+                f"{kind} n={int(n)}"
+                + "".join(
+                    f" {name} {1e3 * phase[name] / n:.1f}"
+                    for name in ("match", "keys", "rpc", "load")
+                    if n
+                )
+            )
+            self._phase_s[kind] = dict.fromkeys(phase, 0.0)
+        logger.info(
+            "External linker lookups: %s; re-query waits since last log: %d, "
+            "p50 %.3f s, p90 %.3f s; ms per lookup: %s; loads plus holds peak %d "
+            "of cap %d tokens; queue locks: depth peak %d, tokens peak %d of cap %d, %s",
+            self._lookup_stats,
+            len(waits),
+            p50,
+            p90,
+            "; ".join(phases),
+            self._occupied_peak,
+            self._load_cap(),
+            self._qlock_peak[0],
+            self._qlock_peak[1],
+            self.qlock_cap_tokens,
+            self._qlock_stats,
+        )
+        self._occupied_peak = 0
+        self._qlock_peak = [0, 0]
+        if self._requery_records:
+            logger.info(
+                "External linker re-queried rids (rid:wait_s:outcome): %s",
+                " ".join(f"{rid}:{w:.3f}:{o}" for rid, w, o in self._requery_records),
+            )
+            self._requery_records.clear()
+
+    def _cancel_lookup(self, request: CacheRequestHandle) -> None:
+        lookup = self.lookups.pop(request, None)
+        if lookup is not None:
+            # A lookup reads store metadata only, so its result can be dropped.
+            lookup.future.cancel()
+            self.cache.dec_lock_ref(lookup.anchor_node_id, lookup.anchor_lock)
+
+    def _drain_lookups(self) -> None:
+        """Start the loads of lookups every rank has finished, in submission order."""
+        if not self.lookups:
+            return
+        pending = list(self.lookups.items())
+        done = torch.tensor([lk.future.done() for _, lk in pending], dtype=torch.int)
+        self.cache._all_reduce_attn_groups(done, torch.distributed.ReduceOp.MIN)
+        self._draining_lookups = True
+        try:
+            for (request, _), finished in zip(pending, done.tolist()):
+                lookup = self.lookups.pop(request, None) if finished else None
+                if lookup is None:
+                    continue
+                try:
+                    restorable = lookup.future.result()
+                except Exception:
+                    logger.warning(
+                        "External linker prefetch lookup failed", exc_info=True
+                    )
+                    restorable = []
+                t0 = time.perf_counter() if self.log_lookup_stats else 0.0
+                self._start_prefetch_load(
+                    request,
+                    lookup.key,
+                    lookup.hashes,
+                    lookup.start,
+                    lookup.anchor_node_id,
+                    lookup.anchor_lock,
+                    restorable,
+                    lookup.timeout_s,
+                    kind=lookup.kind,
+                )
+                if self.log_lookup_stats:
+                    self._phase_s[lookup.kind]["load"] += time.perf_counter() - t0
+        finally:
+            self._draining_lookups = False
+
     def _cancel_prefetch(self, request: CacheRequestHandle) -> None:
+        self._cancel_lookup(request)
         state = self.prefetches.get(request)
         if state is not None:
             state.discard = True
@@ -514,7 +990,10 @@ class UnifiedCacheLinkerWrapper:
             if transfer.name == pool and transfer.device_indices is not None
         )
 
-    def check_prefetch_events(self) -> None:
+    def check_prefetch_events(self, drain_lookups: bool = True) -> None:
+        if drain_lookups:
+            self._start_pending_requeries()
+            self._drain_lookups()
         if not self.prefetches:
             return
         pending = list(self.prefetches.items())
@@ -541,6 +1020,11 @@ class UnifiedCacheLinkerWrapper:
         state = self.prefetches.pop(request, None)
         if state is None:
             return
+        started = self._requery_started.pop(request, None)
+        if started is not None:
+            waited = time.perf_counter() - started
+            self._requery_waits.append(waited)
+            self._requery_records.append((request.rid, waited, "loaded" if publish else "aborted"))
         # Event polling or reset/close has already quiesced every device writer.
         if state.future is not None:
             assert state.future.done()
@@ -589,10 +1073,218 @@ class UnifiedCacheLinkerWrapper:
             )
             if mamba is not None and inserted.mamba_exist:
                 storage.free_state_slots(sub_pool, mamba.device_indices)
+            if self.hold_cap_tokens:
+                self._hold(request, state.key, end, len(full))
             self.cache.prefetch_loaded_tokens_by_reqid[request] = len(full)
             self.cache.prefetch_loaded_storage_start_by_reqid[request] = start
         finally:
             self.cache.dec_lock_ref(state.anchor_node_id, state.anchor_lock)
+
+    def _hold(self, request, key: RadixKey, end: int, tokens: int) -> None:
+        """Lock a just-published prefix for its waiting request, under the cap."""
+        stats = self._hold_stats
+        resident = self.cache.match_prefix(MatchPrefixParams(key=key))
+        if resident.device_prefix_len < end:
+            stats["not_resident"] += 1
+            self.unheld[request] = end
+        elif self.held_tokens + tokens > self.hold_cap_tokens:
+            stats["over_cap"] += 1
+            self.unheld[request] = end
+        else:
+            node = resident.last_device_node
+            lock = self.cache.inc_lock_ref(node).to_dec_params()
+            self.holds[request] = _PrefetchHold(node, lock, tokens)
+            self.held_tokens += tokens
+            stats["held"] += 1
+        self._log_holds()
+
+    def release_hold(
+        self, request: CacheRequestHandle, *, admitted: bool, prefix_len: int = 0
+    ) -> None:
+        stats = self._hold_stats
+        self.match_targets.pop(request, None)
+        end = self.unheld.pop(request, None)
+        if end is not None and admitted:
+            # An unheld prefix the request no longer matches in full was evicted.
+            if prefix_len < end:
+                stats["unheld_evicted"] += 1
+                stats["unheld_evicted_tokens"] += end - prefix_len
+            else:
+                stats["unheld_kept"] += 1
+        hold = self.holds.pop(request, None)
+        if hold is not None:
+            self.cache.dec_lock_ref(hold.node_id, hold.lock)
+            self.held_tokens -= hold.tokens
+            stats["admitted" if admitted else "released"] += 1
+        self._release_qlock(request, admitted=admitted)
+        if self.qlock_cap_tokens:
+            input_len = self._input_len.pop(request, None)
+            if admitted and input_len is not None:
+                self._admit_times.append((time.monotonic(), max(input_len - prefix_len, 0)))
+        if admitted:
+            self._log_holds()
+
+    def protect_queue(self, reqs: Sequence[Req], depth_override: Optional[int] = None) -> None:
+        """At the event-loop boundary: lock the device prefixes of the queued requests
+        in the window (those admitted within qlock_seconds at the observed prefill
+        rate) while their tokens fit the cap; queue a re-query for a request that
+        reaches the window with part of its prefix already lost."""
+        if not self.qlock_cap_tokens:
+            return
+        window = self._window_requests(reqs, depth_override)
+        if self.qlock_defer_far:
+            self._window = {r.cache_request_handle for r in window}
+            self._window_full = len(window) < len(reqs)
+        # Look-ahead loads take load-cap room head first; a lookup the cap would refuse
+        # is not sent, so a full cap does not turn into a lookup every loop.
+        room = self._load_room()
+        keep: set[CacheRequestHandle] = set()
+        tokens = depth = 0
+        for req in window:
+            request = req.cache_request_handle
+            depth += 1
+            if (
+                request in self.holds
+                or request in self.prefetches
+                or request in self.lookups
+                or request in self._pending_requeries
+                or request in self._qlock_empty
+            ):
+                continue
+            qlock = self.qlocks.get(request)
+            short = self._qlock_short.get(request)
+            if short is not None:
+                need = self.match_targets.get(request, short) - short
+                if need > room:
+                    if qlock is None:
+                        continue
+                else:
+                    # An unlocked one is matched again below, which charges the room.
+                    del self._qlock_short[request]
+                    if qlock is not None:
+                        self._queue_lookahead(req)
+                        room -= need
+            if qlock is None:
+                qlock, room = self._lock_queued(req, room)
+                if qlock is None:
+                    continue
+            if tokens + qlock.tokens > self.qlock_cap_tokens:
+                if request not in self.qlocks:
+                    self.cache.dec_lock_ref(qlock.node_id, qlock.lock)
+                break
+            if request not in self.qlocks:
+                self.qlocks[request] = qlock
+                self._qlock_stats["locked"] += 1
+            keep.add(request)
+            tokens += qlock.tokens
+        for request in [r for r in self.qlocks if r not in keep]:
+            self._release_qlock(request, admitted=False)
+        self.qlocked_tokens = tokens
+        self._qlock_peak = [max(self._qlock_peak[0], depth), max(self._qlock_peak[1], tokens)]
+
+    def _window_requests(
+        self, reqs: Sequence[Req], depth_override: Optional[int]
+    ) -> list[Req]:
+        """The queue's head up to the first request that starts after qlock_seconds of
+        prefill work; a pipeline stage that admits at other times passes stage 0's depth."""
+        if depth_override is not None:
+            return list(itertools.islice(reqs, depth_override))
+        budget = self.qlock_window_tokens()
+        window: list[Req] = []
+        work = 0
+        for req in reqs:
+            if window and work >= budget:
+                break
+            window.append(req)
+            # A loaded prefix is not prefilled; its target is what the load leaves.
+            known = max(req.prefix_len, self.match_targets.get(req.cache_request_handle, 0))
+            work += max(len(req.origin_input_ids) - known, 0)
+        return window
+
+    def qlock_window_tokens(self) -> float:
+        """New tokens prefilled in qlock_seconds at the rate of the last 30 s of
+        admissions; unbounded (the token cap rules) until two are seen."""
+        now = time.monotonic()
+        while self._admit_times and now - self._admit_times[0][0] > 30.0:
+            self._admit_times.popleft()
+        if len(self._admit_times) < 2:
+            return math.inf
+        span = max(now - self._admit_times[0][0], 1.0)
+        return sum(n for _, n in self._admit_times) / span * self.qlock_seconds
+
+    def _lock_queued(
+        self, req: Req, room: float
+    ) -> tuple[Optional[_PrefetchHold], float]:
+        """Lock ``req``'s current device match, or queue its look-ahead re-query when
+        the device lost part of the prefix its last lookup left there and ``room``
+        (load-cap tokens) takes it; return the lock and the room left."""
+        request = req.cache_request_handle
+        req.init_next_round_input(self.cache, cow_mamba=False)
+        if is_virtual_node(req.last_node):
+            self._qlock_empty.add(request)
+            return None, room
+        target = self.match_targets.get(request)
+        need = 0
+        if self.requery_on_device_loss and target is not None:
+            need = target - req.prefix_len
+        if need > 0:
+            if need <= room:
+                self._queue_lookahead(req)
+                return None, room - need
+            # Lock what is left on device; the re-query waits for room.
+            self._qlock_short[request] = req.prefix_len
+            self._qlock_stats["lookahead_deferred"] += 1
+        if not req.prefix_len:
+            if need <= 0:
+                self._qlock_empty.add(request)
+            return None, room
+        lock = self.cache.inc_lock_ref(req.last_node).to_dec_params()
+        return _PrefetchHold(req.last_node, lock, req.prefix_len), room
+
+    def _queue_lookahead(self, req: Req) -> None:
+        request = req.cache_request_handle
+        self._lookup_stats["requeried"] += 1
+        self._qlock_stats["lookahead_requeries"] += 1
+        self._pending_requeries[request] = req
+        if self.log_lookup_stats:
+            self._requery_started[request] = time.perf_counter()
+
+    def _beyond_window(self, request: CacheRequestHandle) -> bool:
+        """Queued behind the last walk's full window: new arrivals join the tail."""
+        return self.qlock_defer_far and self._window_full and request not in self._window
+
+    def _load_room(self) -> float:
+        """Load-cap tokens free for new loads now; unbounded without a cap."""
+        cap = self._load_cap()
+        if not cap:
+            return math.inf
+        occupied = self.prefetch_size(PoolName.KV)
+        if not self.load_cap_tokens:
+            occupied += self.held_tokens
+        return cap - occupied
+
+    def _release_qlock(self, request: CacheRequestHandle, *, admitted: bool) -> None:
+        self._qlock_empty.discard(request)
+        self._qlock_short.pop(request, None)
+        qlock = self.qlocks.pop(request, None)
+        if qlock is None:
+            return
+        self.cache.dec_lock_ref(qlock.node_id, qlock.lock)
+        self.qlocked_tokens -= qlock.tokens
+        self._qlock_stats["released_admitted" if admitted else "released_other"] += 1
+
+    def _log_holds(self) -> None:
+        now = time.monotonic()
+        if now < self._hold_next_log:
+            return
+        self._hold_next_log = now + 60.0
+        logger.info(
+            "External linker prefetch holds: %d requests hold %d of %d tokens; %s",
+            len(self.holds),
+            self.held_tokens,
+            self.hold_cap_tokens,
+            self._hold_stats,
+        )
 
     def _sync_restorable_prefix(
         self, restorable: list[int], *, num_pages: int, device_hit_pages: int
@@ -891,6 +1583,22 @@ class UnifiedCacheLinkerWrapper:
     def _clear_state(self) -> None:
         for request in list(self.prefetches):
             self._finish_prefetch(request, publish=False)
+        for request in list(self.lookups):
+            self._cancel_lookup(request)
+        for request in list(self.holds):
+            self.release_hold(request, admitted=False)
+        for request in list(self.qlocks):
+            self._release_qlock(request, admitted=False)
+        self._qlock_empty.clear()
+        self._qlock_short.clear()
+        self._input_len.clear()
+        self._window.clear()
+        self._window_full = False
+        self.unheld.clear()
+        self.match_targets.clear()
+        self._pending_requeries.clear()
+        self._requery_started.clear()
+        self._requery_records.clear()
         self.hit_markers.clear()
         self.inflight_load_rids.clear()
         self.private_load_indices.clear()
@@ -905,7 +1613,10 @@ class UnifiedCacheLinkerWrapper:
     def release_request(self, request: CacheRequestHandle) -> None:
         rid = request.rid
         self.hit_markers.pop(rid, None)
+        self._pending_requeries.pop(request, None)
+        self._requery_started.pop(request, None)
         self._cancel_prefetch(request)
+        self.release_hold(request, admitted=False)
         # A queued load targets slots the request owns and is about to free.
         # A started one is finished by finish_loads before anything is freed.
         if rid in self.inflight_load_rids and self.cache_linker.cancel_queued_load(rid):
@@ -913,5 +1624,10 @@ class UnifiedCacheLinkerWrapper:
             self.private_load_indices.pop(rid, None)
 
     def close(self) -> None:
+        if self._lease_refresher is not None:
+            self._lease_refresher.stop()
+            self._lease_refresher = None
         self.cache_linker.close()
         self._clear_state()
+        if self._lookup_executor is not None:
+            self._lookup_executor.shutdown(wait=False, cancel_futures=True)

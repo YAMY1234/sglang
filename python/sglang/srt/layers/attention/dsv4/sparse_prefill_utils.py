@@ -101,10 +101,13 @@ class SparsePrefillKVBuffer:
         return self._reserve(num_tokens, dtype)
 
     def get_with_head(
-        self, num_tokens: int, head_source: tuple
+        self,
+        num_tokens: int,
+        head_source: tuple,
+        dtype: torch.dtype = torch.bfloat16,
     ) -> Tuple[torch.Tensor, bool]:
         """Returns the rows and whether the head already holds ``head_source``."""
-        buffer = self._reserve(num_tokens, torch.bfloat16)
+        buffer = self._reserve(num_tokens, dtype)
         head_filled = head_source == self._head_source
         self._head_source = head_source
         return buffer, head_filled

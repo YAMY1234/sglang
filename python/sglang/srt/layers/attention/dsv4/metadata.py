@@ -269,14 +269,27 @@ class PagedIndexerMetadata:
             )
             if varlen:
                 assert compressed_seq_lens.shape[1] == 1, compressed_seq_lens.shape
-                self.deep_gemm_indices = (
-                    torch.arange(
-                        self.rows_per_chunk or num_rows,
-                        dtype=torch.int32,
-                        device=compressed_seq_lens.device,
+                self.deep_gemm_indices = None
+                if envs.SGLANG_OPT_DSV4_FUSED_ATTN_METADATA.get():
+                    from sglang.kernels.ops.attention.dsv4.fused_attn_metadata import (
+                        row_group_indices,
                     )
-                    // group
-                )
+
+                    self.deep_gemm_indices = row_group_indices(
+                        num_rows=self.rows_per_chunk or num_rows,
+                        group=group,
+                        device=compressed_seq_lens.device,
+                        max_rows=DEEP_GEMM_VARLEN_MAX_ROWS,
+                    )
+                if self.deep_gemm_indices is None:
+                    self.deep_gemm_indices = (
+                        torch.arange(
+                            self.rows_per_chunk or num_rows,
+                            dtype=torch.int32,
+                            device=compressed_seq_lens.device,
+                        )
+                        // group
+                    )
 
             def schedule(lens: torch.Tensor):
                 if varlen:

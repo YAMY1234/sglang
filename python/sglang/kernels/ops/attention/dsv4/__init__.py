@@ -13,6 +13,7 @@ from .compress import (
 )
 from .norm_rope import (
     fused_k_norm_rope_flashmla,
+    fused_qkv_norm_flashmla,
     fused_norm_rope_inplace,
     fused_q_indexer_rope_hadamard_fp4_quant,
     fused_q_indexer_rope_hadamard_quant,
@@ -41,6 +42,7 @@ __all__ = [
     "fused_q_indexer_rope_hadamard_fp4_quant",
     "fused_q_indexer_rope_hadamard_quant",
     "fused_k_norm_rope_flashmla",
+    "fused_qkv_norm_flashmla",
     "make_name",
     "get_paged_mqa_logits_metadata",
     "topk_transform_paged",

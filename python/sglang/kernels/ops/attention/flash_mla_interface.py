@@ -10,6 +10,7 @@ token-interleaved V4.1 caches (``KVLayout.V41_NEW`` / ``V41_FP4_NEW``) take
 ``use_legacy=False``. CUDA only: HIP and XPU keep their own sgl-kernel ops.
 """
 
+from functools import lru_cache
 from typing import Optional, Tuple, Union
 
 import flash_mla
@@ -197,8 +198,40 @@ def flash_mla_mega_prefill(
     enable_q_norm: bool = False,
     rms_norm_eps: float = 0.0,
     use_legacy: bool = True,
+    out_sf_swizzled_128x4: bool = False,
+    q_head_scale: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, ...]:
-    """MegaAttention prefill over a bf16 ``kv``: (out_fp8, out_sf, max_logits, lse)."""
+    """MegaAttention prefill over a bf16 ``kv``: (out_fp8, out_sf, max_logits, lse).
+    ``out_sf_swizzled_128x4`` writes out_sf per wv group in the 128x4 layout (s_q % 128 == 0).
+    An E4M3 ``q`` with ``q_head_scale`` (fp32 [heads], q = Q / scale) needs the e4m3 ``kv``."""
+    if q_head_scale is not None:
+        # The op directly: the installed wheel's Python wrapper may predate q_head_scale.
+        from flash_mla._loader import get_ops
+
+        assert not use_legacy and q.dtype == torch.float8_e4m3fn
+        p = _MEGA_FIXED_PARAMS
+        return get_ops(False).fused_norm_rope_attn_rope_cast_fwd(
+            q,
+            kv,
+            indices,
+            softmax_scale,
+            512,
+            attn_sink,
+            topk_length,
+            enable_q_norm,
+            rms_norm_eps,
+            positions,
+            p["is_rope_neox_style"],
+            p["rope_dim"],
+            cos_sin_cache,
+            q.shape[1] // 8,
+            p["num_per_channels"],
+            p["use_tma_aligned_col_major_sf"],
+            p["round_sf"],
+            p["use_packed_ue8m0"],
+            out_sf_swizzled_128x4,
+            q_head_scale,
+        )
     return _mega.prefill(
         token_positions=positions,
         cos_sin_cache=cos_sin_cache,
@@ -212,6 +245,7 @@ def flash_mla_mega_prefill(
         enable_q_norm=enable_q_norm,
         rms_norm_eps=rms_norm_eps,
         use_legacy=use_legacy,
+        **({"out_sf_swizzled_128x4": True} if out_sf_swizzled_128x4 else {}),
         **_MEGA_FIXED_PARAMS,
     )
 
@@ -232,8 +266,28 @@ def flash_mla_mega_decode(
     enable_q_norm: bool = False,
     rms_norm_eps: float = 0.0,
     use_legacy: bool = True,
+    q_head_scale: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """MegaAttention decode over a paged cache: (out_fp8, out_sf, lse)."""
+    """MegaAttention decode over a paged cache: (out_fp8, out_sf, lse). An E4M3 ``q``
+    with ``q_head_scale`` (fp32 [heads], q = Q / scale) runs FlashMLA's fp8 decode."""
+    if q_head_scale is not None:
+        return _mega_decode_fp8_q(
+            q,
+            kv,
+            indices,
+            positions,
+            cos_sin_cache,
+            softmax_scale,
+            attn_sink,
+            topk_length,
+            extra_kv,
+            extra_indices,
+            extra_topk_length,
+            enable_q_norm,
+            rms_norm_eps,
+            use_legacy,
+            q_head_scale,
+        )
     return _mega.decode(
         token_positions=positions,
         cos_sin_cache=cos_sin_cache,
@@ -251,4 +305,88 @@ def flash_mla_mega_decode(
         rms_norm_eps=rms_norm_eps,
         use_legacy=use_legacy,
         **_MEGA_FIXED_PARAMS,
+    )
+
+
+def mega_decode_takes_q_head_scale() -> bool:
+    """Whether the installed FlashMLA's current-side decode op takes ``q_head_scale``
+    (an E4M3 q with static per-head scales)."""
+    global _TAKES_Q_HEAD_SCALE
+    if _TAKES_Q_HEAD_SCALE is None:
+        from flash_mla._loader import get_ops
+
+        op = get_ops(False).fused_norm_rope_attn_rope_cast_decode
+        _TAKES_Q_HEAD_SCALE = any(
+            a.name == "q_head_scale" for a in op.default._schema.arguments
+        )
+    return _TAKES_Q_HEAD_SCALE
+
+
+_TAKES_Q_HEAD_SCALE: Optional[bool] = None
+
+
+@lru_cache(maxsize=1)
+def mega_prefill_takes_q_head_scale() -> bool:
+    """Whether the installed FlashMLA's prefill op takes ``q_head_scale`` (an E4M3 q with
+    static per-head scales, over the e4m3 kv workspace)."""
+    from flash_mla._loader import get_ops
+
+    op = get_ops(False).fused_norm_rope_attn_rope_cast_fwd
+    return any(a.name == "q_head_scale" for a in op.default._schema.arguments)
+_FP8_Q_LOGGED = False
+
+
+def _mega_decode_fp8_q(
+    q,
+    kv,
+    indices,
+    positions,
+    cos_sin_cache,
+    softmax_scale,
+    attn_sink,
+    topk_length,
+    extra_kv,
+    extra_indices,
+    extra_topk_length,
+    enable_q_norm,
+    rms_norm_eps,
+    use_legacy,
+    q_head_scale,
+):
+    # The op directly: the installed wheel's Python wrapper may predate q_head_scale.
+    from flash_mla._loader import get_ops
+
+    global _FP8_Q_LOGGED
+    assert not use_legacy and q.dtype == torch.float8_e4m3fn
+    if not _FP8_Q_LOGGED:
+        _FP8_Q_LOGGED = True
+        import logging
+
+        logging.getLogger(__name__).info(
+            "MegaAttention decode: E4M3 Q at static per-head scales (FlashMLA fp8 decode)"
+        )
+    p = _MEGA_FIXED_PARAMS
+    return get_ops(False).fused_norm_rope_attn_rope_cast_decode(
+        q,
+        kv,
+        indices,
+        softmax_scale,
+        512,
+        attn_sink,
+        topk_length,
+        extra_kv,
+        extra_indices,
+        extra_topk_length,
+        enable_q_norm,
+        rms_norm_eps,
+        positions,
+        p["is_rope_neox_style"],
+        p["rope_dim"],
+        cos_sin_cache,
+        q.shape[1] // 8,
+        p["num_per_channels"],
+        p["use_tma_aligned_col_major_sf"],
+        p["round_sf"],
+        p["use_packed_ue8m0"],
+        q_head_scale,
     )

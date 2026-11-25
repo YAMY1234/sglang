@@ -8,6 +8,7 @@ from sglang.kernels.jit.utils import (
     load_jit,
     make_cpp_args,
 )
+from sglang.srt.environ import envs
 from sglang.srt.utils import is_hip, is_xpu
 
 from .kv_layout import KVLayout
@@ -29,6 +30,17 @@ def _jit_fused_rope_module():
         *args,
         cuda_files=["deepseek_v4/rope.cuh"],
         cuda_wrappers=[("forward", f"FusedQKRopeKernel<{args}>::forward")],
+    )
+
+
+@cache_once
+def _jit_fused_rope_rows_module():
+    args = make_cpp_args(is_arch_support_pdl())
+    return load_jit(
+        make_name("fused_rope_rows"),
+        *args,
+        cuda_files=["deepseek_v4/rope_rows.cuh"],
+        cuda_wrappers=[("forward", f"RopeRowsKernel<{args}>::forward")],
     )
 
 
@@ -86,6 +98,28 @@ def _jit_main_k_norm_rope_flashmla_module(
         cuda_files=["deepseek_v4/main_norm_rope.cuh"],
         cuda_wrappers=[
             ("forward", f"FusedKNormRopeFlashMLAKernel<{args}>::forward"),
+        ],
+    )
+
+
+@cache_once
+def _jit_fused_qkv_norm_flashmla_module(
+    dtype: torch.dtype,
+    head_dim: int,
+    rope_dim: int,
+    page_size: int,
+    layout: KVLayout,
+):
+    """The K kernel above and rmsnorm_mxfp8 of the q_lora rows in one launch."""
+    args = make_cpp_args(
+        dtype, head_dim, rope_dim, page_size, layout.cpp_name, is_arch_support_pdl()
+    )
+    return load_jit(
+        make_name("fused_qkv_norm_flashmla"),
+        *args,
+        cuda_files=["deepseek_v4/main_norm_rope.cuh"],
+        cuda_wrappers=[
+            ("forward", f"FusedQKVNormFlashMLAKernel<{args}>::forward"),
         ],
     )
 
@@ -166,6 +200,9 @@ def fused_rope_inplace(
         return
 
     freqs_real = torch.view_as_real(freqs_cis).flatten(-2).contiguous()
+    if k is None and envs.SGLANG_OPT_DSV4_ROPE_ROW_LAUNCH.get():
+        _jit_fused_rope_rows_module().forward(q, freqs_real, positions, inverse)
+        return
     module = _jit_fused_rope_module()
     module.forward(q, k, freqs_real, positions, inverse)
 
@@ -338,3 +375,36 @@ def fused_k_norm_rope_flashmla(
             kv.dtype, head_dim, rope_dim, page_size, layout
         )
         module.forward(kv, kv_weight, freqs_real, positions, out_loc, kvcache, eps)
+
+
+def fused_qkv_norm_flashmla(
+    q_lora: torch.Tensor,
+    q_weight: torch.Tensor,
+    q_eps: float,
+    kv: torch.Tensor,
+    kv_weight: torch.Tensor,
+    eps: float,
+    freqs_cis: torch.Tensor,
+    positions: torch.Tensor,
+    out_loc: torch.Tensor,
+    kvcache: torch.Tensor,
+    page_size: int,
+    layout: Union[KVLayout, str],
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """``fused_k_norm_rope_flashmla`` (V4.1 layouts, < 2048 tokens) and
+    ``rmsnorm_mxfp8(q_lora, q_weight, q_eps)`` in one launch; returns the latter's
+    ``(y_bf16, y_q, y_sf)``, bitwise equal."""
+    layout = KVLayout.parse(layout)
+    m, k = q_lora.shape
+    y = torch.empty((m, k), dtype=q_lora.dtype, device=q_lora.device)
+    q = torch.empty((m, k), dtype=torch.float8_e4m3fn, device=q_lora.device)
+    s = torch.empty((k // 32) * -(-m // 128) * 128, dtype=torch.uint8, device=q_lora.device)
+    freqs_real = torch.view_as_real(freqs_cis).flatten(-2)
+    module = _jit_fused_qkv_norm_flashmla_module(
+        kv.dtype, kv.shape[-1], freqs_real.shape[-1], page_size, layout
+    )
+    module.forward(
+        kv, kv_weight, freqs_real, positions, out_loc, kvcache, eps,
+        q_lora, q_weight, q_eps, y, q, s,
+    )
+    return y, q, s

@@ -796,6 +796,21 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         """Expected storage-hit span in logical tokens for a waiting request."""
         return None
 
+    def release_prefetch_hold(self, handle: CacheRequestHandle, prefix_len: int) -> None:
+        """Drop the lock a published prefetch holds for a request admitted with a
+        ``prefix_len``-token device prefix."""
+
+    def protect_queued_prefixes(
+        self, reqs: list[Req], depth_override: Optional[int] = None
+    ) -> None:
+        """Keep the device prefixes of the queued requests next in line until
+        admission (external linker queue locks); a no-op elsewhere."""
+
+    def requery_prefetch_after_device_loss(self, req: Req) -> bool:
+        """Re-query a queued request's prefix lost on device since its lookup;
+        True while that lookup or load runs."""
+        return False
+
     def pop_prefetch_loaded_span(
         self, handle: CacheRequestHandle
     ) -> tuple[int, Optional[int]]:

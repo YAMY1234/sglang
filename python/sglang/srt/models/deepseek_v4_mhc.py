@@ -57,6 +57,7 @@ from sglang.srt.model_executor.runner_utils.prefill_graph import (
 from sglang.srt.models.deepseek_v2 import MoEOutput
 from sglang.srt.runtime_context import get_forward, get_parallel, get_platform
 from sglang.srt.utils import is_gfx95_supported, is_hip, is_npu, is_xpu
+from sglang.srt.utils.log_utils import print_info_once
 
 _is_gfx95_supported = is_gfx95_supported()
 _is_hip = is_hip()
@@ -144,6 +145,7 @@ class HcSubLayer(NamedTuple):
     norm: RMSNorm
     tf32_parts: Optional[Any] = None
     bf16_parts: Optional[Any] = None
+    bf16_packed: Optional[torch.Tensor] = None
 
 
 # ---------------------------------------------------------------------------
@@ -343,6 +345,9 @@ def use_stats_stream(cfg: HcConfig, forward_batch: ForwardBatch, x: torch.Tensor
     )
 
 
+_PACKED_MIN_ROWS = 8192
+
+
 def mix_stats(
     hc: HcSubLayer, x: torch.Tensor, stats_stream: Optional[torch.cuda.Stream] = None
 ) -> HcTriplet:
@@ -401,7 +406,27 @@ def _mix_stats_impl(hc: HcSubLayer, x: torch.Tensor) -> HcTriplet:
     if x.is_cuda and use_fused_stats and x.dtype == torch.bfloat16:
         # The default split-K/Sinkhorn fusion preserves batch invariance;
         # compensated projections above are disabled in batch-invariant mode.
-        if use_bf16_projection:
+        # Below 8192 rows the packed kernel's 256-row tiles leave the grid under one
+        # wave; the stock projection is as fast there (VR200).
+        if (
+            use_bf16_projection
+            and hc.bf16_packed is not None
+            and x_flat.shape[0] >= _PACKED_MIN_ROWS
+        ):
+            from sglang.kernels.ops.layernorm.mhc import (
+                hc_mix_stats_sinkhorn_packed,
+            )
+
+            pre, post, comb = hc_mix_stats_sinkhorn_packed(
+                x_flat,
+                hc.bf16_packed,
+                hc.scale,
+                hc.base,
+                cfg.sinkhorn_iters,
+                cfg.rms_eps,
+                cfg.eps,
+            )
+        elif use_bf16_projection:
             from sglang.kernels.ops.layernorm.mhc import (
                 hc_mix_stats_sinkhorn_bf16x3,
             )
@@ -479,6 +504,10 @@ def defer_attn_stats_fork(stats_stream: torch.cuda.Stream) -> None:
     instead of beside the full-grid projection GEMMs."""
     global _deferred_attn_fork
     assert _deferred_attn_fork is None
+    if envs.SGLANG_OPT_DSV41_ATTN_STATS_FORK_AT_READ.get():
+        print_info_once("mHC attention mix: side stream forked at the read")
+        fork_stats_stream(stats_stream)
+        return
     _deferred_attn_fork = stats_stream
 
 
@@ -504,6 +533,44 @@ def combine(
 ) -> torch.Tensor:
     """The sublayer's input: ``norm(sum_k pre[k] * R[k])``, short-circuited by
     whatever the previous post left in ``state.input``."""
+    return combine_input(hc.cfg, hc.norm, state, quantized)
+
+
+def broadcast_mix_stats(
+    hc: HcSubLayer, packed_sum: Optional[torch.Tensor], streams: torch.Tensor
+) -> Optional[HcTriplet]:
+    """The triplet of ``mix_stats(hc, streams)`` when all hc streams are copies of
+    stream 0 (the first layer's broadcast embedding): one quarter of the reads,
+    through the weight summed over streams."""
+    if packed_sum is None or not envs.SGLANG_OPT_DSV41_HC_STATS_PACKED.get():
+        return None
+    if not (_PACKED_MIN_ROWS <= streams.shape[0] <= 65536 and streams.is_contiguous()):
+        return None
+    from sglang.kernels.ops.layernorm.mhc import hc_mix_stats_sinkhorn_packed
+
+    cfg = hc.cfg
+    return hc_mix_stats_sinkhorn_packed(
+        streams[:, 0, :],
+        packed_sum,
+        hc.scale,
+        hc.base,
+        cfg.sinkhorn_iters,
+        cfg.rms_eps,
+        cfg.eps,
+    )
+
+
+def combine_input(
+    cfg: HcConfig,
+    norm: RMSNorm,
+    state: HcState,
+    quantized: Optional[list] = None,
+) -> torch.Tensor:
+    """Collapse and normalize the previous state without predicting a new triplet.
+
+    Cache-only producer boundaries need this input but have no attention or
+    following sublayer, so they do not materialize mixing predictor weights.
+    """
     shortcut = state.input
     if isinstance(shortcut, HcQuantized):
         if quantized is not None:
@@ -511,18 +578,18 @@ def combine(
         return shortcut.rows
     if isinstance(shortcut, HcNormed):
         return shortcut.rows
-    return _combine(hc, state, quantized)
+    return _combine(cfg, norm, state, quantized)
 
 
 def _combine(
-    hc: HcSubLayer,
+    cfg: HcConfig,
+    norm: RMSNorm,
     state: HcState,
     quantized: Optional[list],
 ) -> torch.Tensor:
     """The combine computed from the residual's rows."""
     from sglang.kernels.ops.layernorm.mhc import mhc_combine
 
-    cfg, norm = hc.cfg, hc.norm
     x, apply_pre = state.residual, state.pre
     quantize = quantized is not None
     x_flat = x.flatten(1)
@@ -562,8 +629,15 @@ def _combine(
             quantized.append(Mxfp8SwizzledInput(y_q, y_sf))
             return y
         from sglang.kernels.ops.layernorm.hc_combine_norm import hc_combine_norm
+        from sglang.kernels.ops.layernorm.mhc_mega import locality_normed_rows
 
-        return hc_combine_norm(x_flat, apply_pre, norm.weight, norm.variance_epsilon)
+        return hc_combine_norm(
+            x_flat,
+            apply_pre,
+            norm.weight,
+            norm.variance_epsilon,
+            out=locality_normed_rows(x_flat.shape[0]),
+        )
     return norm(mhc_combine(x_flat, apply_pre, cfg.mult, x.dtype))
 
 
@@ -578,6 +652,7 @@ def post(
     residual: torch.Tensor,
     post_mix: torch.Tensor,
     comb: torch.Tensor,
+    out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """``R'[i] = post[i] * x + sum_j comb[j][i] * R[j]``, by whichever kernel fits."""
     if x.shape[0] == 0:
@@ -635,7 +710,7 @@ def post(
 
         from sglang.kernels.ops.layernorm.mhc import mhc_post
 
-        return mhc_post(x, residual, post_mix, comb)
+        return mhc_post(x, residual, post_mix, comb, out=out)
 
     if _is_hip:
         from aiter.ops.mhc import mhc_post
@@ -828,7 +903,14 @@ def _post_fusion(
             next.norm.variance_epsilon,
         )
         return HcState(updated, pre, HcNormed(normalized))
-    return HcState(post(cfg, y, residual, post_mix, comb), pre)
+    # A closed seam (Engram, capture, tail start) keeps the stream in the locality slot; the final post does not,
+    # its residual outlives the forward.
+    out = None
+    if next is not None:
+        from sglang.kernels.ops.layernorm.mhc_mega import locality_inplace_out
+
+        out = locality_inplace_out(residual)
+    return HcState(post(cfg, y, residual, post_mix, comb, out=out), pre)
 
 
 def run_attn_post(

@@ -8,7 +8,10 @@ from sglang.kernels.ops.speculative.dspark.blockwise_rejection import (
 )
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.environ import envs
+from sglang.srt.eplb.eplb_manager import EPLBFamily
+from sglang.srt.eplb.expert_location import DRAFT_EXPERT_LOCATION_FAMILY
 from sglang.srt.layers.dp_attention import get_dp_tp_group
+from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.logprob_processor import compute_spec_logprobs
 from sglang.srt.lora.layers import unwrap_lora_layer
 from sglang.srt.managers.schedule_batch import ScheduleBatch
@@ -72,6 +75,7 @@ from sglang.srt.speculative.dspark_components.dspark_planner import (
     idle_ragged_layout,
 )
 from sglang.srt.speculative.dspark_components.dspark_sampling_accept_graph import (
+    AcceptGraphCheck,
     DsparkSamplingAcceptGraph,
 )
 from sglang.srt.speculative.dspark_components.dspark_verify import (
@@ -79,8 +83,10 @@ from sglang.srt.speculative.dspark_components.dspark_verify import (
     CommitInjectCtx,
     DsparkVerifyEpilogue,
     TargetVerifyExecutor,
+    force_verify_rows,
     target_model_type,
     verify_logits_adjustments_are_noop,
+    widen_verify_logits,
 )
 from sglang.srt.speculative.online_acceptance_estimator import (
     OnlineAcceptanceEstimator,
@@ -210,6 +216,13 @@ class DSparkWorkerV2(BaseSpecWorker):
             )
         )
         self._is_pd_prefill = get_disagg().disaggregation_mode == "prefill"
+        # SGLANG_DSV41_FUSED_TAIL on a split PD decode: fed tails ride the verify.
+        self._dsv41_fused_tail = (
+            get_disagg().dsv41_encoder_only_prefill
+            and get_disagg().disaggregation_mode == "decode"
+            and envs.SGLANG_DSV41_FUSED_TAIL.get()
+        )
+        self._dsv41_forced_draft_logged = False
         self._decode_graph_allowed = (
             get_exec().graph.cuda_graph_config.decode.backend != Backend.DISABLED
             and not self._is_pd_prefill
@@ -247,6 +260,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         self.draft_model_runner = bundle.draft_model_runner
         self.draft_model = bundle.draft_model
         self._draft_sampler = None
+        self._maybe_register_draft_eplb()
 
         # The mask token is input-only (it is embedded, never sampled), so its
         # bound is the embedding-table row count: the PADDED vocab when the
@@ -405,6 +419,9 @@ class DSparkWorkerV2(BaseSpecWorker):
         self._verify_epilogue = None
         self._deferred_draft_kv: Optional[DeferredDraftKVStore] = None
         self._sampling_accept_graph: Optional[DsparkSamplingAcceptGraph] = None
+        self._accept_graph_check = AcceptGraphCheck(
+            steps=envs.SGLANG_DSPARK_ACCEPT_GRAPH_CHECK_STEPS.get()
+        )
         # Counter-based draws from the server seed: every TP rank draws the same coins,
         # so no accept broadcast is needed.
         self._rejection_noise = (
@@ -423,11 +440,19 @@ class DSparkWorkerV2(BaseSpecWorker):
             and torch.device(self.device).type == "cuda"
             else None
         )
+        # Each attention-DP rank runs its own batch: with attn_tp 1 the sampling-accept
+        # graph holds no collective, so it can serve one rank (the verify graph folds nothing).
+        self._dp_accept_graph = (
+            envs.SGLANG_OPT_DSV41_DSPARK_DP_ACCEPT_GRAPH.get()
+            and get_parallel().attn_dp_enabled
+            and get_parallel().attn_tp_size == 1
+            and is_cuda()
+        )
         static_epilogue_supported = (
             target_is_dsv41
             and self._verify_planner.mode_value == "static"
             and self._draft_is_moe
-            and not get_parallel().attn_dp_enabled
+            and (not get_parallel().attn_dp_enabled or self._dp_accept_graph)
             and get_parallel().pp_size == 1
         )
         # ROCm (V4.1 target only): inside a HIP graph the accept-site TP broadcasts
@@ -462,6 +487,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                     static_epilogue_supported
                     and envs.SGLANG_OPT_DSV41_DSPARK_POST_FOLD.get()
                 ),
+                fold_accept=not self._dp_accept_graph,
                 commit_ctx=CommitInjectCtx(
                     draft_model=self.draft_model,
                     block_pos_offsets=self._block_pos_offsets,
@@ -485,7 +511,10 @@ class DSparkWorkerV2(BaseSpecWorker):
                 self._verify_epilogue.capture_hook
             )
             if (
-                envs.SGLANG_OPT_DSV41_SAMPLING_ACCEPT_GRAPH.get()
+                (
+                    envs.SGLANG_OPT_DSV41_SAMPLING_ACCEPT_GRAPH.get()
+                    or self._dp_accept_graph
+                )
                 and static_epilogue_supported
                 and is_cuda()
             ):
@@ -496,7 +525,15 @@ class DSparkWorkerV2(BaseSpecWorker):
                     block_verification=get_spec().speculative_use_block_verification,
                     device=self.device,
                     rejection_noise=self._rejection_noise,
+                    rank_local=self._dp_accept_graph,
+                    side_streams=envs.SGLANG_OPT_DSV41_DSPARK_ACCEPT_GRAPH_STREAMS.get(),
                 )
+                if self._dp_accept_graph:
+                    log_info_on_rank0(
+                        logger,
+                        "DSpark sampling-accept graph per attention-DP rank; the verify "
+                        "graph folds no accept.",
+                    )
 
         self._simulate_acc_greedy = (
             self._simulate_acc_len > 0 and envs.SGLANG_SIMULATE_ACC_GREEDY.get()
@@ -532,6 +569,8 @@ class DSparkWorkerV2(BaseSpecWorker):
             block_verification=get_spec().speculative_use_block_verification,
             rejection_noise=self._rejection_noise,
         )
+        self._bf16_verify_logits = self._keep_verify_logits_dtype()
+        self._bf16_verify_logits_noted = False
 
         self._forced_budget_frac: Optional[float] = None
         self._need_mamba_verify_commit = False
@@ -547,6 +586,61 @@ class DSparkWorkerV2(BaseSpecWorker):
 
         if self._is_pd_prefill and not self._draft_is_moe:
             self.draft_model.prune_to_ctx_kv_injection()
+
+    def _keep_verify_logits_dtype(self) -> bool:
+        """SGLANG_OPT_DSPARK_BF16_VERIFY_LOGITS: opt the target LM head out of its FP32
+        cast while every verify-logits consumer runs eagerly after the graph."""
+        if not (
+            envs.SGLANG_OPT_DSPARK_BF16_VERIFY_LOGITS.get()
+            and is_cuda()
+            and self._rejection_noise is not None
+            # The per-DP-rank accept graph reads the verify graph's own logits buffer,
+            # so a batch widened to FP32 after the graph takes the eager accept.
+            and (self._verify_epilogue is None or self._dp_accept_graph)
+            and (self._sampling_accept_graph is None or self._dp_accept_graph)
+            and not self._verify_planner.is_compact_mode
+        ):
+            return False
+        processors = [
+            module
+            for module in self.target_worker.model_runner.model.modules()
+            if isinstance(module, LogitsProcessor)
+        ]
+        if len(processors) != 1:
+            return False
+        processors[0].verify_keeps_lm_head_dtype = True
+        log_info_on_rank0(
+            logger, "DSpark target verify keeps the LM head's logits dtype"
+        )
+        return True
+
+    def _verify_logits_stay_lm_head_dtype(
+        self, *, batch: ScheduleBatch, sampling_info, draft_block
+    ) -> bool:
+        """The batch's only verify-logits readers widen on load: the block-wise
+        rejection and, under simulated acceptance, the temperature-only bonus."""
+        return (
+            not batch.has_grammar
+            and not batch.return_logprob
+            and self._verify_executor.accepts_blockwise(
+                sampling_info=sampling_info, draft_block=draft_block
+            )
+            and verify_logits_adjustments_are_noop(sampling_info)
+            and not sampling_info.need_min_p_sampling
+            and not sampling_info.has_watermark_candidates
+            and sampling_info.sampling_mask_batch_indices is None
+        )
+
+    def _note_bf16_verify_logits(self, batch: ScheduleBatch, dtype) -> None:
+        if self._bf16_verify_logits_noted:
+            return
+        self._bf16_verify_logits_noted = True
+        unit = all(req.sampling_params.temperature == 1.0 for req in batch.reqs)
+        log_info_on_rank0(
+            logger,
+            f"DSpark verify accept reads {dtype} logits (bs={len(batch.reqs)}, "
+            f"all temperatures 1.0: {unit})",
+        )
 
     def _build_acceptance_estimator(self) -> Optional[OnlineAcceptanceEstimator]:
         if (
@@ -610,6 +704,21 @@ class DSparkWorkerV2(BaseSpecWorker):
 
     def _draft_context(self):
         return draft_tp_context(self.draft_parallel_layout)
+
+    def _maybe_register_draft_eplb(self) -> None:
+        draft_runner = self.draft_model_runner
+        if draft_runner.expert_location_family != DRAFT_EXPERT_LOCATION_FAMILY:
+            return
+        eplb_manager = self.model_runner.eplb_manager
+        assert eplb_manager is not None, "draft EPLB rides on the target's EPLB"
+        eplb_manager.register_family(
+            EPLBFamily(
+                name=DRAFT_EXPERT_LOCATION_FAMILY,
+                model_config=draft_runner.model_config,
+                get_model=lambda: draft_runner.model,
+                expert_location_updater=draft_runner.expert_location_updater,
+            )
+        )
 
     def alloc_memory_pool(
         self,
@@ -882,6 +991,50 @@ class DSparkWorkerV2(BaseSpecWorker):
         )
         return batch_output
 
+    def write_tail_draft_kv(
+        self, *, req_pool_indices: torch.Tensor, starts: torch.Tensor, aux: torch.Tensor
+    ) -> None:
+        """SGLANG_DSV41_TAIL_STAGE: the draft KV of each admitted tail's window
+        [start, start + window), from the tail server's target captures: aux is
+        [n * window, captures * hidden], each tail's rows in position order."""
+        from sglang.kernels.ops.speculative.dspark.dspark_verify_window import (
+            build_commit_inject_layout,
+            build_ring_commit_inject_layout,
+        )
+
+        if not self._hosts_draft:
+            return
+        window = aux.shape[0] // req_pool_indices.shape[0]
+        offsets = torch.arange(window, dtype=torch.int64, device=aux.device)
+        commit_lens = torch.full_like(req_pool_indices, window)
+        pool = self.draft_model_runner.token_to_kv_pool
+        if pool.swa_req_ring_size is not None:
+            layout = build_ring_commit_inject_layout(
+                req_pool_indices=req_pool_indices,
+                prefix_lens=starts,
+                block_pos_offsets=offsets,
+                commit_lens=commit_lens,
+                stride=window,
+                ring_stride=pool.swa_req_ring_size,
+            )
+        else:
+            layout = build_commit_inject_layout(
+                req_pool_indices=req_pool_indices,
+                req_to_token=self.model_runner.req_to_token_pool.req_to_token,
+                prefix_lens=starts,
+                block_pos_offsets=offsets,
+                full_to_swa_mapping=pool.full_to_swa_index_mapping,
+                commit_lens=commit_lens,
+                stride=window,
+            )
+        with torch.inference_mode(), self._draft_context():
+            self.draft_model.write_target_hidden_kv(
+                main_hidden=aux,
+                swa_loc=layout.swa_loc,
+                positions=layout.positions,
+                pool=pool,
+            )
+
     def _idle_verify_ragged_layout(self, batch: ScheduleBatch):
         if batch.global_num_tokens is None or not self._verify_planner.is_compact_mode:
             return None
@@ -1000,6 +1153,12 @@ class DSparkWorkerV2(BaseSpecWorker):
         batch.seq_lens.record_stream(
             torch.get_device_module(self.device).current_stream()
         )
+        for scheduled in (batch.dsv41_forced_tokens, batch.dsv41_swa_floor):
+            if scheduled is not None:
+                # Built on the schedule stream, read by this step's kernels.
+                scheduled.record_stream(
+                    torch.get_device_module(self.device).current_stream()
+                )
         bs = len(batch.seq_lens)
         device = self.device
         prefix_lens = batch.seq_lens
@@ -1099,8 +1258,42 @@ class DSparkWorkerV2(BaseSpecWorker):
         )
         run_compact = self._verify_planner.should_run_compact(layout=layout)
 
+        # SGLANG_DSV41_FUSED_TAIL: fed tails verify their next prompt tokens.
+        forced_tokens = batch.dsv41_forced_tokens
+        if forced_tokens is not None:
+            assert layout is None and not run_compact, (
+                "fused decode tails need the static verify layout"
+            )
+            gamma = draft_tokens.shape[1]
+            draft_tokens.copy_(
+                torch.where(
+                    forced_tokens[:, :gamma] >= 0,
+                    forced_tokens[:, :gamma].to(draft_tokens.dtype),
+                    draft_tokens,
+                )
+            )
+            draft_logits = draft_block.corrected_logits
+            if draft_logits is not None:
+                # A sampled accept rejects a draft its distribution gives no mass
+                # (an fp32 softmax underflows far below the max); a forced row
+                # must always be taken, so its draft distribution is one-hot too.
+                shard = draft_block.vocab_shard
+                force_verify_rows(
+                    draft_logits[:bs].view(bs * gamma, draft_logits.shape[-1]),
+                    forced_tokens[:, :gamma],
+                    vocab_start=0 if shard is None else shard.start,
+                )
+                if not self._dsv41_forced_draft_logged:
+                    self._dsv41_forced_draft_logged = True
+                    logger.info(
+                        "SGLANG_DSV41_FUSED_TAIL: forced verify rows carry a one-hot "
+                        "draft distribution (first step)."
+                    )
+
         verify_ids_2d = proposal.verify_ids
-        if verify_ids_2d is None:
+        if verify_ids_2d is None or forced_tokens is not None:
+            # Forced rows replace draft tokens, so ids folded in the draft graph
+            # are stale for them; build the verify ids from the patched block.
             verify_ids_2d = torch.cat(
                 [draft_block_ids[:, :1], draft_tokens], dim=1
             ).contiguous()
@@ -1118,6 +1311,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         # the cuda graph off its own buffers, where the mask below never lands.
         fold_eligible = (
             self._verify_executor.verify_epilogue is not None
+            and self._verify_executor.verify_epilogue.folds_accept
             and proposal.folded
             # The epilogue's in-graph accept is greedy (AcceptGreedy);
             # sampling batches must take the eager accept path even when the
@@ -1131,6 +1325,8 @@ class DSparkWorkerV2(BaseSpecWorker):
                 or self._verify_executor.verify_epilogue.simulate_fold
             )
             and not batch.has_grammar
+            # Fed tails force rows of the logits below, after the graph.
+            and forced_tokens is None
         )
         if not self._sim_draw_ahead:
             self._verify_executor.begin_simulated_step()
@@ -1143,6 +1339,11 @@ class DSparkWorkerV2(BaseSpecWorker):
                         else simulate_bonus_sampling_info.temperatures[:bs]
                     ),
                 )
+        if self._dsv41_fused_tail:
+            # Every verify step, so a step without fed tails clears the floors.
+            self.target_worker.model_runner.attn_backend.set_verify_swa_floor(
+                batch.dsv41_swa_floor
+            )
         with self._observers.segment(InfoSegment.TARGET_VERIFY):
             if run_compact:
                 target_verify, hidden_strided = self._verify_executor.run_compact(
@@ -1172,6 +1373,15 @@ class DSparkWorkerV2(BaseSpecWorker):
                 hidden_strided = None
         logits_output = target_verify.logits_output
         can_run_cuda_graph = target_verify.can_run_cuda_graph
+        if logits_output.next_token_logits.dtype != torch.float32:
+            if self._verify_logits_stay_lm_head_dtype(
+                batch=batch, sampling_info=sampling_info, draft_block=draft_block
+            ):
+                self._note_bf16_verify_logits(
+                    batch, logits_output.next_token_logits.dtype
+                )
+            else:
+                widen_verify_logits(logits_output)
         if batch.has_grammar:
             # run_compact scatters its rows back to (bs * chain_len), so the mask
             # lines up with the logits on both verify paths.
@@ -1184,6 +1394,8 @@ class DSparkWorkerV2(BaseSpecWorker):
             )
             if grammar_mask is not None:
                 grammar_mask.apply(logits_output.next_token_logits)
+        if forced_tokens is not None:
+            force_verify_rows(logits_output.next_token_logits, forced_tokens)
 
         target_logits, watermark_rows = self._force_watermark(
             batch=batch,
@@ -1201,6 +1413,8 @@ class DSparkWorkerV2(BaseSpecWorker):
         region_accept = None
         if (
             not folded_accept
+            # Fed tails take the eager accept, which keeps their forced rows.
+            and forced_tokens is None
             and can_run_cuda_graph
             and not run_compact
             and self._sampling_graph_eligible(
@@ -1214,8 +1428,37 @@ class DSparkWorkerV2(BaseSpecWorker):
                 epilogue.begin_sim_bonus(
                     bs, simulate_bonus_sampling_info.temperatures[:bs]
                 )
-            region_accept = self._sampling_accept_graph.run(
-                bs=bs, target_logits=target_logits
+            region_accept = self._run_accept_region(
+                bs=bs,
+                target_logits=target_logits,
+                eager_accept=lambda: self._verify_executor.accept_and_finalize(
+                    folded_accept=False,
+                    bs=bs,
+                    verify_ids_2d=verify_ids_2d,
+                    target_logits=target_logits,
+                    draft_block=draft_block,
+                    sampling_info=sampling_info,
+                    draft_input=draft_input,
+                    layout=layout,
+                    prefix_lens=prefix_lens,
+                    draft_tokens=draft_tokens,
+                    simulate_bonus_sampling_info=simulate_bonus_sampling_info,
+                ),
+                live_io=lambda: (
+                    verify_ids_2d,
+                    prefix_lens,
+                    batch.req_pool_indices,
+                    verify_window.positions_2d.reshape(-1),
+                    self._kv_injector.ids_for(verify_window.iteration_ids),
+                ),
+                eager_kv_commit=lambda commit_lens: self._commit_hidden_eagerly(
+                    batch=batch,
+                    layout=layout,
+                    verify_window=verify_window,
+                    logits_output=logits_output,
+                    commit_lens=commit_lens,
+                    bs=bs,
+                ),
             )
         # The accept and its commits ran in a graph: the verify graph's fold or the
         # sampling-accept region replayed right after it.
@@ -1235,6 +1478,10 @@ class DSparkWorkerV2(BaseSpecWorker):
                 prefix_lens=prefix_lens,
                 draft_tokens=draft_tokens,
                 simulate_bonus_sampling_info=simulate_bonus_sampling_info,
+                # Fed tails keep their served accept under simulated acceptance.
+                forced_rows=(
+                    None if forced_tokens is None else (forced_tokens != -1).any(dim=1)
+                ),
             )
         if proposal.acceptance_features is not None and self._simulate_acc_len <= 0:
             self._observe_acceptance(
@@ -1394,6 +1641,62 @@ class DSparkWorkerV2(BaseSpecWorker):
             sampling_info=sampling_info,
         )
         return target_logits, watermark_rows
+
+    def _run_accept_region(
+        self,
+        *,
+        bs: int,
+        target_logits: torch.Tensor,
+        eager_accept,
+        live_io,
+        eager_kv_commit,
+    ) -> Optional[AcceptOuts]:
+        """The sampling-accept graph's accept, or None for the eager path. Under
+        attention DP it replays at the verify graph's padded batch size."""
+        check = self._accept_graph_check.begin(self._rejection_noise)
+        region_accept = self._sampling_accept_graph.run(
+            bs=bs,
+            target_logits=target_logits,
+            graph_bs=(
+                self.target_worker.model_runner.decode_cuda_graph_runner.bs
+                if self._dp_accept_graph
+                else None
+            ),
+        )
+        if region_accept is not None and check is not None:
+            self._accept_graph_check.compare(
+                check,
+                region_accept=region_accept,
+                reference=eager_accept,
+                io=self._sampling_accept_graph.last_io,
+                live_io=live_io(),
+                kv_fingerprint=self._draft_kv_fingerprint,
+                eager_kv_commit=(
+                    eager_kv_commit if self._verify_epilogue.folds_commit else None
+                ),
+            )
+        return region_accept
+
+    def _commit_hidden_eagerly(self, *, commit_lens, **kwargs) -> None:
+        with self._draft_context():
+            self._verify_executor.commit_hidden(
+                hidden_strided=None, commit_lens=commit_lens, run_compact=False, **kwargs
+            )
+
+    def _draft_kv_fingerprint(self) -> torch.Tensor:
+        """Integer sums of the draft layers' SWA KV bytes (accept graph check)."""
+        pool = self.draft_model_runner.token_to_kv_pool
+        return torch.stack(
+            [
+                torch.sum(
+                    pool.get_swa_raw_buffer(stage.self_attn.layer_id)
+                    .reshape(-1)
+                    .view(torch.uint8),
+                    dtype=torch.int64,
+                )
+                for stage in self.draft_model.stages
+            ]
+        )
 
     def _sampling_graph_eligible(
         self,

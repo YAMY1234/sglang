@@ -587,6 +587,9 @@ class Envs:
     # plane; off, or no such plane, keeps the NCCL all-gather.
     SGLANG_DSPARK_NVLINK_VOCAB_GATHER = EnvBool(True)
     SGLANG_DSPARK_ENABLE_MULTI_STREAM = EnvBool(True)
+    # With --enable-eplb, rebalance a DeepSeek-V4 MegaMoE draft's stages with
+    # their own placement (same redundant-slot count and schedule as the target).
+    SGLANG_DSPARK_ENABLE_DRAFT_EPLB = EnvBool(False)
     SGLANG_DSPARK_CONFIDENCE_RELAY_LAG_STEPS = EnvInt(2)
     # Static verify graphs with bs in [MIN_BS, MAX_BS] (MAX_BS 0: unbounded) run the
     # greedy accept and its bookkeeping as one kernel.
@@ -623,6 +626,62 @@ class Envs:
     SGLANG_OPT_DSV41_BLOCKWISE_REJECTION = EnvBool(
         SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
     )
+    # DSpark eager sampled accept (no in-graph accept): the target verify keeps its
+    # BF16 LM-head logits; batches off the block-wise rejection path get the FP32 cast.
+    SGLANG_OPT_DSPARK_BF16_VERIFY_LOGITS = EnvBool(False)
+    # DSpark's block-wise resample and local Markov draft steps draw by inverse CDF
+    # (inverse_cdf.py): one uniform per row instead of a Gumbel-max over the vocab.
+    SGLANG_OPT_DSPARK_INVERSE_CDF_SAMPLING = EnvBool(False)
+    # Fused-tail forced verify rows (dspark_verify.force_verify_rows) are made one-hot by
+    # a Triton kernel that writes only the forced rows, instead of a masked fill of all rows.
+    SGLANG_OPT_DSPARK_FORCED_ROW_FILL = EnvBool(False)
+    # DSpark draft attention: wq_a and wkv as one wqkv_a GEMM on one input quantize
+    # (weights stacked at load; bitwise equal to the two GEMMs).
+    SGLANG_OPT_DSPARK_FUSED_WQKV_A = EnvBool(False)
+    # fused_rope_inplace on q only: one CTA per row looping over the heads, instead of
+    # one warp per (row, head). Same per-element arithmetic.
+    SGLANG_OPT_DSV4_ROPE_ROW_LAUNCH = EnvBool(False)
+    # expand_prefill_causally on CUDA: tokens per program sized by the batch (sglang#49499)
+    # instead of 256, so a draft block spreads over many SMs. Same per-token arithmetic.
+    SGLANG_OPT_DSV4_EXPAND_CAUSAL_ROWS = EnvBool(False)
+    # Launch the q_lora RMSNorm + MXFP8 kernel (rmsnorm_mxfp8) with PDL, so it does not
+    # wait a full launch after wqkv_a.
+    SGLANG_OPT_DSV4_Q_NORM_PDL = EnvBool(False)
+    # DSpark draft attention on the target's flashmla_mega path: q norm + MXFP8 quant,
+    # wq_b, MegaAttention (RoPE in the kernel, MXFP8 output) and the fp8 wo_a einsum.
+    # Changes draft numerics only (the attention output is MXFP8, as in the target).
+    SGLANG_OPT_DSPARK_MEGA_ATTENTION = EnvBool(False)
+    # Per-step DSV4 attention metadata (verify row expansion, page table, low-ratio
+    # slots and lengths, indexer block tables, SWA write locations) in single Triton
+    # launches instead of torch-op chains. Bitwise equal outputs.
+    SGLANG_OPT_DSV4_FUSED_ATTN_METADATA = EnvBool(False)
+    # Decode/verify: the q_lora RMSNorm + MXFP8 (rmsnorm_mxfp8) and the kv RMSNorm + RoPE +
+    # V4.1 SWA cache store in one launch before wq_b, instead of two. Bitwise equal outputs.
+    SGLANG_OPT_DSV4_FUSED_QKV_NORM = EnvBool(False)
+    # Decode/verify, low-ratio multi-stream prepare: the index-source layers' head-weight GEMM
+    # (weights_proj(x)) runs on the idle KV stream beside wqkv_a and the compressor, instead of
+    # after the indexer wq_b. Same kernels and inputs (bitwise); only the stream order moves.
+    SGLANG_OPT_DSV41_HOIST_INDEX_WEIGHTS = EnvBool(False)
+    # CUDA-graph replay fill: the num_token_non_padded and global_num_tokens slots are written
+    # from their host ints by one write_host_ints launch, instead of sub + clamp + copy and two
+    # fills per replay. Same values.
+    SGLANG_OPT_GRAPH_FILL_HOST_INTS = EnvBool(False)
+    # mhc_post_combine_norm_decode's MegaMoE-input variant issues griddepcontrol.launch_dependents
+    # after its PDL wait, so the mega gate's prologue overlaps its tail (the gate waits before
+    # reading). Scheduling only.
+    SGLANG_OPT_MHC_POST_GATE_PDL_TRIGGER = EnvBool(False)
+    # The same trigger in the MXFP8-output variant, whose consumer is the wqkv_a GEMM: the PDL
+    # SM107 table kernel waits after its weight prefetch; stock FlashInfer launches without PDL.
+    SGLANG_OPT_MHC_POST_QUANT_PDL_TRIGGER = EnvBool(False)
+    # MegaAttention reads fork the attention mix's side stream at the read (beside the q/kv
+    # projections) instead of deferring it to the attention core. Scheduling only.
+    SGLANG_OPT_DSV41_ATTN_STATS_FORK_AT_READ = EnvBool(False)
+    # DSpark draft forward: the bonus-into-block-ids write and the positions / cache-loc
+    # column slices in one Triton launch instead of three torch copies. Same values.
+    SGLANG_OPT_DSPARK_FUSED_DRAFT_INPUTS = EnvBool(False)
+    # Request-window commit of new SWA rows with a tile of rows per program instead of
+    # one program per row. Same copies.
+    SGLANG_OPT_DSV41_WINDOW_COMMIT_TILED = EnvBool(False)
     # The deferred draft KV store's staging (write locations, positions, state slots,
     # commit lengths) in one Triton launch instead of four copies and a fill.
     SGLANG_OPT_DSV41_DSPARK_ONE_LAUNCH_COMMIT_STAGE = EnvBool(
@@ -785,6 +844,13 @@ class Envs:
     # (auto-enabled for GLM-5.2-style DSA); set True to A/B synchronous swap-in.
     SGLANG_DISABLE_HISPARSE_PREFETCH = EnvBool(False)
     SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS = EnvBool(True)
+    # Skip a finished request's insert when the tree already holds and the
+    # request locks every page it would key (PD prefill release after its
+    # prefill-end checkpoint): saves a full-path walk per request.
+    SGLANG_OPT_CACHE_SKIP_NOOP_FINISH_INSERT = EnvBool(False)
+    # Checkpoint inserts build one capped key over the fill ids and read back
+    # only the new span's tree indices (from the request's protected node).
+    SGLANG_OPT_CACHE_TAIL_CHECKPOINT = EnvBool(False)
     # Decode batches between SWA out-of-window evictions.
     SGLANG_SWA_EVICTION_INTERVAL = EnvInt(128)
     # The tree-core registry falls back to Python for:
@@ -842,6 +908,15 @@ class Envs:
     # Under overlap, publish decode KV destinations one iteration later instead of
     # reading them back inline; False restores the inline publish.
     SGLANG_ENABLE_DISAGG_DECODE_DEFERRED_PUBLISH = EnvBool(True)
+    # With the deferred publish, read the destination ids back through pinned copies
+    # and send them once landed, instead of one blocking D2H per payload.
+    SGLANG_DISAGG_DECODE_ASYNC_PUBLISH_READBACK = EnvBool(False)
+    # PD decode: a running request streams the prefill's token with its first decode
+    # output, not at admission (sglang#50895); a request finished at admission still goes then.
+    SGLANG_DISAGG_DECODE_STREAM_FIRST_TOKEN_WITH_DECODE = EnvBool(False)
+    # DeepSeek-V4.1 prefill: replay the decoder tail from its CUDA graph while the
+    # expert distribution recorder records (EPLB); the graph counts its routing in-graph.
+    SGLANG_DSV4_REPLAY_TAIL_GRAPH_WHILE_RECORDING = EnvBool(False)
 
     # ===================================================================
     # Distributed and model-parallel runtime
@@ -895,6 +970,10 @@ class Envs:
     SGLANG_HICACHE_HF3FS_CONFIG_PATH = EnvStr(None)
     SGLANG_HICACHE_DECODE_OFFLOAD_STRIDE = EnvInt(None)
     SGLANG_HICACHE_SKIP_HOST_DUPLICATE_RECLAIM = EnvBool(False)
+    # Staged write-back: one cudaMemcpyBatchAsync per staging chunk, adjacent host rows merged.
+    SGLANG_OPT_HICACHE_BATCH_WRITE_BACK_COPY = EnvBool(False)
+    # write_back eviction walks: the forward stream waits on the D2H copies, not the scheduler thread.
+    SGLANG_OPT_HICACHE_DEVICE_ORDERED_WRITE_BACK = EnvBool(False)
     SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR = EnvStr(None)
     # File-backend LRU eviction (opt-in; sizes accept SI/IEC suffixes, "0" disables).
     SGLANG_HICACHE_FILE_BACKEND_MAX_SIZE = EnvStr(None)
@@ -908,6 +987,39 @@ class Envs:
     # to consumption so eviction cannot waste the fetch. Cap = fraction of
     # the pool the pins may hold; 0 disables pinning.
     SGLANG_HICACHE_BUFFER_ANCHOR_LOCK_CAP = EnvFloat(0.5)
+    # External linker prefetch mode: a published prefetch keeps its prefix
+    # locked until its request is admitted or released, while held prefixes
+    # total at most this share of the Full device pool. 0 releases at publish.
+    SGLANG_EXTERNAL_LINKER_PREFETCH_HOLD_FRACTION = EnvFloat(0.0)
+    # External linker prefetch mode: look a queued request up in the store on
+    # this many worker threads instead of the scheduler thread; the load starts
+    # when the lookup returns. 0 keeps the synchronous lookup.
+    SGLANG_EXTERNAL_LINKER_ASYNC_LOOKUP_THREADS = EnvInt(0)
+    # External linker prefetch mode: a queued request whose device prefix
+    # shrank since its enqueue-time lookup (device eviction while it waited)
+    # looks the lost range up again before admission, as HiCache storage does.
+    SGLANG_EXTERNAL_LINKER_REQUERY_ON_DEVICE_LOSS = EnvBool(False)
+    # External linker prefetch mode: cap the Full device slots of loads in flight
+    # at this share of the pool, apart from holds; 0 keeps loads and holds under
+    # the hold cap together.
+    SGLANG_EXTERNAL_LINKER_LOAD_FRACTION = EnvFloat(0.0)
+    # External linker prefetch mode: keep the device prefixes of the queued requests
+    # next in line locked, up to this share of the Full pool and to the requests
+    # expected within QUEUE_LOCK_SECONDS of admissions; 0 keeps them unlocked.
+    SGLANG_EXTERNAL_LINKER_QUEUE_LOCK_FRACTION = EnvFloat(0.0)
+    SGLANG_EXTERNAL_LINKER_QUEUE_LOCK_SECONDS = EnvFloat(4.0)
+    # With the queue lock and device-loss re-query on: an enqueue-time load for a
+    # request queued beyond that window starts when the window reaches it.
+    SGLANG_EXTERNAL_LINKER_QUEUE_LOCK_DEFER_FAR_LOADS = EnvBool(False)
+    # External linker prefetch mode: log lookup counters (issued, skipped for a
+    # device anchor with no storage hash, zero restorable, re-queried) every 60 s.
+    SGLANG_EXTERNAL_LINKER_LOOKUP_STATS = EnvBool(False)
+    # Seconds between L3 lease renewals of a prefix the device serves: an
+    # existence query renews its pages' leases, so Mooncake (oldest lease
+    # evicted first) keeps hot prefixes. 0 disables.
+    SGLANG_EXTERNAL_LINKER_LEASE_REFRESH_INTERVAL = EnvFloat(0.0)
+    # Cap on the renewal existence queries, in object keys per second.
+    SGLANG_EXTERNAL_LINKER_LEASE_REFRESH_MAX_KEYS_PER_S = EnvInt(200000)
     # Buffer mode: store only the SWA window ending at each node (what a
     # prefetch ending there restores) instead of every SWA page.
     SGLANG_ENABLE_HICACHE_SWA_TAIL_ONLY_BACKUP = EnvBool(False)
@@ -1321,6 +1433,43 @@ class Envs:
     # HIP: convert only MXFP8 dense linears to block-fp8; fused MoE stays MX 1x32,
     # since the block-scale MoE kernel lacks SwiGLU-OAI
     SGLANG_FORCE_MXFP8_BLOCK_CONVERT_DENSE = EnvBool(False)
+    # SM107: run the decode-size MXFP8 dense linears listed in
+    # kernels/ops/gemm/mxfp8_sm107_dense.py (DECODE_TABLE) on its PDL / split-K copy
+    # of FlashInfer's SM107 CuTe-DSL GEMM instead of mm_mxfp8(backend="cute-dsl").
+    SGLANG_OPT_SM107_MXFP8_DENSE_TABLE = EnvBool(False)
+    # Kernel for the tabled shapes: "pdl" (the copy, PDL on), "nopdl" (the copy, PDL off),
+    # "stock" (FlashInfer's SM107 runner pinned to the table's tactic).
+    SGLANG_OPT_SM107_MXFP8_DENSE_TABLE_MODE = EnvStr("pdl")
+    # With the table on: also take DECODE_TABLE_BUCKETS (exact M of the decode graph buckets, incl. wo_b).
+    SGLANG_OPT_SM107_MXFP8_DENSE_TABLE_BUCKETS = EnvBool(False)
+    # SM107 prefill (M >= 8192): run the MXFP8 dense linears whose (N, K) are in
+    # fp8_utils._SM107_CUBLASLT_MXFP8_NK on cuBLASLt (torch._scaled_mm) instead of
+    # FlashInfer's CuTe-DSL GEMM; same operands, bitwise-equal outputs.
+    SGLANG_OPT_SM107_MXFP8_PREFILL_CUBLASLT = EnvBool(False)
+    # DSV4.1 MegaAttention prefill (>= 4096 rows): wo_a of the 128-aligned rows as one cuDNN MXFP8 BMM with a
+    # fused MXFP8 quantize epilogue, on the attention kernel's 128x4 output scales, instead of DeepGEMM's
+    # fp8_einsum (a tail of < 128 rows stays on it). Same FP8 operands; output rounding differs in the last
+    # FP8 bit on a few percent of values.
+    SGLANG_OPT_DSV41_WO_A_CUDNN = EnvBool(False)
+    # DSV4.1 MegaAttention prefill, compressed layers (64 heads): gather the flat sparse-prefill KV workspace as
+    # e4m3 at unit scale instead of bf16, which selects FlashMLA's all-fp8 prefill (Q, K, V and P as e4m3 on the
+    # tensor cores). SWA-only layers keep bf16. Needs a FlashMLA whose prefill takes an e4m3 kv; changes numerics.
+    SGLANG_OPT_DSV41_FP8_PREFILL_ATTN = EnvBool(False)
+    # DSV4.1 MegaAttention decode on SM107, compressed layers with an fp4 extra cache: wq_b writes Q as E4M3 at
+    # static per-head power-of-two scales (folded into its UE8M0 weight scales) and FlashMLA's fp8 decode reads it
+    # (QK and SV on e4m3 tensor cores). Needs a FlashMLA whose decode takes q_head_scale; changes attention numerics.
+    SGLANG_OPT_DSV4_MEGA_FP8_Q = EnvBool(False)
+    # DSV4.1 MegaAttention prefill on SM107 (with SGLANG_OPT_DSV41_FP8_PREFILL_ATTN), compressed layers, extend
+    # steps of at least SGLANG_OPT_DSV41_FP8_PREFILL_Q_MIN_ROWS rows: wq_b writes Q as E4M3 at the same static
+    # per-head scales on FlashInfer's SM107 GEMM (tactic (256, 256), cluster (4, 2), swap AB, inst M 256), and
+    # FlashMLA's fp8 prefill reads it with q_head_scale; halves wq_b's output bytes. Needs a FlashMLA whose prefill
+    # takes q_head_scale; changes Q rounding (once to E4M3 at the head scale instead of bf16 then E4M3).
+    SGLANG_OPT_DSV41_FP8_PREFILL_Q = EnvBool(False)
+    SGLANG_OPT_DSV41_FP8_PREFILL_Q_MIN_ROWS = EnvInt(4096)
+    # fp8xfp4 MegaMoE through the deep_gemm_fp4acts DeepGEMM build: routed tasks run MXFP4 activations
+    # (requantized in the dispatch; DG_MEGA_MOE_ACT_DTYPE defaults to mxfp4 under this switch), the fused shared
+    # expert stays FP8. Changes MoE numerics.
+    SGLANG_OPT_DEEPGEMM_MEGA_MOE_FP4_ACTS = EnvBool(False)
     SGLANG_FP8_IGNORED_LAYERS = EnvStr("")
     SGLANG_FP4_IGNORED_LAYERS = EnvStr("")
 
@@ -1614,7 +1763,13 @@ class Envs:
     # residency margin so every cluster can launch beside other streams.
     SGLANG_OPT_DEEPGEMM_MEGA_MOE_RESERVED_SMS = EnvInt(2)
     SGLANG_OPT_DEEPGEMM_MEGA_GATE = EnvBool(False)
+    # MegaGate row masks built inside a CUDA graph capture are not shared with eager runs.
+    SGLANG_OPT_DEEPGEMM_MEGA_GATE_MASKS_PER_CAPTURE = EnvBool(False)
     SGLANG_OPT_DEEPGEMM_MEGA_MOE_LOCALIZE = EnvBool(False)
+    # PDL for the FP4-activation MegaMoE build (deep_gemm_fp4acts), which SGLANG_DEEPGEMM_PDL does not reach.
+    SGLANG_OPT_DEEPGEMM_FP4_ACTS_PDL = EnvBool(False)
+    # FP4-act MegaMoE: size a light or idle DP rank's tiles for the EP-average batch.
+    SGLANG_OPT_DEEPGEMM_MEGA_MOE_TILE_BY_EP_AVERAGE = EnvBool(False)
 
     # ===================================================================
     # Top-k kernels
@@ -1773,8 +1928,13 @@ class Envs:
         SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get,
         deprecated_name="SGLANG_Q35MF_EDGE_MULTIHOST_TCP",
     )
+    # The DP-attention MLP sync rows through the same per-host shared-memory table; across
+    # hosts only the host leaders meet, over TCP (one link, or a mesh beyond two hosts).
+    SGLANG_DP_SYNC_SHM_EXCHANGE = EnvBool(False)
     # PD decode optimizations follow the shared switch unless explicitly disabled.
     SGLANG_ENABLE_NV_MEGA_PDDEC_RUNTIME_OPTIMIZATION = EnvBool(True)
+    # Preallocate queued PD-decode requests after the batch launch, beside the forward.
+    SGLANG_DISAGG_DECODE_DEFER_PREALLOC = EnvBool(False)
     # Reuse the resolved CPU sequence lengths for FlashInfer draft planning,
     # avoiding a second blocking readback after generating the same indptr.
     SGLANG_OPT_FLASHINFER_DRAFT_HOST_INDPTR = EnvBool(False)
@@ -2045,6 +2205,16 @@ class Envs:
     SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE = EnvBool(False)
     SGLANG_OPT_ENGRAM_EXTEND_HASH = EnvBool(False)
     SGLANG_OPT_DSV41_MEGA_MHC_PREFILL = EnvBool(False)
+    # Prefill Mega mHC through the deep_gemm_fp4acts build's task-ring kernel (tasks claimed from a ticket ring, four
+    # IO stages); same outputs bitwise.
+    SGLANG_OPT_DSV41_MEGA_MHC_TASK_RING = EnvBool(False)
+    # With the task ring: residual and normed outputs of batches of 5000+ rows in a locality-striped pool sized for
+    # LOCALITY_MAX_TOKENS rows (two slots), each die's SMs posting its own rows. Needs MLOPart.
+    SGLANG_OPT_DSV41_MEGA_MHC_LOCALITY = EnvBool(False)
+    SGLANG_OPT_DSV41_MEGA_MHC_LOCALITY_MAX_TOKENS = EnvInt(32768)
+    # With LOCALITY: one pool slot whose residual is updated in place (the first layer's broadcast writes into it),
+    # reserved before the KV cache is sized and charged to the runtime slack instead of the KV budget.
+    SGLANG_OPT_DSV41_MEGA_MHC_LOCALITY_INPLACE = EnvBool(False)
     # Deprecated for --engram-config "replication".
     SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT = EnvStr("per_rank")
     # Scheduler-side staging of shared host-table rows on GPUs without ATS
@@ -2052,9 +2222,15 @@ class Envs:
     SGLANG_OPT_DSV41_ENGRAM_HOST_STAGING = EnvBool(False)
     # Deprecated for --engram-config "lookup".
     SGLANG_OPT_DSV41_ENGRAM_PEER_SHARDS = EnvBool(False)
+    # --engram-config replication node_shared: one copy per host NUMA node, read by
+    # the GPUs of that socket; false: one copy per node, spread over the sockets.
+    SGLANG_DSV41_ENGRAM_NODE_TABLE_PER_NUMA = EnvBool(True)
 
     # Kernels and indexer
     SGLANG_OPT_DEEPGEMM_HC_PRENORM = EnvBool(True)
+    # Prefill (8192-65536 rows, and the first layer from its broadcast embedding) mHC mix stats on Blackwell: packed K-major bf16x3 weights and a row-blocked
+    # reduce/Sinkhorn instead of _hc_mix_stats_bf16x3 + the per-row reduce. Same compensated precision.
+    SGLANG_OPT_DSV41_HC_STATS_PACKED = EnvBool(False)
     SGLANG_OPT_USE_TILELANG_MHC_PRE = EnvBool(True)
     SGLANG_OPT_USE_TILELANG_MHC_POST = EnvBool(True)
     SGLANG_OPT_USE_FLASHINFER_MHC = EnvBool(False)
@@ -2078,6 +2254,72 @@ class Envs:
     # of fp32 (the reference ranks bf16 scores); every consumer of those logits must take bf16.
     # Unset: bf16 on SM100 (with bf16 head weights), fp32 elsewhere.
     SGLANG_OPT_DSV41_BF16_INDEX_LOGITS = EnvBool(None)
+    # PD decode with --dsv41-encoder-only-prefill: while decode has work, run tail
+    # extends only on the first step of each period of this many ms, so one extend
+    # step runs several (a step's cost is mostly fixed) and DP ranks share it.
+    # Counted in forward steps of a nominal 20 ms (decode.DSV41_TAIL_HOLD_STEP_MS),
+    # so every rank decides alike. 0 runs waiting tails on the next step that
+    # alternates with decode.
+    SGLANG_DSV41_TAIL_HOLD_MS = EnvInt(0)
+    # PD decode with --dsv41-encoder-only-prefill and DSpark: feed each tail through
+    # the verify steps decode runs anyway, six prompt tokens per step, instead of a
+    # separate extend step. Ranks without running requests keep the extend.
+    SGLANG_DSV41_FUSED_TAIL = EnvBool(False)
+    # PD decode with DP attention: a DP rank joins transferred requests to its running
+    # batch only up to the mean batch over DP ranks at the last step plus the slack.
+    # Every rank replays the CUDA graph of the largest rank's batch, so one rank ahead
+    # of the others slows all of them. A request held longer than the max hold joins.
+    SGLANG_DECODE_DP_ADMIT_BALANCE = EnvBool(False)
+    SGLANG_DECODE_DP_ADMIT_SLACK = EnvInt(2)
+    SGLANG_DECODE_DP_ADMIT_MAX_HOLD_MS = EnvInt(500)
+    # PD with --dsv41-encoder-only-prefill, set alike on prefill, decode and the tail
+    # server: a shared tail server runs every late-fed request's last window through
+    # the late layers and sends their SWA and DSpark captures to decode as PP rank 1;
+    # decode admits the request with one fused step (the prefill needs
+    # --dsv41-tail-stage-addr).
+    SGLANG_DSV41_TAIL_STAGE = EnvBool(False)
+    # Seconds without a heartbeat before a tail-stage peer counts as down; a cold
+    # first forward blocked the tail server's loop for tens of seconds.
+    SGLANG_DSV41_TAIL_STAGE_HEARTBEAT_TIMEOUT_S = EnvFloat(120.0)
+    # Prefill: slot writes in flight at once, and Mooncake batches per write.
+    SGLANG_DSV41_TAIL_STAGE_WRITE_ROOMS = EnvInt(4)
+    SGLANG_DSV41_TAIL_STAGE_WRITE_PARTS = EnvInt(8)
+    # Prefill: late-fed requests a rank holds from bootstrap to the end of their slot
+    # write (5.24 MB each); bootstrap waits when all are taken.
+    SGLANG_DSV41_TAIL_STAGE_CAPTURE_SLOTS = EnvInt(64)
+    # Decode: late-fed transfers a rank holds draft captures for, from pre-allocation
+    # to admission (3.9 MB each at window 128); pre-allocation waits when all are taken.
+    SGLANG_DSV41_TAIL_STAGE_DECODE_AUX_SLOTS = EnvInt(64)
+    # The tail server (--dsv41-tail-stage-server): its ROUTER port (0 serves nothing)
+    # and the address it registers with each prefill's bootstrap server.
+    SGLANG_DSV41_TAIL_STAGE_PORT = EnvInt(0)
+    SGLANG_DSV41_TAIL_STAGE_HOST = EnvStr(None)
+    # Tails in flight from grant to the end of their send to decode: 9.2 MB each
+    # (residual and DSpark captures); 256 is arbitrary within the tail GPU's spare memory.
+    SGLANG_DSV41_TAIL_STAGE_SLOTS = EnvInt(256)
+    # A forward runs at MIN_TAILS ready tails, or once the oldest waited WAIT_MS; at
+    # most MAX_TAILS (whose rows the tail graphs and MegaMoE cap must cover).
+    SGLANG_DSV41_TAIL_STAGE_MIN_TAILS = EnvInt(8)
+    SGLANG_DSV41_TAIL_STAGE_MAX_TAILS = EnvInt(32)
+    SGLANG_DSV41_TAIL_STAGE_WAIT_MS = EnvFloat(15.0)
+    # Requests waiting for a slot beyond this are deferred and retried; arbitrary, high
+    # enough that waiting rooms queue in the table instead of retrying.
+    SGLANG_DSV41_TAIL_STAGE_QUEUE_CAP = EnvInt(1 << 20)
+    SGLANG_DSV41_TAIL_STAGE_READY_TIMEOUT_S = EnvFloat(600.0)
+    # Send decode the tail rows' DSpark captures; decode must run DSpark.
+    SGLANG_DSV41_TAIL_STAGE_DRAFT_AUX = EnvBool(True)
+    # Startup timing of the tail server's forward: comma-separated tail counts, each
+    # over each of the comma-separated SELF_BENCH_PREFIX token prefixes,
+    # SELF_BENCH_ITERS timed runs.
+    SGLANG_DSV41_TAIL_STAGE_SELF_BENCH = EnvStr(None)
+    SGLANG_DSV41_TAIL_STAGE_SELF_BENCH_PREFIX = EnvStr("142720")
+    SGLANG_DSV41_TAIL_STAGE_SELF_BENCH_ITERS = EnvInt(10)
+    # Rate benchmark only: the tail server registers nowhere, sends to no decode (each
+    # send ends at once) and runs on random residuals, for a driver of synthetic rooms.
+    SGLANG_DSV41_TAIL_STAGE_NULL_DECODE = EnvBool(False)
+    # Rate benchmark only: prefill requests with the fake bootstrap host also ask for
+    # tail slots and write them (by default they skip the tail stage).
+    SGLANG_DSV41_TAIL_STAGE_PUSH_FAKE = EnvBool(False)
     SGLANG_FP8_PAGED_MQA_LOGITS_TORCH = EnvBool(False)
     SGLANG_OPT_FLASHMLA_SPARSE_PREFILL = EnvBool(True)
     # gfx950 DeepSeek-V4.1 prefill: attend with aiter's OPUS sparse kernel over a bf16
@@ -2142,6 +2384,16 @@ class Envs:
     SGLANG_OPT_DSV41_SAMPLING_ACCEPT_GRAPH = EnvBool(
         SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
     )
+    # The same sampling-accept graph under attention DP with attn_tp 1: each rank captures
+    # and replays its own region (no collective inside) at the verify graph's padded
+    # batch size; the verify graph itself folds nothing.
+    SGLANG_OPT_DSV41_DSPARK_DP_ACCEPT_GRAPH = EnvBool(False)
+    # The captured sampling-accept graph runs the draft KV projection and the simulated
+    # bonus on side streams beside the accept, joined where their results are read.
+    SGLANG_OPT_DSV41_DSPARK_ACCEPT_GRAPH_STREAMS = EnvBool(False)
+    # Debug: for this many sampling-accept graph steps, also run the eager accept on the
+    # same inputs and log whether every accept output matches bitwise (syncs the host).
+    SGLANG_DSPARK_ACCEPT_GRAPH_CHECK_STEPS = EnvInt(0)
     SGLANG_OPT_USE_MULTI_STREAM_OVERLAP = EnvBool(True)
 
     # ===================================================================

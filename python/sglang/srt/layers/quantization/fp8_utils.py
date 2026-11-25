@@ -2196,6 +2196,10 @@ def mxfp8_group_quantize(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
 # prefill sizes (wo_b, Engram KV); the two backends are bitwise equal.
 _SM107_CUDNN_MXFP8_NK = ((5120, 8192), (25600, 6144))
 _SM107_CUDNN_MXFP8_MIN_M = 8192
+# (N, K) where cuBLASLt beats the default CuTe-DSL tactic at M 8192-32768 (DSV4.1 wq_b and
+# shared expert); SGLANG_OPT_SM107_MXFP8_PREFILL_CUBLASLT.
+_SM107_CUBLASLT_MXFP8_NK = ((32768, 1280), (4608, 5120), (5120, 2304))
+_SM107_CUBLASLT_MXFP8_MIN_M = 8192
 
 
 @lru_cache(maxsize=1)
@@ -2247,6 +2251,42 @@ def flashinfer_mxfp8_blockscaled_linear(
             output_dtype = input_2d.dtype
         else:
             output_dtype = torch.bfloat16
+
+    if (
+        backend == "cute-dsl"
+        and not pin_tactic
+        and envs.SGLANG_OPT_SM107_MXFP8_DENSE_TABLE.get()
+        and get_platform().device_sm == 107
+    ):
+        from sglang.kernels.ops.gemm.mxfp8_sm107_dense import decode_linear
+
+        output = decode_linear(q_input, x_scale_u8, weight, weight_scale, output_dtype)
+        if output is not None:
+            if bias is not None:
+                output += bias
+            return output.view(*output_shape)
+
+    if (
+        backend == "cute-dsl"
+        and not pin_tactic
+        and input_2d.shape[0] >= _SM107_CUBLASLT_MXFP8_MIN_M
+        and (weight.shape[0], k) in _SM107_CUBLASLT_MXFP8_NK
+        and envs.SGLANG_OPT_SM107_MXFP8_PREFILL_CUBLASLT.get()
+        and get_platform().device_sm == 107
+        and x_scale_u8.numel()
+        == -(-input_2d.shape[0] // 128) * 128 * (-(-k // 128) * 4)
+    ):
+        # cuBLASLt's block-scaled MXFP8 GEMM reads the same 128x4-swizzled scales.
+        output = torch._scaled_mm(
+            q_input,
+            weight.t(),
+            scale_a=x_scale_u8.view(torch.float8_e8m0fnu),
+            scale_b=weight_scale.reshape(-1).view(torch.float8_e8m0fnu),
+            out_dtype=output_dtype,
+        )
+        if bias is not None:
+            output += bias
+        return output.view(*output_shape)
 
     if (
         backend == "cute-dsl"

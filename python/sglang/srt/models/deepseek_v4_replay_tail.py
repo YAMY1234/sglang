@@ -64,12 +64,31 @@ from sglang.srt.models.deepseek_common.decoder_swa_bounded_replay import (
 from sglang.srt.models.deepseek_v4_mhc import HcState
 from sglang.srt.runtime_context import get_flags, get_parallel
 from sglang.srt.utils import is_cuda
+from sglang.srt.utils.log_utils import print_info_once
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.deepseek_v4_backend import LateLayerTail
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 _in_replay_tail = False
+
+
+def _recorder_blocks_tail_graph() -> bool:
+    # A tail graph replays the recorder's counting kernels captured with each layer's
+    # context; per-layer contexts are not set under the piecewise prefill graph.
+    recorder = get_global_expert_distribution_recorder()
+    if not recorder.recording:
+        return False
+    if (
+        not envs.SGLANG_DSV4_REPLAY_TAIL_GRAPH_WHILE_RECORDING.get()
+        or not recorder.counts_in_graph()
+        or check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE)
+    ):
+        return True
+    print_info_once(
+        "Decoder replay tail runs from its CUDA graph while expert distribution is recorded"
+    )
+    return False
 
 
 def in_replay_tail_graph() -> bool:
@@ -220,7 +239,7 @@ class DecoderReplayTail:
             tail_in_graph
             or get_is_capture_mode()
             or is_unified_kv_triton()
-            or get_global_expert_distribution_recorder().recording
+            or _recorder_blocks_tail_graph()
             or not self.runner.warm
             or (tail is not None and tail.cp_metadata is not None)
             or not self._can_capture_moe_bound(forward_batch)

@@ -150,6 +150,9 @@ class FillContext:
     # slot's source_fn — e.g. the pipeline-parallel proxy tensors, which the
     # replay path receives as a separate argument rather than off the FB.
     pp_proxy_tensors: Optional[Any] = None
+    # SGLANG_OPT_GRAPH_FILL_HOST_INTS: (buffer, host ints) that post_fill hooks queue for one
+    # write_host_ints launch at the end of fill_from; None when off.
+    host_writes: Optional[List[Tuple[torch.Tensor, Tuple[int, ...]]]] = None
 
 
 @dataclass
@@ -448,6 +451,13 @@ class CudaGraphBufferRegistry:
             raw_num_tokens=raw_num_tokens,
             padded_num_tokens=padded_num_tokens,
             pp_proxy_tensors=pp_proxy_tensors,
+            # Kernel-argument writes would freeze into a capture.
+            host_writes=(
+                []
+                if envs.SGLANG_OPT_GRAPH_FILL_HOST_INTS.get()
+                and not torch.cuda.is_current_stream_capturing()
+                else None
+            ),
         )
 
         # Phase 1: reset padded regions where it matters (none when neither
@@ -523,6 +533,10 @@ class CudaGraphBufferRegistry:
             ):
                 continue
             slot.post_fill(slot.buffer, forward_batch, ctx)
+        if ctx.host_writes:
+            from sglang.kernels.ops.memory.small_copy import write_host_ints
+
+            write_host_ints(*zip(*ctx.host_writes))
 
     def copy_slots(self, sources: Dict[str, torch.Tensor]) -> None:
         """``fill_from`` for an unpadded batch, by slot name: no padding reset or hooks,
@@ -713,6 +727,7 @@ def build_decode_registry(
     if enable_num_token_non_padded:
         from sglang.srt.model_executor.forward_batch_info import (
             compute_local_num_token_non_padded,
+            compute_local_num_token_non_padded_cpu,
         )
 
         def _num_token_non_padded_post_fill(buf, fb, ctx):
@@ -731,6 +746,17 @@ def build_decode_registry(
             sharded = not enable_prefill_cp and attn_tp_sharded_fn(
                 ctx.padded_num_tokens
             )
+            if (
+                ctx.host_writes is not None
+                and fb.global_num_token_non_padded_cpu is not None
+            ):
+                local = compute_local_num_token_non_padded_cpu(
+                    fb.global_num_token_non_padded_cpu,
+                    ctx.padded_num_tokens,
+                    sharded=sharded,
+                )
+                ctx.host_writes.append((buf, (local,)))
+                return
             buf.copy_(
                 compute_local_num_token_non_padded(
                     global_num_token_non_padded=fb.global_num_token_non_padded,
@@ -757,7 +783,12 @@ def build_decode_registry(
         def _global_num_tokens_post_fill(buf, fb, ctx):
             # Only the gathered (DP) path writes a value; otherwise left as init.
             if require_gathered_buffer:
-                buf.fill_(ctx.padded_num_tokens)
+                if ctx.host_writes is not None:
+                    ctx.host_writes.append(
+                        (buf, (ctx.padded_num_tokens,) * buf.numel())
+                    )
+                else:
+                    buf.fill_(ctx.padded_num_tokens)
 
         _global_shape = (
             (lambda _bs, _mt: (num_dp_ranks,))
