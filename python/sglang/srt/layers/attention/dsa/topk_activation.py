@@ -16,7 +16,7 @@ NATIVE_SHA = "f2b7bc2e09c4331fa5aa7f3624e06ee2d89f62d8854d651f7d970289b7497b36"
 API_SHA = "9093ea0735ac596fdb522648f078130d4a23b4ade862f6d678de3576543e6d06"
 OP = "sgl_kernel.fast_topk_transform_fused_overflow_prefix"
 LEGACY_OP = "sgl_kernel.fast_topk_transform_fused"
-# Packaged builds (no ARIA receipt): the sha of each overflow binary, by file name.
+# Packaged builds (no ARIA receipt): the accepted shas of each overflow binary, by file name.
 NATIVE_MANIFEST = Path(__file__).with_name("topk_overflow_native.sha256")
 _native = None
 _counts = {"candidate": 0, "legacy": 0}
@@ -32,13 +32,13 @@ def load_native():
     import sgl_kernel
 
     # With the receipt (frozen packs): the frozen binary and one receipted source commit.
-    # Without it (a packaged image): the binary listed in NATIVE_MANIFEST.
+    # Without it (a packaged image): a binary listed in NATIVE_MANIFEST.
     receipt = os.environ.get("ARIA_SOURCE_IMPORT_EXPECTED_B64")
     binary = Path(os.environ["TOPK_OVERFLOW_NATIVE_SO"]).resolve()
     api_path = Path(os.environ["TOPK_OVERFLOW_API_SOURCE"]).resolve()
     actual = hashlib.sha256(binary.read_bytes()).hexdigest()
-    native_sha = NATIVE_SHA if receipt is not None else _manifest_sha(binary.name)
-    if actual != native_sha or hashlib.sha256(api_path.read_bytes()).hexdigest() != API_SHA:
+    accepted = {NATIVE_SHA} if receipt is not None else _manifest_shas(binary.name)
+    if actual not in accepted or hashlib.sha256(api_path.read_bytes()).hexdigest() != API_SHA:
         raise RuntimeError("overflow native/API differs from the frozen build component")
     if str(torch.__version__) != "2.15.0+cu134" or torch.version.cuda != "13.4":
         raise RuntimeError("overflow native runtime differs from its build receipt")
@@ -67,12 +67,12 @@ def load_native():
     return _native
 
 
-def _manifest_sha(name):
-    for line in NATIVE_MANIFEST.read_text().splitlines():
-        fields = line.split()
-        if len(fields) == 2 and fields[1] == name:
-            return fields[0]
-    raise RuntimeError(f"{NATIVE_MANIFEST.name} lists no sha for {name}")
+def _manifest_shas(name):
+    lines = (line.split() for line in NATIVE_MANIFEST.read_text().splitlines())
+    shas = {fields[0] for fields in lines if len(fields) == 2 and fields[1] == name}
+    if not shas:
+        raise RuntimeError(f"{NATIVE_MANIFEST.name} lists no sha for {name}")
+    return shas
 
 
 def note_dispatch(kind, score):
