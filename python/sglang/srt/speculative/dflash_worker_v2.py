@@ -661,6 +661,10 @@ class DFlashWorkerV2(BaseSpecWorker):
                     "--speculative-domino-candidate-pool-size must be non-negative, "
                     f"got {self.domino_candidate_pool_size}."
                 )
+        # A PD prefill server never proposes: its drafting stage only writes the
+        # prompt's draft KV from target hidden states, and on a pipelined prefill
+        # that last stage holds lm_head but not the target input embedding.
+        if self._is_domino and get_disagg().disaggregation_mode != "prefill":
             target_model = self.target_worker.model_runner.model
             target_embedding = target_model.get_input_embeddings()
             lm_head = getattr(target_model, "lm_head", None)
@@ -1139,6 +1143,10 @@ class DFlashWorkerV2(BaseSpecWorker):
                         "Disable DFLASH draft cuda graph because dp attention "
                         "is enabled (draft runs eager)."
                     )
+            if capture_decode_cuda_graph and get_disagg().disaggregation_mode == "prefill":
+                # No draft decode on a PD prefill server, so no draft decode
+                # graphs (a Domino sampler would need the target embedding).
+                capture_decode_cuda_graph = False
             if is_cuda() and capture_decode_cuda_graph:
                 available_mem = self._tp_sync.available_memory_gb(
                     SpecTpSyncSite.DFLASH_MEM,
