@@ -71,4 +71,19 @@ register_kernel(
     )
 )
 
+for _fn in (
+    "corrector_history_attention",
+    "corrector_context_attention",
+    "corrector_draw",
+):
+    register_kernel(
+        KernelSpec(
+            op=f"speculative.{_fn}",
+            backend=KernelBackend.TRITON,
+            target=f"sglang.kernels.ops.speculative.domino_corrector:{_fn}",
+            capabilities=CUDA_ONLY,
+        )
+    )
+del _fn
+
 __all__ = []

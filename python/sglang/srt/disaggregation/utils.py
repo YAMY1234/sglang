@@ -2005,6 +2005,11 @@ def get_pd_kv_layout(token_to_kv_pool) -> Optional[str]:
     return None
 
 
+def pre_alloc_fill_len(req: Req) -> int:
+    """The last output id is the pending decode input, so its KV is not written."""
+    return len(req.origin_input_ids) + max(len(req.output_ids) - 1, 0)
+
+
 def prepare_abort(req: Req, error_message: str, status_code=None):
     from sglang.srt.managers.schedule_batch import FINISH_ABORT
 
