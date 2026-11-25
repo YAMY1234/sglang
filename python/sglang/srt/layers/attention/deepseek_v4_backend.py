@@ -4016,6 +4016,7 @@ class DeepseekV4AttnBackend(
         from sglang.kernels.ops.attention.dsv4.fp4_indexer_rope import (
             index_k_norm_rope_pack_store,
         )
+        from sglang.srt.layers.attention.dsv4_kv_dump import kv_dump
         from sglang.kernels.ops.attention.dsv4.low_ratio_compress import (
             c1_decode_norm_rope_store,
             c2_decode_norm_rope_store,
@@ -4055,6 +4056,9 @@ class DeepseekV4AttnBackend(
                 layout=kv_layout,
                 e4m3_cache=pool.get_c1_e4m3_store_target(layer_id),
             )
+            dump = kv_dump()
+            if dump is not None:
+                dump.add(layer_id, latent, pos, freqs_cis, kv_cache, raw_out_loc, page_size)
             out_loc = core.c1_out_loc
         else:
             # CompressStatePool stores each request's pending pairs in a position ring.

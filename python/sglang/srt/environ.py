@@ -685,6 +685,9 @@ class Envs:
     # With the SWA copy: also an e4m3 copy of the ratio-1 (fp4) compressed pool, written by the c1 store and filled at
     # PD decode admission, so FlashMLA's fp8 decode reads those layers' top-k rows without dequantizing them.
     SGLANG_OPT_DSV41_C1_E4M3_COPY = EnvBool(False)
+    # Debug only, never in counted runs: "<dir>:<tokens>" dumps real ratio-1 KV latents from eager forwards
+    # (layers/attention/dsv4_kv_dump.py), for the offline fp4 scale-format study.
+    SGLANG_H282_KV_DUMP = EnvStr("")
     # DSpark draft forward: the bonus-into-block-ids write and the positions / cache-loc
     # column slices in one Triton launch instead of three torch copies. Same values.
     SGLANG_OPT_DSPARK_FUSED_DRAFT_INPUTS = EnvBool(False)
