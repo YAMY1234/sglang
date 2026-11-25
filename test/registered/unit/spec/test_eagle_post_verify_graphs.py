@@ -490,17 +490,17 @@ class TestPostVerifyGraphs(CustomTestCase):
             graphs._key(verify_batch, verify_input, shards, True, 20),
         )
 
-    def test_a_packed_verify_result_is_one_buffer_holding_the_stock_values(self):
-        """With SGLANG_OPT_SPEC_PACKED_VERIFY_BCAST a sampled verify result goes to
-        the TP group in one broadcast: predict, accept_index and num_correct_drafts
-        must be views of one buffer, in order, starting from the values the
-        unpacked tensors start from."""
-        kw = dict(rows=14, bs=2, depth=7, device="cpu")
-        stock = eagle_utils._verify_outputs(packed=False, **kw)
-        *views, buffer = eagle_utils._verify_outputs(packed=True, **kw)
-        self.assertIsNone(stock[3])
-        for got, want in zip(views[:2], stock[:2]):
-            self.assertTrue(torch.equal(got, want))
+    def test_a_verify_result_is_one_buffer_holding_the_initial_values(self):
+        """A sampled verify result goes to the TP group in one broadcast: predict,
+        accept_index and num_correct_drafts must be views of one buffer, in order,
+        predict starting at 0 and accept_index at -1."""
+        *views, buffer = eagle_utils._verify_outputs(
+            rows=14, bs=2, depth=7, device="cpu"
+        )
+        self.assertTrue(torch.equal(views[0], torch.zeros(14, dtype=torch.int32)))
+        self.assertTrue(
+            torch.equal(views[1], torch.full((2, 7), -1, dtype=torch.int32))
+        )
         offset = 0
         for view in views:
             self.assertEqual(view.data_ptr(), buffer.data_ptr() + 4 * offset)

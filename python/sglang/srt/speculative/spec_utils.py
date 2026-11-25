@@ -1128,12 +1128,8 @@ def _versions(*tensors: torch.Tensor) -> Optional[tuple[int, ...]]:
     return tuple(t._version for t in tensors)
 
 
-# SGLANG_OPT_SPEC_VERIFY_REUSE_STAGED_INPUTS: the verify rounds of this process reuse the last indices.
-_VERIFY_TRACK_INDICES: Optional[VerifyTrackIndices] = (
-    VerifyTrackIndices()
-    if envs.SGLANG_OPT_SPEC_VERIFY_REUSE_STAGED_INPUTS.get()
-    else None
-)
+# The verify rounds of this process reuse the last indices while their inputs are unchanged.
+_VERIFY_TRACK_INDICES = VerifyTrackIndices()
 
 
 def prepare_mamba_track_for_verify(batch: ScheduleBatch) -> None:
@@ -1162,7 +1158,7 @@ def prepare_mamba_track_for_verify(batch: ScheduleBatch) -> None:
             "lazy spec verify without a track plan: mamba_lazy_spec_prepare "
             "must run in prepare_for_decode for every spec decode iteration"
         )
-    if track_positions is None and _VERIFY_TRACK_INDICES is not None:
+    if track_positions is None:
         _VERIFY_TRACK_INDICES.set_from_reqs(batch)
     else:
         set_mamba_track_indices_from_reqs(batch, track_positions)

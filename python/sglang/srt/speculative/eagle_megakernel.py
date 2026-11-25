@@ -297,10 +297,12 @@ class EagleMegakernel(EagleDraftRuntime):
         """Keep compatible EP1 relay outputs in the next draft's input buffers."""
         from sglang.srt.managers.overlap_utils import spec_relay_bypass_enabled
 
-        if not spec_relay_bypass_enabled() or get_parallel().moe_ep_size != 1:
-            return None
         draft_runner = self._draft_worker.cuda_graph_runner
-        if draft_runner is None:
+        if (
+            draft_runner is None
+            or not spec_relay_bypass_enabled()
+            or get_parallel().moe_ep_size != 1
+        ):
             return None
         b = draft_runner.buffers
         hidden = b.hidden_states

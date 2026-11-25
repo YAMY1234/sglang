@@ -82,10 +82,8 @@ def spec_relay_bypass_enabled(
     ``spec_algo`` is omitted by the EAGLE-only draft-extend runner.
     """
     return (
-        envs.SGLANG_OPT_SPEC_RELAY_IN_PLACE.get()
-        and (get_spec().speculative_eagle_topk or 1) == 1
-        and (spec_algo is None or spec_algo.is_eagle() or spec_algo.is_standalone())
-    )
+        spec_algo is None or spec_algo.is_eagle() or spec_algo.is_standalone()
+    ) and (get_spec().speculative_eagle_topk or 1) == 1
 
 
 @torch.compile(dynamic=True, disable=_is_npu)

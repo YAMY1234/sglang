@@ -504,7 +504,6 @@ class TestPrePlannedReplayRestage(CustomTestCase):
         runner._resolve_lora_variant = lambda _: None
         runner._resolve_attention_variant = lambda *_: None
         runner._make_graph_key = lambda *key: key
-        # SGLANG_OPT_SPEC_VERIFY_REUSE_STAGED_INPUTS on
         runner._restage_skip, runner._staged_inputs = True, None
         return runner
 

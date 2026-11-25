@@ -371,7 +371,7 @@ class TestMambaPrefillTrackMetadata(unittest.TestCase):
                     )
                     with (
                         patch.object(spec_utils, "get_exec", return_value=settings),
-                        patch.object(spec_utils, "set_mamba_track_indices_from_reqs"),
+                        patch.object(spec_utils, "_VERIFY_TRACK_INDICES"),
                     ):
                         spec_utils.prepare_mamba_track_for_verify(batch)
                     self.assertIsNone(batch.mamba_track_mask)
@@ -505,7 +505,9 @@ class TestVerifyTrackIndexReuse(unittest.TestCase):
                 enable_mamba_extra_buffer=True, enable_mamba_extra_buffer_lazy=lazy
             )
         )
-        # reuse: the process's indices under SGLANG_OPT_SPEC_VERIFY_REUSE_STAGED_INPUTS, None without it
+        # reuse: the process's indices; None builds from scratch (a fresh instance)
+        if reuse is None:
+            reuse = spec_utils.VerifyTrackIndices()
         with (
             patch.object(spec_utils, "get_exec", return_value=settings),
             patch.object(spec_utils, "_VERIFY_TRACK_INDICES", reuse),

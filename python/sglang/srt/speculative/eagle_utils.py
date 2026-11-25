@@ -71,7 +71,6 @@ _is_hip = is_hip()
 _is_xpu = is_xpu()
 _is_cpu = is_cpu()
 _COMPACT_VERIFY_SAMPLING = envs.SGLANG_OPT_SPEC_COMPACT_VERIFY_SAMPLING.get()
-_PACKED_VERIFY_BCAST = envs.SGLANG_OPT_SPEC_PACKED_VERIFY_BCAST.get()
 
 # The binding defaults probe this explicit capability once instead of relying on
 # exception handling in the hot path.  Runtime itself remains independent of the
@@ -1032,7 +1031,6 @@ def _tree_accept(
         bs=bs,
         depth=verify_input.max_tree_depth,
         device=device,
-        packed=_PACKED_VERIFY_BCAST,
         init=not fused_verify,
     )
 
@@ -1156,12 +1154,7 @@ def _tree_accept(
             else get_parallel().tp_group
         )
         if tp_group.world_size > 1:
-            if verify_out is not None:
-                tp_group.broadcast(verify_out, src=0)
-            else:
-                tp_group.broadcast(predict, src=0)
-                tp_group.broadcast(accept_index, src=0)
-                tp_group.broadcast(num_correct_drafts, src=0)
+            tp_group.broadcast(verify_out, src=0)
     else:
         if use_rejection_sampling:
             sampling_fn = chain_speculative_sampling_triton
@@ -1248,12 +1241,7 @@ def _tree_accept(
             else get_parallel().tp_group
         )
         if tp_group.world_size > 1:
-            if verify_out is not None:
-                tp_group.broadcast(verify_out, src=0)
-            else:
-                tp_group.broadcast(predict, src=0)
-                tp_group.broadcast(accept_index, src=0)
-                tp_group.broadcast(num_correct_drafts, src=0)
+            tp_group.broadcast(verify_out, src=0)
 
     if SIMULATE_ACC_LEN > 0 and accept_lens is None:
         # Do simulation. The helper builds (and returns) a replacement
@@ -1402,21 +1390,12 @@ def _chain_accept(
 
 
 def _verify_outputs(
-    *, rows: int, bs: int, depth: int, device, packed: bool, init: bool = True
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+    *, rows: int, bs: int, depth: int, device, init: bool = True
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """predict [rows] (zeros), accept_index [bs, depth] (-1) and num_correct_drafts
-    [bs] int32; packed (SGLANG_OPT_SPEC_PACKED_VERIFY_BCAST): views of one buffer,
-    returned last so a sampled result goes to the TP group in one broadcast. Without
-    init they are left unset, for chain_accept to write whole."""
-    if not packed:
-        if not init:
-            predict = torch.empty((rows,), dtype=torch.int32, device=device)
-            accept_index = torch.empty((bs, depth), dtype=torch.int32, device=device)
-        else:
-            predict = torch.zeros((rows,), dtype=torch.int32, device=device)
-            accept_index = torch.full((bs, depth), -1, dtype=torch.int32, device=device)
-        num_correct_drafts = torch.empty((bs,), dtype=torch.int32, device=device)
-        return predict, accept_index, num_correct_drafts, None
+    [bs] int32: views of one buffer, returned last so a sampled result goes to the
+    TP group in one broadcast. Without init they are left unset, for chain_accept to
+    write whole."""
     out = torch.empty((rows + bs * depth + bs,), dtype=torch.int32, device=device)
     predict = out[:rows]
     accept_index = out[rows : rows + bs * depth].view(bs, depth)

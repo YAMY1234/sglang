@@ -102,6 +102,8 @@ class TestEagleDraftExtendCudaGraphRunner(unittest.TestCase):
                 "require_mlp_tp_gather": False,
                 "require_mlp_sync": False,
                 "require_attn_tp_gather": False,
+                # the detaching path; the in-place relay is covered with the draft runner
+                "spec_relay_bypass_enabled": False,
             }
             for name, result in replacements.items():
                 stack.enter_context(mock.patch.object(mod, name, return_value=result))
