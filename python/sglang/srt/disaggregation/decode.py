@@ -4823,11 +4823,12 @@ class SchedulerDisaggregationDecodeMixin:
         span = kv_pool.sliding_window + 4
         locs, history = [], []
         for req in batch.reqs:
-            end = len(req.origin_input_ids) + len(req.output_ids)
-            locs.append(req_to_token[req.req_pool_idx, max(0, end - span) : end])
+            end = req.seqlen
+            row = req.kv.req_pool_idx
+            locs.append(req_to_token[row, max(0, end - span) : end])
             if kv_pool.c1_e4m3 is not None:
                 # SGLANG_OPT_DSV41_C1_E4M3_COPY: the ratio-1 pool holds every token, so its whole history
-                history.append(req_to_token[req.req_pool_idx, :end])
+                history.append(req_to_token[row, :end])
         if locs:
             kv_pool.fill_swa_e4m3_copy(torch.cat(locs))
         if history:
