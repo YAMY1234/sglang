@@ -1566,19 +1566,18 @@ def test_shared_draft_metadata_reads_what_each_step_writes(bs):
 
 
 @pytest.mark.parametrize(
-    "runtime_optimization,steps,swa,translating,expected",
+    "steps,swa,translating,expected",
     [
-        (False, 3, False, False, False),
-        (True, 1, False, False, False),
-        (True, 3, True, False, False),
-        (True, 3, False, True, False),
-        (True, 3, False, False, True),
+        (1, False, False, False),
+        (3, True, False, False),
+        (3, False, True, False),
+        (3, False, False, True),
     ],
 )
-def test_shared_draft_metadata_policy_is_runtime_only_and_safe(
-    monkeypatch, runtime_optimization, steps, swa, translating, expected
+def test_shared_draft_metadata_policy_is_safe(
+    monkeypatch, steps, swa, translating, expected
 ):
-    """The generic runtime switch, never plugin presence, owns metadata sharing."""
+    """Multi-step drafts share metadata unless a step's pool needs its own."""
     from sglang.srt.layers.attention.trtllm_mha_backend import (
         TRTLLMHAAttnMultiStepDraftBackend,
     )
@@ -1590,11 +1589,10 @@ def test_shared_draft_metadata_policy_is_runtime_only_and_safe(
         )
         for _ in range(max(steps, 1))
     ]
-    with envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.override(runtime_optimization):
-        assert (
-            TRTLLMHAAttnMultiStepDraftBackend._can_share_draft_metadata(backends, steps)
-            is expected
-        )
+    assert (
+        TRTLLMHAAttnMultiStepDraftBackend._can_share_draft_metadata(backends, steps)
+        is expected
+    )
 
 
 if __name__ == "__main__":

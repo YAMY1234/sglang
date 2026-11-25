@@ -230,11 +230,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             return SharedReadEnds.PRE_REPLAY
         # Only metadata prep reads req_to_token in a draft-extend graph; the
         # model kernels consume the backend-owned page table after it.
-        if (
-            fm.is_draft_extend_v2()
-            and envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get()
-            and envs.SGLANG_ENABLE_NV_MEGA_PDDEC_RUNTIME_OPTIMIZATION.get()
-        ):
+        if fm.is_draft_extend_v2():
             return SharedReadEnds.IN_REPLAY
         return super().shared_read_ends(fm)
 
@@ -472,11 +468,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         )
         if self._full_attn_kv_splits > 1:
             self._init_full_attn_kv_splits(v_head_dim=config.v_head_dim)
-        self.decode_split_hoist = (
-            self.decode_seq_len_splits > 1
-            and envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get()
-            and envs.SGLANG_ENABLE_NV_MEGA_PDDEC_RUNTIME_OPTIMIZATION.get()
-        )
+        self.decode_split_hoist = self.decode_seq_len_splits > 1
         self._decode_group_plans = (
             DecodeGroupPlans() if self.decode_split_hoist else None
         )
@@ -2264,14 +2256,10 @@ class TRTLLMHAAttnMultiStepDraftBackend(FlashInferMultiStepDraftBackend):
 
     @staticmethod
     def _can_share_draft_metadata(attn_backends, steps: int) -> bool:
-        return (
-            envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get()
-            and steps > 1
-            and all(
-                not backend.use_sliding_window_kv_pool
-                and not backend.runner_ids.is_translating
-                for backend in attn_backends[:steps]
-            )
+        return steps > 1 and all(
+            not backend.use_sliding_window_kv_pool
+            and not backend.runner_ids.is_translating
+            for backend in attn_backends[:steps]
         )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):

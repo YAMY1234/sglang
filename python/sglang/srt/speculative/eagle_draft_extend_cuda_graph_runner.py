@@ -7,7 +7,6 @@ from typing import TYPE_CHECKING, Callable, Optional
 import torch
 
 from sglang.srt.compilation.torch_compile_decoration import set_torch_compile_config
-from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import SharedReadEnds
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
@@ -314,10 +313,9 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         self.attention_variant_sizes = self.specialized_batches
 
         self.in_graph_metadata_prep_done: Optional[torch.cuda.Event] = None
-        self._runtime_optimization = (
-            envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get()
-            and envs.SGLANG_ENABLE_NV_MEGA_PDDEC_RUNTIME_OPTIMIZATION.get()
-        )
+        # In-replay read fence and guarded KV page reuse (the class default keeps a
+        # runner built without __init__ on the plain path).
+        self._runtime_optimization = True
         allocator = (
             self.model_runner.token_to_kv_pool_allocator
             if self._runtime_optimization

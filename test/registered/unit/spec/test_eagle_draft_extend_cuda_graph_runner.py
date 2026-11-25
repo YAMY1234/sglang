@@ -33,6 +33,10 @@ class TestEagleDraftExtendCudaGraphRunner(unittest.TestCase):
         model_runner = SimpleNamespace(
             device="cpu",
             model=SimpleNamespace(),
+            # unsorted pages: no KV reuse guard and no forced full replay
+            token_to_kv_pool_allocator=SimpleNamespace(
+                need_sort=False, supports_reuse_guard=False
+            ),
             kv_cache_configurator=SimpleNamespace(modelslim_cache_layout=None),
             device_timer=None,
             model_config=SimpleNamespace(
