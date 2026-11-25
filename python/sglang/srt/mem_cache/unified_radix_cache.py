@@ -238,6 +238,7 @@ class UnifiedRadixCache(BasePrefixCache):
     _l3_write_on_host_evict: bool = False
     _l3_write_state_on_tombstone: bool = False
     _l3_saved_token_threshold: bool = False
+    _l3_belief_query_renew: bool = True
     _l3_lifetime_ledger: Optional[L3LifetimeLedger] = None
     _l3_tombstone_quarantined_ops: frozenset[int] = frozenset()
     # SGLANG_HICACHE_L3_TOMBSTONE_ASYNC: storage op id -> pinned victim, in issue order.
@@ -743,6 +744,7 @@ class UnifiedRadixCache(BasePrefixCache):
         )
         self._l3_wb_ack_credit = envs.SGLANG_HICACHE_L3_WB_ACK_CREDIT.get()
         self._l3_wb_walk_every = max(1, envs.SGLANG_HICACHE_L3_WB_WALK_EVERY.get())
+        self._l3_belief_query_renew = envs.SGLANG_HICACHE_L3_BELIEF_QUERY_RENEW.get()
         self._init_ack_lag()
         self._l3_write_state_on_tombstone = (
             envs.SGLANG_HICACHE_L3_WRITE_STATE_ON_TOMBSTONE.get()
@@ -4240,8 +4242,9 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def _invalidate_absent_from_hit_query(self, operation) -> None:
         """Heal each pool's beliefs beyond its rank-agreed boundary (a
-        chain-page pool also learns presence up to it); a pool without a
-        verdict heals from the folded cut."""
+        chain-page pool also learns presence up to it, unless
+        SGLANG_HICACHE_L3_BELIEF_QUERY_RENEW=0); a pool without a verdict
+        heals from the folded cut."""
         if operation.deadline_expired:
             # A cut query's agreed hit may be a MIN over skipped lookups, not a verdict.
             return
@@ -4260,8 +4263,14 @@ class UnifiedRadixCache(BasePrefixCache):
             return (folded_pages, False) if pages is None else (pages, True)
 
         kv_pages, kv_evidence = verdict(PoolName.KV)
+        renew = self._l3_belief_query_renew
         self._belief_policy(PoolName.KV, PoolHitPolicy.ALL_PAGES).heal_from_query(
-            beliefs.pool(PoolName.KV), chain, chain, kv_pages, evidence=kv_evidence
+            beliefs.pool(PoolName.KV),
+            chain,
+            chain,
+            kv_pages,
+            evidence=kv_evidence,
+            renew=renew,
         )
         for transfer in operation.pool_transfers or ():
             hit_pages, evidence = verdict(transfer.name)
@@ -4271,6 +4280,7 @@ class UnifiedRadixCache(BasePrefixCache):
                 list(transfer.keys or ()),
                 hit_pages,
                 evidence=evidence,
+                renew=renew,
             )
 
     def _account_prefetch_outcome(self, operation, revoked: bool) -> None:

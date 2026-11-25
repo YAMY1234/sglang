@@ -362,6 +362,7 @@ class TestBufferModeSidecar(unittest.TestCase):
             components={ComponentType.FULL: SimpleNamespace()},
             sidecar_pool_specs=sidecar_pool_specs,
             storage_existence_cache=StorageExistenceCache(),
+            _l3_belief_query_renew=True,
         )
         cache._build_sidecar_transfers = (
             UnifiedRadixCache._build_sidecar_transfers.__get__(cache)

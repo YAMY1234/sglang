@@ -1161,6 +1161,9 @@ class Envs:
     # for one to two half-TTLs after its last write (storage evicts unannounced), so
     # a later host eviction re-writes it; set below the store's turnover. 0: forever.
     SGLANG_HICACHE_L3_BELIEF_TTL_S = EnvFloat(900.0)
+    # A hit query's evidence renews the beliefs of the pages it found. The store's exists does
+    # not refresh its LRU, so 0 renews only on write acks and L3 fills (which do).
+    SGLANG_HICACHE_L3_BELIEF_QUERY_RENEW = EnvBool(True)
     # Hybrid (Mamba) trees: when the tree holds KV past the deepest state (the tail state was
     # dropped, the KV kept), query L3 from the end of that KV instead of from the state, so a
     # tail L3 wrote on host eviction can resume the request through the tree's stateless KV.
