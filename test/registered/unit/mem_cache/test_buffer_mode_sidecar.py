@@ -2,6 +2,7 @@
 
 import unittest
 from array import array
+from collections import defaultdict
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
@@ -81,6 +82,7 @@ class TestBufferModeSidecar(unittest.TestCase):
                 cache.host_memory_mode = "buffer_only"
                 cache.tree_core = SimpleNamespace(page_size=2)
                 cache.components = {}
+                cache._prefetch_outcome_stats = defaultdict(int)
                 cache.storage_existence_cache = StorageExistenceCache()
                 beliefs = cache.storage_existence_cache.pool(PoolName.KV)
                 chain = operation.all_hash_values
@@ -363,6 +365,7 @@ class TestBufferModeSidecar(unittest.TestCase):
             sidecar_pool_specs=sidecar_pool_specs,
             storage_existence_cache=StorageExistenceCache(),
             _l3_belief_query_renew=True,
+            _prefetch_outcome_stats=defaultdict(int),
         )
         cache._build_sidecar_transfers = (
             UnifiedRadixCache._build_sidecar_transfers.__get__(cache)

@@ -197,7 +197,8 @@ class PoolBeliefPolicy:
     """How a pool's keys sit on a node's page-hash chain, hence how a storage
     verdict heals its beliefs: a rank-agreed hit-query boundary (``evidence``
     = the query reported this pool; ``renew`` = it may teach presence) or a
-    transfer's delivered page count."""
+    transfer's delivered page count. heal_from_query returns the pages its
+    evidence renews (or would renew, with ``renew`` False)."""
 
     def heal_from_query(
         self,
@@ -208,7 +209,7 @@ class PoolBeliefPolicy:
         *,
         evidence: bool,
         renew: bool = True,
-    ) -> None:
+    ) -> int:
         raise NotImplementedError
 
     def heal_from_transfer(
@@ -226,8 +227,11 @@ class ChainPagesPolicy(PoolBeliefPolicy):
 
     def heal_from_query(self, beliefs, chain, keys, hit_pages, *, evidence, renew=True):
         beliefs.invalidate_beyond(chain, hit_pages)
-        if evidence and renew:
+        if not evidence:
+            return 0
+        if renew:
             beliefs.add(chain[:hit_pages], BELIEF_QUERY)
+        return min(hit_pages, len(chain))
 
 
 class TrailingWindowPolicy(PoolBeliefPolicy):
@@ -237,6 +241,7 @@ class TrailingWindowPolicy(PoolBeliefPolicy):
 
     def heal_from_query(self, beliefs, chain, keys, hit_pages, *, evidence, renew=True):
         beliefs.invalidate_beyond(chain, hit_pages)
+        return 0
 
 
 def default_belief_policy(hit_policy: PoolHitPolicy) -> PoolBeliefPolicy:

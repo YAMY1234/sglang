@@ -445,6 +445,10 @@ class UnifiedRadixCache(BasePrefixCache):
             "hits_past_tree_kv": 0,
             "hit_tokens_past_tree_kv": 0,
             "lookups_logged": 0,
+            # KV pages a hit query's evidence renewed in the beliefs, or would have under
+            # SGLANG_HICACHE_L3_BELIEF_QUERY_RENEW=0.
+            "belief_query_renew_pages": 0,
+            "belief_query_renew_suppressed_pages": 0,
         }
         # Exclusive L2->L3 tiering: storage is written from the coldest host pages ahead
         # of eviction, not at L2 admission. Resolved in init_hicache.
@@ -4276,7 +4280,9 @@ class UnifiedRadixCache(BasePrefixCache):
 
         kv_pages, kv_evidence = verdict(PoolName.KV)
         renew = self._l3_belief_query_renew
-        self._belief_policy(PoolName.KV, PoolHitPolicy.ALL_PAGES).heal_from_query(
+        renewed = self._belief_policy(
+            PoolName.KV, PoolHitPolicy.ALL_PAGES
+        ).heal_from_query(
             beliefs.pool(PoolName.KV),
             chain,
             chain,
@@ -4284,6 +4290,11 @@ class UnifiedRadixCache(BasePrefixCache):
             evidence=kv_evidence,
             renew=renew,
         )
+        self._prefetch_outcome_stats[
+            "belief_query_renew_pages"
+            if renew
+            else "belief_query_renew_suppressed_pages"
+        ] += renewed
         for transfer in operation.pool_transfers or ():
             hit_pages, evidence = verdict(transfer.name)
             self._belief_policy(transfer.name, transfer.hit_policy).heal_from_query(
