@@ -17,7 +17,7 @@ import dataclasses
 import logging
 from contextlib import contextmanager
 from enum import IntEnum
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
 import numpy as np
 import torch
@@ -34,6 +34,10 @@ from sglang.kernels.ops.activation.softcap import (
     softcap_to_float32_logits,
 )
 from sglang.kernels.ops.sampling.softcap_row_argmax import softcap_row_argmax
+from sglang.kernels.ops.speculative.topk1 import (
+    draft_topk1_shard_partials,
+    draft_topk1_shard_partials_width,
+)
 from sglang.srt.beam_search.logits_capture import BeamLogitsCapture
 from sglang.srt.distributed.device_communicators import triton_symm_mem_ag
 from sglang.srt.environ import envs
@@ -48,6 +52,7 @@ from sglang.srt.layers.dp_attention import (
     get_dp_device,
     get_dp_dtype,
     get_dp_hidden_size,
+    world_dp_gather_enabled,
 )
 from sglang.srt.layers.logprob_processor import (
     InputLogprobProcessor,
@@ -61,6 +66,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_mode import CaptureHiddenMode, ForwardMode
 from sglang.srt.runtime_context import (
     LoRABatchLayout,
+    get_disagg,
     get_exec,
     get_forward,
     get_parallel,
@@ -69,6 +75,7 @@ from sglang.srt.runtime_context import (
 from sglang.srt.utils.device import (
     async_d2h,
     is_cpu,
+    is_cuda,
     is_gfx1250_supported,
     is_hip,
     is_npu,
@@ -80,6 +87,7 @@ logger = logging.getLogger(__name__)
 
 _is_npu = is_npu()
 _is_cpu = is_cpu()
+_is_cuda = is_cuda()
 # On gfx1250, torch.mm for a bf16 lm_head is slower than aiter's GEMM.
 _use_aiter_lm_head = is_hip() and envs.SGLANG_USE_AITER.get() and is_gfx1250_supported()
 if _use_aiter_lm_head:
@@ -279,6 +287,10 @@ class LogitsProcessorOutput:
     # (--enable-return-aux-hidden-states).
     # For in-process consumers of this output; not copied into the response path.
     last_hidden_states: Optional[torch.Tensor] = None
+
+    # Under the draft_argmax_only forward flag, set instead of next_token_logits:
+    # all-reduced draft_topk1_shard_partials, fp32 [#seq, tp_size * num_splits * 4].
+    next_token_argmax_partials: Optional[torch.Tensor] = None
 
     ## Part 2: This part will be assigned in python/sglang/srt/layers/sampler.py::Sampler
     # he log probs of output tokens, if SGLANG_RETURN_ORIGINAL_LOGPROB = True, will get the log probs before applying temperature. If False, will get the log probs before applying temperature.
@@ -593,6 +605,32 @@ class LogitsProcessor(nn.Module):
         ):
             self.final_logit_softcapping = None
 
+        # Pure-TP vocab-parallel logits that are only gathered and cast: the
+        # top-1 can be taken per shard (see enable_draft_argmax_exchange).
+        self.can_exchange_argmax = (
+            _is_cuda
+            and envs.SGLANG_SPEC_DRAFT_ARGMAX_EXCHANGE.get()
+            and self.do_tensor_parallel_all_gather
+            and not self.use_attn_tp_group
+            and not self.do_tensor_parallel_all_gather_dp_attn
+            and not self.use_tp_lm_head_all_to_all
+            and self.final_logit_softcapping is None
+        )
+        # The replicated --enable-dp-lm-head head, run vocab-parallel over the DP
+        # ranks for a greedy draft (see _get_argmax_partials_dp).
+        self.can_exchange_argmax_dp = _is_cuda and _dp_lm_head_can_shard_for_draft(
+            use_attn_tp_group=self.use_attn_tp_group,
+            final_logit_softcapping=self.final_logit_softcapping,
+            fp32_lm_head=self.use_fp32_lm_head or self.use_fp32_lm_head_output,
+        )
+        # Opted in only on speculative draft processors; see _draft_argmax_requested.
+        self.draft_argmax_exchange = False
+        # (group name, rows, partials width) -> all-reduce method or None.
+        self._argmax_exchange_methods: Dict[Tuple[str, int, int], Optional[str]] = {}
+        self._argmax_exchange_logged: Set[str] = set()
+        # The draft-head row gather of _get_argmax_partials_dp, made on first use.
+        self._draft_head_gather = None
+
         self.return_full_logits = return_full_logits
         self.enable_mis = get_exec().features.enable_mis
         features = get_exec().features
@@ -683,6 +721,28 @@ class LogitsProcessor(nn.Module):
                 and get_capture_logits_variant() == VERIFY_VOCAB_SHARDS
             )
         return self.verify_uses_vocab_shards(forward_batch)
+
+    def enable_draft_argmax_exchange(self) -> bool:
+        """Opt this speculative-draft processor into argmax partials.
+
+        Afterwards a forward under ``get_forward().scoped(draft_argmax_only=True)``
+        may return ``next_token_argmax_partials`` instead of logits; it still
+        returns logits whenever the exchange does not apply, so callers handle
+        both. Returns whether the processor is eligible (rank-invariant).
+        """
+        self.draft_argmax_exchange = (
+            self.can_exchange_argmax or self.can_exchange_argmax_dp
+        )
+        return self.draft_argmax_exchange
+
+    def _draft_argmax_requested(self) -> bool:
+        # Processors never opted in (targets) and compiled forwards skip the
+        # flag read: it is contextvar-backed, which Dynamo cannot trace.
+        return (
+            self.draft_argmax_exchange
+            and not torch.compiler.is_compiling()
+            and get_forward().draft_argmax_only
+        )
 
     def forward(
         self,
@@ -791,6 +851,27 @@ class LogitsProcessor(nn.Module):
                     last_hidden_states=last_hidden_states_to_store,
                     mm_input_embeds=logits_metadata.mm_input_embeds,
                 )
+            if self._draft_argmax_requested():
+                partials = (
+                    self._get_argmax_partials_dp(
+                        pruned_states, lm_head, logits_metadata
+                    )
+                    if self.can_exchange_argmax_dp
+                    else self._get_argmax_partials(pruned_states, lm_head)
+                )
+                if partials is not None:
+                    return LogitsProcessorOutput(
+                        next_token_logits=None,
+                        next_token_argmax_partials=(
+                            partials[sample_indices]
+                            if sample_indices is not None
+                            else partials
+                        ),
+                        hidden_states=hidden_states_to_store,
+                        last_hidden_states=last_hidden_states_to_store,
+                        mm_input_embeds=logits_metadata.mm_input_embeds,
+                    )
+
             # Compute logits for both input and sampled tokens.
             logits = self._get_logits(pruned_states, lm_head, logits_metadata)
             sampled_logits = (
@@ -1365,6 +1446,193 @@ class LogitsProcessor(nn.Module):
         assert output.dtype == torch.float32
         return gathered_softcap_logits(gathered, self.final_logit_softcapping, output)
 
+    def _get_argmax_partials(
+        self, hidden_states: torch.Tensor, lm_head: VocabParallelEmbedding
+    ) -> Optional[torch.Tensor]:
+        """All-reduced draft_topk1_shard_partials of this rank's LM-head shard.
+
+        None when the exchange does not apply; the caller then gathers logits.
+        Every check is rank-invariant (group state, config, tensor metadata).
+        """
+        group = get_parallel().tp_group
+        num_rows = hidden_states.shape[0]
+        if num_rows == 0:
+            return None
+        if not _is_plain_vocab_parallel_head(lm_head, tp_size=group.world_size):
+            self._log_argmax_exchange_once(
+                group=group,
+                outcome="falls back to the logits gather: the LM head is not a "
+                "plain vocab-parallel shard",
+            )
+            return None
+        local_width = lm_head.num_embeddings_per_partition
+        assert (
+            lm_head.shard_indices.padded_org_vocab_start_index
+            == group.rank_in_group * local_width
+        ), "LM-head shard is not at its rank's slot of the gathered logits"
+        shape = (
+            num_rows,
+            draft_topk1_shard_partials_width(
+                local_width=local_width, tp_size=group.world_size
+            ),
+        )
+        key = (group.unique_name, *shape)
+        partials = None
+        if key not in self._argmax_exchange_methods:
+            partials = torch.empty(
+                shape, dtype=torch.float32, device=hidden_states.device
+            )
+            method = group.device_all_reduce_method(partials)
+            self._argmax_exchange_methods[key] = method
+            self._log_argmax_exchange_once(
+                group=group,
+                outcome=(
+                    f"engaged: {method} all-reduce of fp32 partials"
+                    if method is not None
+                    else "falls back to the logits gather: the TP all-reduce of "
+                    "fp32 partials would run on NCCL"
+                ),
+                shape=shape,
+            )
+        # An NCCL all-reduce costs more than the gather it would replace.
+        if self._argmax_exchange_methods[key] is None:
+            return None
+        if partials is None:
+            partials = torch.empty(
+                shape, dtype=torch.float32, device=hidden_states.device
+            )
+
+        with get_forward().scoped(lora_batch_layout=LoRABatchLayout.DP_LOCAL):
+            logits = self._compute_lm_head(hidden_states, lm_head)
+        if self.logit_scale is not None:
+            logits.mul_(self.logit_scale)
+        assert logits.shape == (num_rows, local_width), logits.shape
+        draft_topk1_shard_partials(
+            logits,
+            tp_rank=group.rank_in_group,
+            tp_size=group.world_size,
+            vocab_size=self.vocab_size,
+            out=partials,
+        )
+        return group.all_reduce(partials)
+
+    def _get_argmax_partials_dp(
+        self,
+        hidden_states: torch.Tensor,
+        lm_head: VocabParallelEmbedding,
+        logits_metadata: LogitsMetadata,
+    ) -> Optional[torch.Tensor]:
+        """This rank's rows of the all-reduced draft_topk1_shard_partials, with the
+        replicated head run vocab-parallel over the TP group (the attention-DP ranks).
+
+        None (the replicated head runs) unless every rank holds the same number of
+        rows. Every check is rank-invariant (group state, config, global counts).
+        """
+        group = get_parallel().tp_group
+        tp_size, tp_rank = group.world_size, group.rank_in_group
+        num_rows = hidden_states.shape[0]
+        if not _dp_rows_equal(logits_metadata, num_rows=num_rows, tp_size=tp_size):
+            return None
+        if world_dp_gather_enabled() or not _is_replicated_plain_head(
+            lm_head, tp_size=tp_size
+        ):
+            self._log_argmax_exchange_once(
+                group=group,
+                outcome="keeps the replicated LM head: it is not a plain "
+                "full-vocab weight, or DP gathers span the world group",
+            )
+            return None
+        assert tp_rank == get_parallel().attn_dp_rank, (tp_rank, "attn_dp_rank")
+        local_width = lm_head.weight.shape[0] // tp_size
+        shape = (
+            tp_size * num_rows,
+            draft_topk1_shard_partials_width(local_width=local_width, tp_size=tp_size),
+        )
+        partials = torch.empty(shape, dtype=torch.float32, device=hidden_states.device)
+        key = (group.unique_name, *shape)
+        if key not in self._argmax_exchange_methods:
+            method = group.device_all_reduce_method(partials)
+            self._argmax_exchange_methods[key] = method
+            self._log_argmax_exchange_once(
+                group=group,
+                outcome="engaged on the DP-attention ranks, replicated LM head "
+                f"sharded {tp_size} ways: {method or 'nccl'} all-reduce of fp32 "
+                "partials",
+                shape=shape,
+            )
+
+        # Rank-major rows: rank r's rows land at [r * num_rows, (r + 1) * num_rows).
+        if envs.SGLANG_OPT_SPEC_DRAFT_TP_LM_HEAD_PUSH_GATHER.get():
+            gathered = self._gather_draft_head_rows(group, hidden_states.contiguous())
+        else:
+            gathered = torch.empty(
+                (tp_size * num_rows, hidden_states.shape[1]),
+                dtype=hidden_states.dtype,
+                device=hidden_states.device,
+            )
+            group.all_gather_into_tensor(gathered, hidden_states.contiguous())
+        shard = lm_head.weight[tp_rank * local_width : (tp_rank + 1) * local_width]
+        # The plain branch of _compute_lm_head, on this rank's vocab rows.
+        logits = torch.matmul(gathered.to(shard.dtype), shard.T)
+        if self.logit_scale is not None:
+            logits.mul_(self.logit_scale)
+        draft_topk1_shard_partials(
+            logits,
+            tp_rank=tp_rank,
+            tp_size=tp_size,
+            vocab_size=self.vocab_size,
+            out=partials,
+        )
+        partials = group.all_reduce(partials)
+        return partials[tp_rank * num_rows : (tp_rank + 1) * num_rows]
+
+    def _gather_draft_head_rows(self, group, local: torch.Tensor) -> torch.Tensor:
+        """Every TP rank's rows, rank-major: [tp_size * rows, hidden]."""
+        if envs.SGLANG_OPT_SPEC_DRAFT_TP_LM_HEAD_PUSH_GATHER.get():
+            from sglang.srt.distributed.device_communicators.vocab_gather import (
+                NVLinkVocabGather,
+                make_vocab_gather,
+            )
+
+            if self._draft_head_gather is None:
+                self._draft_head_gather = make_vocab_gather(
+                    group, local_width=local.shape[1], dtype=local.dtype, symm_rows=0
+                )
+            gather = self._draft_head_gather
+            if (
+                isinstance(gather, NVLinkVocabGather)
+                and local.nbytes <= gather.slot_bytes
+            ):
+                how = f"NVLink one-shot push ({gather.slot_bytes >> 10} KB slot)"
+            else:
+                how = "NCCL (no NVLink push plane, or rows past its slot)"
+            self._log_argmax_exchange_once(
+                group=group, outcome=f"gathers the draft-head rows by {how}"
+            )
+            return gather.gather_stacked(local)
+        gathered = torch.empty(
+            (group.world_size * local.shape[0], local.shape[1]),
+            dtype=local.dtype,
+            device=local.device,
+        )
+        group.all_gather_into_tensor(gathered, local)
+        return gathered
+
+    def _log_argmax_exchange_once(
+        self, *, group, outcome: str, shape: Optional[Tuple[int, int]] = None
+    ) -> None:
+        if outcome in self._argmax_exchange_logged:
+            return
+        self._argmax_exchange_logged.add(outcome)
+        if group.rank_in_group == 0:
+            logger.info(
+                "Draft argmax exchange (vocab %d, TP %d%s) %s.",
+                self.vocab_size,
+                group.world_size,
+                f", first partials {list(shape)}" if shape is not None else "",
+                outcome,
+            )
+
     def _compute_lm_head(
         self,
         hidden_states: torch.Tensor,
@@ -1797,6 +2065,83 @@ class LogitsProcessor(nn.Module):
             input_token_ids_logprobs_idx=input_token_ids_logprobs_idx,
             mm_input_embeds=logits_metadata.mm_input_embeds,
         )
+
+
+def _is_plain_vocab_parallel_head(lm_head, *, tp_size: int) -> bool:
+    """Shard r holds global vocab [r * width, (r + 1) * width), the layout the
+    TP all-gather along the last dim assumes. LoRA wrappers do not qualify."""
+    return (
+        isinstance(lm_head, VocabParallelEmbedding)
+        and lm_head.tp_size == tp_size
+        and not lm_head.use_attn_tp_group
+        and lm_head.num_added_embeddings == 0
+        # No plain weight (GGUF), or rows re-sliced after construction (a
+        # hot-token draft vocab): the logits are not this shard's vocab range.
+        and hasattr(lm_head, "weight")
+        and lm_head.weight.shape[0] == lm_head.num_embeddings_per_partition
+        # draft_topk1_shard_partials carries indices as exact fp32 integers.
+        and tp_size * lm_head.num_embeddings_per_partition < (1 << 24)
+    )
+
+
+def _dp_lm_head_can_shard_for_draft(
+    *,
+    use_attn_tp_group: bool,
+    final_logit_softcapping: Optional[float],
+    fp32_lm_head: bool,
+) -> bool:
+    """A pure-DP-attention decode node whose TP group is the DP ranks in DP-rank
+    order, where every draft LM-head call runs in the same phase on every rank."""
+    parallel = get_parallel()
+    return (
+        envs.SGLANG_OPT_SPEC_DRAFT_TP_LM_HEAD.get()
+        and use_attn_tp_group
+        and parallel.attn_tp_size == 1
+        and parallel.attn_cp_size == 1
+        and parallel.attn_dp_size > 1
+        and parallel.tp_size == parallel.attn_dp_size
+        and get_disagg().disaggregation_mode == "decode"
+        # Sampled drafts need logits, and whether a batch samples differs per DP rank.
+        and not get_spec().speculative_use_rejection_sampling
+        and final_logit_softcapping is None
+        and not fp32_lm_head
+        and get_exec().deterministic.rl_on_policy_target is None
+    )
+
+
+def _dp_rows_equal(
+    logits_metadata: LogitsMetadata, *, num_rows: int, tp_size: int
+) -> bool:
+    """Every DP rank holds num_rows > 0 rows: decode CUDA graphs pad every rank to
+    one bucket and carry no CPU counts; eager batches carry the global counts."""
+    counts = logits_metadata.global_num_tokens_for_logprob_cpu
+    if counts is None:
+        return (
+            logits_metadata.global_num_tokens_for_logprob_gpu is not None
+            and num_rows > 0
+        )
+    if len(counts) != tp_size or any(c != counts[0] for c in counts):
+        return False
+    return counts[0] > 0 and num_rows == counts[0]
+
+
+def _is_replicated_plain_head(lm_head, *, tp_size: int) -> bool:
+    """The whole padded vocab on this rank, multiplied by the plain matmul branch
+    of _compute_lm_head, splitting into tp_size equal row slices."""
+    return (
+        isinstance(lm_head, VocabParallelEmbedding)
+        and lm_head.tp_size == 1
+        and lm_head.num_added_embeddings == 0
+        and hasattr(lm_head, "weight")
+        and lm_head.weight.shape[0] == lm_head.num_embeddings_padded
+        and lm_head.weight.shape[0] % tp_size == 0
+        # draft_topk1_shard_partials carries indices as exact fp32 integers.
+        and lm_head.weight.shape[0] < (1 << 24)
+        and not should_apply_lm_head_quant_method(
+            lm_head, getattr(lm_head, "quant_method", None)
+        )
+        and not use_intel_amx_backend(lm_head)
+    )
 
 
 def _reassemble_tp_lm_head_all_to_all_output(

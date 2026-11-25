@@ -21,10 +21,13 @@ Life cycle of a request in the decode server
 from __future__ import annotations
 
 import contextlib
+import copy
 import hashlib
 import logging
+import os
 import random
 import time
+import zlib
 from collections import deque
 from concurrent.futures import Future
 from dataclasses import dataclass
@@ -55,6 +58,10 @@ from sglang.srt.disaggregation.checksum import (
     state_indices_for_request,
 )
 from sglang.srt.disaggregation.common.conn import CommonKVManager, CommonKVReceiver
+from sglang.srt.disaggregation.late_binding import (
+    DecodeLateBinding,
+    LateBindingHandoff,
+)
 from sglang.srt.disaggregation.decode_hicache_mixin import (
     DecodeHiCachePreallocMixin,
     DecodeHiCacheTransferMixin,
@@ -162,6 +169,35 @@ from sglang.srt.utils.network import NetworkAddress
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 logger = logging.getLogger(__name__)
+_TIMELINE_N = int(os.environ.get("SGLANG_D_REQ_TIMELINE", "0"))  # 1 in N requests (crc32 of rid), 0 = off
+
+
+# Running clamp: admit to running only up to floor(mean running over active DP ranks) + K (K = 0: off), never below
+# MIN; ranks below half the median (idle / slow / stuck) are left out so one cannot pull every rank's limit down. Per-rank running comes from the previous step's MLP-sync gather (decode num_tokens = batch size), no new sync.
+_RUN_CLAMP_K = int(os.environ.get("SGLANG_D_RUN_CLAMP_K", "0"))
+_RUN_CLAMP_MIN = int(os.environ.get("SGLANG_D_RUN_CLAMP_MIN", "0"))
+
+
+def _run_clamp_limit(global_running, cap: int, own_rank: int = -1, own_bs: int = -1, coord: bool = False) -> int:
+    """Admission limit for this rank: mean over ranks with running >= max(1, median / 2), plus K, within [MIN, cap].
+    The gathered values must be requests: a step whose counts were rewritten to verify tokens (DP spec prefill
+    coordination), or whose own entry is far above this rank's batch size (token-scaled; a request or two finishing
+    between the gather and now is normal), falls back to the cap."""
+    if _RUN_CLAMP_K <= 0 or not global_running or len(global_running) < 2 or coord:
+        return cap
+    if 0 <= own_rank < len(global_running) and own_bs >= 0 and global_running[own_rank] > 2 * own_bs + 2:
+        return cap
+    med = sorted(global_running)[(len(global_running) - 1) // 2]
+    active = [n for n in global_running if n >= max(1, med / 2)]
+    if not active:
+        return cap
+    return min(cap, max(_RUN_CLAMP_MIN, sum(active) // len(active) + _RUN_CLAMP_K))
+
+
+def _timeline(stage: str, req) -> None:
+    """Log-only: per-request decode stage times for sampled rids (same sample as the DP dispatch line)."""
+    if _TIMELINE_N and zlib.crc32(req.rid.encode()) % _TIMELINE_N == 0:
+        logger.info("D_TIMELINE %s rid=%s t=%.4f", stage, req.rid, time.time())
 
 # The default window of a window payload: the scheduler's sliding window.
 _SCHEDULER_WINDOW = object()
@@ -417,6 +453,10 @@ class DecodeRequest:
     # Overlap without the deferred publish: (ready event, send_metadata args,
     # kwargs) until the forward and any pinned metadata readback are done.
     pending_metadata: Optional[Tuple[Any, tuple, dict]] = None
+    # Later requests preallocated ahead of this one while its KV did not fit.
+    num_prealloc_overtakes: int = 0
+    # Late binding: 1 once this request was handed here from another DP rank.
+    late_binding_hops: int = 0
 
     # HiCache Status
     prefix_match: Optional[DecodePrefixMatch] = None
@@ -445,6 +485,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
     """
 
     _defer_publish: bool = False
+    prealloc_max_overtakes: int = 0
+    late_binding: Optional[DecodeLateBinding] = None
+    _num_overtaking_admissions: int = 0
+    _num_overtake_limit_stops: int = 0
+    _overtake_log_time: float = float("-inf")
 
     def __init__(
         self,
@@ -511,6 +556,14 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             abort=self._abort_prealloc,
             req_of=lambda x: x.req,
         )
+        self.prealloc_max_overtakes = (
+            envs.SGLANG_DISAGG_DECODE_PREALLOC_MAX_OVERTAKES.get()
+        )
+        if self.prealloc_max_overtakes > 0:
+            logger.info(
+                "Disagg decode preallocation admits past a request whose KV does "
+                f"not fit yet, up to {self.prealloc_max_overtakes} time(s) per request"
+            )
         self.retracted_queue = IndexedReqList(
             ListKind.PD_RETRACTED, abort=self._abort_retracted
         )
@@ -538,6 +591,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         self.kv_manager = self._init_kv_manager()
         if self.enable_staging:
             self.transfer_queue._init_staging_handler(self.kv_manager)
+        if get_disagg().disaggregation_decode_late_binding:
+            self.late_binding = self._init_late_binding()
 
         if (
             self.scheduler.tp_worker.is_hybrid_swa
@@ -572,6 +627,154 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             )
         else:
             self.scheduler.kv_checksum_computer = None
+
+    def _init_late_binding(self) -> DecodeLateBinding:
+        parallel = get_parallel()
+        problems = [
+            name
+            for name, bad in (
+                (
+                    "--disaggregation-decode-allocation-policy prefill_complete",
+                    get_disagg().disaggregation_decode_allocation_policy
+                    != "prefill_complete",
+                ),
+                ("DP attention with >1 DP rank", parallel.num_dp_ranks < 2),
+                ("decode pp_size 1", parallel.pp_size != 1),
+                (
+                    "attention TP*CP 1 per DP rank",
+                    parallel.attn_tp_size * parallel.attn_cp_size != 1,
+                ),
+                ("mooncake transfer backend", self.transfer_backend != TransferBackend.MOONCAKE),
+            )
+            if bad
+        ]
+        if problems:
+            raise ValueError(
+                "--disaggregation-decode-late-binding requires " + ", ".join(problems)
+            )
+        late_binding = DecodeLateBinding(
+            dp_rank=parallel.attn_dp_rank,
+            num_dp_ranks=parallel.num_dp_ranks,
+            threshold=get_disagg().disaggregation_decode_late_binding_threshold,
+            is_sender=parallel.attn_tp_rank == 0 and parallel.attn_cp_rank == 0,
+            local_ip=self.kv_manager.local_ip,
+            kv_manager=self.kv_manager,
+            ack_timeout=get_disagg().disaggregation_decode_late_binding_ack_timeout,
+            get_limits=lambda: (
+                self.scheduler.max_running_requests,
+                self.scheduler.max_total_num_tokens,
+            ),
+        )
+        late_binding.on_timeout = self._late_binding_timeout_abort
+        from sglang.srt.managers.io_struct import AbortReq
+
+        late_binding.on_cancel_enqueued = lambda rid: self.scheduler.abort_request(
+            AbortReq(rid=rid, abort_message="Late binding handoff cancelled")
+        )
+        late_binding.exchange_addresses(
+            parallel.tp_group.cpu_group, parallel.attn_tp_size * parallel.attn_cp_size
+        )
+        # Pre-connect all D->D sockets (bounded wait); unconnected peers are
+        # skipped as targets until their handshake completes.
+        late_binding.connect_peers()
+        logger.info(
+            "Decode late binding ON: DP%d of %d, threshold %d, handoff peers %s, "
+            "connected %s",
+            late_binding.dp_rank,
+            late_binding.num_dp_ranks,
+            late_binding.threshold,
+            late_binding.peers,
+            sorted(late_binding.connected),
+        )
+        return late_binding
+
+    def late_binding_committed(self) -> int:
+        """The "late_count": running + allocated-not-yet-running (waiting with
+        KV arrived, receiving with KV allocated), plus requests handed here that
+        are not allocated yet, so an in-flight handoff is not counted zero."""
+        scheduler = self.scheduler
+        return (
+            len(scheduler.running_reqs)
+            + len(scheduler.waiting_queue)
+            + len(self.transfer_queue.queue)
+            + sum(1 for d in self.queue.items() if d.late_binding_hops)
+        )
+
+    def _late_binding_ineligible_reason(self, decode_req: DecodeRequest) -> Optional[str]:
+        req = decode_req.req
+        if decode_req.is_rebootstrap:
+            return "rebootstrap"
+        if _is_fake_transfer(req):
+            return "fake"
+        if getattr(req, "late_binding_recv_req", None) is None:
+            return "no_recv_req"
+        # A session request is excluded only when this scheduler keeps state for it: a
+        # streaming Session object, or radix-native session references. Otherwise the
+        # session_id Dynamo attaches to every request is inert here (D runs without radix).
+        if req.session is not None or (
+            req.session_id is not None and self.scheduler.enable_session_radix_cache
+        ):
+            return "session_state"
+        if decode_req.kv_receiver is None:
+            return "no_receiver"
+        if isinstance(req.finished_reason, FINISH_ABORT):
+            return "aborted"
+        return None
+
+    def _late_binding_eligible(self, decode_req: DecodeRequest) -> bool:
+        return self._late_binding_ineligible_reason(decode_req) is None
+
+    def _late_binding_hand_off(self, decode_req: DecodeRequest, target: int) -> bool:
+        """Move a ready, unallocated request to DP rank ``target`` without ABORT.
+
+        The payload is queued (non-blocking) first; only then is the request
+        detached and dropped here. False: nothing changed, the caller keeps it.
+        """
+        req = decode_req.req
+        receiver = decode_req.kv_receiver
+        if not receiver.can_detach_for_handoff():
+            self.late_binding.stats["inelig_cannot_detach"] += 1
+            return False
+        recv_req = copy.copy(req.late_binding_recv_req)
+        # The target skips the prefill DP-rank lookup the source already did.
+        recv_req.disagg_prefill_dp_rank = req.disagg_prefill_dp_rank
+        handoff = LateBindingHandoff(
+            recv_req=recv_req,
+            room=req.bootstrap_room,
+            old_endpoint=(self.kv_manager.local_ip, self.kv_manager.rank_port),
+            source_dp_rank=self.late_binding.dp_rank,
+            target_dp_rank=target,
+            sent_at=time.time(),
+            handoff_id=self.late_binding.new_handoff_id(req.bootstrap_room),
+        )
+        if not self.late_binding.send_handoff(handoff, decode_req):
+            return False
+        receiver.detach_for_handoff()
+        self.queue.leave([req])
+        self.pending_reqs = [r for r in self.pending_reqs if r is not decode_req]
+        logger.debug(
+            "Late binding: handed rid=%s room=%s DP%d -> DP%d",
+            req.rid,
+            req.bootstrap_room,
+            self.late_binding.dp_rank,
+            target,
+        )
+        return True
+
+    def _late_binding_timeout_abort(
+        self, handoff: LateBindingHandoff, decode_req: DecodeRequest
+    ) -> None:
+        """No ack in time: the source fails the request (never silently) and
+        releases P's KV via an ABORT from the old endpoint."""
+        decode_req.kv_receiver.send_abort_after_handoff_timeout()
+        req = decode_req.req
+        prepare_abort(
+            req,
+            f"Late binding handoff {handoff.handoff_id} to DP{handoff.target_dp_rank} "
+            f"not acknowledged within {self.late_binding.ack_timeout:.0f}s",
+            status_code=HTTPStatus.SERVICE_UNAVAILABLE,
+        )
+        self.scheduler.output_streamer.stream_output([req], req.return_logprob)
 
     def _uses_swa_tail_prealloc(self) -> bool:
         return (
@@ -615,6 +818,33 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             swa_tokens,
             full_budget_tokens=full_allocatable_tokens,
             swa_budget_tokens=swa_allocatable_tokens,
+        )
+
+    def _may_pass_over(self, decode_req: DecodeRequest) -> bool:
+        if self.prealloc_max_overtakes <= 0:
+            return False
+        if decode_req.num_prealloc_overtakes < self.prealloc_max_overtakes:
+            return True
+        self._num_overtake_limit_stops += 1
+        return False
+
+    def _note_overtake(self, passed_over: List[DecodeRequest]) -> bool:
+        self._num_overtaking_admissions += 1
+        for decode_req in passed_over:
+            decode_req.num_prealloc_overtakes += 1
+        now = time.monotonic()
+        if now - self._overtake_log_time >= 60:
+            self._overtake_log_time = now
+            logger.info(
+                "Disagg decode preallocation out of order: "
+                f"{self._num_overtaking_admissions} admission(s) past a request "
+                f"that did not fit, {self._num_overtake_limit_stops} pass(es) "
+                f"held at the limit of {self.prealloc_max_overtakes} (since start)"
+            )
+        # True stops the pass: a request at its limit must not be overtaken again.
+        return any(
+            decode_req.num_prealloc_overtakes >= self.prealloc_max_overtakes
+            for decode_req in passed_over
         )
 
     def _reclaim_swa_tail_capacity(
@@ -1024,6 +1254,12 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         decode_req = DecodeRequest(
             req=req, kv_receiver=kv_receiver, is_rebootstrap=is_rebootstrap
         )
+        if self.late_binding is not None:
+            handoff = self.late_binding.incoming.pop(req.rid, None)
+            if handoff is not None:
+                # Bind the room here with REBIND (see CommonKVReceiver.init).
+                kv_receiver.rebind_from = handoff.old_endpoint
+                decode_req.late_binding_hops = 1
         self.queue.join([decode_req])
         return decode_req
 
@@ -1265,6 +1501,23 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             if poll == KVPoll.Bootstrapping:
                 pass
             elif poll == KVPoll.WaitingForInput:
+                if self.late_binding is not None and not decode_req.waiting_for_input:
+                    # First readiness, before any allocation: keep or hand off.
+                    reason = self._late_binding_ineligible_reason(decode_req)
+                    if reason is not None:
+                        self.late_binding.stats["inelig_" + reason] += 1
+                    else:
+                        self.late_binding.stats["eligible"] += 1
+                        if decode_req.req.session_id is not None:
+                            self.late_binding.stats["eligible_with_session_id"] += 1
+                        target = self.late_binding.decide(decode_req)
+                        self.late_binding.stats[
+                            "decide_no_target" if target is None else "decide_target"
+                        ] += 1
+                        if target is not None and self._late_binding_hand_off(
+                            decode_req, target
+                        ):
+                            continue
                 decode_req.waiting_for_input = True
                 decode_req.req.time_stats.set_bootstrap_done_time()
             elif poll == KVPoll.Failed:
@@ -1289,6 +1542,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     self.scheduler.metrics_collector.increment_bootstrap_failed_reqs()
             else:
                 raise ValueError(f"Unexpected poll case: {poll}")
+        if self.late_binding is not None:
+            self.late_binding.maybe_log_summary()
 
     def _ensure_prefill_info(
         self, addr_to_reqs: Dict[str, List[DecodeRequest]]
@@ -1558,6 +1813,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             running_loras.update(req.lora_id for req in self.scheduler.waiting_queue)
 
         # Then, preallocate the remaining requests if possible
+        passed_over: List[DecodeRequest] = []
         for i, decode_req in enumerate(queue):
             if rids_to_check is not None and decode_req.req.rid not in rids_to_check:
                 continue
@@ -1586,6 +1842,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             ):
                 if not self._pre_alloc_host(decode_req):
                     break
+                _timeline("prealloc", decode_req.req)
                 preallocated_reqs.append(decode_req)
                 indices_to_remove.add(i)
                 if self.scheduler.enable_lora:
@@ -1692,7 +1949,10 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 if prefix_match is not None and prefix_match.l1_prefix_len > 0:
                     self.tree_cache.unlock(decode_req.req.lock)
                     decode_req.req.lock = None
-                break
+                if not self._may_pass_over(decode_req):
+                    break
+                passed_over.append(decode_req)
+                continue
 
             if swa_allocatable_tokens is not None:
                 reclaim_error = self._reclaim_swa_tail_capacity(
@@ -1791,10 +2051,13 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     fill_len=fill_len,
                 )
             num_device_preallocated += 1
+            _timeline("prealloc", decode_req.req)
             preallocated_reqs.append(decode_req)
             indices_to_remove.add(i)
             if self.scheduler.enable_lora:
                 running_loras.add(decode_req.req.lora_id)
+            if passed_over and self._note_overtake(passed_over):
+                break
 
         if failed_reqs:
             failed_ids = {id(r) for r in failed_reqs}
@@ -3451,6 +3714,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                         decode_req.req.finished_reason.message
                     )
                 else:
+                    _timeline("transferred", decode_req.req)
                     transferred_reqs.append(decode_req.req)
             elif poll in [
                 KVPoll.Bootstrapping,
@@ -3988,6 +4252,21 @@ class SchedulerDisaggregationDecodeMixin:
         curr_batch_size = running_batch.batch_size()
 
         batch_size = min(self.req_to_token_pool.size, self.max_running_requests)
+        if _RUN_CLAMP_K > 0:  # previous decode step's per-rank batch sizes (running) from the DP gather
+            g = running_batch.global_num_tokens
+            own_rank = get_parallel().attn_dp_rank
+            cap = batch_size
+            batch_size = _run_clamp_limit(
+                g, cap, own_rank, curr_batch_size, running_batch.dp_spec_prefill_coordination_applied
+            )
+            now = time.time()
+            if now - getattr(self, "_run_clamp_logged", 0.0) >= 60.0:  # units check for the first GPU run
+                self._run_clamp_logged = now
+                logger.info(
+                    "D_RUN_CLAMP own_gathered=%s bs=%d limit=%d cap=%d coord=%d",
+                    g[own_rank] if g and 0 <= own_rank < len(g) else None, curr_batch_size, batch_size, cap,
+                    int(running_batch.dp_spec_prefill_coordination_applied),
+                )
 
         num_not_used_batch = batch_size - curr_batch_size
 
@@ -4003,6 +4282,7 @@ class SchedulerDisaggregationDecodeMixin:
                 or id(req) in restores_ready
             ):
                 can_run_list.append(req)
+                _timeline("running", req)
                 if req.kv.restore_done_event is not None:
                     finish_restore_kv_cache(req, self.tree_cache)
                 # `pop_preallocated` matched and locked new requests; a retracted or

@@ -465,6 +465,7 @@ class MultimemAllGatherer:
     ):
         self._max_tokens = int(max_tokens)
         self._skip_entry_sync = skip_entry_sync
+        self._multinode = False
         # None => always NCCL; _UNINIT => build on first eager call.
         self._state = self._UNINIT if enabled else None
         if self._state is self._UNINIT:
@@ -474,6 +475,8 @@ class MultimemAllGatherer:
                 in_the_same_node_as,
             )
 
+            from sglang.srt.environ import envs
+
             tp_group = get_tp_group()
             # Only probe node topology when the deployment can actually span
             # nodes. Check world_size first so a TP=1 gatherer short-circuits
@@ -481,11 +484,14 @@ class MultimemAllGatherer:
             # offline paths). On a single node every TP rank is co-located, so skip the
             # in_the_same_node_as() all-reduce, which can segfault under some
             # EP/mooncake setups, and keep multimem enabled.
-            if (
+            # SGLANG_OPT_MULTIMEM_AG_MNNVL: the nodes share one NVLink domain, so
+            # the multicast object spans them (_build checks every rank got one).
+            self._multinode = (
                 tp_group.world_size > 1
                 and get_parallel().nnodes > 1
                 and not all(in_the_same_node_as(tp_group.cpu_group, source_rank=0))
-            ):
+            )
+            if self._multinode and not envs.SGLANG_OPT_MULTIMEM_AG_MNNVL.get():
                 logger.warning(
                     "multimem all-gather disabled because the TP group spans "
                     "across nodes."
@@ -540,7 +546,15 @@ class MultimemAllGatherer:
                 max_tokens=self._max_tokens,
                 hidden_size=x.shape[-1] * tp_group.world_size,
             )
-            if state.symm_mem_hdl.multicast_ptr == 0:
+            multicast = state.symm_mem_hdl.multicast_ptr != 0
+            if self._multinode:
+                # Across nodes every rank must have its multicast pointer (a
+                # rank-local failure would split the ranks between multimem and
+                # NCCL): agree on the CPU group, outside capture.
+                ok = torch.tensor([int(multicast)], dtype=torch.int32)
+                dist.all_reduce(ok, op=dist.ReduceOp.MIN, group=tp_group.cpu_group)
+                multicast = bool(ok.item())
+            if not multicast:
                 # No multicast for this world size / arch; multimem.st would
                 # write nowhere. Fall back to NCCL.
                 logger.warning(
@@ -548,6 +562,14 @@ class MultimemAllGatherer:
                     tp_group.world_size,
                 )
                 return None
+            if self._multinode and tp_group.rank_in_group == 0:
+                logger.info(
+                    "multimem all-gather on across nodes (MNNVL): world_size=%d, "
+                    "max_tokens=%d, hidden=%d",
+                    tp_group.world_size,
+                    self._max_tokens,
+                    state.hidden_dim,
+                )
             return state
         except Exception as e:
             logger.warning("multimem all-gather disabled (%s)", e)

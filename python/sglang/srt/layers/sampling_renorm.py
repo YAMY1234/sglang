@@ -23,6 +23,12 @@ from typing import Optional, Union
 import torch
 
 from sglang.kernels.ops.sampling import renorm as _platform
+from sglang.kernels.ops.sampling.air_top_p_parallel import (
+    air_top_p_note_bypass,
+    air_top_p_reject_reason,
+    air_top_p_renorm_parallel,
+)
+from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_exec, get_parallel
 
 try:
@@ -57,10 +63,19 @@ def _top_p_renorm_prob(
     probs: torch.Tensor,
     top_p: Union[torch.Tensor, float],
     deterministic: Optional[bool] = None,
+    parallel: bool = False,
 ) -> torch.Tensor:
     if deterministic is None:
         deterministic = renorm_deterministic()
     if deterministic and _FI_TOP_P_DETERMINISTIC and probs.is_cuda:
+        # Same bits as the flashinfer call below, from many CTAs per row; only callers that
+        # opt in (`parallel`, EAGLE target verify) take it; rejected inputs are
+        # counted as bypassed.
+        if parallel and envs.SGLANG_OPT_AIR_TOP_P_PARALLEL.get():
+            reason = air_top_p_reject_reason(probs, top_p)
+            if reason is None:
+                return air_top_p_renorm_parallel(probs, top_p)
+            air_top_p_note_bypass(reason, probs.shape[0])
         return _flashinfer_sampling.top_p_renorm_probs(
             probs, top_p, is_deterministic=True
         )

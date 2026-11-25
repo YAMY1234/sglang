@@ -43,6 +43,9 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import 
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
     is_in_breakable_cuda_graph,
 )
+from sglang.srt.models.deepseek_common.attention_forward_methods.fused_qkv_a_norm import (
+    fused_qkv_a_rmsnorm,
+)
 from sglang.srt.models.deepseek_common.utils import (
     FORWARD_ABSORB_CORE_ATTENTION_BACKENDS,
     _is_cpu,
@@ -62,6 +65,30 @@ logger = logging.getLogger(__name__)
 _SGLANG_EXPERIMENTAL_LORA_OPTI = envs.SGLANG_EXPERIMENTAL_LORA_OPTI.get()
 _ENABLE_DSA_Q8KV8_BORN_FP8_Q = envs.SGLANG_ENABLE_DSA_Q8KV8_BORN_FP8_Q.get()
 _ENABLE_DSA_Q8KV8_QPREP_OVERLAP = envs.SGLANG_ENABLE_DSA_Q8KV8_QPREP_OVERLAP.get()
+_ENABLE_FUSED_MLA_QKV_A_NORM = envs.SGLANG_OPT_FUSED_MLA_QKV_A_NORM.get()
+# TARGET_VERIFY under CUDA graph capture: absorbed bmm + FP8 RoPE/quantize + KV store on a
+# side stream, concurrent with the DSA indexer; joined before attention.
+_ENABLE_VERIFY_QPREP_SIDE_STREAM = (
+    __import__("os").environ.get("SGLANG_DSA_VERIFY_QPREP_SIDE_STREAM", "0") == "1"
+)
+_QPREP_SIDE_STREAMS: dict = {}
+_QPREP_LOGGED: set = set()
+
+
+def _log_verify_qprep_once(kind: str, detail: str) -> None:
+    if kind in _QPREP_LOGGED:
+        return
+    _QPREP_LOGGED.add(kind)
+    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+    logger.info(f"VERIFY_QPREP_SIDE {kind} {detail} tp_rank={rank}")
+
+
+def _qprep_side_stream(device: torch.device) -> torch.cuda.Stream:
+    # Not self.alt_stream: the indexer forks and joins on that one internally.
+    stream = _QPREP_SIDE_STREAMS.get(device.index)
+    if stream is None:
+        stream = _QPREP_SIDE_STREAMS[device.index] = torch.cuda.Stream(device=device)
+    return stream
 
 from sglang.srt.model_executor.runner_utils.forward_batch import get_forward_batch
 from sglang.srt.model_executor.runner_utils.prefill_graph import (
@@ -462,18 +489,26 @@ class DeepseekMLAForwardMixin:
         k_pe = None
         fusion_plan: Optional[MlaBmmFusionPlan] = None
         if self.q_lora_rank is not None:
-            q, latent_cache = (
-                get_attn_tp_context()
-                .fetch_qkv_latent()
-                .split(
-                    [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim],
-                    dim=-1,
-                )
+            fused_norms = (
+                fused_qkv_a_rmsnorm(self, forward_batch)
+                if _ENABLE_FUSED_MLA_QKV_A_NORM
+                else None
             )
-            k_nope = latent_cache[..., : self.kv_lora_rank]
+            if fused_norms is None:
+                q, latent_cache = (
+                    get_attn_tp_context()
+                    .fetch_qkv_latent()
+                    .split(
+                        [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim],
+                        dim=-1,
+                    )
+                )
+                k_nope = latent_cache[..., : self.kv_lora_rank]
 
             # overlap qk norm
-            if self.alt_stream is not None and get_is_capture_mode():
+            if fused_norms is not None:
+                q, k_nope, latent_cache = fused_norms
+            elif self.alt_stream is not None and get_is_capture_mode():
                 current_stream = torch.cuda.current_stream()
                 self.alt_stream.wait_stream(current_stream)
                 q = self.q_a_layernorm(q)
@@ -521,6 +556,29 @@ class DeepseekMLAForwardMixin:
                     q = self.q_b_proj_replicated_forward(q)
                 else:
                     q = self.q_b_proj_forward(q)
+
+                qprep_side = None
+                if self._verify_qprep_side_ok(
+                    forward_batch,
+                    cp_overlap,
+                    q_replicate_active,
+                    fuse_bmm_attention,
+                    llama_4_scaling,
+                ):
+                    from sglang.kernels.ops.attention.dsa.gvr_decode_topk import (
+                        defer_until_topk,
+                    )
+
+                    # Forked at the GVR launch (after the logits), so the side work
+                    # fills GVR's idle SMs; run_deferred() below covers no-GVR layers.
+                    qprep_side = {}
+                    defer_until_topk(
+                        lambda q=q, latent_cache=latent_cache, k_nope=k_nope: qprep_side.update(
+                            r=self._verify_qprep_on_side_stream(
+                                q, latent_cache, k_nope, forward_batch
+                            )
+                        )
+                    )
 
                 # Hoist these above the DSA indexer split op so the indexer
                 # and the composite bmm+attention split op are adjacent in FX.
@@ -591,6 +649,37 @@ class DeepseekMLAForwardMixin:
                         topk_indices = maybe_capture_indexer_topk(
                             self.layer_id, prev_topk_indices
                         )
+                if qprep_side is not None:
+                    from sglang.kernels.ops.attention.dsa.gvr_decode_topk import (
+                        run_deferred,
+                    )
+
+                    where = "gvr-window" if "r" in qprep_side else "fallback"
+                    run_deferred()
+                    _log_verify_qprep_once(
+                        f"active ({where})", f"layer={self.layer_id}"
+                    )
+                    side, q_fp8, k_fp8, k_rope_fp8 = qprep_side["r"]
+                    torch.cuda.current_stream().wait_stream(side)
+                    # KV is stored; attention takes the prepared FP8 Q/K (q_rope=None).
+                    self._qprep_side_stored = True
+                    return (
+                        None,
+                        k_rope_fp8,
+                        q_fp8,
+                        k_fp8,
+                        forward_batch,
+                        zero_allocator,
+                        positions,
+                        topk_indices,
+                        llama_4_scaling,
+                        None,
+                        *(
+                            (attention_output_gate,)
+                            if hasattr(self, "prepare_attention_output_gate")
+                            else ()
+                        ),
+                    )
         else:
             if q_replicate_active:
                 q = self.q_b_proj_replicated_forward(hidden_states)
@@ -838,6 +927,9 @@ class DeepseekMLAForwardMixin:
         attention_output_gate: Optional[torch.Tensor] = None,
     ):
         save_kv_cache = True
+        if getattr(self, "_qprep_side_stored", False):
+            self._qprep_side_stored = False
+            save_kv_cache = False
 
         if self.current_attention_backend in FORWARD_ABSORB_CORE_ATTENTION_BACKENDS:
             extra_args = {}
@@ -898,6 +990,7 @@ class DeepseekMLAForwardMixin:
                     k_nope,
                     k_nope,
                     forward_batch,
+                    save_kv_cache=save_kv_cache,
                     q_rope=q_pe,
                     k_rope=k_pe,
                     **extra_args,
@@ -1143,6 +1236,84 @@ class DeepseekMLAForwardMixin:
                 ).transpose(0, 1),
             )
         return attn_bmm_output
+
+    def _verify_qprep_side_ok(
+        self: DeepseekV2AttentionMLA,
+        forward_batch: ForwardBatch,
+        cp_overlap,
+        q_replicate_active: bool,
+        fuse_bmm_attention: bool,
+        llama_4_scaling: Optional[torch.Tensor],
+    ) -> bool:
+        from sglang.srt.layers.attention.dsa_backend import dsa_use_prefill_cp
+        from sglang.srt.model_executor.runner import get_is_capture_mode
+
+        if not (
+            _ENABLE_VERIFY_QPREP_SIDE_STREAM
+            and get_is_capture_mode()
+            and forward_batch.forward_mode.is_target_verify()
+        ):
+            return False
+        # Evaluated in order, first failure wins (later checks may assume earlier ones).
+        for name, ok in (
+            ("use_dsa", lambda: self.use_dsa),
+            ("attention_backend", lambda: self.current_attention_backend in ("dsa", "nsa")),
+            ("dsa_decode_backend", lambda: get_exec().kernel.dsa_decode_backend == "trtllm"),
+            ("fused_rope_fp8", lambda: self._fuse_rope_for_trtllm_mla(forward_batch)),
+            ("cp_overlap", lambda: cp_overlap is None),
+            ("prefill_cp", lambda: not dsa_use_prefill_cp(forward_batch)),
+            ("q_replicate", lambda: not q_replicate_active),
+            ("fuse_bmm_attention", lambda: not fuse_bmm_attention),
+            ("dcp", lambda: self.dcp_size == 1),
+            ("llama_4_scaling", lambda: llama_4_scaling is None),
+            ("deep_gemm_bmm", lambda: not self.use_deep_gemm_bmm),
+            ("w_kc_bf16", lambda: self.w_kc.dtype == torch.bfloat16),
+            ("unfused_mla_qkv", lambda: not self.needs_unfused_mla_qkv),
+            ("born_fp8_q", lambda: not _ENABLE_DSA_Q8KV8_BORN_FP8_Q),
+            ("lora_opti", lambda: not _SGLANG_EXPERIMENTAL_LORA_OPTI),
+            ("kv_b_lora", lambda: not kv_b_lora_correction(self)),
+            ("kimi_gguf", lambda: not getattr(self, "_kimi_split_gguf_kv_b", False)),
+            ("learnable_sink", lambda: getattr(self, "learnable_sink_param", None) is None),
+        ):
+            if not ok():
+                _log_verify_qprep_once(
+                    "inactive", f"gate={name} layer={self.layer_id}"
+                )
+                return False
+        return True
+
+    def _verify_qprep_on_side_stream(
+        self: DeepseekV2AttentionMLA,
+        q: torch.Tensor,
+        latent_cache: torch.Tensor,
+        k_nope: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ):
+        """The main path's absorbed bmm, then the DSA trtllm backend's FP8 RoPE/quantize
+        and KV store, with the same calls and arguments, on a side stream."""
+        from sglang.kernels.ops.attention.utils import mla_quantize_and_rope_for_fp8
+
+        backend = get_attn_backend()
+        side = _qprep_side_stream(q.device)
+        side.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(side):
+            q_nope, q_pe, k_pe = self._split_q_nope_pe(q, latent_cache)
+            q_nope_out = torch.bmm(q_nope.transpose(0, 1), self.w_kc).transpose(0, 1)
+            q_fp8, k_fp8, k_rope_fp8 = mla_quantize_and_rope_for_fp8(
+                q_nope_out,
+                q_pe,
+                k_nope.squeeze(1),
+                k_pe.squeeze(1),
+                forward_batch.positions,
+                self.rotary_emb.cos_sin_cache,
+                self.rotary_emb.is_neox_style,
+                backend.kv_lora_rank,
+                backend.qk_rope_head_dim,
+            )
+            backend.kv_layers.layer(self.attn_mqa.layer_id).store_mla(
+                self.attn_mqa, forward_batch.out_cache_loc, k_fp8, k_rope_fp8
+            )
+        return side, q_fp8, k_fp8, k_rope_fp8
 
     def _fuse_rope_for_trtllm_mla(
         self: DeepseekV2AttentionMLA, forward_batch: ForwardBatch

@@ -152,3 +152,25 @@ def fast_topk_transform_ragged_fused(
         score, lengths, topk_indices_ragged, topk_indices_offset, row_starts
     )
     return topk_indices_ragged
+
+
+def fast_topk_transform_fused_overflow_prefix(
+    score: torch.Tensor,
+    lengths: torch.Tensor,
+    page_table_size_1: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    topk: int,
+    row_starts: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Experimental legacy PAGED prefill ABI; original page mapping is retained."""
+    assert topk == 2048
+    assert score.dim() == 2
+    assert cu_seqlens_q is not None
+    assert row_starts is not None or cu_seqlens_q.shape[0] - 1 != score.shape[0], (
+        "overflow-prefix is restricted to the original legacy prefill entry"
+    )
+    dst_page_table = score.new_empty((score.shape[0], topk), dtype=torch.int32)
+    torch.ops.sgl_kernel.fast_topk_transform_fused_overflow_prefix(
+        score, lengths, dst_page_table, page_table_size_1, cu_seqlens_q, row_starts
+    )
+    return dst_page_table

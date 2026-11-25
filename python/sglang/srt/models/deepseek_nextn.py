@@ -56,6 +56,30 @@ _is_cuda = is_cuda()
 _is_npu = is_npu()
 
 
+def _request_nextn_moe_fp8(decoder: nn.Module) -> None:
+    """SGLANG_NEXTN_MOE_FP8 (default off): ask the draft layer's BF16 routed experts for an
+    FP8 copy, built at process_weights_after_loading (layers/moe/nextn_moe_fp8.py).
+    SGLANG_NEXTN_MOE_DEFER_FINALIZE (default off): their finalize as the deferred finalize."""
+    from sglang.srt.layers.moe import nextn_moe_fp8
+
+    mode = nextn_moe_fp8.nextn_moe_fp8_mode()
+    experts = getattr(getattr(decoder, "mlp", None), "experts", None)
+    if experts is None:
+        return
+    if mode is not None:
+        setattr(experts, nextn_moe_fp8.REQUEST_ATTR, mode)
+    if nextn_moe_fp8.defer_finalize_requested():
+        why = nextn_moe_fp8.unsupported_reason(experts, dtype_check=False)
+        if why:
+            logger.warning("%s declined: %s", nextn_moe_fp8.DEFER_ENV, why)
+        else:
+            experts.supports_deferred_finalize = True
+            logger.info(
+                "%s: the draft MoE finalizes with the shared-expert add (deferred finalize)",
+                nextn_moe_fp8.DEFER_ENV,
+            )
+
+
 class DeepseekModelNextN(nn.Module):
     def __init__(
         self,
@@ -135,6 +159,7 @@ class DeepseekModelNextN(nn.Module):
                 alt_stream=self.alt_stream,
                 skip_rope=config.qk_rope_head_dim == 0,
             )
+        _request_nextn_moe_fp8(self.decoder)
 
         self.shared_head = nn.Module()
         self.shared_head.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)

@@ -1,12 +1,25 @@
 from __future__ import annotations
 
+import logging
+
 from enum import Enum, IntEnum, auto
 from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Tuple
 
 import torch
 
 from sglang.srt.environ import envs
+
+if envs.SGLANG_DSA_TOPK_OVERFLOW_PREFIX.get() or envs.SGLANG_DSA_TOPK_ACTIVATION_LOG.get():
+    from .topk_activation import load_native
+
+    load_native()  # P-only source; both experiment arms load the same frozen DSO.
 from sglang.srt.runtime_context import get_exec, get_spec
+
+if (
+    envs.SGLANG_DSA_DECODE_GVR_TOPK.get()
+    and envs.SGLANG_TOPK_V2_MODE.get() == 2
+):
+    logging.getLogger(__name__).info("GVR top-k disabled: deterministic mode 2")
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
@@ -62,6 +75,13 @@ class DSATopKBackend(Enum):
         if self.is_sgl_kernel():
             from sgl_kernel import fast_topk_v2
 
+            if row_starts is not None and topk == 2048 and score.dtype == torch.float32:
+                from sglang.srt.layers.attention.dsa.hcb_prefill_port import fi_positions
+
+                pos = fi_positions(score, lengths, row_starts,
+                                   lambda: fast_topk_v2(score, lengths, topk, row_starts=row_starts))
+                if pos is not None:
+                    return pos
             return fast_topk_v2(score, lengths, topk, row_starts=row_starts)
         if self.is_torch():
             return _topk_unfused(
@@ -195,12 +215,50 @@ class DSATopKBackend(Enum):
             )
 
             if topk_transform_method == TopkTransformMethod.PAGED:
+                from sglang.srt.layers.attention.dsa.hcb_prefill_port import enabled, topk_paged
+
+                if (enabled() and topk == 2048 and row_starts is not None
+                        and logits.is_cuda and logits.dtype == torch.float32
+                        and isinstance(batch_idx_list, torch.Tensor)):
+                    return topk_paged(logits, lengths, attn_metadata.page_table_1,
+                                      cu_seqlens_q_topk, row_starts, batch_idx_list)
                 page_table_size_1 = (
                     attn_metadata.page_table_1[batch_idx_list]
                     if batch_idx_list is not None
                     else attn_metadata.page_table_1
                 )
-                return fast_topk_transform_fused(
+                # The experiment changes only legacy PAGED prefill selection.
+                # Keep page-table expansion and every earlier v2 dispatch intact.
+                if (
+                    envs.SGLANG_DSA_TOPK_OVERFLOW_PREFIX.get()
+                    and cu_seqlens_q_topk is not None
+                    and not packed_extend_topk
+                    and (
+                        batch_idx_list is None
+                        or isinstance(batch_idx_list, torch.Tensor)
+                    )
+                    and topk == 2048
+                    and not (
+                        row_starts is None
+                        and cu_seqlens_q_topk.shape[0] - 1 == logits.shape[0]
+                    )
+                ):
+                    from sgl_kernel import fast_topk_transform_fused_overflow_prefix
+
+                    result = fast_topk_transform_fused_overflow_prefix(
+                        score=logits,
+                        lengths=lengths,
+                        page_table_size_1=page_table_size_1,
+                        cu_seqlens_q=cu_seqlens_q_topk,
+                        topk=topk,
+                        row_starts=row_starts,
+                    )
+                    if envs.SGLANG_DSA_TOPK_ACTIVATION_LOG.get():
+                        from .topk_activation import note_dispatch
+
+                        note_dispatch('candidate', logits)
+                    return result
+                result = fast_topk_transform_fused(
                     score=logits,
                     lengths=lengths,
                     page_table_size_1=page_table_size_1,
@@ -208,6 +266,11 @@ class DSATopKBackend(Enum):
                     topk=topk,
                     row_starts=row_starts,
                 )
+                if envs.SGLANG_DSA_TOPK_ACTIVATION_LOG.get():
+                    from .topk_activation import note_dispatch
+
+                    note_dispatch('legacy', logits)
+                return result
             if topk_transform_method == TopkTransformMethod.RAGGED:
                 if topk_indices_offset is None:
                     raise RuntimeError(
@@ -374,6 +437,28 @@ def _topk_transform_v2_paged(
     )
 
     page_size = attn_metadata.page_size
+    if (
+        envs.SGLANG_DSA_DECODE_GVR_TOPK.get()
+        and envs.SGLANG_TOPK_V2_MODE.get() != 2
+        and logits.device.type == "cuda"
+        and topk == 2048
+        and page_size == 64
+        and 0 < num_rows <= 256
+        # Full-graph tables include 79 speculative headroom slots at F3
+        # fixed-eight/page64, then round up to 128 extra score columns.
+        # These physical columns are distinct from each row's live KV length.
+        and logits.shape[1] <= 1048576 + 128
+        and attn_metadata.cache_seqlens_int32.dim() == 1
+        and num_rows == 8 * attn_metadata.cache_seqlens_int32.shape[0]
+    ):
+        from sglang.kernels.ops.attention.dsa.gvr_decode_topk import (
+            gvr_decode_topk,
+        )
+
+        return gvr_decode_topk(
+            logits, lengths, page_table,
+            attn_metadata.cache_seqlens_int32,
+        )
     out = logits.new_empty((num_rows, topk), dtype=torch.int32)
     topk_transform_paged_v2(logits, lengths, page_table, out, page_size, plan)
     return out

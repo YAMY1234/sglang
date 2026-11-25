@@ -7,6 +7,7 @@ import torch
 
 from sglang.kernels.ops.kvcache import dsa_index_k_cache
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.utils import (
     INDEXER_K_CACHE_PRESHUFFLE_TILE,
     aiter_can_use_preshuffle_paged_mqa,
@@ -136,13 +137,19 @@ class IndexKeyCache:
             index_k_scale=index_k_scale,
         )
 
+    def _retraction_page_chunk(self):
+        if not envs.SGLANG_OPT_RETRACTION_PINNED_CHUNKS.get():
+            return max(1, self.pool.cpu_offloading_chunk_size // self.pool.page_size)
+        # Pinned host blocks are rounded up to a power of two: fill one 8 MiB block per chunk.
+        buf = next((b for b in self.buffer if b.shape[0]), self.buffer[0])
+        return max(1, (8 << 20) // (buf.shape[1] * buf.element_size()))
+
     def cpu_copy(self, indices):
         # Retracted pages may be reused before resume, so offload index-K with KV.
         page_indices = indices[:: self.pool.page_size] // self.pool.page_size
         torch.cuda.synchronize()
         index_k_cpu = []
-        chunk_size = self.pool.cpu_offloading_chunk_size
-        page_chunk_size = max(1, chunk_size // self.pool.page_size)
+        page_chunk_size = self._retraction_page_chunk()
         for layer_id in range(self.pool.layer_num):
             index_k_cpu.append([])
             if self.buffer[layer_id].shape[0] == 0:
@@ -159,8 +166,7 @@ class IndexKeyCache:
     def load_cpu_copy(self, index_k_cpu, indices) -> None:
         page_indices = indices[:: self.pool.page_size] // self.pool.page_size
         torch.cuda.synchronize()
-        chunk_size = self.pool.cpu_offloading_chunk_size
-        page_chunk_size = max(1, chunk_size // self.pool.page_size)
+        page_chunk_size = self._retraction_page_chunk()
         for layer_id in range(self.pool.layer_num):
             if self.buffer[layer_id].shape[0] == 0:
                 continue

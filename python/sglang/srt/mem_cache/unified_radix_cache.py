@@ -3,13 +3,16 @@ from __future__ import annotations
 import atexit
 import json
 import logging
+import os
 import threading
 import time
+import zlib
 from array import array
+from collections import deque
 from contextlib import nullcontext
 from dataclasses import replace
 from http import HTTPStatus
-from queue import Queue
+from queue import Empty, Queue
 from typing import (
     TYPE_CHECKING,
     Callable,
@@ -26,12 +29,14 @@ import torch
 from sglang.srt.distributed.communication_tags import P2PTag
 from sglang.srt.environ import envs
 from sglang.srt.layers.cp.base import get_cp_strategy, is_cp_sharded_padded
-from sglang.srt.managers.cache_controller import CacheOperation
+from sglang.srt.managers.cache_controller import CacheOperation, WriteBackFenceStats
 from sglang.srt.managers.scheduler_components.shm_tag_exchange import (
     ShmTagExchange,
     fold_u64,
     get_shm_exchange,
 )
+from sglang.srt.mem_cache.events import PMICRO, PMICRO_HOST_REMOVED
+from sglang.srt.mem_cache.prefetch_timing import PrefetchTiming, prefetch_timing
 from sglang.srt.mem_cache.allocator.page_interleave import (
     page_interleave_shard_size,
 )
@@ -100,6 +105,10 @@ from sglang.srt.mem_cache.unified_cache.session_ref_tracker import (
     UnifiedSessionRefTracker,
 )
 from sglang.srt.mem_cache.unified_cache.storage_attachment import StorageAttachment
+from sglang.srt.mem_cache.unified_cache.storage_write_back import (
+    StorageWriteBack,
+    WriteOnHostEvictFinalStats,
+)
 from sglang.srt.mem_cache.unified_cache.tree_core_registry import (
     create_tree_core,
     select_tree_core_backend,
@@ -131,13 +140,13 @@ if TYPE_CHECKING:
     from sglang.srt.managers.cache_controller import HiCacheAck
     from sglang.srt.managers.schedule_batch import Req, ReqKvInfo
     from sglang.srt.mem_cache.cache_init_params import CacheInitParams
-    from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import (
-        BaseEvictionResult,
-    )
     from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
         PrefetchOperation,
     )
     from sglang.srt.mem_cache.pool_host import PoolEntry
+    from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import (
+        BaseEvictionResult,
+    )
     from sglang.srt.server_args import ServerArgs
     from sglang.srt.models.unlimited_ocr_v2_support.document_reuse import DocReuse
 
@@ -170,6 +179,206 @@ COMPONENT_REGISTRY: dict[str, type[TreeComponent]] = {
 
 
 logger = logging.getLogger(__name__)
+
+
+# SGLANG_HICACHE_PP_LAGGED_DRAIN (default off): see PPLaggedDrain.
+PP_LAG_RELEASE_KEY = "__pp_lagged_drain_mark__"
+_PP_LAG_INF = 1 << 62
+_PP_LAG_MOD = (1 << 61) - 1
+
+
+class PPLaggedDrain:
+    """Lagged-MIN drain of the storage queues filled by per-rank IO under PP.
+
+    Each PP rank drains exactly PP0's count of every storage-control queue at the same
+    loop point. ack_backup_queue (and the host release queues) are filled by this rank's
+    own IO, so a rank whose L3 write acks later than PP0's blocks in q.get() and stalls
+    the ring. Here PP0 drains, of these queues, target = min(its produced, the ring min
+    of the other ranks' produced), produced = consumed + qsize (monotone). The min rides
+    the ready-count vector downstream (each stage folds its own produced in) and returns
+    to PP0 inside the last stage's release consensus. Every rank still drains the same n
+    at the same loop point, and never an item it has not produced. Commits on these
+    queues come about one ring trip later.
+    Checks: I1 each stage's consumed count and digest equal PP0's (one drain behind);
+    I2 PP0 drains no item beyond the ring min; I3 a lagged get finds its item (else
+    counted, and the blocking get keeps the old behaviour)."""
+
+    def __init__(self, pp_rank: int, pp_size: int, mode: str):
+        self.pp_rank, self.pp_size, self.mode = pp_rank, pp_size, mode
+        self.names: list[str] = []
+        self.ids: list[int] = []
+        self.positions: list[int] = []  # index in the storage-count tuple
+        self.index: dict[int, int] = {}  # id(queue) -> lagged slot
+        self.qs: list = []
+        self.write_back = None
+        self.epoch = 0
+        self.consumed_n: list[int] = []
+        self.digest: list[int] = []
+        self.prev = None  # (consumed, digest) after this rank's previous drain
+        self.last_produced: list[int] = []
+        self.m_latest: Optional[list[int]] = None  # PP0: newest ring min
+        self.mark: Optional[list[int]] = None  # last stage: [epoch, *ring min]
+        self.agreed: list[int] = []
+        self.drain_base: list[int] = []
+        self.stats = dict(drains=0, consumed=0, empty_gets=0, i1_checks=0, i1_skipped=0, marks=0, held=0)
+        self.engaged = False
+        self.last_log = 0.0
+        self.last_mark_t = time.monotonic()
+
+    def _reset(self, cc, extra_pool_names, write_back) -> None:
+        named = [("ack_backup_queue", cc.ack_backup_queue, 2)]
+        if self.mode == "all":
+            named.append(("host_mem_release_queue", cc.host_mem_release_queue, 3))
+            extra = getattr(cc, "extra_host_mem_release_queues", {})
+            for j, name in enumerate(extra_pool_names):
+                named.append((f"extra_release.{name}", extra[name], 4 + j))
+        self.names = [n for n, _, _ in named]
+        self.qs = [q for _, q, _ in named]
+        self.positions = [p for _, _, p in named]
+        self.ids = [id(q) for q in self.qs]
+        self.index = {id(q): i for i, q in enumerate(self.qs)}
+        self.write_back = write_back
+        k = len(self.qs)
+        self.consumed_n, self.digest = [0] * k, [0] * k
+        self.prev = ([0] * k, [0] * k)
+        self.m_latest, self.mark = None, None
+        self.last_produced = [q.qsize() for q in self.qs]
+
+    def _total(self, i: int) -> int:
+        # Every scheduler-thread take goes through _drain_queue, write-back _wait's too
+        # (it calls _drain_storage_control_queues_impl), so consumed_n is the whole count.
+        return self.consumed_n[i]
+
+    def produced(self, i: int) -> int:
+        return self._total(i) + self.qs[i].qsize()
+
+    def begin(self, cc, extra_pool_names, write_back) -> None:
+        """Bind the queues; a swapped or cleared queue starts a new epoch on every rank."""
+        want = [id(cc.ack_backup_queue)]
+        if self.mode == "all":
+            extra = getattr(cc, "extra_host_mem_release_queues", {})
+            want += [id(cc.host_mem_release_queue)] + [id(extra[n]) for n in extra_pool_names]
+        if want != self.ids or write_back is not self.write_back:
+            # Swaps come from replicated actions (reset, attach), so every rank re-binds at the same point.
+            if self.ids:
+                self.epoch += 1
+                logger.warning("HICACHE_PP_LAGGED_DRAIN new epoch %d (queues re-bound)", self.epoch)
+            self._reset(cc, extra_pool_names, write_back)
+            return
+        now = [self.produced(i) for i in range(len(self.qs))]
+        if any(a < b for a, b in zip(now, self.last_produced)) and not self.stats.get("non_monotone"):
+            self.stats["non_monotone"] = 1
+            logger.warning("HICACHE_PP_LAGGED_DRAIN produced count went down: %s -> %s", self.last_produced, now)
+        self.last_produced = now
+
+    def request_reset(self) -> None:
+        """Cache reset (replicated on every rank): the queues are cleared, start a new epoch."""
+        self.ids = []
+        if self.qs:
+            self.epoch += 1
+        self.qs, self.index = [], {}
+
+    def slot_len(self) -> int:
+        return 3 * len(self.qs) + 1
+
+    def pp0_counts(self, sizes: tuple) -> tuple[tuple, list[int]]:
+        """PP0: lagged counts = min(own produced, ring min) - consumed; plus the slots."""
+        sizes = list(sizes)
+        held = 0
+        self.drain_base = [self.consumed_n[i] for i in range(len(self.qs))]
+        for i, pos in enumerate(self.positions):
+            total = self._total(i)
+            ring = self.m_latest[i] if self.m_latest is not None else total
+            target = min(self.produced(i), ring)
+            n = max(0, target - total)
+            # I2: PP0 never drains past what every other stage had produced.
+            assert total + n <= max(ring, total), "HICACHE_PP_LAGGED_DRAIN I2: PP0 ahead of the ring"
+            held += self.produced(i) - total - n
+            sizes[pos] = n
+        self.stats["held"] = held
+        consumed, digest = self.prev
+        slots = [_PP_LAG_INF] * len(self.qs) + list(consumed) + list(digest) + [self.epoch]
+        return tuple(sizes), slots
+
+    def placeholder(self) -> list[int]:
+        self.drain_base = [self.consumed_n[i] for i in range(len(self.qs))]
+        return [0] * self.slot_len()
+
+    def fold_values(self, values: list, offset: int) -> list:
+        """Stages after PP0: fold this rank's produced into the ring min before forwarding."""
+        for i in range(len(self.qs)):
+            values[offset + i] = min(int(values[offset + i]), self.produced(i))
+        return values
+
+    def after_sync(self, slots: list, sizes: tuple) -> None:
+        k = len(self.qs)
+        self.agreed = [int(sizes[p]) for p in self.positions]
+        if self.pp_rank == 0:
+            return
+        ring, consumed, digest, epoch = slots[:k], slots[k : 2 * k], slots[2 * k : 3 * k], slots[3 * k]
+        if epoch == self.epoch:
+            self.stats["i1_checks"] += 1
+            mine = self.prev
+            if list(consumed) != mine[0] or list(digest) != mine[1]:
+                raise RuntimeError(
+                    "HICACHE_PP_LAGGED_DRAIN I1: stage %d drained %s digest %s, PP0 %s digest %s (queues %s)"
+                    % (self.pp_rank, mine[0], mine[1], list(consumed), list(digest), self.names)
+                )
+        else:
+            self.stats["i1_skipped"] += 1
+        if self.pp_rank == self.pp_size - 1:
+            self.mark = [self.epoch] + [int(x) for x in ring]
+
+    def take(self, i: int, item) -> None:
+        self.consumed_n[i] += 1
+        if i == 0:
+            hv = getattr(item, "hash_value", None) or ()
+            key = (len(hv) << 32) | (zlib.crc32(str(hv[-1]).encode()) if hv else 0)
+        else:
+            key = int(item.numel())
+        self.digest[i] = (self.digest[i] + key + 1) % _PP_LAG_MOD
+
+    def empty_get(self, i: int) -> None:
+        self.stats["empty_gets"] += 1
+        if self.stats["empty_gets"] == 1:
+            logger.warning("HICACHE_PP_LAGGED_DRAIN I3: %s was empty at its lagged count", self.names[i])
+
+    def after_drain(self) -> None:
+        for i in range(len(self.qs)):
+            # The drain takes at most the agreed n; a write-back wait inside it may take fewer.
+            assert self.consumed_n[i] - self.drain_base[i] <= self.agreed[i], "HICACHE_PP_LAGGED_DRAIN over-drain"
+        self.stats["consumed"] += sum(c - b for c, b in zip(self.consumed_n, self.drain_base))
+        self.prev = (list(self.consumed_n), list(self.digest))
+        self.stats["drains"] += 1
+        now = time.monotonic()
+        if not self.engaged:
+            self.engaged = True
+            self.last_log = now
+            logger.info(
+                "HICACHE_PP_LAGGED_DRAIN_ENGAGED %s",
+                json.dumps(dict(pp_rank=self.pp_rank, pp_size=self.pp_size, mode=self.mode, queues=self.names, epoch=self.epoch)),
+            )
+        elif now - self.last_log >= 60.0:
+            self.last_log = now
+            stats = dict(self.stats, pp_rank=self.pp_rank, epoch=self.epoch, consumed_total=self.consumed_n,
+                         pending=[q.qsize() for q in self.qs], since_mark_s=round(now - self.last_mark_t, 1))
+            logger.info("HICACHE_PP_LAGGED_DRAIN_STATS %s", json.dumps(stats))
+            if self.pp_rank == 0 and stats["since_mark_s"] > 30.0 and self.stats["held"] > 0:
+                logger.warning("HICACHE_PP_LAGGED_DRAIN no ring mark for %.0f s, %d items held", now - self.last_mark_t, self.stats["held"])
+
+    def note_mark(self, mark: list) -> None:
+        """PP0: the ring min the last stage returned with its release consensus."""
+        if not mark or mark[0] != self.epoch or len(mark) != len(self.qs) + 1:
+            return
+        ring = [int(x) for x in mark[1:]]
+        self.m_latest = ring if self.m_latest is None else [max(a, b) for a, b in zip(self.m_latest, ring)]
+        self.stats["marks"] += 1
+        self.last_mark_t = time.monotonic()
+        if self.stats["marks"] == 1:
+            logger.info("HICACHE_PP_LAGGED_DRAIN_FIRST_MARK %s", json.dumps(dict(pp_rank=self.pp_rank, epoch=self.epoch, ring_min=ring)))
+
+# PP0's prefetch stop verdict under the timeout policy (MAX-reduced: a miss is final).
+_STOP_WAIT, _STOP_DEADLINE, _STOP_LOCAL_MISS = 0, 1, 2
 device_module = get_device_module()
 
 
@@ -209,6 +418,26 @@ class _OngoingPrefetch(NamedTuple):
 class UnifiedRadixCache(BasePrefixCache):
     # Unlimited-OCR v2 split-document KV reuse; None for every other model.
     uocr_doc_reuse: Optional[DocReuse] = None
+    # L2->L3 write-back (SGLANG_OPT_HICACHE_STORAGE_WRITE_BACK); set in init_hicache.
+    _storage_write_back: Optional[StorageWriteBack] = None
+    # SGLANG_HICACHE_PP_LAGGED_DRAIN state, set by the PP prefill scheduler.
+    _pp_lag: Optional[PPLaggedDrain] = None
+    # check_hicache_events reads this on stubs built with object.__new__ in unit tests;
+    # init_hicache sets the real value.
+    _l3_write_on_host_evict: bool = False
+    # Final stats at SIGTERM / exit under SGLANG_HICACHE_L3_WRITE_ON_HOST_EVICT.
+    _l3_tier_final: Optional[WriteOnHostEvictFinalStats] = None
+    # PP relay and prefetch flags read on the same object.__new__ stubs; __init__
+    # and the PP prefill scheduler set the real values.
+    pp_counts_piggyback: bool = False
+    prefetch_verdict_relay: bool = False
+    prefetch_pp0_miss_shortcut: bool = False
+    _prefetch_timing: Optional[PrefetchTiming] = None
+    # Relaxed write_back eviction fence; enable_wb_relaxed_fence sets both.
+    _wb_relaxed: bool = False
+    _wb_fence_stats: Optional[WriteBackFenceStats] = None
+    # SGLANG_HICACHE_ASYNC_WB_ACK (needs the relaxed fence): see _defer_eviction_write_acks.
+    _async_wb_ack: bool = False
 
     def __init__(
         self,
@@ -297,6 +526,7 @@ class UnifiedRadixCache(BasePrefixCache):
             params=tree_params,
             components=self.components,
         )
+        logger.info("Radix cache tree core: %s", self._tree_core_backend)
         # Components execute boundary actions through the tree core.
         for component in self.components.values():
             component.tree_core = self.tree_core
@@ -350,6 +580,19 @@ class UnifiedRadixCache(BasePrefixCache):
         self.pp_rank = params.pp_rank
         self.pp_size = params.pp_size
         self.work_list: list[torch.distributed.Work] = []
+        # Set by the PP prefill scheduler: ready counts ride its request relay.
+        # PP0 queues its reduced counts in pp_counts_out; later stages take them
+        # from pp_counts_in and forward them through pp_counts_out.
+        self.pp_counts_piggyback = False
+        self.pp_counts_in: deque[list[int]] = deque()
+        self.pp_counts_out: list[list[int]] = []
+        # Set by the PP prefill scheduler: PP0's prefetch stop verdicts ride its
+        # request relay; later stages take them in order from pp_verdicts_in.
+        self.prefetch_verdict_relay = False
+        self.pp_verdicts_in: deque[int] = deque()
+        self.pp_verdicts_out: list[int] = []
+        self.prefetch_pp0_miss_shortcut = envs.SGLANG_PREFETCH_PP0_MISS_SHORTCUT.get()
+        self._prefetch_timing = prefetch_timing(self.pp_rank)
 
         # HiCache D↔H defaults (overridden by init_hicache)
         self.cache_controller: Optional[HybridCacheController] = None
@@ -394,6 +637,32 @@ class UnifiedRadixCache(BasePrefixCache):
             "l3_miss_tokens": 0,
             "l1l2_miss_tokens": 0,
         }
+        # Log-only L3 lever counters (belief TTL, prefetch threshold), per query-length
+        # band: [issued, fetched, loaded tokens, latency ms sum, max, <10/<50/<200/<1000/>=1000 ms].
+        self._lever_bands = {b: [0] * 10 for b in ("lt2k", "2k-4k", "4k-8k", "ge8k")}
+        self._lever_query_rate_limited = 0
+        # Exclusive L2->L3 tiering: storage is written from the coldest host pages ahead
+        # of eviction, not at L2 admission. Resolved in init_hicache.
+        self._l3_write_on_host_evict = False
+        self._l3_evict_write_reserve_fraction = 0.0
+        # op id -> tokens of write-behind backups not yet acked; they count as
+        # covered reserve so a slow ack does not re-issue deeper into the tail.
+        self._write_behind_inflight: dict[int, int] = {}
+        # Step counter (not wall clock: the walk must run on every rank in the
+        # same steps to keep backup issue order identical).
+        self._write_behind_step = 0
+        # Prefill batches seen (ready_to_load_host_cache): the existence-belief clock.
+        self._belief_batch = 0
+        # Tail tokens the last walk found already in storage; they count as
+        # covered until host eviction consumes them, so a steady state with a
+        # fully tiered tail does not re-walk the heap every step.
+        self._write_behind_clean_tokens = 0
+        self._l3_tier_stats: dict[str, int] = {
+            "wb_walks": 0,
+            "wb_issued_tokens": 0,
+            "wb_clean_tokens": 0,
+            "wb_unbacked_tokens": 0,
+        }
 
         self.reset()
         logger.info(
@@ -422,7 +691,7 @@ class UnifiedRadixCache(BasePrefixCache):
             work.wait()
         self.work_list.clear()
 
-    def _all_reduce(self, data: torch.Tensor, tp_reduce_op: torch.distributed.ReduceOp):
+    def _all_reduce(self, data: torch.Tensor, tp_reduce_op: torch.distributed.ReduceOp, fold=None):
         """
         Synchronize data across all TP and PP ranks.
 
@@ -433,11 +702,19 @@ class UnifiedRadixCache(BasePrefixCache):
         """
         if self.pp_rank == 0:
             self._all_reduce_attn_groups(data, tp_reduce_op)
-        self._pp_sync(data)
+        self._pp_sync(data, fold)
 
-    def _pp_sync(self, data: torch.Tensor) -> None:
+    def agree_on_all_ranks(self, flags: list[bool]) -> list[bool]:
+        """AND of per-rank flags with the same reduction as the drained counts
+        (TP on PP0, then propagated along PP), so every rank decides alike."""
+        data = torch.tensor(flags, dtype=torch.int)
+        self._all_reduce(data, torch.distributed.ReduceOp.MIN)
+        return [bool(flag) for flag in data.tolist()]
+
+    def _pp_sync(self, data: torch.Tensor, fold=None) -> None:
         """
         Synchronize data across the PP pipeline, where PPn (n>0) will receive PP0's data.
+        fold (lagged drain) edits the received data in place before it is forwarded.
         """
         if self.pp_size <= 1 or self.pp_group is None:
             return
@@ -448,6 +725,8 @@ class UnifiedRadixCache(BasePrefixCache):
                 group=self.pp_group,
                 tag=P2PTag.HICACHE_PP_SYNC,
             )
+            if fold is not None:
+                fold(data)
         if self.pp_rank + 1 < self.pp_size:
             copy_of_data = data.clone()
             send_work = torch.distributed.isend(
@@ -489,6 +768,10 @@ class UnifiedRadixCache(BasePrefixCache):
         """Full reset: destroy entire tree and all state."""
         # In-flight restores still read their host slots; finish them first.
         self._discard_restore_backups()
+        if self._pp_lag is not None:
+            self._pp_lag.request_reset()
+        if self._async_wb_ack:
+            self._drain_deferred_wb_acks()
         self.tree_core.reset()
         self.session_refs.reset()
 
@@ -511,6 +794,10 @@ class UnifiedRadixCache(BasePrefixCache):
         ] = {}
         self.storage_prefetch_retries = StoragePrefetchRetries()
         self.ongoing_backup: dict[int, tuple[NodeId, DecLockRefParams]] = {}
+        if self._storage_write_back is not None:
+            self._storage_write_back.reset()
+        self._write_behind_inflight.clear()
+        self._write_behind_clean_tokens = 0
         if self.buffer_pipeline is not None:
             self.buffer_pipeline.reset()
             # The dropped writes' content no longer reaches a storage ack.
@@ -592,6 +879,36 @@ class UnifiedRadixCache(BasePrefixCache):
                 swa = self.component_of(TREE_WINDOW)
                 self.tree_core.has_swa_host_pool = swa._swa_kv_pool_host is not None
 
+        self._l3_write_on_host_evict = bool(
+            envs.SGLANG_HICACHE_L3_WRITE_ON_HOST_EVICT.get()
+            and self.cache_controller is not None
+            and self.cache_controller.enable_storage
+        )
+        if self._l3_write_on_host_evict:
+            if self.host_memory_mode == "buffer_only":
+                raise ValueError(
+                    "SGLANG_HICACHE_L3_WRITE_ON_HOST_EVICT needs a host cache tier; "
+                    "it does not apply to --hicache-host-memory-mode buffer_only"
+                )
+            if self._tree_core_backend != "python":
+                raise ValueError(
+                    "SGLANG_HICACHE_L3_WRITE_ON_HOST_EVICT requires "
+                    "SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND=python"
+                )
+            self._l3_evict_write_reserve_fraction = (
+                envs.SGLANG_HICACHE_L3_EVICT_WRITE_RESERVE_FRACTION.get()
+            )
+            logger.info(
+                "HiCache L3 write-on-host-evict enabled: reserve fraction %.3f "
+                "of host pool (%d tokens)",
+                self._l3_evict_write_reserve_fraction,
+                int(
+                    self._l3_evict_write_reserve_fraction
+                    * self.cache_controller.mem_pool_host.size
+                ),
+            )
+            self._l3_tier_final = WriteOnHostEvictFinalStats.register(self)
+
         if self.host_memory_mode == "buffer_only":
             self.tree_core.set_host_memory_buffer_only()
             swa = self.component_of(TREE_WINDOW)
@@ -631,6 +948,7 @@ class UnifiedRadixCache(BasePrefixCache):
             self.cache_controller is not None
             and self.cache_controller.write_policy == "write_back"
         )
+        self._storage_write_back = StorageWriteBack.create(self)
         # Pre-seed the logical dropped-tokens series.
         if self.metrics_collector is not None and self.cache_controller is not None:
             reasons = ["host_pressure"]
@@ -906,6 +1224,8 @@ class UnifiedRadixCache(BasePrefixCache):
         start_time = time.perf_counter()
         tracker = {ct: 0 for ct in self.tree_components}
 
+        if self._wb_relaxed and self._wb_evict_relaxed_fence():
+            self._flush_queued_writes_fenced()
         if (
             available_size_targets is None
             and self.evicts_by_joint_lru
@@ -1256,10 +1576,17 @@ class UnifiedRadixCache(BasePrefixCache):
         """Wait once for the queued copies, then demote the nodes in order."""
         if not node_ids:
             return
-        self.writing_check(write_back=True)
+        if self._async_wb_ack:
+            self._defer_eviction_write_acks()
+        elif self._wb_relaxed:
+            self.writing_check(write_back=True, relaxed_fence=True)
+        else:
+            self.writing_check(write_back=True)
         for node_id in node_ids:
             self._demote(node_id, tracker)
         node_ids.clear()
+        if self._storage_write_back is not None:
+            self._storage_write_back.on_demoted()
 
     def _evict_by_joint_lru(
         self,
@@ -1764,13 +2091,33 @@ class UnifiedRadixCache(BasePrefixCache):
         self, num_tokens: int, component_type: ComponentType = BASE_COMPONENT_TYPE
     ) -> int:
         """Evict host resources for a specific component to free host pool space."""
+        if self._async_wb_ack:
+            self._drain_deferred_wb_acks(before=self.cache_controller.launch_seq)
         if self.host_memory_mode == "buffer_only":
             # The tree never holds host values in buffer mode, and staging
             # is operation-owned (freed at each ack): nothing is evictable.
             return 0
+        evicted = self._drive_host_eviction(num_tokens, component_type)
+        if (
+            self._storage_write_back is not None
+            and component_type == BASE_COMPONENT_TYPE
+        ):
+            evicted = self._storage_write_back.evict_host(num_tokens, evicted)
+        if self._l3_tier_final is not None and component_type == BASE_COMPONENT_TYPE:
+            self._l3_tier_final.host_evicted_tokens += evicted
+        return evicted
+
+    def _drive_host_eviction(
+        self, num_tokens: int, component_type: ComponentType
+    ) -> int:
         result = self.tree_core.drive_host_eviction(component_type, num_tokens)
         self._apply_eviction_result(result)
-        return result.tracker.get(component_type, 0)
+        evicted = result.tracker.get(component_type, 0)
+        if component_type == BASE_COMPONENT_TYPE and self._write_behind_clean_tokens:
+            self._write_behind_clean_tokens = max(
+                0, self._write_behind_clean_tokens - evicted
+            )
+        return evicted
 
     # ---- Decode retraction ----
 
@@ -1993,6 +2340,7 @@ class UnifiedRadixCache(BasePrefixCache):
         load_host, load_device, load_pools = self.cache_controller._move_op_indices(
             operation
         )
+        self.cache_controller._wait_wb_done_h2d()
         completion = self.cache_controller.l2_transfer_engine.submit_host_to_device(
             self.cache_controller._l2_load_transfers(
                 load_host, load_device, load_pools
@@ -2074,6 +2422,9 @@ class UnifiedRadixCache(BasePrefixCache):
             )
             if host_indices is None:
                 return 0
+            if PMICRO["on"] and node_id in PMICRO_HOST_REMOVED:
+                PMICRO_HOST_REMOVED.discard(node_id)
+                PMICRO["rebacked"] += len(host_indices)
             self.tree_core.commit_backup(node_id, host_indices, comp_xfers)
             lock_params = None
             if not write_back:
@@ -2182,7 +2533,10 @@ class UnifiedRadixCache(BasePrefixCache):
         self.tree_core.finish_write_through(publish_node_ids, ack_id)
         if lock_params is not None:
             self.dec_lock_ref(lock_node_id, lock_params)
-        if self.enable_storage:
+        if self.enable_storage and self._storage_write_back is not None:
+            # Storage is written when these host copies are evicted.
+            self._storage_write_back.pin(publish_node_ids)
+        elif self.enable_storage and not self._l3_write_on_host_evict:
             # Back up each fragment: after a split, lock_node only holds the
             # suffix; the prefix fragment must be persisted as well.
             for node_id in publish_node_ids:
@@ -2355,15 +2709,41 @@ class UnifiedRadixCache(BasePrefixCache):
             )
         return transfers
 
+    def _storage_backup_is_covered(self, spec) -> bool:
+        beliefs = self.storage_existence_cache
+        if not beliefs.pool(PoolName.KV).covered(spec.hash_value):
+            return False
+        kv_xfer = PoolTransfer(
+            name=PoolName.KV, host_indices=spec.host_value, keys=spec.hash_value
+        )
+        aux_xfers = [x for xfers in spec.comp_xfers.values() for x in xfers]
+        aux_xfers.extend(
+            self._build_sidecar_transfers(
+                CacheTransferPhase.BACKUP_STORAGE, kv_xfer, spec.comp_xfers
+            )
+        )
+        # KV coverage alone does not prove that a checkpoint or sidecar was written.
+        return all(
+            transfer.keys is not None
+            and beliefs.pool(transfer.name).covered(transfer.keys)
+            for transfer in aux_xfers
+        )
+
     @rank_consensus
-    def write_backup_storage(self, node_id: NodeId) -> None:
+    def write_backup_storage(self, node_id: NodeId) -> Optional[int]:
+        """Issue the node's host->storage backup; returns the operation id, or
+        None when nothing was issued (no host copy or all pools covered)."""
         if not self.enable_storage or self.cache_controller is None:
-            return
+            return None
         spec = self.tree_core.build_storage_backup_spec(
             node_id, self.hicache_storage_pass_prefix_keys
         )
         if spec is None:
-            return
+            return None
+        # A recompute after L2 eviction re-creates the node with backuped=False, so the
+        # flag alone would re-write content L3 holds; stale positives heal on prefetch miss.
+        if self._storage_backup_is_covered(spec):
+            return None
 
         kv_xfer = PoolTransfer(
             name=PoolName.KV,
@@ -2386,6 +2766,78 @@ class UnifiedRadixCache(BasePrefixCache):
         self.ongoing_backup[operation_id] = (
             node_id,
             self.inc_host_lock_ref(node_id).to_dec_params(),
+        )
+        return operation_id
+
+    def _write_behind_host_tail(self) -> None:
+        """Keep the reserve at the LRU host tail either free or already in
+        storage, so drive_host_eviction only drops pages storage holds. Every
+        input (pool state, tree, beliefs, in-flight set) is rank-replicated."""
+        self._write_behind_step += 1
+        if self._write_behind_step % 2400 == 0:
+            self._log_lever_stats()
+        if self._write_behind_step % 4:
+            return
+        pool = self.cache_controller.mem_pool_host
+        target = int(self._l3_evict_write_reserve_fraction * pool.size)
+        covered = (
+            pool.available_size()
+            + sum(self._write_behind_inflight.values())
+            + self._write_behind_clean_tokens
+        )
+        deficit = target - covered
+        # Refill in quarter-reserve quanta: the candidate walk heapifies every
+        # host leaf, so running it per freed page would eat the scheduler thread.
+        if deficit < max(1, target // 4):
+            return
+        stats = self._l3_tier_stats
+        stats["wb_walks"] += 1
+        # write_backup_storage repeats this check for its write-through callers;
+        # doing it here first lets clean tail tokens count toward the reserve.
+        beliefs = self.storage_existence_cache
+        clean = 0
+        for (
+            node_id,
+            num_tokens,
+            hash_value,
+        ) in self.tree_core.peek_host_eviction_candidates(
+            BASE_COMPONENT_TYPE, target - pool.available_size()
+        ):
+            if hash_value and beliefs.pool(PoolName.KV).covered(hash_value):
+                spec = self.tree_core.build_storage_backup_spec(
+                    node_id, self.hicache_storage_pass_prefix_keys
+                )
+                if spec is not None and self._storage_backup_is_covered(spec):
+                    clean += num_tokens
+                    continue
+            operation_id = self.write_backup_storage(node_id)
+            if operation_id is None:
+                # No host copy to write from; the page leaves L2 without an L3 copy.
+                stats["wb_unbacked_tokens"] += num_tokens
+                continue
+            self._write_behind_inflight[operation_id] = num_tokens
+            stats["wb_issued_tokens"] += num_tokens
+        self._write_behind_clean_tokens = clean
+        stats["wb_clean_tokens"] += clean
+
+    @staticmethod
+    def _lever_band(tokens: int) -> str:
+        return "lt2k" if tokens < 2048 else "2k-4k" if tokens < 4096 else "4k-8k" if tokens < 8192 else "ge8k"
+
+    def _log_lever_stats(self) -> None:
+        o = self._prefetch_outcome_stats
+        logger.info(
+            "HiCache L3 levers: step=%d batch_step=%d ttl_steps=%d threshold=%d expired_pages,fetched=%s "
+            "bands[issued,fetched,loaded,lat_ms_sum,lat_ms_max,<10,<50,<200,<1000,>=1000]=%s "
+            "attempts=%d issued=%d declined_too_short=%d declined_rate_limited=%d query_rate_limited=%d",
+            self._write_behind_step,
+            self._belief_batch,
+            self.storage_existence_cache.ttl_steps,
+            self.prefetch_threshold,
+            self.storage_existence_cache.expiry_stats(),
+            self._lever_bands,
+            o["attempts"], o["issued"], o["declined_too_short"], o["declined_rate_limited"],
+            self._lever_query_rate_limited,
         )
 
     def is_backuped(self, node_id: NodeId) -> bool:
@@ -2415,11 +2867,10 @@ class UnifiedRadixCache(BasePrefixCache):
         cache_salt: Optional[str] = None,
     ) -> int:
         """Probe L3 with the request namespace."""
-        if (
-            not self.enable_storage
-            or self.cache_controller is None
-            or self.cache_controller.prefetch_rate_limited()
-        ):
+        if not self.enable_storage or self.cache_controller is None:
+            return 0
+        if self.cache_controller.prefetch_rate_limited():
+            self._lever_query_rate_limited += 1
             return 0
 
         prefetch_key = RadixKey(
@@ -2528,6 +2979,9 @@ class UnifiedRadixCache(BasePrefixCache):
             # Paced: the limiter clears as transfers finish, not on the next pass.
             self.storage_prefetch_retries.poll_miss(req_id, storage_hit_end)
             return
+        self._lever_bands[self._lever_band(prefetch_length)][0] += 1
+        if self._prefetch_timing is not None:
+            self._prefetch_timing.record("issue_len", req_id, query_tokens=prefetch_length)
 
         # Buffer mode holds no tree state during the fetch: buffers are
         # operation-owned, so the anchor needs no pin.
@@ -2677,9 +3131,44 @@ class UnifiedRadixCache(BasePrefixCache):
             should_terminate_tensor = torch.tensor(
                 int(should_terminate), dtype=torch.int, device="cpu"
             )
-            self._all_reduce(should_terminate_tensor, torch.distributed.ReduceOp.MAX)
+            self._exchange_pp0_verdict(should_terminate_tensor)
             return should_terminate_tensor.item() == 1
         return True
+
+    def _exchange_pp0_verdict(self, verdict: torch.Tensor) -> None:
+        """PP0's verdict, MAX over its attention ranks, reaches every stage:
+        over the PP chain, or on the same loop iteration's request relay."""
+        started = time.monotonic()
+        if not self.prefetch_verdict_relay:
+            self._all_reduce(verdict, torch.distributed.ReduceOp.MAX)
+        elif self.pp_rank == 0:
+            self._all_reduce_attn_groups(verdict, torch.distributed.ReduceOp.MAX)
+            self.pp_verdicts_out.append(int(verdict.item()))
+        else:
+            assert self.pp_verdicts_in, "prefetch verdict missing from the PP relay"
+            verdict.fill_(self.pp_verdicts_in.popleft())
+            if self.pp_rank + 1 < self.pp_size:
+                self.pp_verdicts_out.append(int(verdict.item()))
+        if self._prefetch_timing is not None:
+            self._prefetch_timing.record("verdict_exchange", None,
+                                         dur_s=time.monotonic() - started,
+                                         relay=self.prefetch_verdict_relay,
+                                         verdict=int(verdict.item()))
+
+    @rank_consensus(same_results=True)
+    def _prefetch_stop_verdict(self, operation: PrefetchOperation) -> int:
+        """Timeout policy with the PP0 miss shortcut: _STOP_WAIT, _STOP_DEADLINE,
+        or _STOP_LOCAL_MISS when PP0's own storage query found nothing. Every
+        stage's hit is MIN-agreed, so one rank's miss makes the agreed hit zero."""
+        verdict = _STOP_WAIT
+        if self.pp_rank == 0:
+            if operation.local_query_tokens == 0:
+                verdict = _STOP_LOCAL_MISS
+            elif self._prefetch_deadline_expired(operation):
+                verdict = _STOP_DEADLINE
+        verdict_tensor = torch.tensor(verdict, dtype=torch.int, device="cpu")
+        self._exchange_pp0_verdict(verdict_tensor)
+        return int(verdict_tensor.item())
 
     def has_ongoing_prefetch(self, handle: CacheRequestHandle) -> bool:
         return handle in self.ongoing_prefetch
@@ -2773,10 +3262,25 @@ class UnifiedRadixCache(BasePrefixCache):
         operation = self.ongoing_prefetch[request].operation
 
         if not operation.is_terminated():
-            if not self._can_terminate_prefetch(operation):
+            started = time.monotonic()
+            local_miss = False
+            if self.prefetch_pp0_miss_shortcut and self.prefetch_stop_policy == "timeout":
+                verdict = self._prefetch_stop_verdict(operation)
+                terminate = verdict != _STOP_WAIT
+                local_miss = verdict == _STOP_LOCAL_MISS
+            else:
+                terminate = self._can_terminate_prefetch(operation)
+            if self._prefetch_timing is not None:
+                self._prefetch_timing.record("check", request.rid,
+                                             dur_s=time.monotonic() - started,
+                                             terminate=terminate, local_miss=local_miss)
+            if not terminate:
                 self._start_storage_prefetch_wait(operation)
                 return False
-            if self.prefetch_stop_policy == "timeout":
+            if local_miss:
+                # Same retirement as a drained zero hit (no deadline: a miss may retry).
+                operation.local_miss_terminated = True
+            elif self.prefetch_stop_policy == "timeout":
                 self._mark_prefetch_deadline_expired(operation)
 
         self.cache_controller.terminate_prefetch(operation)
@@ -2832,6 +3336,10 @@ class UnifiedRadixCache(BasePrefixCache):
             and self.storage_metrics_collector is not None
         ):
             self.storage_metrics_collector.log_prefetched_tokens(completed_tokens)
+        if self._storage_write_back is not None:
+            self._storage_write_back.on_storage_read(completed_tokens)
+        if self._l3_tier_final is not None:
+            self._l3_tier_final.read_tokens += completed_tokens
 
         if self.buffer_pipeline is not None:
             # No graft: release the rank-local tail beyond the synced usable
@@ -2851,7 +3359,14 @@ class UnifiedRadixCache(BasePrefixCache):
         # Apply the host-insert walk's actions before the transfer commit.
         self._apply_cache_actions(insert_result.cache_actions)
 
+        # The rank-synced fetch proves L3 presence even if the host insert is dropped.
+        kv_beliefs = self.storage_existence_cache.pool(PoolName.KV)
+        kv_beliefs.note_fetched(hash_value[: completed_tokens // self.page_size])
+        kv_beliefs.add(hash_value[: completed_tokens // self.page_size])
+
         if insert_result.host_insert_dropped:
+            if self._storage_write_back is not None:
+                self._storage_write_back.on_storage_read_dropped(completed_tokens)
             self._resolve_storage_prefetch_tokens(request, insert_result.prefix_len)
             self._finish_storage_prefetch(request, fulfilled_tokens=0, reason="dropped")
             self.cache_controller.append_host_mem_release(
@@ -2877,6 +3392,10 @@ class UnifiedRadixCache(BasePrefixCache):
                 host_indices[: insert_result.prefix_len]
             )
             loaded_from_storage = completed_tokens - insert_result.prefix_len
+            if self._storage_write_back is not None and insert_result.prefix_len:
+                self._storage_write_back.on_storage_read_dropped(
+                    insert_result.prefix_len
+                )
             # Cache mode has only completed L3 -> L2 here. Keep the usable
             # storage span unresolved until admission proves that L2 -> L1
             # load-back actually materialized it for this request.
@@ -2887,6 +3406,13 @@ class UnifiedRadixCache(BasePrefixCache):
         self.cache_controller.prefetch_tokens_occupied -= len(prefetch_key)
 
         self.prefetch_loaded_tokens_by_reqid[request] = loaded_from_storage
+        band = self._lever_bands[self._lever_band(len(prefetch_key))]
+        lat_ms = (time.monotonic() - operation.start_time) * 1e3
+        band[1] += 1
+        band[2] += loaded_from_storage
+        band[3] += int(lat_ms)
+        band[4] = max(band[4], int(lat_ms))
+        band[5 + sum(lat_ms >= e for e in (10, 50, 200, 1000))] += 1
         if loaded_from_storage > 0:
             self.prefetch_loaded_storage_start_by_reqid[request] = (
                 operation.storage_start + insert_result.prefix_len
@@ -3131,8 +3657,11 @@ class UnifiedRadixCache(BasePrefixCache):
         self, request: CacheRequestHandle
     ) -> tuple[int, Optional[int]]:
         """Pop the loaded L3 token count and its absolute prefix start."""
+        loaded = self.prefetch_loaded_tokens_by_reqid.pop(request, 0)
+        if loaded and self._storage_write_back is not None:
+            self._storage_write_back.on_storage_hit(loaded)
         return (
-            self.prefetch_loaded_tokens_by_reqid.pop(request, 0),
+            loaded,
             self.prefetch_loaded_storage_start_by_reqid.pop(request, None),
         )
 
@@ -3215,7 +3744,7 @@ class UnifiedRadixCache(BasePrefixCache):
         """Heal each pool's beliefs beyond its rank-agreed boundary (a
         chain-page pool also learns presence up to it); a pool without a
         verdict heals from the folded cut."""
-        if self.host_memory_mode != "buffer_only" or operation.deadline_expired:
+        if operation.deadline_expired:
             # A cut query's agreed hit may be a MIN over skipped lookups, not a verdict.
             return
         chain = operation.all_hash_values
@@ -3265,7 +3794,11 @@ class UnifiedRadixCache(BasePrefixCache):
         stats["l3_miss_tokens"] += miss
 
     def prefetch_outcome_stats_snapshot(self) -> dict:
-        return self._prefetch_outcome_stats.copy()
+        stats = self._prefetch_outcome_stats.copy()
+        if self._l3_write_on_host_evict:
+            stats.update(self._l3_tier_stats)
+            stats["wb_inflight_tokens"] = sum(self._write_behind_inflight.values())
+        return stats
 
     def _prefetch_occupied_span(
         self, prefetch_key, host_indices, *, operation=None
@@ -3391,6 +3924,9 @@ class UnifiedRadixCache(BasePrefixCache):
         log_metrics: bool,
     ) -> None:
         cc = self.cache_controller
+        write_back = self._storage_write_back
+        acks_taken_at_entry = 0 if write_back is None else write_back.acks_taken
+        lag = self._pp_lag if self._pp_lag is not None and self._pp_lag.index else None
 
         def _drain_queue(q: Queue[T], n: Optional[int]) -> Iterator[T]:
             """If n is None, consume all items from the queue.
@@ -3406,10 +3942,20 @@ class UnifiedRadixCache(BasePrefixCache):
                     item = q.get()
                     yield item
             else:
+                slot = None if lag is None else lag.index.get(id(q))
                 for _ in range(n):
                     # Block when there are not enough elements.
                     # All TP/PP ranks must consume the same number of elements.
-                    item = q.get()
+                    if slot is None:
+                        item = q.get()
+                    else:
+                        # Lagged count: this rank reported the item as produced (I3).
+                        try:
+                            item = q.get_nowait()
+                        except Empty:
+                            lag.empty_get(slot)
+                            item = q.get()
+                        lag.take(slot, item)
                     yield item
 
         buffer_mode = self.host_memory_mode == "buffer_only"
@@ -3542,9 +4088,17 @@ class UnifiedRadixCache(BasePrefixCache):
                 request = operation.handle
                 hit_tokens = operation.storage_hit_count
                 info = self.ongoing_prefetch.get(request)
+                if self._prefetch_timing is not None:
+                    self._prefetch_timing.record("hit_drain", request.rid,
+                                                 agreed_tokens=hit_tokens,
+                                                 retired=info is None,
+                                                 local_miss=operation.local_miss_terminated)
                 if info is None:
                     if hit_tokens > 0:
                         self.discard_storage_prefetch_accounting(request)
+                    if operation.local_miss_terminated:
+                        # The agreed (zero) hit is the L3 verdict a drained miss records.
+                        self._account_prefetch_outcome(operation, revoked=True)
                     continue
                 if hit_tokens > 0:
                     self._record_storage_prefetch_hit(request, hit_tokens)
@@ -3618,7 +4172,13 @@ class UnifiedRadixCache(BasePrefixCache):
 
         def _drain_backup():
             drained = 0
-            for operation in _drain_queue(cc.ack_backup_queue, n_backup):
+            n = n_backup
+            if write_back is not None and n:
+                # A write-back wait inside this drain took acks off the queue
+                # front; they count against the n agreed before it.
+                n = max(0, n - (write_back.acks_taken - acks_taken_at_entry))
+            write_back_acks = []
+            for operation in _drain_queue(cc.ack_backup_queue, n):
                 drained += 1
                 if buffer_mode:
                     # Storage write acked: free the staging.
@@ -3628,6 +4188,25 @@ class UnifiedRadixCache(BasePrefixCache):
                     if entry is not None:
                         node_id, lock_params = entry
                         self.dec_host_lock_ref(node_id, lock_params)
+                    if write_back is not None:
+                        write_back_acks.append(operation)
+                    if (
+                        self._l3_tier_final is not None
+                        and operation.id in self._write_behind_inflight
+                    ):
+                        self._l3_tier_final.written_tokens += operation.completed_tokens
+                    self._write_behind_inflight.pop(operation.id, None)
+                    # Added unconditionally: completed_tokens can diverge across ranks on
+                    # backend failure and a divergent belief desyncs the rank collectives.
+                    if operation.hash_value:
+                        self.storage_existence_cache.pool(PoolName.KV).add(
+                            operation.hash_value
+                        )
+                    for transfer in operation.pool_transfers or ():
+                        if transfer.keys:
+                            self.storage_existence_cache.pool(transfer.name).add(
+                                transfer.keys
+                            )
                 if (
                     log_metrics
                     and self.enable_storage_metrics
@@ -3636,6 +4215,9 @@ class UnifiedRadixCache(BasePrefixCache):
                     self.storage_metrics_collector.log_backuped_tokens(
                         operation.completed_tokens
                     )
+            if write_back_acks:
+                # n is None only on the unsynchronized detach/shutdown drain.
+                write_back.on_backup_acks(write_back_acks, synced=n is not None)
             return drained
 
         def _drain_release():
@@ -3708,6 +4290,17 @@ class UnifiedRadixCache(BasePrefixCache):
             log_metrics=True,
         )
 
+    def enable_pp_lagged_drain(self, mode: str) -> None:
+        self._pp_lag = PPLaggedDrain(self.pp_rank, self.pp_size, mode)
+
+    def pp_lag_mark(self) -> Optional[list[int]]:
+        """Last stage: [epoch, *ring min] for the release consensus to PP0."""
+        return None if self._pp_lag is None else self._pp_lag.mark
+
+    def pp_lag_note_mark(self, mark: list) -> None:
+        if self._pp_lag is not None and self._pp_lag.index:
+            self._pp_lag.note_mark(mark)
+
     def drain_storage_control_queues_local(self) -> None:
         """Drain the storage control queues without cross-rank synchronization.
 
@@ -3765,6 +4358,16 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def shutdown(self) -> None:
         """Best-effort auto-detach of the storage backend on process shutdown."""
+        if self._storage_write_back is not None:
+            try:
+                self._storage_write_back.finish(reason="exit")
+            except Exception:
+                logger.exception("HiCache L3 write-back: final stats failed.")
+        if self._l3_tier_final is not None:
+            try:
+                self._l3_tier_final.finish(reason="exit")
+            except Exception:
+                logger.exception("HiCache L3 write-on-host-evict: final stats failed.")
         if self._storage_attachment is not None:
             self._storage_attachment.shutdown()
 
@@ -3818,10 +4421,21 @@ class UnifiedRadixCache(BasePrefixCache):
                 else ()
             )
 
+        lag = self._pp_lag
+        lag_slots: list[int] = []
+        if lag is not None and self.enable_storage and cc is not None and cc.ack_backup_queue is not None:
+            lag.begin(cc, extra_pool_names, self._storage_write_back)
+            if self.pp_rank == 0:
+                storage_queue_sizes, lag_slots = lag.pp0_counts(storage_queue_sizes)
+            else:
+                lag_slots = lag.placeholder()
+        else:
+            lag = None
+
         # Piggybacked TP check: [digest, -digest] MIN-reduces to [min, -max],
         # equal iff reclaim victim order matched on every rank.
         digest = self.tree_core.write_back_duplicate_reclaim_digest
-        exchange = self._shm_count_exchange()
+        exchange = self._shm_count_exchange() if lag is None else None
         if exchange is not None:
             values = [write_acks, load_acks, *storage_queue_sizes, *fold_u64(digest)]
             # Storage adds a count per extra host pool; a row wider than the table
@@ -3838,27 +4452,58 @@ class UnifiedRadixCache(BasePrefixCache):
                 write_acks,
                 load_acks,
                 *storage_queue_sizes,
+                *lag_slots,
                 digest,
                 -digest,
             ],
             dtype=torch.int64,
             device="cpu",
         )
+        fold = None
+        if lag is not None and self.pp_rank > 0:
+            offset = 2 + len(storage_queue_sizes)
+            fold = lambda data: data.copy_(
+                torch.tensor(lag.fold_values(data.tolist(), offset), dtype=torch.int64)
+            )
         if self.host_memory_mode == "buffer_only" and self.pp_size > 1:
             self._all_reduce_attn_groups(ready_counts, torch.distributed.ReduceOp.MIN)
+        elif self.pp_counts_piggyback:
+            ready_counts = self._piggyback_ready_counts(ready_counts, fold)
         else:
-            self._all_reduce(ready_counts, torch.distributed.ReduceOp.MIN)
+            self._all_reduce(ready_counts, torch.distributed.ReduceOp.MIN, fold)
 
         count_values = list(map(int, ready_counts.tolist()))
         assert digest == count_values[-2] and digest == -count_values[-1], (
             "write_back duplicate-reclaim victims diverged across PP/TP ranks"
         )
+        n_sizes = len(storage_queue_sizes)
+        sizes = tuple(count_values[2 : 2 + n_sizes])
+        if lag is not None:
+            lag.after_sync(count_values[2 + n_sizes : -2], sizes)
         return (
             count_values[0],
             count_values[1],
-            tuple(count_values[2:-2]),
+            sizes,
             extra_pool_names,
         )
+
+    def _piggyback_ready_counts(self, ready_counts: torch.Tensor, fold=None) -> torch.Tensor:
+        """Same values as _all_reduce: PP0 reduces over its attention TP/CP ranks
+        and every later stage adopts PP0's result, here taken from the request
+        relay received earlier in the same loop iteration."""
+        if self.pp_rank == 0:
+            self._all_reduce_attn_groups(ready_counts, torch.distributed.ReduceOp.MIN)
+            counts = ready_counts.tolist()
+        else:
+            assert self.pp_counts_in, "HiCache ready counts missing from the PP relay"
+            counts = self.pp_counts_in.popleft()
+            ready_counts = torch.tensor(counts, dtype=torch.int64, device="cpu")
+            if fold is not None:
+                fold(ready_counts)
+                counts = ready_counts.tolist()
+        if self.pp_rank + 1 < self.pp_size:
+            self.pp_counts_out.append(counts)
+        return ready_counts
 
     def _shm_count_exchange(self) -> Optional[ShmTagExchange]:
         # Only the single-group, single-stage layout; anything else keeps the gloo reduce.
@@ -3878,20 +4523,177 @@ class UnifiedRadixCache(BasePrefixCache):
         # the request broadcast stays on gloo there, a one-source broadcast does not gain.
         return get_shm_exchange(group, "hicache", multihost=True)
 
+    def wb_relaxed_fence_unmet(self) -> list[str]:
+        """Cache-side conditions of the relaxed fence's safety argument that
+        this cache does not meet (see Scheduler._enable_wb_relaxed_fence)."""
+        cc = self.cache_controller
+        checks = (
+            ("hicache-write-policy write_back", cc.write_policy == "write_back"),
+            ("PD prefill", get_disagg().disaggregation_mode == "prefill"),
+            ("python tree core", self._tree_core_backend == "python"),
+            (
+                "a Full-only tree (no SWA / Mamba)",
+                not self.is_swa_enabled and not self.is_mamba_enabled,
+            ),
+            ("no cache linker", self.linker is None),
+            ("host cache mode", self.buffer_pipeline is None),
+        )
+        return [name for name, ok in checks if not ok]
+
+    def enable_wb_relaxed_fence(self) -> None:
+        self._wb_relaxed = True
+        self._wb_fence_stats = WriteBackFenceStats()
+        self.cache_controller.wb_fence_stats = self._wb_fence_stats
+        if os.environ.get("SGLANG_HICACHE_ASYNC_WB_ACK", "0") == "1":
+            if self.buffer_pipeline is not None:
+                raise ValueError("SGLANG_HICACHE_ASYNC_WB_ACK needs host cache mode")
+            self._async_wb_ack = True
+            self.cache_controller.async_wb_ack = True
+            self.cache_controller.deferred_wb_acks = []
+            logger.info("HiCache write_back eviction: async ack on (SGLANG_HICACHE_ASYNC_WB_ACK)")
+        logger.info(
+            "HiCache write_back eviction: relaxed D2H fence on "
+            "(SGLANG_ENABLE_HICACHE_WB_EVICT_RELAXED_FENCE)"
+        )
+
+    def _defer_eviction_write_acks(self) -> None:
+        """writing_check(write_back=True) for eviction victims without the CPU wait:
+        submit, commit each write to the tree now (so the victims can be demoted and
+        their rows freed), keep the host copies host-locked, and defer the host-side
+        work (L3 pin, unlock, metrics) to _drain_deferred_wb_acks. Streams that reuse
+        the freed rows wait on the latest ack's event on the GPU (wait_wb_done)."""
+        cc = self.cache_controller
+        self._drain_deferred_wb_acks(before=cc.launch_seq)
+        stats = self._wb_fence_stats
+        if self._wb_evict_relaxed_fence():
+            self._wb_check_relaxed_victims(cc.write_queue)
+            stats.note_submit(cc.write_queue, relaxed=True)
+            cc.start_writing(fence_event=cc.forward_start_event)
+        else:
+            stats.note_submit(cc.write_queue, relaxed=False)
+            cc.start_writing()
+        for ack in cc.ack_write_queue:
+            cc.last_wb_done_event = ack.finish_event
+            host_parts = [
+                self._finish_write_through_tree_part(ack_id)
+                for ack_id in ack.node_ids
+                if ack_id in self.ongoing_write_through
+            ]
+            cc.deferred_wb_acks.append((cc.launch_seq, ack, host_parts))
+        cc.ack_write_queue.clear()
+        assert not self.ongoing_write_through, list(self.ongoing_write_through)
+
+    def _finish_write_through_tree_part(self, ack_id: int):
+        lock_node_id, lock_params, publish_node_ids = self.ongoing_write_through.pop(
+            ack_id
+        )
+        self.tree_core.finish_write_through(publish_node_ids, ack_id)
+        if lock_params is not None:
+            self.dec_lock_ref(lock_node_id, lock_params)
+        # Until the copy lands, its host rows must not be evicted, reused or read by L3.
+        host_locks = [
+            (node_id, self.inc_host_lock_ref(node_id).to_dec_params())
+            for node_id in publish_node_ids
+        ]
+        return publish_node_ids, host_locks
+
+    def _drain_deferred_wb_acks(self, before: Optional[int] = None) -> None:
+        """Finish deferred eviction acks submitted before launch ``before`` (all if
+        None). Decided by launch count only, never by event state, so every rank
+        drains the same acks; the wait is normally already satisfied."""
+        cc = self.cache_controller
+        if cc is None or not cc.deferred_wb_acks:
+            return
+        keep = []
+        for tag, ack, host_parts in cc.deferred_wb_acks:
+            if before is not None and tag >= before:
+                keep.append((tag, ack, host_parts))
+                continue
+            if self._wb_fence_stats is None:
+                ack.finish_event.synchronize()
+            else:
+                self._wb_fence_stats.timed_sync(ack.finish_event)
+            for publish_node_ids, host_locks in host_parts:
+                for node_id, params in host_locks:
+                    self.dec_host_lock_ref(node_id, params)
+                if self.enable_storage and self._storage_write_back is not None:
+                    self._storage_write_back.pin(publish_node_ids)
+                elif self.enable_storage and not self._l3_write_on_host_evict:
+                    for node_id in publish_node_ids:
+                        self.write_backup_storage(node_id)
+            self._log_write_ack_metrics(ack)
+        cc.deferred_wb_acks = keep
+
+    def _wb_evict_relaxed_fence(self) -> bool:
+        """With the fence on: whether device-eviction victims may fence their
+        D2H on the latest PP launch's forward-start event instead of the whole
+        forward stream.
+
+        A victim holds no lock, and in this profile a lock drops only after the
+        host saw the forward that wrote the pages finish; the in-flight forward
+        writes only its own requests' new pages or a chunked checkpoint, which
+        its request keeps locked.
+        """
+        return (
+            self.cache_controller.forward_start_event is not None
+            # Re-read: a PD role switch keeps this cache and flips the mode.
+            and get_disagg().disaggregation_mode == "prefill"
+        )
+
+    def _wb_check_relaxed_victims(self, ops: list[CacheOperation]) -> None:
+        """Fail loud before a relaxed-fence copy: a source node that is locked
+        (a request or load-back may still write it) or pending under a copy
+        outside this submission must not be read without the forward fence."""
+        queued = {node_id for op in ops for node_id in op.node_ids}
+        for node_id in queued:
+            node = self.tree_core.node_by_id(node_id)
+            locks = [cd.lock_ref for cd in node.component_data]
+            pending = node.write_through_pending_id
+            if any(locks) or (pending is not None and pending not in queued):
+                raise RuntimeError(
+                    f"relaxed write_back fence: node {node_id} has lock_ref "
+                    f"{locks} / pending write {pending}; refusing the copy"
+                )
+
+    def _flush_queued_writes_fenced(self) -> None:
+        # Writes queued before eviction keep the full fence; the relaxed submit
+        # must not carry them.
+        cc = self.cache_controller
+        if cc.write_queue:
+            self._wb_fence_stats.note_submit(cc.write_queue, relaxed=False)
+            cc.start_writing()
+
     def writing_check(
-        self, write_back: bool = False, finish_count: Optional[int] = None
+        self,
+        write_back: bool = False,
+        finish_count: Optional[int] = None,
+        relaxed_fence: bool = False,
     ) -> None:
-        """Poll write-through completions."""
+        """Poll write-through completions. Only device-eviction victims pass
+        ``relaxed_fence`` (see _wb_evict_relaxed_fence)."""
         cc = self.cache_controller
         if cc is None:
             return
+        if self._async_wb_ack:
+            self._drain_deferred_wb_acks(before=cc.launch_seq)
 
         if write_back:
             # Blocking: submit what is still queued, then wait for every ack.
-            cc.start_writing()
+            stats = self._wb_fence_stats
+            if relaxed_fence and self._wb_evict_relaxed_fence():
+                self._wb_check_relaxed_victims(cc.write_queue)
+                stats.note_submit(cc.write_queue, relaxed=True)
+                cc.start_writing(fence_event=cc.forward_start_event)
+            else:
+                if stats is not None:
+                    stats.note_submit(cc.write_queue, relaxed=False)
+                cc.start_writing()
             while self.ongoing_write_through:
                 for ack in cc.ack_write_queue:
-                    ack.finish_event.synchronize()
+                    if stats is None:
+                        ack.finish_event.synchronize()
+                    else:
+                        stats.timed_sync(ack.finish_event)
                     for ack_id in ack.node_ids:
                         if ack_id in self.ongoing_write_through:
                             self._finish_write_through_ack(ack_id)
@@ -3915,7 +4717,10 @@ class UnifiedRadixCache(BasePrefixCache):
         # Process completed acks
         while finish_count > 0:
             ack = cc.ack_write_queue.pop(0)
-            ack.finish_event.synchronize()
+            if self._wb_fence_stats is None:
+                ack.finish_event.synchronize()
+            else:
+                self._wb_fence_stats.timed_sync(ack.finish_event)
             for ack_id in ack.node_ids:
                 self._finish_write_through_ack(ack_id)
             self._log_write_ack_metrics(ack)
@@ -4134,6 +4939,10 @@ class UnifiedRadixCache(BasePrefixCache):
                 extra_release_counts=extra_release_counts,
                 log_metrics=True,
             )
+            if self._pp_lag is not None and self._pp_lag.index:
+                self._pp_lag.after_drain()
+        if self._l3_write_on_host_evict:
+            self._write_behind_host_tail()
         if self.buffer_pipeline is not None:
             self.buffer_pipeline.flush_pending_writes()
         if self.enable_storage_metrics and self.storage_metrics_collector is not None:
@@ -4148,12 +4957,19 @@ class UnifiedRadixCache(BasePrefixCache):
         """Submit pending D2H backups as a merged operation."""
         if self.linker is not None or self.cache_controller is None:
             return
+        if self._wb_fence_stats is not None:
+            self._wb_fence_stats.note_submit(
+                self.cache_controller.write_queue, relaxed=False
+            )
         self.cache_controller.start_writing()
 
     def ready_to_load_host_cache(self) -> int:
         """Notify the cache controller to start the KV cache loading."""
         if self.linker is not None:
             return self.linker.start_layer_wise_loading()
+        # Once per prefill batch on every rank: ages the existence beliefs.
+        self._belief_batch += 1
+        self.storage_existence_cache.set_step(self._belief_batch)
         if self.cache_controller is not None:
             return self.cache_controller.start_loading()
         return 0

@@ -148,10 +148,25 @@ class Memory(msgspec.Struct):
             ],
         ),
     ] = "page_first"
+    hicache_host_kv_dtype: A[
+        str,
+        Arg(
+            help=(
+                "Data type of the KV the HiCache host pool (and so L3) stores. "
+                "'auto' keeps the device KV bytes. 'nvfp4' stores FP8 MLA rows and "
+                "DSA index keys as NVFP4 (E2M1 with an E4M3 scale per 16 values, "
+                "1.78x fewer bytes per MLA row) and decodes them back to FP8 on "
+                "load; the device pool, attention and PD transfer stay FP8. "
+                "Requires --hicache-io-backend direct and --hicache-mem-layout "
+                "page_first_direct."
+            ),
+            choices=["auto", "nvfp4"],
+        ),
+    ] = "auto"
     hicache_storage_backend: A[
         Optional[str],
         Arg(
-            help="The storage backend for hierarchical KV cache. Built-in backends: file, fast_file, mooncake, npu_memcache, hf3fs, nixl, aibrix, tensorcast, seaweedfs. For dynamic backend, use --hicache-storage-backend-extra-config to specify: backend_name (custom name), module_path (Python module path), class_name (backend class name).",
+            help="The storage backend for hierarchical KV cache. Built-in backends: file, fast_file, mooncake, npu_memcache, hf3fs, nixl, nixl_dram, aibrix, tensorcast, seaweedfs. For dynamic backend, use --hicache-storage-backend-extra-config to specify: backend_name (custom name), module_path (Python module path), class_name (backend class name).",
             choices=[
                 "file",
                 "fast_file",
@@ -160,6 +175,7 @@ class Memory(msgspec.Struct):
                 "npu_memcache",
                 "hf3fs",
                 "nixl",
+                "nixl_dram",
                 "aibrix",
                 "dynamic",
                 "eic",

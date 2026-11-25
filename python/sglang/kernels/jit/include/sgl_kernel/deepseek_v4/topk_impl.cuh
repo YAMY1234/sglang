@@ -56,7 +56,14 @@ static_assert(SGL_TOPK_MODE >= 0 && SGL_TOPK_MODE <= 2, "SGL_TOPK_MODE must be 0
 // different modes can be loaded into one process without colliding.
 #define SGL_TOPK_CONCAT_IMPL(a, b) a##b
 #define SGL_TOPK_CONCAT(a, b) SGL_TOPK_CONCAT_IMPL(a, b)
+// A build with a non-default small-batch knob (topk_v2.cuh, SGL_TOPK_SB_FLOOR) passes SGL_TOPK_NS_TAG so its
+// symbols, and the per-device init statics of its launchers (one copy per process for identical mangled names),
+// stay its own.
+#ifdef SGL_TOPK_NS_TAG
+#define SGL_TOPK_MODE_NAMESPACE SGL_TOPK_CONCAT(SGL_TOPK_CONCAT(topk_mode_, SGL_TOPK_MODE), SGL_TOPK_NS_TAG)
+#else
 #define SGL_TOPK_MODE_NAMESPACE SGL_TOPK_CONCAT(topk_mode_, SGL_TOPK_MODE)
+#endif
 
 namespace sglang {
 
