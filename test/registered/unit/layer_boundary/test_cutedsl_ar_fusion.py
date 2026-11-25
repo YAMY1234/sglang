@@ -251,14 +251,16 @@ def test_finalize_handoff_is_a_producer_capability(eligible):
         assert fusion.can_defer_finalize(comm, _DECODE)
 
 
-def test_ep_finalize_switch_does_not_bypass_runtime_capability_gate():
+def test_ep_finalize_follows_the_runtime_capability_gate():
     fusion = CuteDSLFusion()
-    with (
-        envs.SGLANG_OPT_CUTEDSL_EP_DEFERRED_FINALIZE.override(True),
-        patch.object(CuteDSLFusion, "_eligible", return_value=False),
-        patch(f"{_MODULE}.get_parallel", return_value=SimpleNamespace(moe_ep_size=4)),
-    ):
-        assert not fusion._finalize_eligible(object(), _DECODE, 8)
+    for eligible in (False, True):
+        with (
+            patch.object(CuteDSLFusion, "_eligible", return_value=eligible),
+            patch(
+                f"{_MODULE}.get_parallel", return_value=SimpleNamespace(moe_ep_size=4)
+            ),
+        ):
+            assert fusion._finalize_eligible(object(), _DECODE, 8) == eligible
 
 
 def test_install_does_not_require_a_fused_successor():

@@ -1679,11 +1679,6 @@ class Envs:
     # The [M*top_k, hidden] HBM round trip pays only at small M; 0 disables.
     # GLM-5.2 (H=6144): neutral at 192 on B300 TP8, crossover 192-223 on GB300 TP4.
     SGLANG_MOE_DEFERRED_FINALIZE_MAX_TOKENS = EnvInt(192)
-    # Let the CuTe DSL fused MoE finalize consume expert-parallel handoffs.
-    # Unset follows the NVIDIA runtime master; an explicit value wins.
-    SGLANG_OPT_CUTEDSL_EP_DEFERRED_FINALIZE = EnvBool(
-        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
-    )
     # DeepSeek/GLM MoE (deepseek_v2.py): quantize the (dp-gathered) MoE input
     # to per-token-group-128 fp8 ONCE and feed both the fused shared-expert
     # GEMM (cutlass w8a8 linear) and the routed experts' triton fused runner,
@@ -2769,7 +2764,12 @@ class _DeprecatedEnv:
 # ad-hoc warnings. For a rename where the old name must keep working through a
 # descriptor, use EnvBoolWithAlias / EnvIntWithAlias instead. Once the
 # deprecation period ends, move the entry to REMOVED_ENVS.
-_DEPRECATED_ENVS: Dict[str, _DeprecatedEnv] = {}
+_DEPRECATED_ENVS: Dict[str, _DeprecatedEnv] = {
+    "SGLANG_OPT_CUTEDSL_EP_DEFERRED_FINALIZE": _DeprecatedEnv(
+        note="The CuTe DSL fused MoE finalize always takes expert-parallel handoffs "
+        "where its capability checks pass; unset it."
+    ),
+}
 
 
 def _handle_deprecated_envs():
