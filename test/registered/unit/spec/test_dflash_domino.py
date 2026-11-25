@@ -139,9 +139,7 @@ class TestDFlashDominoWeights(CustomTestCase):
         # The corrector and loader are independent of the attention backend and TP.
         with (
             patch.object(DFlash2DominoDraftModel, "decoder_layer_cls") as layer_cls,
-            patch.object(
-                DFlash2DominoDraftModel, "_resolve_fc_tp_columns", return_value=None
-            ),
+            patch.object(DFlash2DominoDraftModel, "_fc_tp_columns", return_value=None),
         ):
             layer_cls.return_value = nn.Module()
             layer_cls.return_value.self_attn = nn.Identity()
