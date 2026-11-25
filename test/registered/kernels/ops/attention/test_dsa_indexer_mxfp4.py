@@ -408,5 +408,82 @@ def test_one_block_logits_bitwise_deepgemm(next_n):
         assert torch.equal(x, y), (b, int((x != y).sum()))
 
 
+@pytest.mark.parametrize("next_n", [1, 3, 6, 7])
+@pytest.mark.parametrize("fp8", [False, True])
+def test_one_block_row_split_bitwise(fp8, next_n):
+    """The row-split epilogue (math warpgroups split the rows, weights in registers) writes bitwise
+    the logits of the key-split epilogue, for the FP8 and the MXFP4 one-block kernels."""
+    _skip()
+    import deep_gemm
+
+    from sglang.kernels.ops.attention.dsa import paged_mqa_logits_1blk as p1b
+    from sglang.kernels.ops.attention.dsa.indexer_mxfp4 import q_quant_mxfp4
+
+    H = 32
+    ctx = [700, 64, 1500, 129, 3000, 2049, 5, 255, 256, 9000]
+    B = len(ctx)
+    lens = [c + next_n - 1 for c in ctx]
+    cache, table, _, _ = _paged_mxfp4_cache(lens, seed=200 + next_n)
+    g = torch.Generator(device="cuda").manual_seed(13)
+    rows = B * next_n
+    q = torch.randn(rows, H, D, device="cuda", generator=g).to(torch.bfloat16)
+    ctx_2d = torch.tensor(
+        [[c + j for j in range(next_n)] for c in ctx], device="cuda", dtype=torch.int32
+    )
+    sched = deep_gemm.get_paged_mqa_logits_metadata(
+        ctx_2d, PAGE, deep_gemm.get_num_sms()
+    )
+    max_len = table.shape[1] * PAGE
+    w = torch.randn(rows, H, device="cuda", generator=g)
+    if fp8:
+        kv = torch.randint(
+            0,
+            256,
+            (cache.shape[0], PAGE * (D + 4)),
+            dtype=torch.uint8,
+            device="cuda",
+            generator=g,
+        )
+        kv[:, PAGE * D :].view(torch.float32).copy_(
+            torch.rand(cache.shape[0], PAGE, device="cuda", generator=g) + 0.5
+        )
+        kv[:, : PAGE * D] &= 0x77
+        q8 = q.view(B, next_n, H, D).to(torch.float8_e4m3fn)
+        run = (
+            lambda rs: p1b.fp8_paged_mqa_logits_1blk(  # noqa: E731
+                q8,
+                kv.view(-1, PAGE, 1, D + 4),
+                w,
+                ctx_2d,
+                table,
+                sched,
+                max_len,
+                config=p1b.default_config(next_n)[:4] + (rs,),
+            )
+        )
+    else:
+        q4, q_sf, _ = q_quant_mxfp4(q, w.to(torch.bfloat16), 1.0)
+        run = (
+            lambda rs: p1b.fp4_paged_mqa_logits_1blk(  # noqa: E731
+                q4.view(torch.int8).view(B, next_n, H, D // 2),
+                q_sf.view(B, next_n, H),
+                cache.view(-1, PAGE, 1, 68),
+                w,
+                ctx_2d,
+                table,
+                sched,
+                max_len,
+                config=p1b.default_config_mxfp4(next_n)[:4] + (rs,),
+            )
+        )
+    ref, out = run(False), run(True)
+    torch.cuda.synchronize()
+    for b in range(B):
+        cols = min(-(-int(ctx_2d[b, -1]) // 256) * 256, max_len)
+        x = ref[b * next_n : (b + 1) * next_n, :cols].contiguous().view(torch.int32)
+        y = out[b * next_n : (b + 1) * next_n, :cols].contiguous().view(torch.int32)
+        assert torch.equal(x, y), (b, int((x != y).sum()))
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))

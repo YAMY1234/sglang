@@ -140,12 +140,12 @@ def default_config_mxfp4(next_n: int) -> tuple[int, int, int, bool, bool]:
 
     DeepGEMM's FP4 stages (3 Q, 10 KV) fit 227 KB up to next_n 8. TMEM holds the accumulators plus
     the Q and KV scale factors (align(next_n x 32, 128) / 32 + 8 columns): 3 stages up to next_n 5.
-    Row split as in ``default_config``.
+    Row split as in ``default_config``, on: the MXFP4 kernel is bound by its epilogue (R100 x 6 rows: 57 -> 49 us).
     """
     n = next_n * NUM_HEADS
     sf_cols = -(-n // 128) * 128 // 32 + SPLIT_KV // 32
     tmem_stages = 3 if 3 * n + sf_cols <= 512 else 2
-    return 3, 10, tmem_stages, next_n > 5, False
+    return 3, 10, tmem_stages, next_n > 5, True
 
 
 @cache_once
