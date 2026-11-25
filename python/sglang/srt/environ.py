@@ -1850,19 +1850,6 @@ class Envs:
     SGLANG_OPT_SPEC_PACKED_VERIFY_BCAST = EnvBool(
         SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
     )
-    # The scheduler's per-pass TP syncs (request broadcast size, HiCache ready counts)
-    # through a shared-memory table when the group shares a host (shm_tag_exchange.py).
-    SGLANG_OPT_SCHEDULER_SHM_SYNC = EnvBool(
-        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
-    )
-    # With SGLANG_OPT_SCHEDULER_SHM_SYNC, a group across hosts exchanges per host and only
-    # the host leaders meet (HierTagExchange); with two hosts, optionally over one TCP link.
-    SGLANG_OPT_SCHEDULER_SHM_SYNC_MULTIHOST = EnvBool(
-        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
-    )
-    SGLANG_OPT_SCHEDULER_SHM_SYNC_LEADER_TCP = EnvBool(
-        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
-    )
     # PD decode optimizations follow the shared switch unless explicitly disabled.
     SGLANG_ENABLE_NV_MEGA_PDDEC_RUNTIME_OPTIMIZATION = EnvBool(True)
     # Reuse the resolved CPU sequence lengths for FlashInfer draft planning,
@@ -2769,7 +2756,17 @@ class _DeprecatedEnv:
 # ad-hoc warnings. For a rename where the old name must keep working through a
 # descriptor, use EnvBoolWithAlias / EnvIntWithAlias instead. Once the
 # deprecation period ends, move the entry to REMOVED_ENVS.
-_DEPRECATED_ENVS: Dict[str, _DeprecatedEnv] = {}
+_DEPRECATED_ENVS: Dict[str, _DeprecatedEnv] = {
+    name: _DeprecatedEnv(
+        note="The scheduler's TP syncs always go through shared memory where they "
+        "can; unset it."
+    )
+    for name in (
+        "SGLANG_OPT_SCHEDULER_SHM_SYNC",
+        "SGLANG_OPT_SCHEDULER_SHM_SYNC_MULTIHOST",
+        "SGLANG_OPT_SCHEDULER_SHM_SYNC_LEADER_TCP",
+    )
+}
 
 
 def _handle_deprecated_envs():
@@ -2827,9 +2824,9 @@ REMOVED_ENVS: Dict[str, str] = {
     "SGLANG_Q35MF_EDGE_CHAIN_TREE": "use SGLANG_OPT_TRTLLM_MHA_CHAIN_VERIFY",
     "SGLANG_Q35MF_EDGE_SPARSE_VERIFY_SAMPLING": "use SGLANG_OPT_SPEC_COMPACT_VERIFY_SAMPLING",
     "SGLANG_Q35MF_EDGE_PACKED_VERIFY_BCAST": "use SGLANG_OPT_SPEC_PACKED_VERIFY_BCAST",
-    "SGLANG_Q35MF_EDGE_SHM_SYNC": "use SGLANG_OPT_SCHEDULER_SHM_SYNC",
-    "SGLANG_Q35MF_EDGE_SHM_SYNC_MULTIHOST": "use SGLANG_OPT_SCHEDULER_SHM_SYNC_MULTIHOST",
-    "SGLANG_Q35MF_EDGE_MULTIHOST_TCP": "use SGLANG_OPT_SCHEDULER_SHM_SYNC_LEADER_TCP",
+    "SGLANG_Q35MF_EDGE_SHM_SYNC": "the path always runs now; unset it",
+    "SGLANG_Q35MF_EDGE_SHM_SYNC_MULTIHOST": "the path always runs now; unset it",
+    "SGLANG_Q35MF_EDGE_MULTIHOST_TCP": "the path always runs now; unset it",
     "SGLANG_USE_TRITON_ROUTER_SUM": "use SGLANG_USE_CUSTOM_ROUTER_SUM",
     "SGL_DSA_TOPK_ROW_SPLIT": "use SGLANG_DSA_TOPK_ROW_SPLIT",
 }

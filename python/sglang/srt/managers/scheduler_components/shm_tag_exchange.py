@@ -13,10 +13,10 @@ loads and stores. The table is double-buffered by sequence parity: a rank can
 reuse a slot only after every rank has published the next call, which a rank
 does only after it has finished reading the previous call.
 
-Enabled by SGLANG_OPT_SCHEDULER_SHM_SYNC=1 (default off). Groups that span hosts
-keep the stock gloo path unless SGLANG_OPT_SCHEDULER_SHM_SYNC_MULTIHOST=1 is also
-set: then each host exchanges through shared memory and only the host leaders
-meet in one small gloo all_gather (HierTagExchange).
+Groups that span hosts exchange through shared memory on each host, and only the
+host leaders meet (HierTagExchange): in one small gloo all_gather, or over one TCP
+link when there are two hosts. A caller that cannot make the hierarchical exchange
+collective (multihost=False) keeps the gloo path for such a group.
 """
 
 from __future__ import annotations
@@ -34,7 +34,6 @@ from unittest.mock import patch
 import torch
 import torch.distributed as dist
 
-from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_device
 
 logger = logging.getLogger(__name__)
@@ -225,11 +224,7 @@ class HierTagExchange:
         )
         # Two hosts: the leaders swap rows over one TCP connection instead of a gloo all_gather.
         self.link = None
-        if (
-            self.is_leader
-            and len(self.members) == 2
-            and envs.SGLANG_OPT_SCHEDULER_SHM_SYNC_LEADER_TCP.get()
-        ):
+        if self.is_leader and len(self.members) == 2:
             self.link = _LeaderLink(self.leaders, host == 0, self.local.timeout_s)
 
     def allgather(self, values: Sequence[int]) -> List[List[int]]:
@@ -265,17 +260,15 @@ def get_shm_exchange(
     group: Optional[dist.ProcessGroup], kind: str, multihost: bool = False
 ):
     """Collective on first call per (group, kind): every rank of the group must call it
-    at the same point. Returns None (stock path) when disabled, under --sleep-on-idle,
-    or when the group spans hosts and the caller did not opt in with multihost=True."""
+    at the same point. Returns None (stock path) under --sleep-on-idle, or when the
+    group spans hosts and the caller did not opt in with multihost=True."""
     if group is None:
         return None
     key = (id(group), kind)
     if key not in _EXCHANGES:
         if (
-            not envs.SGLANG_OPT_SCHEDULER_SHM_SYNC.get()
             # an idle rank 0 sleeps in its poller; the waiting ranks would spin meanwhile
-            or get_device().sleep_on_idle
-            or dist.get_world_size(group) <= 1
+            get_device().sleep_on_idle or dist.get_world_size(group) <= 1
         ):
             _EXCHANGES[key] = None
         else:
@@ -289,11 +282,7 @@ def get_shm_exchange(
                     kind,
                     dist.get_world_size(group),
                 )
-            elif (
-                multihost
-                and envs.SGLANG_OPT_SCHEDULER_SHM_SYNC_MULTIHOST.get()
-                and dist.get_world_size() == dist.get_world_size(group)
-            ):
+            elif multihost and dist.get_world_size() == dist.get_world_size(group):
                 # Only when this group is the whole default group, so the subgroup
                 # creation inside is collective over exactly these ranks.
                 _EXCHANGES[key] = HierTagExchange(group, kind)

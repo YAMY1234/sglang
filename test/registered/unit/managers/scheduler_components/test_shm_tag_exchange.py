@@ -14,7 +14,6 @@ import torch
 import torch.distributed
 import torch.multiprocessing
 
-from sglang.srt.environ import envs
 from sglang.srt.managers.scheduler_components import shm_tag_exchange
 from sglang.srt.managers.scheduler_components.request_receiver import (
     SchedulerRequestReceiver,
@@ -88,11 +87,7 @@ def _sync_hicache_ready_counts(rank: int, init_file: str) -> None:
         backend="gloo", init_method=Path(init_file).as_uri(), rank=rank, world_size=2
     )
     try:
-        with (
-            envs.SGLANG_OPT_SCHEDULER_SHM_SYNC.override(True),
-            _sleep_on_idle(False),
-            _shm_names(),
-        ):
+        with _sleep_on_idle(False), _shm_names():
             # A row holds 6 ready counts, one more per extra host pool, and the folded
             # digest's 2 words: 8, 9 and 10 values here. The shm table holds 8.
             for extra_pools in (0, 1, 2):
@@ -117,12 +112,11 @@ def _exchange_rounds(rank: int, init_file: str) -> None:
     )
     group = torch.distributed.group.WORLD
     try:
-        with envs.SGLANG_OPT_SCHEDULER_SHM_SYNC.override(True):
-            # --sleep-on-idle keeps the gloo path: the other ranks would spin
-            with _sleep_on_idle(True):
-                assert shm_tag_exchange.get_shm_exchange(group, "idle") is None
-            with _sleep_on_idle(False), _shm_names():
-                exchange = shm_tag_exchange.get_shm_exchange(group, "rounds")
+        # --sleep-on-idle keeps the gloo path: the other ranks would spin
+        with _sleep_on_idle(True):
+            assert shm_tag_exchange.get_shm_exchange(group, "idle") is None
+        with _sleep_on_idle(False), _shm_names():
+            exchange = shm_tag_exchange.get_shm_exchange(group, "rounds")
         assert isinstance(exchange, ShmTagExchange)
         # a broken protocol fails here instead of waiting out the 30-minute default
         exchange.timeout_s = 30.0
@@ -147,26 +141,20 @@ def _exchange_rounds(rank: int, init_file: str) -> None:
 
 
 class TestShmTagExchange(CustomTestCase):
-    def test_request_receiver_opts_into_multihost_exchange_with_runtime_switch(self):
+    def test_request_receiver_opts_into_multihost_exchange(self):
         cpu_group = object()
         tp_group = SimpleNamespace(cpu_group=cpu_group, rank=0, ranks=list(range(8)))
         parallel = SimpleNamespace(attn_dp_enabled=False, tp_size=8, tp_group=tp_group)
         exchange, requests = object(), [{"rid": "a"}]
         module = "sglang.srt.managers.scheduler_components.request_receiver."
-        for enabled in (False, True):
-            with (
-                patch(module + "get_parallel", return_value=parallel),
-                patch(
-                    module + "get_shm_exchange", return_value=exchange
-                ) as get_exchange,
-                patch(module + "_broadcast_via_exchange", return_value=requests),
-                envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.override(enabled),
-            ):
-                got = SchedulerRequestReceiver._broadcast_reqs_across_ranks(
-                    None, requests
-                )
-            self.assertEqual(got, requests)
-            self.assertEqual(get_exchange.call_args.kwargs["multihost"], enabled)
+        with (
+            patch(module + "get_parallel", return_value=parallel),
+            patch(module + "get_shm_exchange", return_value=exchange) as get_exchange,
+            patch(module + "_broadcast_via_exchange", return_value=requests),
+        ):
+            got = SchedulerRequestReceiver._broadcast_reqs_across_ranks(None, requests)
+        self.assertEqual(got, requests)
+        self.assertTrue(get_exchange.call_args.kwargs["multihost"])
 
     def test_rounds_and_request_broadcast_match_on_every_rank(self):
         """Every rank reads every rank's values of each call, through repeated reuse
