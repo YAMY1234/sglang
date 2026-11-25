@@ -1112,6 +1112,8 @@ CUTLASS_DEVICE void radix_pick_bin(const uint32_t* hist, uint32_t remaining, uin
 }
 
 constexpr uint32_t kSelectThreads = 256;
+// fstk_select_fast_kernel gathers a shared-memory row sub-list by sub-list when it has at most this many.
+constexpr uint32_t kSelectGatherSubs = 4;
 constexpr uint32_t kSelectWarps = kSelectThreads / 32;
 // Keys a row may hold in the select kernel's shared memory: 64 KiB for the main select (several
 // CTAs per SM), 128 KiB for the repair select (rows of up to 4 full sub-lists). A row with more
@@ -1346,7 +1348,7 @@ __global__ __launch_bounds__(kThreads, kMinBlocks) void fstk_select_fast_kernel(
   auto* s_small = s_keys + (kSmemKeys ? kChunk : 0);
   __shared__ __align__(16) uint32_t hist[3][256];
   __shared__ uint64_t s_or[kWarps], s_and[kWarps];
-  __shared__ uint32_t s_cnt[kItems][kWarps];
+  __shared__ uint32_t s_warp_taken[kWarps];
   __shared__ uint32_t s_small_n;
 
   const uint32_t tx = threadIdx.x;
@@ -1396,6 +1398,7 @@ __global__ __launch_bounds__(kThreads, kMinBlocks) void fstk_select_fast_kernel(
       k[i] = t < n ? select_gather(row_keys, off, p.cand_sub_cap, t) : 0ull;
     }
   };
+  // Keys of chunk cb for one pass; items >= live(cb) are past the row's end for every thread.
   const auto fetch = [&](uint32_t cb) {
     if (not resident) {
       load_chunk(cb);
@@ -1404,20 +1407,46 @@ __global__ __launch_bounds__(kThreads, kMinBlocks) void fstk_select_fast_kernel(
       for (uint32_t i = 0; i < kItems; ++i) k[i] = s_keys[i * kThreads + tx];
     }
   };
+  const auto live = [&](uint32_t cb) { return min(kItems, (n - cb + kThreads - 1) / kThreads); };
 
-  load_chunk(0);
-  if (kSmemKeys and resident) {
-#pragma unroll
-    for (uint32_t i = 0; i < kItems; ++i) s_keys[i * kThreads + tx] = k[i];
-  }
   // Bits set in some key and clear in another: the radix steps start at the highest one.
   uint64_t k_or = 0, k_and = ~0ull;
-#pragma unroll 1
-  for (uint32_t cb = 0; cb < n; cb += kChunk) {
-    if (cb > 0) load_chunk(cb);
+  if (kSmemKeys and resident and p.num_sub <= kSelectGatherSubs) {
+    // Sub-list by sub-list into shared memory (no per-key sub-list search), first 4 x kThreads keys
+    // of every sub-list in flight together.
+    constexpr uint32_t kPerSub = 4;
+    uint64_t v[kSelectGatherSubs][kPerSub];
 #pragma unroll
-    for (uint32_t i = 0; i < kItems; ++i) {
-      if (cb + i * kThreads + tx < n) k_or |= k[i], k_and &= k[i];
+    for (uint32_t w = 0; w < kSelectGatherSubs; ++w) {
+      const uint32_t cw = __shfl_sync(0xffffffffu, c, w);
+#pragma unroll
+      for (uint32_t g = 0; g < kPerSub; ++g) {
+        const uint32_t j = g * kThreads + tx;
+        v[w][g] = j < cw ? row_keys[w * p.cand_sub_cap + j] : 0ull;
+      }
+    }
+#pragma unroll
+    for (uint32_t w = 0; w < kSelectGatherSubs; ++w) {
+      const uint32_t cw = __shfl_sync(0xffffffffu, c, w);
+#pragma unroll
+      for (uint32_t g = 0; g < kPerSub; ++g) {
+        const uint32_t j = g * kThreads + tx;
+        if (j < cw) s_keys[off[w] + j] = v[w][g], k_or |= v[w][g], k_and &= v[w][g];
+      }
+      for (uint32_t j = kPerSub * kThreads + tx; j < cw; j += kThreads) {
+        const uint64_t key = row_keys[w * p.cand_sub_cap + j];
+        s_keys[off[w] + j] = key, k_or |= key, k_and &= key;
+      }
+    }
+  } else {
+#pragma unroll 1
+    for (uint32_t cb = 0; cb < n; cb += kChunk) {
+      load_chunk(cb);
+#pragma unroll
+      for (uint32_t i = 0; i < kItems; ++i) {
+        if (cb + i * kThreads + tx < n) k_or |= k[i], k_and &= k[i];
+        if (kSmemKeys and resident) s_keys[i * kThreads + tx] = k[i];
+      }
     }
   }
 #pragma unroll
@@ -1452,8 +1481,10 @@ __global__ __launch_bounds__(kThreads, kMinBlocks) void fstk_select_fast_kernel(
 #pragma unroll 1
       for (uint32_t cb = 0; cb < n; cb += kChunk) {
         fetch(cb);
+        const uint32_t items = live(cb);
 #pragma unroll
         for (uint32_t i = 0; i < kItems; ++i) {
+          if (i >= items) break;
           const bool in = cb + i * kThreads + tx < n and (k[i] & prefix_mask) == prefix;
           const uint32_t bin = static_cast<uint32_t>((k[i] >> shift) & dmask);
           if constexpr (kPlainAtomics) {
@@ -1482,8 +1513,10 @@ __global__ __launch_bounds__(kThreads, kMinBlocks) void fstk_select_fast_kernel(
 #pragma unroll 1
         for (uint32_t cb = 0; cb < n; cb += kChunk) {
           fetch(cb);
+          const uint32_t items = live(cb);
 #pragma unroll
           for (uint32_t i = 0; i < kItems; ++i) {
+            if (i >= items) break;
             const bool in = cb + i * kThreads + tx < n and (k[i] & prefix_mask) == prefix;
             const uint32_t m = __ballot_sync(0xffffffffu, in);
             uint32_t at = 0;
@@ -1500,47 +1533,44 @@ __global__ __launch_bounds__(kThreads, kMinBlocks) void fstk_select_fast_kernel(
   }
 
   // The keys >= prefix under the bits fixed so far are exactly the top-k (the last bin is taken
-  // whole); item i of warp w lands after items < i of all warps and item i of warps < w.
+  // whole). Output order: chunk, then warp, then item, then lane.
   const uint32_t lanes_below = (1u << lane) - 1u;
   uint32_t base = 0;
 #pragma unroll 1
   for (uint32_t cb = 0; cb < n; cb += kChunk) {
     fetch(cb);
-    uint32_t m[kItems], mine = 0;
+    const uint32_t items = live(cb);
+    uint32_t m[kItems], warp_total = 0;
 #pragma unroll
     for (uint32_t i = 0; i < kItems; ++i) {
+      if (i >= items) break;
       m[i] = __ballot_sync(0xffffffffu, cb + i * kThreads + tx < n and (k[i] & prefix_mask) >= prefix);
-      if (lane == i) mine = __popc(m[i]);
+      warp_total += __popc(m[i]);
     }
-    if (lane < kItems) s_cnt[lane][warp] = mine;
-    __syncthreads();
-    uint32_t tot = 0, before = 0;
-    if (lane < kItems) {
-#pragma unroll
-      for (uint32_t w = 0; w < kWarps; ++w) {
-        const uint32_t x = s_cnt[lane][w];
-        tot += x;
-        before += w < warp ? x : 0u;
-      }
-    }
-    uint32_t inc = tot;
-#pragma unroll
-    for (int o = 1; o < 32; o <<= 1) {
-      const uint32_t x = __shfl_up_sync(0xffffffffu, inc, o);
-      if (lane >= static_cast<uint32_t>(o)) inc += x;
-    }
-    const uint32_t item_base = base + inc - tot + before;
+    if (lane == 0) s_warp_taken[warp] = warp_total;
     // Every page-table load before the first store (out may alias the table for the compiler).
     int32_t slot[kItems];
 #pragma unroll
-    for (uint32_t i = 0; i < kItems; ++i) slot[i] = (m[i] >> lane) & 1u ? to_slot(~static_cast<uint32_t>(k[i])) : 0;
+    for (uint32_t i = 0; i < kItems; ++i) {
+      if (i >= items) break;
+      slot[i] = (m[i] >> lane) & 1u ? to_slot(~static_cast<uint32_t>(k[i])) : 0;
+    }
+    __syncthreads();
+    uint32_t at = base, chunk_total = 0;
+#pragma unroll
+    for (uint32_t w = 0; w < kWarps; ++w) {
+      const uint32_t x = s_warp_taken[w];
+      at += w < warp ? x : 0u;
+      chunk_total += x;
+    }
 #pragma unroll
     for (uint32_t i = 0; i < kItems; ++i) {
-      const uint32_t ib = __shfl_sync(0xffffffffu, item_base, i);
-      if ((m[i] >> lane) & 1u) out[ib + __popc(m[i] & lanes_below)] = slot[i];
+      if (i >= items) break;
+      if ((m[i] >> lane) & 1u) out[at + __popc(m[i] & lanes_below)] = slot[i];
+      at += __popc(m[i]);
     }
-    base += __shfl_sync(0xffffffffu, inc, 31);
-    if (cb + kChunk < n) __syncthreads();  // s_cnt is rewritten by the next chunk
+    base += chunk_total;
+    if (cb + kChunk < n) __syncthreads();  // s_warp_taken is rewritten by the next chunk
   }
 }
 
