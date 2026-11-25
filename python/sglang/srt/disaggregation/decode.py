@@ -4802,12 +4802,31 @@ class SchedulerDisaggregationDecodeMixin:
             # before the next one, without parking the host behind that forward.
             self.forward_stream.wait_stream(self.schedule_stream)
             with self.forward_stream_ctx:
+                self._fill_swa_e4m3_copy(batch)
                 batch.process_prebuilt(self.future_map)
             batch.req_pool_indices.record_stream(self.forward_stream)
             batch.seq_lens.record_stream(self.forward_stream)
         else:
+            self._fill_swa_e4m3_copy(batch)
             batch.process_prebuilt(self.future_map)
         return batch
+
+    def _fill_swa_e4m3_copy(self: Scheduler, batch: ScheduleBatch) -> None:
+        """SGLANG_OPT_DSV41_SWA_E4M3_COPY: the admitted requests' SWA window rows arrived by
+        transfer or host restore, which skip the store kernels; write their e4m3 copy before the
+        first decode reads it."""
+        kv_pool = self.token_to_kv_pool_allocator.get_kvcache()
+        if not isinstance(kv_pool, DeepSeekV4TokenToKVPool) or kv_pool.swa_e4m3 is None:
+            return
+        req_to_token = self.req_to_token_pool.req_to_token
+        # The window plus a few rows of margin; rows not yet written are rewritten by the store kernels
+        span = kv_pool.sliding_window + 4
+        locs = []
+        for req in batch.reqs:
+            end = len(req.origin_input_ids) + len(req.output_ids)
+            locs.append(req_to_token[req.req_pool_idx, max(0, end - span) : end])
+        if locs:
+            kv_pool.fill_swa_e4m3_copy(torch.cat(locs))
 
     def _nonblocking_admit_in_scope(self: Scheduler, batch: ScheduleBatch) -> bool:
         # EAGLE's seed uses pinned async_h2d_stack already. Other seed paths,

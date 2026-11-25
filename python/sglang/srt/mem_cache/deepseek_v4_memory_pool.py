@@ -22,6 +22,7 @@ from sglang.kernels.ops.attention.dsv4 import (
     fused_qkv_norm_flashmla,
     fused_store_cache,
 )
+from sglang.kernels.ops.attention.dsv4.swa_e4m3_fill import swa_e4m3_fill
 from sglang.kernels.ops.attention.dsv4.kv_layout import (
     KVLayout,
     is_valid_kv_layout_pair,
@@ -2195,10 +2196,12 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             or _is_hip
         ):
             why = "needs the paged, interleaved V4.1 fp8 SWA pool (CUDA)"
-        elif get_disagg().disaggregation_mode == "decode":
-            why = "PD decode receives SWA rows without the store kernels"
-        elif get_server_args().enable_hierarchical_cache:
-            why = "HiCache loads SWA rows back without the store kernels"
+        elif (
+            get_server_args().enable_hierarchical_cache
+            and get_disagg().disaggregation_mode != "decode"
+        ):
+            # PD decode fills the copy at admission, after every restore (fill_swa_e4m3_copy)
+            why = "HiCache load-back outside PD decode lands SWA rows without the store kernels"
         if why is not None:
             logger.warning("SGLANG_OPT_DSV41_SWA_E4M3_COPY is off: %s", why)
             return
@@ -2219,6 +2222,15 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                     )
                 )
         self.swa_e4m3 = copies
+        self._swa_e4m3_cache_ptrs = torch.tensor(
+            [buf.data_ptr() for buf in self.swa_kv_pool.kv_buffer],
+            dtype=torch.int64,
+            device=device,
+        )
+        self._swa_e4m3_copy_ptrs = torch.tensor(
+            [c.data_ptr() for c in copies], dtype=torch.int64, device=device
+        )
+        self._swa_page_bytes = self.swa_kv_pool.kv_buffer[0].shape[1]
         logger.info(
             "DSV4 SWA e4m3 copy: %d layers x %s, %.2f GB",
             len(copies),
@@ -2233,6 +2245,21 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             return None
         copy = self.swa_e4m3[self._swa_local_layer_id(layer_id)]
         return copy[:, : self.swa_kv_pool.page_size].unsqueeze(2)
+
+    def fill_swa_e4m3_copy(self, full_locs: torch.Tensor) -> None:
+        """Write the e4m3 copy of the SWA rows at `full_locs` (full-pool token locations), every
+        SWA layer in one launch: for rows that reached the SWA cache by PD transfer or a host
+        restore, which bypass the store kernels."""
+        if self.swa_e4m3 is None or full_locs.numel() == 0:
+            return
+        swa_e4m3_fill(
+            slots=self.translate_loc_from_full_to_swa(full_locs).to(torch.int32),
+            cache_ptrs=self._swa_e4m3_cache_ptrs,
+            copy_ptrs=self._swa_e4m3_copy_ptrs,
+            page_size=self.swa_kv_pool.page_size,
+            page_bytes=self._swa_page_bytes,
+            bytes_per_token=self.kv_layout.bytes_per_token,
+        )
 
     def _swa_e4m3_store_target(self, layer_id: int) -> Optional[torch.Tensor]:
         return (
