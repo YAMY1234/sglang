@@ -228,7 +228,9 @@ class TestCorrectorContext(unittest.TestCase):
             pool=SimpleNamespace(maybe_get_custom_mem_pool=lambda: None),
             req_pool_rows=2,
         )
-        generations = torch.zeros(2, dtype=torch.long)
+        # A slot's window belongs to the request in it (this tree's draft KV ring keys
+        # the floors by request id): a new id in a used slot starts a new window.
+        rids = {0: "a", 1: "b"}
 
         def write(locs, values):
             features = torch.tensor(values, dtype=torch.float32)[:, None]
@@ -246,13 +248,14 @@ class TestCorrectorContext(unittest.TestCase):
             )
             batch = SimpleNamespace(
                 reqs=[
-                    SimpleNamespace(kv=SimpleNamespace(req_pool_idx=i)) for i in slots
+                    SimpleNamespace(rid=rids[i], kv=SimpleNamespace(req_pool_idx=i))
+                    for i in slots
                 ],
                 prefix_lens=starts,
                 req_pool_indices=torch.tensor(slots),
                 seq_lens=torch.tensor(starts) + torch.tensor(lengths),
             )
-            locs = ctx.extend_locs(batch, positions, torch.tensor(lengths), generations)
+            locs = ctx.extend_locs(batch, positions, torch.tensor(lengths))
             write(locs, values)
 
         def check(slots, ends, values, valid):
@@ -277,26 +280,27 @@ class TestCorrectorContext(unittest.TestCase):
         write(locs, [12, 90, 91, 92, 6, 7, 8, 9])
         check([1, 0], [9, 12], [[7, 8, 9], [10, 11, 12]], [[1, 1, 1], [1, 1, 1]])
 
-        generations[0] += 1
+        rids[0] = "a2"
         extend([0], [11], [1], [42])
         check([0], [12], [[0, 0, 42]], [[0, 0, 1]])
 
         # PD decode: a transferred request starts with no window, whatever its slot
         # held, and sees what its own verifies append.
-        generations[1] += 1
+        rids[1] = "b2"
         transferred = SimpleNamespace(
+            rid=rids[1],
             kv=SimpleNamespace(req_pool_idx=1),
             origin_input_ids=[0] * 9,
             output_ids=[7],
         )
-        ctx.start_windows([transferred], generations)
+        ctx.start_windows([transferred])
         check([1], [9], [[0, 0, 0]], [[0, 0, 0]])
         locs = ctx.verify_locs(
             torch.tensor([1]), torch.tensor([[9, 10, 11, 12]]), torch.tensor([2])
         )
         write(locs, [20, 21, 93, 94])
         transferred.output_ids = [7, 8, 9]
-        ctx.start_windows([transferred], generations)
+        ctx.start_windows([transferred])
         check([1], [11], [[0, 20, 21]], [[0, 1, 1]])
 
 
