@@ -229,8 +229,11 @@ SGL_DEVICE void store_row_fp8(
 /// `scale_row` its 32 scale bytes. Scale `e4m3(clamp(amax / 6, 2^-9, 448))` rounded to
 /// nearest even; codes `cvt.rn.satfinite.e2m1x2` of `x / scale` (ties to even, saturating
 /// at 6, the sign kept for a value that rounds to zero), the even element in the low nibble.
+/// `e4m3_row` (optional): also store the row dequantized and rounded once, e4m3(e2m1 x scale) round to nearest even and
+/// saturating, the values FlashMLA's fp8 decode dequantizes it to (SGLANG_OPT_DSV41_C1_E4M3_COPY).
 template <uint32_t kVecSize>
-SGL_DEVICE void store_row_fp4(uint8_t* data_row, uint8_t* scale_row, uint32_t tx, const float (&v)[kVecSize]) {
+SGL_DEVICE void store_row_fp4(
+    uint8_t* data_row, uint8_t* scale_row, uint32_t tx, const float (&v)[kVecSize], uint8_t* e4m3_row = nullptr) {
   using namespace device;
   constexpr uint32_t kTileLanes = KVLayoutTraits<KVLayout::V41_FP4>::kTileSize / kVecSize;
   static_assert(kVecSize % 2 == 0 && kTileLanes >= 1 && (kTileLanes & (kTileLanes - 1)) == 0);
@@ -259,6 +262,18 @@ SGL_DEVICE void store_row_fp4(uint8_t* data_row, uint8_t* scale_row, uint32_t tx
   out.store(data_row, tx);
   // Every lane of the tile holds the scale; they all store the same byte.
   scale_row[tx / kTileLanes] = scale_bits;
+#ifndef USE_ROCM
+  if (e4m3_row != nullptr) {
+    // e2m1 x e4m3 is exact in fp32 (at most 2 + 4 significant bits), so this is the single RN of the exact value
+    AlignedVector<fp8x2_e4m3_t, kVecSize / 2> copy;
+#pragma unroll
+    for (uint32_t i = 0; i < kVecSize / 2; ++i) {
+      const float2 q = __half22float2(__half2(__nv_cvt_fp4x2_to_halfraw2(static_cast<__nv_fp4x2_storage_t>(out[i]), __NV_E2M1)));
+      copy[i] = fp8x2_e4m3_t{fp32x2_t{fminf(fmaxf(q.x * scale, -448.0f), 448.0f), fminf(fmaxf(q.y * scale, -448.0f), 448.0f)}};
+    }
+    copy.store(e4m3_row, tx);
+  }
+#endif
 }
 
 /// Dispatch on the layout for a 512-wide row held as `kVecSize` consecutive fp32 per thread.
@@ -277,7 +292,7 @@ SGL_DEVICE void store_row(
     }
     out.store(data_row, tx);
   } else {
-    store_row_fp4(data_row, scale_row, tx, v);
+    store_row_fp4(data_row, scale_row, tx, v, e4m3_row);
   }
 }
 

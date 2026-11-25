@@ -682,6 +682,9 @@ class Envs:
     # costs 512 B per SWA slot per layer. Not with PD decode or HiCache (rows they land in the
     # SWA pool have no e4m3 copy).
     SGLANG_OPT_DSV41_SWA_E4M3_COPY = EnvBool(False)
+    # With the SWA copy: also an e4m3 copy of the ratio-1 (fp4) compressed pool, written by the c1 store and filled at
+    # PD decode admission, so FlashMLA's fp8 decode reads those layers' top-k rows without dequantizing them.
+    SGLANG_OPT_DSV41_C1_E4M3_COPY = EnvBool(False)
     # DSpark draft forward: the bonus-into-block-ids write and the positions / cache-loc
     # column slices in one Triton launch instead of three torch copies. Same values.
     SGLANG_OPT_DSPARK_FUSED_DRAFT_INPUTS = EnvBool(False)

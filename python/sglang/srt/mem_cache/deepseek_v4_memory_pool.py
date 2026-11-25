@@ -22,7 +22,7 @@ from sglang.kernels.ops.attention.dsv4 import (
     fused_qkv_norm_flashmla,
     fused_store_cache,
 )
-from sglang.kernels.ops.attention.dsv4.swa_e4m3_fill import swa_e4m3_fill
+from sglang.kernels.ops.attention.dsv4.swa_e4m3_fill import fp4_e4m3_fill, swa_e4m3_fill
 from sglang.kernels.ops.attention.dsv4.kv_layout import (
     KVLayout,
     is_valid_kv_layout_pair,
@@ -1377,6 +1377,9 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         self._init_compressed_layer_mapping()
 
         self._init_paged_compress_states(enable_memory_saver)
+        self.c1_e4m3: Optional[List[torch.Tensor]] = None
+        if envs.SGLANG_OPT_DSV41_C1_E4M3_COPY.get() and not is_draft_worker:
+            self._init_c1_e4m3_copy(device)
 
     def get_unified_kv(self, layer_id: int) -> torch.Tensor:
         # Under HiCache the compressed region is loaded H->D per layer; wait for this
@@ -2236,6 +2239,86 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             len(copies),
             tuple(copies[0].shape),
             sum(c.numel() for c in copies) / 1e9,
+        )
+
+    def _init_c1_e4m3_copy(self, device: str) -> None:
+        """One (pages, rows per page, 512) uint8 copy per layer of the ratio-1 fp4 pool; see
+        SGLANG_OPT_DSV41_C1_E4M3_COPY. It goes with the SWA copy, whose guard it inherits."""
+        pool = self.kv_pools.get(1)
+        why = None
+        if self.swa_e4m3 is None:
+            why = "needs SGLANG_OPT_DSV41_SWA_E4M3_COPY on and engaged"
+        elif pool is None:
+            why = "this stage has no ratio-1 compressed pool"
+        elif pool.kv_layout is not KVLayout.V41_FP4_NEW:
+            why = f"needs the interleaved V4.1 fp4 ratio-1 pool, got {pool.kv_layout}"
+        if why is not None:
+            logger.warning("SGLANG_OPT_DSV41_C1_E4M3_COPY is off: %s", why)
+            return
+        copies = []
+        with (
+            torch.cuda.use_mem_pool(self.custom_mem_pool)
+            if self.custom_mem_pool
+            else nullcontext()
+        ):
+            for buf in pool.kv_buffer:
+                assert buf.ndim == 2 and buf.shape[1] % 288 == 0
+                copies.append(
+                    torch.zeros(
+                        (buf.shape[0], buf.shape[1] // 288, 512),
+                        dtype=torch.uint8,
+                        device=device,
+                    )
+                )
+        self.c1_e4m3 = copies
+        self._c1_e4m3_cache_ptrs = torch.tensor(
+            [buf.data_ptr() for buf in pool.kv_buffer], dtype=torch.int64, device=device
+        )
+        self._c1_e4m3_copy_ptrs = torch.tensor(
+            [c.data_ptr() for c in copies], dtype=torch.int64, device=device
+        )
+        logger.info(
+            "DSV4 ratio-1 e4m3 copy: %d layers x %s, %.2f GB",
+            len(copies),
+            tuple(copies[0].shape),
+            sum(c.numel() for c in copies) / 1e9,
+        )
+
+    def _c1_e4m3_index(self, layer_id: int) -> Optional[int]:
+        """Index into c1_e4m3 of the ratio-1 pool layer this layer reads, or None."""
+        if self.c1_e4m3 is None:
+            return None
+        _, compress_layer_id, compress_kv_pool = self.layer_mapping[layer_id]
+        if compress_kv_pool is None or compress_kv_pool is not self.kv_pools.get(1):
+            return None
+        return compress_layer_id
+
+    def get_extra_e4m3_buffer(self, layer_id: int) -> Optional[torch.Tensor]:
+        """The ratio-1 pool's e4m3 copy as the decode reads it, (pages, page_size, 1, 512), for a layer
+        whose extra cache is that pool; None otherwise or when SGLANG_OPT_DSV41_C1_E4M3_COPY is off."""
+        idx = self._c1_e4m3_index(layer_id)
+        if idx is None:
+            return None
+        return self.c1_e4m3[idx][:, : self.kv_pools[1].page_size].unsqueeze(2)
+
+    def get_c1_e4m3_store_target(self, layer_id: int) -> Optional[torch.Tensor]:
+        """The (pages, rows per page, 512) copy the c1 store writes for this layer, or None."""
+        idx = self._c1_e4m3_index(layer_id)
+        return None if idx is None else self.c1_e4m3[idx]
+
+    def fill_c1_e4m3_copy(self, full_locs: torch.Tensor) -> None:
+        """Write the e4m3 copy of the ratio-1 rows at `full_locs` (at ratio 1 the compressed slot is the
+        full slot), every layer of that pool in one launch: for rows that arrived by PD transfer or a host
+        restore, which bypass the c1 store."""
+        if self.c1_e4m3 is None or full_locs.numel() == 0:
+            return
+        pool = self.kv_pools[1]
+        fp4_e4m3_fill(
+            slots=full_locs.to(torch.int32),
+            cache_ptrs=self._c1_e4m3_cache_ptrs,
+            copy_ptrs=self._c1_e4m3_copy_ptrs,
+            page_size=pool.page_size,
+            page_bytes=pool.kv_buffer[0].shape[1],
         )
 
     def get_swa_e4m3_buffer(self, layer_id: int) -> Optional[torch.Tensor]:

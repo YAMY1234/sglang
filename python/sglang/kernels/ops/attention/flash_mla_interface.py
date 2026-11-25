@@ -268,6 +268,7 @@ def flash_mla_mega_decode(
     use_legacy: bool = True,
     q_head_scale: Optional[torch.Tensor] = None,
     kv_e4m3: Optional[torch.Tensor] = None,
+    extra_kv_e4m3: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """MegaAttention decode over a paged cache: (out_fp8, out_sf, lse). An E4M3 ``q``
     with ``q_head_scale`` (fp32 [heads], q = Q / scale) runs FlashMLA's fp8 decode, which
@@ -290,7 +291,9 @@ def flash_mla_mega_decode(
             use_legacy,
             q_head_scale,
             kv_e4m3,
+            extra_kv_e4m3,
         )
+    assert extra_kv_e4m3 is None, "extra_kv_e4m3 is supported by the fp8 decode only"
     return _mega.decode(
         token_positions=positions,
         cos_sin_cache=cos_sin_cache,
@@ -339,6 +342,16 @@ def mega_decode_takes_kv_e4m3() -> bool:
 
 
 @lru_cache(maxsize=1)
+def mega_decode_takes_extra_kv_e4m3() -> bool:
+    """Whether the installed FlashMLA's fp8 decode op takes ``extra_kv_e4m3`` (the same copy of
+    the fp4 extra cache)."""
+    from flash_mla._loader import get_ops
+
+    op = get_ops(False).fused_norm_rope_attn_rope_cast_decode
+    return any(a.name == "extra_kv_e4m3" for a in op.default._schema.arguments)
+
+
+@lru_cache(maxsize=1)
 def mega_prefill_takes_q_head_scale() -> bool:
     """Whether the installed FlashMLA's prefill op takes ``q_head_scale`` (an E4M3 q with
     static per-head scales, over the e4m3 kv workspace)."""
@@ -366,6 +379,7 @@ def _mega_decode_fp8_q(
     use_legacy,
     q_head_scale,
     kv_e4m3=None,
+    extra_kv_e4m3=None,
 ):
     # The op directly: the installed wheel's Python wrapper may predate q_head_scale.
     # kv_e4m3: `kv` dequantized and rounded to e4m3 once (SGLANG_OPT_DSV41_SWA_E4M3_COPY).
@@ -405,4 +419,6 @@ def _mega_decode_fp8_q(
         p["use_packed_ue8m0"],
         q_head_scale,
         *(() if kv_e4m3 is None else (kv_e4m3,)),
+        # extra_kv_e4m3: the same for the ratio-1 fp4 cache (SGLANG_OPT_DSV41_C1_E4M3_COPY); needs kv_e4m3
+        *(() if extra_kv_e4m3 is None else (extra_kv_e4m3,)),
     )

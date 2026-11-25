@@ -31,6 +31,7 @@ struct Compress1DecodeParams {
   const void* __restrict__ positions;      // [num_tokens] PosT
   const void* __restrict__ out_loc;        // [num_tokens] LocT compressed slot; 0 marks a padded row
   uint8_t* __restrict__ kvcache;           // [npages, kPageBytes] uint8
+  uint8_t* __restrict__ e4m3cache;         // [npages, kPageBytes / kBytesPerToken, 512] e4m3 copy, or null
   float eps;
 };
 
@@ -166,7 +167,11 @@ __global__ __launch_bounds__(kHeadDim / kC1VecSize) void flash_c1_decode_kernel(
     // The fp4 cache takes the rotated bf16 value as is: its row quantizer is the fake quant, minus the dequant.
     if (out_loc <= 0) return;
     const auto kv_row = Paged::row(params.kvcache, out_loc);
-    return deepseek_v4::v41::store_row<kLayout>(kv_row.data, kv_row.scale, tx, data);
+    uint8_t* e4m3_row = nullptr;
+    if constexpr (Paged::Traits::kInterleaved) {
+      if (params.e4m3cache != nullptr) e4m3_row = Paged::e4m3_row(params.e4m3cache, out_loc);
+    }
+    return deepseek_v4::v41::store_row<kLayout>(kv_row.data, kv_row.scale, tx, data, e4m3_row);
   }
 
   // FP4/E4M3 fake-quant over 16 elements, i.e. kFp4Lanes threads.
@@ -263,6 +268,42 @@ struct FlashCompress1Kernel {
       const tvm::ffi::TensorView out_loc,
       const tvm::ffi::TensorView kvcache,
       const float eps) {
+    run_impl(kv_input, kv_output, norm_weight, freqs_cis, positions, out_loc, kvcache, eps, nullptr);
+  }
+
+  /// \brief The same, also writing each row's e4m3 copy (SGLANG_OPT_DSV41_C1_E4M3_COPY).
+  /// \param e4m3cache `[npages, kPageBytes / kBytesPerToken, 512]` uint8, the copy with the cache's row numbering.
+  static void run_decode_fusion_e4m3(
+      const tvm::ffi::TensorView kv_input,
+      const tvm::ffi::TensorView kv_output,
+      const tvm::ffi::TensorView norm_weight,
+      const tvm::ffi::TensorView freqs_cis,
+      const tvm::ffi::TensorView positions,
+      const tvm::ffi::TensorView out_loc,
+      const tvm::ffi::TensorView kvcache,
+      const tvm::ffi::TensorView e4m3cache,
+      const float eps) {
+    using namespace host;
+    if constexpr (!deepseek_v4::KVLayoutTraits<kLayout>::kInterleaved) {
+      RuntimeCheck(false, "the e4m3 copy needs an interleaved layout");
+    } else {
+      constexpr int64_t kRows = kPageBytes / deepseek_v4::KVLayoutTraits<kLayout>::kBytesPerToken;
+      TensorMatcher({-1, kRows, 512}).with_dtype<uint8_t, fp8_e4m3_t>().verify(e4m3cache);
+      run_impl(kv_input, kv_output, norm_weight, freqs_cis, positions, out_loc, kvcache, eps,
+               static_cast<uint8_t*>(e4m3cache.data_ptr()));
+    }
+  }
+
+  static void run_impl(
+      const tvm::ffi::TensorView kv_input,
+      const tvm::ffi::TensorView kv_output,
+      const tvm::ffi::TensorView norm_weight,
+      const tvm::ffi::TensorView freqs_cis,
+      const tvm::ffi::TensorView positions,
+      const tvm::ffi::TensorView out_loc,
+      const tvm::ffi::TensorView kvcache,
+      const float eps,
+      uint8_t* e4m3cache) {
     using namespace host;
 
     auto N = SymbolicSize{"num_tokens"};
@@ -298,6 +339,7 @@ struct FlashCompress1Kernel {
         .positions = positions.data_ptr(),
         .out_loc = out_loc.data_ptr(),
         .kvcache = static_cast<uint8_t*>(kvcache.data_ptr()),
+        .e4m3cache = e4m3cache,
         .eps = eps,
     };
     const auto k = select(pos_dtype.is_type<int32_t>(), loc_dtype.is_type<int32_t>());

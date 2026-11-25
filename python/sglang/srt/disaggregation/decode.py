@@ -4821,12 +4821,17 @@ class SchedulerDisaggregationDecodeMixin:
         req_to_token = self.req_to_token_pool.req_to_token
         # The window plus a few rows of margin; rows not yet written are rewritten by the store kernels
         span = kv_pool.sliding_window + 4
-        locs = []
+        locs, history = [], []
         for req in batch.reqs:
             end = len(req.origin_input_ids) + len(req.output_ids)
             locs.append(req_to_token[req.req_pool_idx, max(0, end - span) : end])
+            if kv_pool.c1_e4m3 is not None:
+                # SGLANG_OPT_DSV41_C1_E4M3_COPY: the ratio-1 pool holds every token, so its whole history
+                history.append(req_to_token[req.req_pool_idx, :end])
         if locs:
             kv_pool.fill_swa_e4m3_copy(torch.cat(locs))
+        if history:
+            kv_pool.fill_c1_e4m3_copy(torch.cat(history))
 
     def _nonblocking_admit_in_scope(self: Scheduler, batch: ScheduleBatch) -> bool:
         # EAGLE's seed uses pinned async_h2d_stack already. Other seed paths,

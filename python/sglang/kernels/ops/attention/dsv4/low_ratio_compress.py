@@ -45,6 +45,10 @@ def _jit_c1_module(head_dim: int, rope_dim: int, page_size: int, layout: KVLayou
         cuda_files=["deepseek_v4/c1.cuh"],
         cuda_wrappers=[
             ("decode_fusion", f"FlashCompress1Kernel<{args}>::run_decode_fusion"),
+            (
+                "decode_fusion_e4m3",
+                f"FlashCompress1Kernel<{args}>::run_decode_fusion_e4m3",
+            ),
         ],
     )
 
@@ -61,6 +65,7 @@ def c1_decode_norm_rope_store(
     page_size: int,
     layout: Union[KVLayout, str] = KVLayout.V4,
     out: Optional[torch.Tensor] = None,
+    e4m3_cache: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """RMSNorm ``kv_input`` and write the main KV slot, in a single launch.
 
@@ -85,6 +90,8 @@ def c1_decode_norm_rope_store(
                    stores the e2m1 codes themselves, rounding once.
     :param out: ``[num_tokens, head_dim]`` bf16 destination for the pre-RoPE
                 latent. Pass a persistent buffer under CUDA graphs.
+    :param e4m3_cache: ``[pages, rows per page, 512]`` uint8, the e4m3 copy of an interleaved fp4 pool
+                       (SGLANG_OPT_DSV41_C1_E4M3_COPY), or None.
     :return: ``out``, the pre-RoPE post-norm latent.
     """
     num_tokens, head_dim = kv_input.shape
@@ -93,17 +100,24 @@ def c1_decode_norm_rope_store(
 
     layout = KVLayout.parse(layout)
     module = _jit_c1_module(head_dim, freqs_cis.shape[-1], page_size, layout)
-    module.decode_fusion(
-        kv_input,
-        out,
-        norm_weight,
-        freqs_cis,
-        positions,
-        out_loc,
-        # HIP's fp8_e4m3_t is uint8_t, so the kernel matches the fp8 pool as bytes
-        k_cache.view(torch.uint8) if is_hip_runtime() else k_cache,
-        float(eps),
-    )
+    # HIP's fp8_e4m3_t is uint8_t, so the kernel matches the fp8 pool as bytes
+    cache = k_cache.view(torch.uint8) if is_hip_runtime() else k_cache
+    if e4m3_cache is None:
+        module.decode_fusion(
+            kv_input, out, norm_weight, freqs_cis, positions, out_loc, cache, float(eps)
+        )
+    else:
+        module.decode_fusion_e4m3(
+            kv_input,
+            out,
+            norm_weight,
+            freqs_cis,
+            positions,
+            out_loc,
+            cache,
+            e4m3_cache,
+            float(eps),
+        )
     return out
 
 
