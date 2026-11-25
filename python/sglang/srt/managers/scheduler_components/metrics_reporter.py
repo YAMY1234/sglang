@@ -1281,6 +1281,8 @@ class SchedulerMetricsReporter:
             f"mamba {stats.hicache_host_mamba_used_states}"
             f"/{stats.hicache_host_mamba_total_states} states"
         )
+        if isinstance(self.scheduler.tree_cache, UnifiedRadixCache):
+            self.scheduler.tree_cache.refresh_mamba_retention_counts()
         counts = getattr(self.scheduler.tree_cache, "mamba_retention_counts", None)
         if counts:
             msg += "".join(f", {name} {value}" for name, value in counts.items())

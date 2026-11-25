@@ -437,6 +437,11 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         self.write_through_threshold = 256
         self.is_write_back = False
         self.mamba_path_cap_counts_host = False
+        self.mamba_backup_internal_state = False
+        # Device-only internal Mamba states with Full KV on host, freed without
+        # (drops) or after (backups) a host copy.
+        self.mamba_internal_state_drops = 0
+        self.mamba_internal_state_backups = 0
         self.has_swa_host_pool = False
         self.enable_session_radix_cache = params.enable_session_radix_cache
         self.eviction_strategy = get_eviction_strategy(
@@ -490,6 +495,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                 component.evict_device_end()
         # Internal victims awaiting the controller's backup and finish call.
         self._pending_internal_evictions: dict[ComponentType, NodeId] = {}
+        self._pending_mamba_state_only: Optional[NodeId] = None
         # Maintains the NodeId -> active tree node mapping.
         self._node_arena: dict[NodeId, UnifiedTreeNode] = {}
 
@@ -1736,6 +1742,8 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             self._pending_internal_evictions[component_type] = step.node_id
             if component_type == ComponentType.MAMBA:
                 result.mamba_backup_node_id = step.node_id
+                if step.state_only:
+                    self._pending_mamba_state_only = step.node_id
             else:
                 result.swa_backup_node_id = step.node_id
                 result.swa_backup_num_tokens = step.num_tokens
@@ -1770,6 +1778,8 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             f"no matching pending internal {component_type.name} eviction"
         )
         del self._pending_internal_evictions[component_type]
+        state_only = self._pending_mamba_state_only == node_id
+        self._pending_mamba_state_only = None
         # Consuming the pending request advances the walk even if I/O changed
         # this victim's eligibility. No frees occur before backup completion.
         result = EvictDeviceNextNodeResult(made_progress=True)
@@ -1800,6 +1810,12 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             # finish must not accidentally perform an atomic Full eviction.
             component._evict_device_cursor = node
             return result
+        if state_only:
+            # A failed Mamba-only backup (no host slot) leaves the state device-only.
+            if node.component_data[ComponentType.MAMBA].host_value is not None:
+                self.mamba_internal_state_backups += 1
+            else:
+                self.mamba_internal_state_drops += 1
         self._begin_tracking_unbacked_tokens()
         try:
             self._evict_component_and_detach_lru(
@@ -1829,6 +1845,8 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         """Finish a component's device-eviction walk."""
         self.components_by_type[component_type].evict_device_end()
         self._pending_internal_evictions.pop(component_type, None)
+        if component_type == ComponentType.MAMBA:
+            self._pending_mamba_state_only = None
 
     def evict_device_leaf(
         self, node_id: NodeId, is_write_back: bool
@@ -2483,6 +2501,12 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
 
     def set_mamba_path_cap_counts_host(self, enabled: bool) -> None:
         self.mamba_path_cap_counts_host = enabled
+
+    def set_mamba_backup_internal_state(self, enabled: bool) -> None:
+        self.mamba_backup_internal_state = enabled
+
+    def mamba_internal_state_counts(self) -> tuple[int, int]:
+        return self.mamba_internal_state_drops, self.mamba_internal_state_backups
 
     def insert_host(
         self,

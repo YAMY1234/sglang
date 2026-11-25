@@ -285,6 +285,12 @@ _WRITE_AHEAD_REBUILD = (
     "rust/sglang-radix-tree or set SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND=python"
 )
 
+_MAMBA_INTERNAL_STATE_REBUILD = (
+    "A Mamba HiCache tree needs a Rust TreeCore extension that has "
+    "set_mamba_backup_internal_state and mamba_internal_state_counts; rebuild "
+    "rust/sglang-radix-tree or set SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND=python"
+)
+
 
 class _RustKVCacheEventRecorder:
     """Expose the Rust event queue through the Python recorder interface."""
@@ -993,6 +999,20 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
                 "rust/sglang-radix-tree or set SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND=python"
             ) from None
         setter(enabled)
+
+    def set_mamba_backup_internal_state(self, enabled: bool) -> None:
+        try:
+            setter = self._binding.set_mamba_backup_internal_state
+        except AttributeError:
+            raise RuntimeError(_MAMBA_INTERNAL_STATE_REBUILD) from None
+        setter(enabled)
+
+    def mamba_internal_state_counts(self) -> tuple[int, int]:
+        try:
+            counts = self._binding.mamba_internal_state_counts
+        except AttributeError:
+            raise RuntimeError(_MAMBA_INTERNAL_STATE_REBUILD) from None
+        return counts()
 
     @property
     def is_host_memory_buffer_only(self) -> bool:
