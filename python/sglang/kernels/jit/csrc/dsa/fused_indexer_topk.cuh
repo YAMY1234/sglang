@@ -1336,8 +1336,11 @@ CUTLASS_DEVICE void warp_pick_bin(const uint32_t* hist, uint32_t remaining, uint
 // barrier (histograms rotate over three buffers), and output positions come from a scan in
 // candidate order (sub-list 0 first) instead of atomics. kSmallCap > 0: after the first step, the
 // keys of the chosen bin (when at most kSmallCap) are copied to shared memory and the later steps
-// count only those. kPlainAtomics: the first step counts with one shared atomic per key.
-template <uint32_t kThreads, uint32_t kItems, bool kSmemKeys, uint32_t kSmallCap, bool kPlainAtomics, uint32_t kMinBlocks>
+// count only those. kPlainAtomics: the first step counts with one shared atomic per key. kMerged (with
+// kSmallCap, rows of one chunk): the copy-out pass also writes the keys above the chosen bin, and the
+// last pass reads only the copied bin.
+template <uint32_t kThreads, uint32_t kItems, bool kSmemKeys, uint32_t kSmallCap, bool kPlainAtomics, uint32_t kMinBlocks,
+          bool kMerged>
 __global__ __launch_bounds__(kThreads, kMinBlocks) void fstk_select_fast_kernel(const SelectParams p) {
   constexpr uint32_t kWarps = kThreads / 32;
   constexpr uint32_t kChunk = kThreads * kItems;
@@ -1348,7 +1351,7 @@ __global__ __launch_bounds__(kThreads, kMinBlocks) void fstk_select_fast_kernel(
   auto* s_small = s_keys + (kSmemKeys ? kChunk : 0);
   __shared__ __align__(16) uint32_t hist[3][256];
   __shared__ uint64_t s_or[kWarps], s_and[kWarps];
-  __shared__ uint32_t s_warp_taken[kWarps];
+  __shared__ uint32_t s_warp_taken[kWarps], s_warp_eq[kWarps];
   __shared__ uint32_t s_small_n;
 
   const uint32_t tx = threadIdx.x;
@@ -1467,6 +1470,9 @@ __global__ __launch_bounds__(kThreads, kMinBlocks) void fstk_select_fast_kernel(
   uint64_t prefix = 0, prefix_mask = 0;
   uint32_t remaining = p.topk, buf = 0, small_n = 0;
   bool small = false;  // the later steps count s_small[0, small_n)
+  const uint32_t lanes_below = (1u << lane) - 1u;
+  bool merged = false;   // kMerged: the keys above the copied bin are written,
+  uint32_t written = 0;  // this many
 #pragma unroll 1
   for (int hi = top; hi >= 0; hi -= 8) {
     const int shift = max(hi - 7, 0);
@@ -1508,8 +1514,56 @@ __global__ __launch_bounds__(kThreads, kMinBlocks) void fstk_select_fast_kernel(
     buf = buf == 2 ? 0 : buf + 1;
     if (remaining == bin_count) break;
     if constexpr (kSmallCap > 0) {
-      // Copy the chosen bin's keys once; s_small_n was zeroed before the first barrier.
-      if (not small and bin_count <= kSmallCap) {
+      if (kMerged and resident and not small and bin_count <= kSmallCap) {
+        // Keys above the chosen bin are top-k keys: write them (positions: warp, item, lane) and
+        // copy the bin's keys to s_small (same order); warp counts first, then the writes.
+        fetch(0);
+        const uint32_t items = live(0);
+        uint32_t n_above = 0, n_eq = 0;
+#pragma unroll
+        for (uint32_t i = 0; i < kItems; ++i) {
+          if (i >= items) break;
+          const bool valid = i * kThreads + tx < n;
+          const uint64_t mk = k[i] & prefix_mask;
+          n_above += __popc(__ballot_sync(0xffffffffu, valid and mk > prefix));
+          n_eq += __popc(__ballot_sync(0xffffffffu, valid and mk == prefix));
+        }
+        if (lane == 0) s_warp_taken[warp] = n_above, s_warp_eq[warp] = n_eq;
+        __syncthreads();
+        uint32_t at = 0, eq_at = 0;
+#pragma unroll
+        for (uint32_t w = 0; w < kWarps; ++w) {
+          if (w < warp) at += s_warp_taken[w], eq_at += s_warp_eq[w];
+        }
+#pragma unroll
+        for (uint32_t g = 0; g < kItems; g += 8) {
+          if (g >= items) break;
+          // Every page-table load of the group before its stores (out may alias the table for the compiler).
+          int32_t slot[8];
+          uint32_t ma[8], me[8];
+#pragma unroll
+          for (uint32_t i = 0; i < 8; ++i) {
+            const bool valid = g + i < items and (g + i) * kThreads + tx < n;
+            const uint64_t mk = k[g + i] & prefix_mask;
+            ma[i] = __ballot_sync(0xffffffffu, valid and mk > prefix);
+            me[i] = __ballot_sync(0xffffffffu, valid and mk == prefix);
+            slot[i] = (ma[i] >> lane) & 1u ? to_slot(~static_cast<uint32_t>(k[g + i])) : 0;
+          }
+#pragma unroll
+          for (uint32_t i = 0; i < 8; ++i) {
+            if ((ma[i] >> lane) & 1u) out[at + __popc(ma[i] & lanes_below)] = slot[i];
+            if ((me[i] >> lane) & 1u) s_small[eq_at + __popc(me[i] & lanes_below)] = k[g + i];
+            at += __popc(ma[i]);
+            eq_at += __popc(me[i]);
+          }
+        }
+        __syncthreads();
+        small = true;
+        small_n = bin_count;
+        merged = true;
+        written = p.topk - remaining;
+      } else if (not small and bin_count <= kSmallCap) {
+        // Copy the chosen bin's keys once; s_small_n was zeroed before the first barrier.
 #pragma unroll 1
         for (uint32_t cb = 0; cb < n; cb += kChunk) {
           fetch(cb);
@@ -1532,9 +1586,33 @@ __global__ __launch_bounds__(kThreads, kMinBlocks) void fstk_select_fast_kernel(
     }
   }
 
+  if constexpr (kMerged and kSmallCap > 0) {
+    if (merged) {
+    // The rest of the top-k: the copied keys >= prefix under the bits fixed so far.
+    constexpr uint32_t kSmallItems = (kSmallCap + kThreads - 1) / kThreads;
+    uint32_t ms[kSmallItems], taken = 0;
+#pragma unroll
+    for (uint32_t q = 0; q < kSmallItems; ++q) {
+      const uint32_t j = q * kThreads + tx;
+      ms[q] = __ballot_sync(0xffffffffu, j < small_n and (s_small[j] & prefix_mask) >= prefix);
+      taken += __popc(ms[q]);
+    }
+    if (lane == 0) s_warp_taken[warp] = taken;
+    __syncthreads();
+    uint32_t at = written;
+#pragma unroll
+    for (uint32_t w = 0; w < kWarps; ++w) at += w < warp ? s_warp_taken[w] : 0u;
+#pragma unroll
+    for (uint32_t q = 0; q < kSmallItems; ++q) {
+      if ((ms[q] >> lane) & 1u) out[at + __popc(ms[q] & lanes_below)] = to_slot(~static_cast<uint32_t>(s_small[q * kThreads + tx]));
+      at += __popc(ms[q]);
+    }
+    return;
+    }
+  }
+
   // The keys >= prefix under the bits fixed so far are exactly the top-k (the last bin is taken
   // whole). Output order: chunk, then warp, then item, then lane.
-  const uint32_t lanes_below = (1u << lane) - 1u;
   uint32_t base = 0;
 #pragma unroll 1
   for (uint32_t cb = 0; cb < n; cb += kChunk) {
@@ -1934,7 +2012,8 @@ struct FusedIndexerTopK {
   // The main select (one CTA per row of out) by fstk_select_fast_kernel; variant picks the
   // instantiation: 1 = 256 threads x 16 keys in registers, 2 = the same in shared memory,
   // 3 = 512 x 8 in shared memory, 4 = 256 x 32 in shared memory; 5-8 = variant 2 with the chosen
-  // bin copied out after the first step (5), plus plain first-step atomics (6), at 4 CTAs/SM (7, 8).
+  // bin copied out after the first step (5), plus plain first-step atomics (6), at 4 CTAs/SM (7, 8);
+  // 9 = 8 with the keys above the bin written by the copy-out pass, 10 = 9 without the CTA/SM bound.
   static void select_fast(
       tvm::ffi::TensorView cand_key,
       tvm::ffi::TensorView cand_count,
@@ -1953,24 +2032,27 @@ struct FusedIndexerTopK {
     if (p.num_rows == 0) return;
     const DLDevice device = out.device();
     switch (variant) {
-      case 1: return launch_select_fast<256, 16, false, 0, false, 1>(p, device);
-      case 2: return launch_select_fast<256, 16, true, 0, false, 1>(p, device);
-      case 3: return launch_select_fast<512, 8, true, 0, false, 1>(p, device);
-      case 4: return launch_select_fast<256, 32, true, 0, false, 1>(p, device);
-      case 5: return launch_select_fast<256, 16, true, 1024, false, 1>(p, device);
-      case 6: return launch_select_fast<256, 16, true, 1024, true, 1>(p, device);
-      case 7: return launch_select_fast<256, 16, true, 1024, false, 4>(p, device);
-      case 8: return launch_select_fast<256, 16, true, 1024, true, 4>(p, device);
-      default: RuntimeCheck(false, "fstk: select_fast variant 1..8, got ", variant);
+      case 1: return launch_select_fast<256, 16, false, 0, false, 1, false>(p, device);
+      case 2: return launch_select_fast<256, 16, true, 0, false, 1, false>(p, device);
+      case 3: return launch_select_fast<512, 8, true, 0, false, 1, false>(p, device);
+      case 4: return launch_select_fast<256, 32, true, 0, false, 1, false>(p, device);
+      case 5: return launch_select_fast<256, 16, true, 1024, false, 1, false>(p, device);
+      case 6: return launch_select_fast<256, 16, true, 1024, true, 1, false>(p, device);
+      case 7: return launch_select_fast<256, 16, true, 1024, false, 4, false>(p, device);
+      case 8: return launch_select_fast<256, 16, true, 1024, true, 4, false>(p, device);
+      case 9: return launch_select_fast<256, 16, true, 1024, true, 4, true>(p, device);
+      case 10: return launch_select_fast<256, 16, true, 1024, true, 1, true>(p, device);
+      default: RuntimeCheck(false, "fstk: select_fast variant 1..10, got ", variant);
     }
   }
 
  private:
-  template <uint32_t kThreads, uint32_t kItems, bool kSmemKeys, uint32_t kSmallCap, bool kPlainAtomics, uint32_t kMinBlocks>
+  template <uint32_t kThreads, uint32_t kItems, bool kSmemKeys, uint32_t kSmallCap, bool kPlainAtomics, uint32_t kMinBlocks,
+            bool kMerged>
   static void launch_select_fast(const SelectParams& p, DLDevice device) {
     using namespace sglang::host;
     constexpr size_t kSmem = ((kSmemKeys ? static_cast<size_t>(kThreads) * kItems : 0) + kSmallCap) * sizeof(uint64_t);
-    constexpr auto kernel = fstk_select_fast_kernel<kThreads, kItems, kSmemKeys, kSmallCap, kPlainAtomics, kMinBlocks>;
+    constexpr auto kernel = fstk_select_fast_kernel<kThreads, kItems, kSmemKeys, kSmallCap, kPlainAtomics, kMinBlocks, kMerged>;
     if constexpr (kSmem > 0) runtime::set_max_dynamic_smem_per_device<kernel>(device, kSmem);
     LaunchKernel(p.num_rows, kThreads, device, kSmem)(kernel, p);
   }
