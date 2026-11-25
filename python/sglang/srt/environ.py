@@ -2029,12 +2029,6 @@ class Envs:
     # Sequences a captured KDA extend bucket accepts; a larger prefill batch on
     # any dp rank runs the step eagerly. Bounds the padded grids and scratch.
     SGLANG_KDA_PREFILL_GRAPH_MAX_SEQS = EnvInt(128)
-    # Experimental: breakable prefill CUDA graphs capture the Triton GDN extend
-    # instead of breaking at every GDN layer (layers/attention/linear/
-    # gdn_prefill_graph.py).
-    SGLANG_ENABLE_GDN_PREFILL_GRAPH_EXTEND = EnvBool(
-        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
-    )
     # Sequences a captured GDN extend bucket accepts (at most the request pool); a
     # larger prefill batch runs the step eagerly. Bounds the padded grids and scratch.
     SGLANG_GDN_PREFILL_GRAPH_MAX_SEQS = EnvInt(128)
@@ -2769,7 +2763,12 @@ class _DeprecatedEnv:
 # ad-hoc warnings. For a rename where the old name must keep working through a
 # descriptor, use EnvBoolWithAlias / EnvIntWithAlias instead. Once the
 # deprecation period ends, move the entry to REMOVED_ENVS.
-_DEPRECATED_ENVS: Dict[str, _DeprecatedEnv] = {}
+_DEPRECATED_ENVS: Dict[str, _DeprecatedEnv] = {
+    "SGLANG_ENABLE_GDN_PREFILL_GRAPH_EXTEND": _DeprecatedEnv(
+        note="Breakable prefill CUDA graphs always capture the GDN extend where "
+        "the setup supports it; unset it."
+    ),
+}
 
 
 def _handle_deprecated_envs():

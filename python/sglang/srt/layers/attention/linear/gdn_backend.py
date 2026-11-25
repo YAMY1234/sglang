@@ -745,12 +745,8 @@ class GDNAttnBackend(MambaAttnBackendBase):
 
     def supports_prefill_graph_extend(self) -> bool:
         # Read here, not in __init__: the support check reads model_config.
-        return (
-            envs.SGLANG_ENABLE_GDN_PREFILL_GRAPH_EXTEND.get()
-            # drafts keep their eager GDN extend; only the target's is captured
-            and not self.is_draft_worker
-            and self._prefill_graph_extend_supported()
-        )
+        # drafts keep their eager GDN extend; only the target's is captured
+        return not self.is_draft_worker and self._prefill_graph_extend_supported()
 
     def _prefill_graph_extend_supported(self) -> bool:
         from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (

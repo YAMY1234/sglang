@@ -5,7 +5,6 @@ from unittest.mock import MagicMock, patch, sentinel
 
 import torch
 
-from sglang.srt.environ import envs
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import MambaAttnBackendBase
 from sglang.srt.layers.attention.linear import gdn_backend
 from sglang.srt.layers.attention.linear.gdn_backend import (
@@ -129,29 +128,23 @@ class TestGDNPrefillGraphExtend(CustomTestCase):
         ):
             yield backend
 
-    def test_the_switch_captures_the_extend_only_where_the_setup_supports_it(self):
-        """Off, the default, breakable prefill graphs keep breaking at every GDN
-        layer; on, they capture the target's extend only where this setup supports
-        the graph-safe chain, and a draft's prefill graphs keep their eager path."""
-        for switch, setup, captured in (
-            (False, {}, False),
-            (True, {}, True),
-            (True, dict(cuda=False), False),
-            (True, dict(enable_mis=True), False),
-            (True, dict(draft=True), False),
+    def test_the_extend_is_captured_only_where_the_setup_supports_it(self):
+        """Breakable prefill graphs capture the target's extend only where this setup
+        supports the graph-safe chain, and a draft's prefill graphs keep their eager
+        path."""
+        for setup, captured in (
+            ({}, True),
+            (dict(cuda=False), False),
+            (dict(enable_mis=True), False),
+            (dict(draft=True), False),
         ):
-            with (
-                self.subTest(switch=switch, **setup),
-                envs.SGLANG_ENABLE_GDN_PREFILL_GRAPH_EXTEND.override(switch),
-                self._setup(**setup) as backend,
-            ):
+            with self.subTest(**setup), self._setup(**setup) as backend:
                 self.assertEqual(backend.supports_prefill_graph_extend(), captured)
 
     def test_another_extend_kernel_is_captured_only_where_an_external_body_asks(self):
         for body_seqs, captured in (("no body", False), (None, False), (8, True)):
             with (
                 self.subTest(body_seqs=body_seqs),
-                envs.SGLANG_ENABLE_GDN_PREFILL_GRAPH_EXTEND.override(True),
                 self._setup(kernel=FlashInferGDNKernel) as backend,
             ):
                 if body_seqs != "no body":
