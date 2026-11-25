@@ -215,7 +215,7 @@ struct OneBlockScheduler {
 // sm100_mqa_logits_core_impl (FP8, FP32 reduce, paged, no clean / compressed logits) with
 // BLOCK_Q = kNextN. kWeightsInSmem reads each row's 32 weights from the Q stage per use instead of
 // holding BLOCK_Q x 32 of them in registers (same values, same arithmetic).
-template <uint32_t kNextN, uint32_t kNumQStages, uint32_t kNumKVStages, uint32_t kNumTmemStages, bool kWeightsInSmem>
+template <uint32_t kNextN, uint32_t kNumQStages, uint32_t kNumKVStages, uint32_t kNumTmemStages, bool kWeightsInSmem, bool kRowSplit>
 __global__ __launch_bounds__(kNumSpecializedThreads + kNumMathThreads, 1) void paged_mqa_logits_1blk_kernel(
     const uint32_t num_q_tokens_total,
     const uint32_t logits_stride,
@@ -288,7 +288,7 @@ __global__ __launch_bounds__(kNumSpecializedThreads + kNumMathThreads, 1) void p
 #pragma unroll
     for (uint32_t i = 0; i < kNumTmemStages; ++i) {
       smem.full_tmem_barriers[i].init(1);
-      smem.empty_tmem_barriers[i].init(128);
+      smem.empty_tmem_barriers[i].init(kRowSplit ? kNumMathThreads : 128);
     }
     cutlass::arch::fence_barrier_init();
   }
@@ -437,110 +437,205 @@ __global__ __launch_bounds__(kNumSpecializedThreads + kNumMathThreads, 1) void p
   } else if (warp_idx == kSpecWarpStart + 3) {
     cutlass::arch::warpgroup_reg_dealloc<kNumSpecializedRegisters>();
   } else if (warp_idx < kSpecWarpStart) {
-    // Math warpgroup g reads keys [128 g, 128 g + 128) of every split: one key per thread.
     cutlass::arch::warpgroup_reg_alloc<kNumMathRegisters>();
 
-    const auto math_warpgroup_idx = warp_idx / 4;
-    const auto math_thread_idx = warp_idx * 32 + lane_idx;
-    tmem_pipeline.advance(math_warpgroup_idx);
+    if constexpr (kRowSplit) {
+      // Math warpgroup g scores rows [g * kRowsPerGroup, ...) of both 128-key halves of every split, so each
+      // thread keeps its rows' weights in registers; warp w reads keys 32 (w % 4) + lane of each half. Same
+      // per-(key, row) arithmetic as below; only the assignment of (key, row) pairs to threads differs.
+      constexpr uint32_t kRowsPerGroup = (BLOCK_Q + 1) / 2;
+      const auto math_warpgroup_idx = warp_idx / 4;
+      const uint32_t row_begin = math_warpgroup_idx * kRowsPerGroup;
+      const uint32_t num_rows = math_warpgroup_idx == 0 ? kRowsPerGroup : BLOCK_Q - kRowsPerGroup;
+      const uint32_t key_in_half = (warp_idx % 4) * 32 + lane_idx;
 
-    float weights[kWeightsInSmem ? 1 : BLOCK_Q][kNumHeads];
-    float accum[kNumHeads];
+      float weights[kRowsPerGroup][kNumHeads];
+      float accum[kNumHeads];
 
-    auto scheduler = make_scheduler();
-    uint32_t q_block_idx, kv_base, num_kv_splits;
-    while (scheduler.next_q_block(q_block_idx, kv_base, num_kv_splits)) {
-      CUTE_TIE_DECL(q_pipeline.advance(), q_stage_idx, q_phase);
-      smem.full_q_barriers[q_stage_idx].wait(q_phase);
-
-      if constexpr (not kWeightsInSmem) {
-#pragma unroll
-        for (uint32_t i = 0; i < BLOCK_Q; ++i) {
-          const auto smem_weights_row = smem.smem_weights[q_stage_idx] + i * kNumWeightElementsPerRow;
-#pragma unroll
-          for (uint32_t j = 0; j < kNumHeads; ++j)
-            weights[i][j] = ptx::ld_shared(smem_weights_row + j);
-        }
-      }
-
-      for (uint32_t kv_split_idx = 0; kv_split_idx < num_kv_splits; ++kv_split_idx) {
-        auto kv_offset = scheduler.get_logits_col(kv_base, kv_split_idx, math_thread_idx);
-
-        // FP8 consumes the KV pipeline directly to read per-KV scales
-        CUTE_TIE_DECL(kv_pipeline.advance(), kv_stage_idx, kv_phase);
-        smem.full_kv_barriers[kv_stage_idx].wait(kv_phase);
-        const float scale_kv = ptx::ld_shared(smem.smem_sf_kv[kv_stage_idx] + math_thread_idx);
-
-        CUTE_TIE_DECL(tmem_pipeline.advance(kNumMathWarpGroups), tmem_stage_idx, tmem_phase);
-        smem.full_tmem_barriers[tmem_stage_idx].wait(tmem_phase);
-        ptx::tcgen05_after_thread_sync();
-
-        // Release KV smem only after UMMA commits TMEM; earlier release races TMA overwrite
-        cutlass::arch::fence_view_async_shared();
-        smem.empty_kv_barriers[kv_stage_idx].arrive();
+      auto scheduler = make_scheduler();
+      uint32_t q_block_idx, kv_base, num_kv_splits;
+      while (scheduler.next_q_block(q_block_idx, kv_base, num_kv_splits)) {
+        CUTE_TIE_DECL(q_pipeline.advance(), q_stage_idx, q_phase);
+        smem.full_q_barriers[q_stage_idx].wait(q_phase);
 
 #pragma unroll
-        for (uint32_t i = 0; i < BLOCK_Q; ++i) {
-          uint32_t tmem_addr = tmem_stage_idx * UMMA_N + i * kNumHeads;
-          ptx::tmem_load_32dp32b<kNumHeads / 2>(tmem_addr, reinterpret_cast<uint32_t*>(accum));
-          cutlass::arch::fence_view_async_tmem_load();
-          ptx::tmem_load_32dp32b<kNumHeads / 2>(
-              tmem_addr + kNumHeads / 2, reinterpret_cast<uint32_t*>(accum + kNumHeads / 2));
-          cutlass::arch::fence_view_async_tmem_load();
-
-          if (i == BLOCK_Q - 1) {
-            ptx::tcgen05_before_thread_sync();
-            smem.empty_tmem_barriers[tmem_stage_idx].arrive();
+        for (uint32_t r = 0; r < kRowsPerGroup; ++r) {
+          if (r < num_rows) {
+            const auto smem_weights_row = smem.smem_weights[q_stage_idx] + (row_begin + r) * kNumWeightElementsPerRow;
+#pragma unroll
+            for (uint32_t j = 0; j < kNumHeads; ++j) weights[r][j] = ptx::ld_shared(smem_weights_row + j);
           }
+        }
 
-          float row_weights[kWeightsInSmem ? kNumHeads : 1];
-          if constexpr (kWeightsInSmem) {
-            const auto smem_weights_row =
-                reinterpret_cast<const float4*>(smem.smem_weights[q_stage_idx] + i * kNumWeightElementsPerRow);
+        for (uint32_t kv_split_idx = 0; kv_split_idx < num_kv_splits; ++kv_split_idx) {
+          // The KV stage holds the split's per-key scales; released once both halves' UMMAs committed.
+          float scale_kv[kNumMathWarpGroups];
+          CUTE_TIE_DECL(kv_pipeline.advance(), kv_stage_idx, kv_phase);
+          smem.full_kv_barriers[kv_stage_idx].wait(kv_phase);
 #pragma unroll
-            for (uint32_t j = 0; j < kNumHeads / 4; ++j) {
-              const float4 w4 = ptx::ld_shared(smem_weights_row + j);
-              row_weights[j * 4 + 0] = w4.x;
-              row_weights[j * 4 + 1] = w4.y;
-              row_weights[j * 4 + 2] = w4.z;
-              row_weights[j * 4 + 3] = w4.w;
+          for (uint32_t h = 0; h < kNumMathWarpGroups; ++h)
+            scale_kv[h] = ptx::ld_shared(smem.smem_sf_kv[kv_stage_idx] + h * UMMA_M + key_in_half);
+
+#pragma unroll
+          for (uint32_t h = 0; h < kNumMathWarpGroups; ++h) {
+            CUTE_TIE_DECL(tmem_pipeline.advance(), tmem_stage_idx, tmem_phase);
+            smem.full_tmem_barriers[tmem_stage_idx].wait(tmem_phase);
+            ptx::tcgen05_after_thread_sync();
+            if (h + 1 == kNumMathWarpGroups) {
+              // Release KV smem only after UMMA commits TMEM; earlier release races TMA overwrite
+              cutlass::arch::fence_view_async_shared();
+              smem.empty_kv_barriers[kv_stage_idx].arrive();
+            }
+            const auto kv_offset = (kv_base + kv_split_idx) * kSplitKV + h * UMMA_M + key_in_half;
+
+#pragma unroll
+            for (uint32_t r = 0; r < kRowsPerGroup; ++r) {
+              if (r < num_rows) {
+                ptx::tmem_load_32dp32b<kNumHeads>(
+                    tmem_stage_idx * UMMA_N + (row_begin + r) * kNumHeads, reinterpret_cast<uint32_t*>(accum));
+                cutlass::arch::fence_view_async_tmem_load();
+              }
+              // one arrival per thread and stage, after its last TMEM read (a group without rows arrives at once)
+              if (num_rows == 0 ? r == 0 : r + 1 == num_rows) {
+                ptx::tcgen05_before_thread_sync();
+                smem.empty_tmem_barriers[tmem_stage_idx].arrive();
+              }
+              if (r < num_rows) {
+                float reduced;
+                {
+                  auto sum_0 = make_float2(0, 0);
+                  auto sum_1 = make_float2(0, 0);
+                  const auto transform = [&](const uint32_t& j, const float2& sum) {
+                    auto a_0 = make_float2(accum[j], accum[j + 1]);
+                    auto a_1 = make_float2(fabsf(accum[j]), fabsf(accum[j + 1]));
+                    auto b = make_float2(weights[r][j], weights[r][j + 1]);
+                    return __ffma2_rn(__fadd2_rn(a_0, a_1), b, sum);
+                  };
+
+#pragma unroll
+                  for (uint32_t j = 0; j < kNumHeads; j += 4) {
+                    sum_0 = transform(j, sum_0);
+                    sum_1 = transform(j + 2, sum_1);
+                  }
+
+                  auto sum = __fadd2_rn(sum_0, sum_1);
+                  reduced = (sum.x + sum.y) / 2;
+                }
+                const auto q_offset = scheduler.get_logits_row(row_begin + r) * static_cast<uint64_t>(logits_stride);
+                logits[q_offset + kv_offset] = reduced * scale_kv[h];
+              }
             }
           }
-          const auto weight = [&](const uint32_t& j) -> float {
-            if constexpr (kWeightsInSmem)
-              return row_weights[j];
-            else
-              return weights[i][j];
-          };
+        }
 
-          float reduced;
-          {
-            auto sum_0 = make_float2(0, 0);
-            auto sum_1 = make_float2(0, 0);
-            const auto transform = [&](const uint32_t& j, const float2& sum) {
-              auto a_0 = make_float2(accum[j], accum[j + 1]);
-              auto a_1 = make_float2(fabsf(accum[j]), fabsf(accum[j + 1]));
-              auto b = make_float2(weight(j), weight(j + 1));
-              return __ffma2_rn(__fadd2_rn(a_0, a_1), b, sum);
+        cutlass::arch::fence_view_async_shared();
+        smem.empty_q_barriers[q_stage_idx].arrive();
+      }
+    } else {
+      // Math warpgroup g reads keys [128 g, 128 g + 128) of every split: one key per thread.
+      const auto math_warpgroup_idx = warp_idx / 4;
+      const auto math_thread_idx = warp_idx * 32 + lane_idx;
+      tmem_pipeline.advance(math_warpgroup_idx);
+
+      float weights[kWeightsInSmem ? 1 : BLOCK_Q][kNumHeads];
+      float accum[kNumHeads];
+
+      auto scheduler = make_scheduler();
+      uint32_t q_block_idx, kv_base, num_kv_splits;
+      while (scheduler.next_q_block(q_block_idx, kv_base, num_kv_splits)) {
+        CUTE_TIE_DECL(q_pipeline.advance(), q_stage_idx, q_phase);
+        smem.full_q_barriers[q_stage_idx].wait(q_phase);
+
+        if constexpr (not kWeightsInSmem) {
+  #pragma unroll
+          for (uint32_t i = 0; i < BLOCK_Q; ++i) {
+            const auto smem_weights_row = smem.smem_weights[q_stage_idx] + i * kNumWeightElementsPerRow;
+  #pragma unroll
+            for (uint32_t j = 0; j < kNumHeads; ++j)
+              weights[i][j] = ptx::ld_shared(smem_weights_row + j);
+          }
+        }
+
+        for (uint32_t kv_split_idx = 0; kv_split_idx < num_kv_splits; ++kv_split_idx) {
+          auto kv_offset = scheduler.get_logits_col(kv_base, kv_split_idx, math_thread_idx);
+
+          // FP8 consumes the KV pipeline directly to read per-KV scales
+          CUTE_TIE_DECL(kv_pipeline.advance(), kv_stage_idx, kv_phase);
+          smem.full_kv_barriers[kv_stage_idx].wait(kv_phase);
+          const float scale_kv = ptx::ld_shared(smem.smem_sf_kv[kv_stage_idx] + math_thread_idx);
+
+          CUTE_TIE_DECL(tmem_pipeline.advance(kNumMathWarpGroups), tmem_stage_idx, tmem_phase);
+          smem.full_tmem_barriers[tmem_stage_idx].wait(tmem_phase);
+          ptx::tcgen05_after_thread_sync();
+
+          // Release KV smem only after UMMA commits TMEM; earlier release races TMA overwrite
+          cutlass::arch::fence_view_async_shared();
+          smem.empty_kv_barriers[kv_stage_idx].arrive();
+
+  #pragma unroll
+          for (uint32_t i = 0; i < BLOCK_Q; ++i) {
+            uint32_t tmem_addr = tmem_stage_idx * UMMA_N + i * kNumHeads;
+            ptx::tmem_load_32dp32b<kNumHeads / 2>(tmem_addr, reinterpret_cast<uint32_t*>(accum));
+            cutlass::arch::fence_view_async_tmem_load();
+            ptx::tmem_load_32dp32b<kNumHeads / 2>(
+                tmem_addr + kNumHeads / 2, reinterpret_cast<uint32_t*>(accum + kNumHeads / 2));
+            cutlass::arch::fence_view_async_tmem_load();
+
+            if (i == BLOCK_Q - 1) {
+              ptx::tcgen05_before_thread_sync();
+              smem.empty_tmem_barriers[tmem_stage_idx].arrive();
+            }
+
+            float row_weights[kWeightsInSmem ? kNumHeads : 1];
+            if constexpr (kWeightsInSmem) {
+              const auto smem_weights_row =
+                  reinterpret_cast<const float4*>(smem.smem_weights[q_stage_idx] + i * kNumWeightElementsPerRow);
+  #pragma unroll
+              for (uint32_t j = 0; j < kNumHeads / 4; ++j) {
+                const float4 w4 = ptx::ld_shared(smem_weights_row + j);
+                row_weights[j * 4 + 0] = w4.x;
+                row_weights[j * 4 + 1] = w4.y;
+                row_weights[j * 4 + 2] = w4.z;
+                row_weights[j * 4 + 3] = w4.w;
+              }
+            }
+            const auto weight = [&](const uint32_t& j) -> float {
+              if constexpr (kWeightsInSmem)
+                return row_weights[j];
+              else
+                return weights[i][j];
             };
 
-#pragma unroll
-            for (uint32_t j = 0; j < kNumHeads; j += 4) {
-              sum_0 = transform(j, sum_0);
-              sum_1 = transform(j + 2, sum_1);
-            }
+            float reduced;
+            {
+              auto sum_0 = make_float2(0, 0);
+              auto sum_1 = make_float2(0, 0);
+              const auto transform = [&](const uint32_t& j, const float2& sum) {
+                auto a_0 = make_float2(accum[j], accum[j + 1]);
+                auto a_1 = make_float2(fabsf(accum[j]), fabsf(accum[j + 1]));
+                auto b = make_float2(weight(j), weight(j + 1));
+                return __ffma2_rn(__fadd2_rn(a_0, a_1), b, sum);
+              };
 
-            auto sum = __fadd2_rn(sum_0, sum_1);
-            reduced = (sum.x + sum.y) / 2;
+  #pragma unroll
+              for (uint32_t j = 0; j < kNumHeads; j += 4) {
+                sum_0 = transform(j, sum_0);
+                sum_1 = transform(j + 2, sum_1);
+              }
+
+              auto sum = __fadd2_rn(sum_0, sum_1);
+              reduced = (sum.x + sum.y) / 2;
+            }
+            auto result = static_cast<float>(reduced * scale_kv);
+            const auto q_offset = scheduler.get_logits_row(i) * static_cast<uint64_t>(logits_stride);
+            logits[q_offset + kv_offset] = result;
           }
-          auto result = static_cast<float>(reduced * scale_kv);
-          const auto q_offset = scheduler.get_logits_row(i) * static_cast<uint64_t>(logits_stride);
-          logits[q_offset + kv_offset] = result;
         }
+
+        cutlass::arch::fence_view_async_shared();
+        smem.empty_q_barriers[q_stage_idx].arrive();
       }
 
-      cutlass::arch::fence_view_async_shared();
-      smem.empty_q_barriers[q_stage_idx].arrive();
     }
 
     cutlass::arch::NamedBarrier(kNumMathThreads, 0).sync();
@@ -581,7 +676,7 @@ inline CUtensorMap make_map(
   return map;
 }
 
-template <uint32_t kNextN, uint32_t kNumQStages, uint32_t kNumKVStages, uint32_t kNumTmemStages, bool kWeightsInSmem>
+template <uint32_t kNextN, uint32_t kNumQStages, uint32_t kNumKVStages, uint32_t kNumTmemStages, bool kWeightsInSmem, bool kRowSplit>
 struct PagedMQALogits1Blk {
   static_assert(kNextN >= 1 and kNextN <= 8, "next_n must be 1..8");
   static constexpr size_t kSmem = sizeof(SharedStorage<kNextN, kNumQStages, kNumKVStages, kNumTmemStages>);
@@ -668,7 +763,7 @@ struct PagedMQALogits1Blk {
     const auto map_w = make_map(
         weights.data_ptr(), CU_TENSOR_MAP_DATA_TYPE_FLOAT32, 2, w_dims, w_strides, w_box, CU_TENSOR_MAP_SWIZZLE_NONE);
 
-    constexpr auto kernel = paged_mqa_logits_1blk_kernel<kNextN, kNumQStages, kNumKVStages, kNumTmemStages, kWeightsInSmem>;
+    constexpr auto kernel = paged_mqa_logits_1blk_kernel<kNextN, kNumQStages, kNumKVStages, kNumTmemStages, kWeightsInSmem, kRowSplit>;
     const DLDevice dl_device = q.device();
     runtime::init_per_device(dl_device, [=] { runtime::set_max_dynamic_smem(kernel, kSmem); });
     LaunchKernel(num_sms, kNumSpecializedThreads + kNumMathThreads, dl_device, kSmem)

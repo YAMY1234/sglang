@@ -25,16 +25,18 @@ NUM_HEADS, HEAD_DIM, PAGE_KV, SPLIT_KV = 32, 128, 64, 256
 MAX_NEXT_N = 8
 
 
-def default_config(next_n: int) -> tuple[int, int, int, bool]:
-    """(Q stages, KV stages, TMEM stages, weights in shared memory) for next_n.
+def default_config(next_n: int) -> tuple[int, int, int, bool, bool]:
+    """(Q stages, KV stages, TMEM stages, weights in shared memory, row split) for next_n.
 
     TMEM: 3 accumulator stages while 3 x next_n x 32 <= 512 columns, else 2. Shared memory
     (227 KB): DeepGEMM's 5 KV stages are kept; Q stages drop to 2 (1 at next_n 8). Weights stay in
-    registers (next_n x 32 of them) up to next_n 5 and are read from the Q stage beyond.
+    registers (next_n x 32 of them) up to next_n 5 and are read from the Q stage beyond. Row split
+    (off by default): the two math warpgroups split the rows instead of the 128-key halves, so each
+    thread keeps its ceil(next_n / 2) rows' weights in registers; bitwise the same logits.
     """
     tmem_stages = 3 if 3 * next_n * NUM_HEADS <= 512 else 2
     q_stages = 2 if next_n <= 7 else 1
-    return q_stages, 5, tmem_stages, next_n > 5
+    return q_stages, 5, tmem_stages, next_n > 5, False
 
 
 def _deep_gemm_include() -> str:
@@ -55,9 +57,12 @@ def _jit_module(
     kv_stages: int,
     tmem_stages: int,
     weights_in_smem: bool,
+    row_split: bool,
     cuh_path: Optional[str] = None,
 ) -> Module:
-    args = make_cpp_args(next_n, q_stages, kv_stages, tmem_stages, weights_in_smem)
+    args = make_cpp_args(
+        next_n, q_stages, kv_stages, tmem_stages, weights_in_smem, row_split
+    )
     return load_jit(
         "dsa_paged_mqa_logits_1blk",
         *args,
@@ -89,7 +94,7 @@ def fp8_paged_mqa_logits_1blk(
     max_context_len: int,
     clean_logits: bool = False,
     *,
-    config: Optional[tuple[int, int, int, bool]] = None,
+    config: Optional[tuple[int, int, int, bool, bool]] = None,
     cuh_path: Optional[str] = None,
 ) -> torch.Tensor:
     """Same arguments and result as ``deep_gemm.fp8_paged_mqa_logits(..., clean_logits=False)``.
@@ -130,16 +135,17 @@ def supports_mxfp4(next_n: int, num_heads: int, head_dim: int) -> bool:
     return supports(next_n, num_heads, head_dim) and next_n <= MXFP4_MAX_NEXT_N
 
 
-def default_config_mxfp4(next_n: int) -> tuple[int, int, int, bool]:
-    """(Q stages, KV stages, TMEM stages, weights in shared memory) for next_n.
+def default_config_mxfp4(next_n: int) -> tuple[int, int, int, bool, bool]:
+    """(Q stages, KV stages, TMEM stages, weights in shared memory, row split) for next_n.
 
     DeepGEMM's FP4 stages (3 Q, 10 KV) fit 227 KB up to next_n 8. TMEM holds the accumulators plus
     the Q and KV scale factors (align(next_n x 32, 128) / 32 + 8 columns): 3 stages up to next_n 5.
+    Row split as in ``default_config``.
     """
     n = next_n * NUM_HEADS
     sf_cols = -(-n // 128) * 128 // 32 + SPLIT_KV // 32
     tmem_stages = 3 if 3 * n + sf_cols <= 512 else 2
-    return 3, 10, tmem_stages, next_n > 5
+    return 3, 10, tmem_stages, next_n > 5, False
 
 
 @cache_once
@@ -149,9 +155,12 @@ def _jit_module_mxfp4(
     kv_stages: int,
     tmem_stages: int,
     weights_in_smem: bool,
+    row_split: bool,
     cuh_path: Optional[str] = None,
 ) -> Module:
-    args = make_cpp_args(next_n, q_stages, kv_stages, tmem_stages, weights_in_smem)
+    args = make_cpp_args(
+        next_n, q_stages, kv_stages, tmem_stages, weights_in_smem, row_split
+    )
     return load_jit(
         "dsa_paged_mqa_logits_1blk_mxfp4",
         *args,
@@ -179,7 +188,7 @@ def fp4_paged_mqa_logits_1blk(
     schedule_meta: torch.Tensor,
     max_context_len: int,
     *,
-    config: Optional[tuple[int, int, int, bool]] = None,
+    config: Optional[tuple[int, int, int, bool, bool]] = None,
     cuh_path: Optional[str] = None,
 ) -> torch.Tensor:
     """Same result as ``deep_gemm.fp8_fp4_paged_mqa_logits((q, q_sf), kv_cache, ..., False, torch.float)``.
