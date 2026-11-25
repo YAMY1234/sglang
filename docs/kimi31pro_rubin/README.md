@@ -1,5 +1,7 @@
 # Kimi-K3.1-Pro on VR200: branch `kimi31pro-rubin`
 
+> **Current max-throughput configuration:** [k10b at concurrency 930](k10b-maxtput-c930.md) (basis B, the NVFP4 R3 precision set). Its code is `167e81cefd`, merged into this branch at `4e1d1706fc`. The configuration section below describes the earlier k10p configuration; k10b adds `SGLANG_K31_BASISB_MXFP8=1` on both roles.
+
 This branch is the SGLang tree used to serve Kimi-K3.1-Pro with prefill/decode (PD) disaggregation on NVIDIA VR200 (SM107). It adds fully asynchronous pipeline-parallel (PP) prefill, a hierarchical KV cache with a remote DRAM L3 tier, Mamba/KDA state handling for that cache, DSA/MLA decode kernels for decode context parallelism (DCP), MegaMoE tuning, and a draft KV ring for DSpark speculative decoding.
 
 Almost every change sits behind an environment flag that is off by default, so the tree behaves like its base unless the flags are set. The [Configuration](#configuration) section lists the flags and server arguments of the deployment this branch was cut for.
