@@ -449,8 +449,11 @@ __global__ __launch_bounds__(kNumSpecializedThreads + kNumMathThreads, 1) void p
       const uint32_t num_rows = math_warpgroup_idx == 0 ? kRowsPerGroup : BLOCK_Q - kRowsPerGroup;
       const uint32_t key_in_half = (warp_idx % 4) * 32 + lane_idx;
 
+      constexpr bool kEvenRows = BLOCK_Q % 2 == 0;  // both groups hold kRowsPerGroup rows
+      // TMEM rows read per wait: all of a group's rows up to 3 (96 accumulator registers), else 2 at a time
+      constexpr uint32_t kRowBatch = kRowsPerGroup <= 3 ? kRowsPerGroup : 2;
       float weights[kRowsPerGroup][kNumHeads];
-      float accum[kNumHeads];
+      float* logits_rows[kRowsPerGroup];
 
       auto scheduler = make_scheduler();
       uint32_t q_block_idx, kv_base, num_kv_splits;
@@ -460,11 +463,12 @@ __global__ __launch_bounds__(kNumSpecializedThreads + kNumMathThreads, 1) void p
 
 #pragma unroll
         for (uint32_t r = 0; r < kRowsPerGroup; ++r) {
-          if (r < num_rows) {
+          if (kEvenRows or r < num_rows) {
             const auto smem_weights_row = smem.smem_weights[q_stage_idx] + (row_begin + r) * kNumWeightElementsPerRow;
 #pragma unroll
             for (uint32_t j = 0; j < kNumHeads; ++j) weights[r][j] = ptx::ld_shared(smem_weights_row + j);
           }
+          logits_rows[r] = logits + scheduler.get_logits_row(row_begin + r) * static_cast<uint64_t>(logits_stride);
         }
 
         for (uint32_t kv_split_idx = 0; kv_split_idx < num_kv_splits; ++kv_split_idx) {
@@ -488,41 +492,50 @@ __global__ __launch_bounds__(kNumSpecializedThreads + kNumMathThreads, 1) void p
             }
             const auto kv_offset = (kv_base + kv_split_idx) * kSplitKV + h * UMMA_M + key_in_half;
 
+            // Rows from TMEM in batches (up to 3: one wait each), then their FFMA2 chains interleaved; the stage
+            // is released after the last batch's loads.
 #pragma unroll
-            for (uint32_t r = 0; r < kRowsPerGroup; ++r) {
-              if (r < num_rows) {
-                ptx::tmem_load_32dp32b<kNumHeads>(
-                    tmem_stage_idx * UMMA_N + (row_begin + r) * kNumHeads, reinterpret_cast<uint32_t*>(accum));
-                cutlass::arch::fence_view_async_tmem_load();
+            for (uint32_t b0 = 0; b0 < kRowsPerGroup; b0 += kRowBatch) {
+              float accum[kRowBatch][kNumHeads];
+#pragma unroll
+              for (uint32_t k = 0; k < kRowBatch; ++k) {
+                const uint32_t r = b0 + k;
+                if (r < kRowsPerGroup and (kEvenRows or r < num_rows))
+                  ptx::tmem_load_32dp32b<kNumHeads>(
+                      tmem_stage_idx * UMMA_N + (row_begin + r) * kNumHeads, reinterpret_cast<uint32_t*>(accum[k]));
               }
-              // one arrival per thread and stage, after its last TMEM read (a group without rows arrives at once)
-              if (num_rows == 0 ? r == 0 : r + 1 == num_rows) {
+              cutlass::arch::fence_view_async_tmem_load();
+              if (b0 + kRowBatch >= kRowsPerGroup) {
                 ptx::tcgen05_before_thread_sync();
                 smem.empty_tmem_barriers[tmem_stage_idx].arrive();
               }
-              if (r < num_rows) {
-                float reduced;
-                {
-                  auto sum_0 = make_float2(0, 0);
-                  auto sum_1 = make_float2(0, 0);
-                  const auto transform = [&](const uint32_t& j, const float2& sum) {
-                    auto a_0 = make_float2(accum[j], accum[j + 1]);
-                    auto a_1 = make_float2(fabsf(accum[j]), fabsf(accum[j + 1]));
-                    auto b = make_float2(weights[r][j], weights[r][j + 1]);
-                    return __ffma2_rn(__fadd2_rn(a_0, a_1), b, sum);
-                  };
 
 #pragma unroll
-                  for (uint32_t j = 0; j < kNumHeads; j += 4) {
-                    sum_0 = transform(j, sum_0);
-                    sum_1 = transform(j + 2, sum_1);
-                  }
+              for (uint32_t k = 0; k < kRowBatch; ++k) {
+                const uint32_t r = b0 + k;
+                if (r < kRowsPerGroup and (kEvenRows or r < num_rows)) {
+                  float reduced;
+                  {
+                    auto sum_0 = make_float2(0, 0);
+                    auto sum_1 = make_float2(0, 0);
+                    const auto transform = [&](const uint32_t& j, const float2& sum) {
+                      auto a_0 = make_float2(accum[k][j], accum[k][j + 1]);
+                      auto a_1 = make_float2(fabsf(accum[k][j]), fabsf(accum[k][j + 1]));
+                      auto b = make_float2(weights[r][j], weights[r][j + 1]);
+                      return __ffma2_rn(__fadd2_rn(a_0, a_1), b, sum);
+                    };
 
-                  auto sum = __fadd2_rn(sum_0, sum_1);
-                  reduced = (sum.x + sum.y) / 2;
+#pragma unroll
+                    for (uint32_t j = 0; j < kNumHeads; j += 4) {
+                      sum_0 = transform(j, sum_0);
+                      sum_1 = transform(j + 2, sum_1);
+                    }
+
+                    auto sum = __fadd2_rn(sum_0, sum_1);
+                    reduced = (sum.x + sum.y) / 2;
+                  }
+                  logits_rows[r][kv_offset] = reduced * scale_kv[h];
                 }
-                const auto q_offset = scheduler.get_logits_row(row_begin + r) * static_cast<uint64_t>(logits_stride);
-                logits[q_offset + kv_offset] = reduced * scale_kv[h];
               }
             }
           }
