@@ -10,6 +10,7 @@ from sglang.srt.speculative.domino_corrector import (
     CorrectorSampling,
     TransformerCorrector,
 )
+from sglang.srt.speculative.domino_utils import _all_gather_candidates
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
@@ -215,6 +216,36 @@ class TestDominoCorrector(unittest.TestCase):
         drawn = (pool == picks).float().mean(0)
         self.assertGreater(q_rows[0, 0].min().item(), 0.05)
         torch.testing.assert_close(drawn, q_rows[0, 0], atol=0.015, rtol=0)
+
+
+class TestCandidateAllGather(unittest.TestCase):
+    def test_one_packed_gather_returns_each_shards_scores_and_ids(self):
+        # Two ranks that picked the same local positions; rank 1's shard starts at V.
+        vocab_shard, rows, k = 40960, 3, 6
+        group = SimpleNamespace(
+            world_size=2,
+            all_gather_into_tensor=lambda out, x: out.copy_(torch.cat((x, x))),
+        )
+        positions = torch.tensor([0, 1, 32767, 32768, 40000, 40959]).repeat(rows, 1)
+        scores = torch.randn(rows, k).to(torch.bfloat16)
+        scores[0, 2], scores[1, 0] = -torch.inf, -0.0
+        gathered_scores, gathered_ids = _all_gather_candidates(
+            scores,
+            positions,
+            tp_group=group,
+            local_vocab_size=vocab_shard,
+            org_vocab_start=0,
+        )
+        self.assertEqual(gathered_ids.dtype, torch.int64)
+        self.assertTrue(
+            torch.equal(
+                gathered_scores.view(torch.int16),
+                torch.cat((scores, scores)).view(torch.int16),
+            )
+        )
+        self.assertTrue(
+            torch.equal(gathered_ids, torch.cat((positions, positions + vocab_shard)))
+        )
 
 
 class TestCorrectorContext(unittest.TestCase):

@@ -77,19 +77,39 @@ def _history_attention(
 
 def _context_attention(
     query: torch.Tensor,
-    context_kv: torch.Tensor,
-    valid: torch.Tensor,
+    context_kv: Optional[torch.Tensor],
+    valid: Optional[torch.Tensor],
     cos: torch.Tensor,
     sin: torch.Tensor,
     *,
     layer: int,
     heads: int,
+    window: Optional["CorrectorWindow"] = None,
 ) -> torch.Tensor:
     """Attend a slot's two streams to the window of projected target context.
 
     The contract is ``corrector_context_attention``'s; this is its reference.
+    ``window`` reads each request's window in place from the ring instead.
     """
     head_dim = query.shape[-1] // heads
+    if window is not None:
+        from sglang.kernels.ops.speculative.domino_corrector import (
+            corrector_ring_context_attention,
+        )
+
+        assert _fused_attention(query, head_dim)
+        return corrector_ring_context_attention(
+            query,
+            window.kv,
+            window.req_pool_indices,
+            window.anchor_positions,
+            window.min_pos,
+            cos,
+            sin,
+            sink_rows=window.sink_rows,
+            layer=layer,
+            heads=heads,
+        )
     if _fused_attention(query, head_dim):
         from sglang.kernels.ops.speculative.domino_corrector import (
             corrector_context_attention,
@@ -183,6 +203,58 @@ def _draw(
     )
 
 
+def _candidate_scores(
+    base: torch.Tensor,
+    candidate_ids: torch.Tensor,
+    table: torch.Tensor,
+    correction: torch.Tensor,
+) -> torch.Tensor:
+    """``base`` plus the correction of each candidate, [batch, K] in the correction's
+    dtype: ``table`` is the head's [vocab, emb] output layer. The contract is
+    ``corrector_candidate_scores``'s; this is its reference."""
+    emb = table.shape[1]
+    if (
+        correction.is_cuda
+        and correction.dtype == torch.float32
+        and table.dtype in (torch.bfloat16, torch.float32)
+        and emb & (emb - 1) == 0
+    ):
+        from sglang.kernels.ops.speculative.domino_corrector import (
+            corrector_candidate_scores,
+        )
+
+        return corrector_candidate_scores(base, candidate_ids, table, correction)
+    weight = F.embedding(candidate_ids, table).to(correction.dtype)
+    return torch.baddbmm(
+        base.to(correction.dtype)[:, :, None], weight, correction[:, :, None]
+    )[:, :, 0]
+
+
+def _fused_output_head(
+    hidden: torch.Tensor, embed_proj: nn.Sequential, *, width: int
+) -> bool:
+    """Whether one launch computes a slot's correction (``corrector_output_head``)."""
+    emb = embed_proj[0].out_features
+    return (
+        _on_kernels(hidden)
+        and isinstance(embed_proj[1], nn.SiLU)
+        and width & (width - 1) == 0
+        and emb & (emb - 1) == 0
+    )
+
+
+class CorrectorWindow(msgspec.Struct, frozen=True, kw_only=True):
+    """Each request's context window, read in place from ``CorrectorContext``'s ring:
+    window row ``w`` is position ``anchor - window + w`` at ring row
+    ``sink_rows + slot * window + position % window``, valid from ``min_pos[slot]``."""
+
+    kv: torch.Tensor  # [ring rows, layers, 2 * d_model]
+    req_pool_indices: torch.Tensor  # [batch]
+    anchor_positions: torch.Tensor  # [batch]
+    min_pos: torch.Tensor  # [req pool rows], int32
+    sink_rows: int
+
+
 class _CorrectorBlock(nn.Module):
     """One block's parameters; ``_RolloutPlan`` lays them out for the rollout."""
 
@@ -218,6 +290,7 @@ class TransformerCorrector(nn.Module):
         self.output_norm = nn.RMSNorm(width, eps)
         self.mlp_act = SiluAndMul()
         self._rollout_plans: dict = {}
+        self._head_plans: dict = {}
 
     def project_context(self, hidden: torch.Tensor) -> torch.Tensor:
         """Project committed target context to [..., layers, 2 * d_model]."""
@@ -239,20 +312,27 @@ class TransformerCorrector(nn.Module):
             self._rollout_plans[key] = _RolloutPlan.build(self, num_slots)
         return self._rollout_plans[key]
 
+    def _head_plan(self, head_weight: torch.Tensor, hidden_size: int) -> "_HeadPlan":
+        key = (id(head_weight), head_weight.device, head_weight.dtype, hidden_size)
+        if key not in self._head_plans:
+            self._head_plans[key] = _HeadPlan.build(head_weight, hidden_size)
+        return self._head_plans[key]
+
     @torch.no_grad()
     def propose(
         self,
         *,
         hidden: torch.Tensor,
         anchors: torch.Tensor,
-        context_kv: torch.Tensor,
-        context_mask: torch.Tensor,
+        context_kv: Optional[torch.Tensor],
+        context_mask: Optional[torch.Tensor],
         token_inputs: torch.Tensor,
         embed_proj: nn.Sequential,
         unary_picks: torch.Tensor,
         unary_scores: torch.Tensor,
         candidate_ids: Optional[torch.Tensor] = None,
         sampling: Optional[CorrectorSampling] = None,
+        context_window: Optional[CorrectorWindow] = None,
     ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Propose [batch, slots] tokens. Slot 1 follows the anchor.
 
@@ -262,7 +342,9 @@ class TransformerCorrector(nn.Module):
         ``sampling``, which needs ``candidate_ids``, they draw from the corrected
         scores instead and their q, [batch, corrected slots, K], is returned too.
 
-        ``token_inputs`` is ``token_table``'s [vocab, width] table.
+        ``token_inputs`` is ``token_table``'s [vocab, width] table. The context is
+        ``context_kv`` / ``context_mask`` (``CorrectorContext.gather``), or
+        ``context_window`` read in place on the kernels.
 
         A block is a few hundred small kernels, so the rollout is laid out for few
         launches (see ``_RolloutPlan``). In the blocks, as in training, products
@@ -275,16 +357,11 @@ class TransformerCorrector(nn.Module):
         wide, width, head_dim = plan.wide, plan.width, self.head_dim
         heads = width // head_dim
 
-        # The correction's first layer, split into its draft hidden and state inputs.
-        head_weight = embed_proj[0].weight.to(wide)
-        hidden_part = F.linear(hidden.to(wide), head_weight[:, :hidden_size])
-        state_t = head_weight[:, hidden_size:].T
-        if candidate_ids is not None:
-            # [batch, K, emb_dim]: the output rows of the pool, shared by the block.
-            candidate_weight = F.embedding(candidate_ids, embed_proj[2].weight).to(wide)
-            unary_scores = unary_scores.to(wide)
+        head = self._head_plan(embed_proj[0].weight, hidden_size)
+        hidden_part = head.hidden_part(hidden, wide)
+        fused_head = _fused_output_head(hidden, embed_proj, width=width)
 
-        context_valid = context_mask.to(torch.uint8)
+        context_valid = None if context_mask is None else context_mask.to(torch.uint8)
         # [batch, slots, 2 streams, width]: what each stream adds to the token.
         hidden_query = self.input_hidden(hidden)
         slot_inputs = torch.stack((torch.zeros_like(hidden_query), hidden_query), dim=2)
@@ -317,6 +394,7 @@ class TransformerCorrector(nn.Module):
                     plan.context_sin,
                     layer=j,
                     heads=heads,
+                    window=context_window,
                 )
                 flat.addmm_(attended.reshape(bs * 2, width), block.cross_out_t)
 
@@ -332,9 +410,8 @@ class TransformerCorrector(nn.Module):
             if i < num_unary_slots:
                 previous = unary_picks[:, i]
             else:
-                state = _rms_norm(streams[:, 1].to(wide), self.output_norm)
-                correction = embed_proj[1](
-                    torch.addmm(hidden_part[:, i], state, state_t)
+                correction = self._correction(
+                    streams, hidden_part[:, i], head, embed_proj, fused=fused_head
                 )
                 scores = unary_scores[:, i - num_unary_slots]
                 if candidate_ids is None:
@@ -342,9 +419,9 @@ class TransformerCorrector(nn.Module):
                         scores + embed_proj[2](correction.to(scores.dtype))
                     ).argmax(dim=-1)
                 else:
-                    scores = torch.baddbmm(
-                        scores[:, :, None], candidate_weight, correction[:, :, None]
-                    )[:, :, 0]
+                    scores = _candidate_scores(
+                        scores, candidate_ids, embed_proj[2].weight, correction
+                    )
                     if sampling is None:
                         choice = scores.argmax(dim=-1, keepdim=True)
                         previous = candidate_ids.gather(1, choice).squeeze(1)
@@ -353,6 +430,58 @@ class TransformerCorrector(nn.Module):
                         q_rows.append(q)
             picks.append(previous)
         return torch.stack(picks, dim=1), torch.stack(q_rows, dim=1) if q_rows else None
+
+    def _correction(
+        self,
+        streams: torch.Tensor,
+        hidden_part: torch.Tensor,
+        head: "_HeadPlan",
+        embed_proj: nn.Sequential,
+        *,
+        fused: bool,
+    ) -> torch.Tensor:
+        """A slot's [batch, emb] correction from its hidden stream, in FP32."""
+        if fused:
+            from sglang.kernels.ops.speculative.domino_corrector import (
+                corrector_output_head,
+            )
+
+            return corrector_output_head(
+                streams,
+                self.output_norm.weight,
+                self.output_norm.eps,
+                head.state_t,
+                hidden_part,
+            )
+        state = _rms_norm(streams[:, 1].to(hidden_part.dtype), self.output_norm)
+        return embed_proj[1](torch.addmm(hidden_part, state, head.state_t))
+
+
+class _HeadPlan(msgspec.Struct, frozen=True, kw_only=True):
+    """The correction head's first layer, split into its draft hidden and state inputs."""
+
+    hidden_weight: torch.Tensor  # [emb, hidden], the head's dtype
+    state_t: torch.Tensor  # [width, emb], wide
+
+    @classmethod
+    def build(cls, head_weight: torch.Tensor, hidden_size: int) -> "_HeadPlan":
+        wide = torch.promote_types(head_weight.dtype, torch.float32)
+        return cls(
+            hidden_weight=head_weight[:, :hidden_size].contiguous(),
+            state_t=head_weight[:, hidden_size:].T.to(wide).contiguous(),
+        )
+
+    def hidden_part(self, hidden: torch.Tensor, wide: torch.dtype) -> torch.Tensor:
+        """[batch, slots, emb] in ``wide``: the draft hidden's share of the layer."""
+        weight = self.hidden_weight
+        if hidden.is_cuda and hidden.dtype == weight.dtype == torch.bfloat16:
+            # BF16 products are exact in FP32, so the tensor cores change only the
+            # order of the FP32 sums.
+            flat = torch.mm(
+                hidden.reshape(-1, hidden.shape[-1]), weight.t(), out_dtype=wide
+            )
+            return flat.view(*hidden.shape[:-1], -1)
+        return F.linear(hidden.to(wide), weight.to(wide))
 
 
 class _BlockPlan(msgspec.Struct, frozen=True, kw_only=True):
@@ -515,6 +644,24 @@ class CorrectorContext:
         context = self.kv[locs].masked_fill_(~valid[:, :, None, None], 0)
         return context, valid
 
+    def window(
+        self,
+        req_pool_indices: torch.Tensor,
+        anchor_positions: torch.Tensor,
+    ) -> CorrectorWindow:
+        """``gather``'s windows, left in the ring for the attention kernel to read."""
+        # CorrectorWindow's row formula is the ring's locs for this layout.
+        ring = self.ring
+        assert ring.dcp_size == 1 and not ring.rebased
+        assert ring.rows_per_req == self.offsets.numel()
+        return CorrectorWindow(
+            kv=self.kv,
+            req_pool_indices=req_pool_indices,
+            anchor_positions=anchor_positions,
+            min_pos=ring.min_pos,
+            sink_rows=ring.sink_rows,
+        )
+
 
 class CorrectorDraftSampler:
     """Corrector rollout over a draft block: eager, or captured in the draft graph."""
@@ -561,6 +708,12 @@ class CorrectorDraftSampler:
         self.q_out = torch.empty(
             (max_bs, slots, pool), dtype=torch.float32, device=device
         )
+        # Token-major rows of each block's positions after its anchor, for up to
+        # max_bs requests: one vectorized gather makes them contiguous.
+        self.slot_rows = (
+            torch.arange(max_bs, device=device)[:, None] * block_size
+            + torch.arange(1, block_size, device=device)
+        ).flatten()
 
     def stage_sampling_params(self, *, bs: int, sampling_info) -> None:
         if not self.sampling_enabled:
@@ -603,11 +756,18 @@ class CorrectorDraftSampler:
         [batch, block_size - 1, K], for the accept.
         """
         bs = hidden_states.shape[0] // self.block_size
-        hidden = hidden_states.view(bs, self.block_size, -1)[:, 1:]
+        hidden = self._slot_hidden(hidden_states, bs)
         # A block's first position is its anchor's.
-        context_kv, context_mask = self.context.gather(
-            req_pool_indices, positions.view(bs, self.block_size)[:, 0]
-        )
+        anchor_positions = positions.view(bs, self.block_size)[:, 0]
+        context_kv = context_mask = context_window = None
+        if _fused_attention(hidden_states, self.corrector.head_dim):
+            context_window = self.context.window(
+                req_pool_indices, anchor_positions.contiguous()
+            )
+        else:
+            context_kv, context_mask = self.context.gather(
+                req_pool_indices, anchor_positions
+            )
         unary_picks, unary_scores, candidate_ids = corrector_unary_scores(
             hidden,
             self.lm_head,
@@ -630,6 +790,7 @@ class CorrectorDraftSampler:
             unary_scores=unary_scores,
             candidate_ids=candidate_ids,
             sampling=sampling,
+            context_window=context_window,
         )
         if q_rows is None:
             return tokens, None, None
@@ -647,6 +808,16 @@ class CorrectorDraftSampler:
             (q_rows.new_ones((bs, num_unary_slots, pool)), q_rows), dim=1
         )
         return tokens, candidates, q_rows
+
+    def _slot_hidden(self, hidden_states: torch.Tensor, bs: int) -> torch.Tensor:
+        """[batch, block_size - 1, hidden], contiguous: a block's draft hidden states
+        after its anchor, copied once for the head and the corrector."""
+        rows = bs * (self.block_size - 1)
+        if rows <= self.slot_rows.numel():
+            return hidden_states[self.slot_rows[:rows]].view(
+                bs, self.block_size - 1, -1
+            )
+        return hidden_states.view(bs, self.block_size, -1)[:, 1:].contiguous()
 
     def capture_hook(self, runner, out, forward_batch, num_tokens) -> None:
         """Draft graph tail hook. The request slots and positions it reads are the

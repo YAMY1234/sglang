@@ -59,6 +59,54 @@ def _domino_tp_first_ids(
     return torch.gather(gathered_ids, 0, best_rank).squeeze(0)
 
 
+def _pool_max(logits: torch.Tensor) -> torch.Tensor:
+    """[batch, steps, vocab] -> [batch, vocab]: the max over a block's steps."""
+    if logits.is_cuda:
+        from sglang.kernels.ops.speculative.domino_corrector import corrector_pool_max
+
+        return corrector_pool_max(logits)
+    return logits.amax(dim=1)
+
+
+def _all_gather_candidates(
+    scores: torch.Tensor,
+    positions: torch.Tensor,
+    *,
+    tp_group,
+    local_vocab_size: int,
+    org_vocab_start: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Every shard's [batch, K] top-K scores and global ids, [tp * batch, K] rank-major."""
+    tp_size = int(tp_group.world_size)
+    rows, local_k = scores.shape
+    if scores.element_size() != 2 or local_vocab_size > 1 << 16:
+        gathered_scores = scores.new_empty((tp_size * rows, local_k))
+        gathered_ids = torch.empty(
+            (tp_size * rows, local_k), dtype=torch.int64, device=scores.device
+        )
+        tp_group.all_gather_into_tensor(gathered_scores, scores.contiguous())
+        tp_group.all_gather_into_tensor(
+            gathered_ids, positions.to(torch.int64) + int(org_vocab_start)
+        )
+        return gathered_scores, gathered_ids
+    # One collective: each candidate's 16-bit local position, then its 16-bit score.
+    packed = torch.stack((positions.to(torch.int16), scores.view(torch.int16)), dim=-1)
+    gathered = torch.empty(
+        (tp_size * rows, local_k), dtype=torch.int32, device=scores.device
+    )
+    tp_group.all_gather_into_tensor(gathered, packed.view(torch.int32).squeeze(-1))
+    halves = gathered.view(torch.int16).view(tp_size, rows, local_k, 2)
+    # Shard r starts at r * local_vocab_size (validate_domino_runtime checks it).
+    starts = torch.arange(
+        0, tp_size * local_vocab_size, local_vocab_size, device=scores.device
+    )
+    gathered_ids = (halves[..., 0].to(torch.int64) & 0xFFFF) + starts[:, None, None]
+    return (
+        halves[..., 1].view(scores.dtype).reshape(tp_size * rows, local_k),
+        gathered_ids.view(tp_size * rows, local_k),
+    )
+
+
 def _domino_tp_candidate_state(
     local_feedback_logits: torch.Tensor,
     *,
@@ -74,26 +122,19 @@ def _domino_tp_candidate_state(
     if int(candidate_pool_size) > tp_size * local_k:
         raise ValueError("Domino TP shards do not cover the requested candidate pool.")
 
-    pool_scores = local_feedback_logits.amax(dim=0)
+    pool_scores = _pool_max(local_feedback_logits.transpose(0, 1))
     if num_org < local_vocab_size:
         pool_scores[:, num_org:].fill_(float("-inf"))
     local_scores, local_positions = torch.topk(
         pool_scores, k=local_k, dim=-1, sorted=False
     )
-    local_ids = local_positions.to(torch.int64) + int(org_vocab_start)
-
-    gathered_scores = torch.empty(
-        (tp_size * batch_size, local_k),
-        dtype=local_scores.dtype,
-        device=local_scores.device,
+    gathered_scores, gathered_ids = _all_gather_candidates(
+        local_scores,
+        local_positions,
+        tp_group=tp_group,
+        local_vocab_size=local_vocab_size,
+        org_vocab_start=org_vocab_start,
     )
-    gathered_ids = torch.empty(
-        (tp_size * batch_size, local_k),
-        dtype=torch.int64,
-        device=local_scores.device,
-    )
-    tp_group.all_gather_into_tensor(gathered_scores, local_scores.contiguous())
-    tp_group.all_gather_into_tensor(gathered_ids, local_ids.contiguous())
     gathered_scores = (
         gathered_scores.view(tp_size, batch_size, local_k)
         .permute(1, 0, 2)
