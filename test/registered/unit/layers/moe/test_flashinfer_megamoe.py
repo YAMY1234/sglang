@@ -69,6 +69,12 @@ def _load_megamoe_module(monkeypatch):
         SGLANG_OPT_FLASHINFER_MEGAMOE_SM107_PER_CTA_PUSH_LAYOUT=types.SimpleNamespace(
             get=lambda: False
         ),
+        SGLANG_OPT_FLASHINFER_MEGAMOE_FUSED_EPILOGUE=types.SimpleNamespace(
+            get=lambda: False
+        ),
+        SGLANG_OPT_FLASHINFER_MEGAMOE_FUSED_ROUTE_QUANT=types.SimpleNamespace(
+            get=lambda: False
+        ),
     )
     runtime_context = fake_modules["sglang.srt.runtime_context"]
     runtime_context.cutedsl_moe_max_num_tokens = lambda: 2048
@@ -1113,6 +1119,451 @@ def test_sm107_layer_runs_fixed_knobs_without_startup_tuning(monkeypatch, varian
     assert layer._flashinfer_megamoe_forward is module.forward_megamoe
     with pytest.raises(ValueError, match="weight reload"):
         module._prepare_nvfp4_weights_for_sm107(layer, variant=variant)
+
+
+@pytest.mark.parametrize(
+    "overrides,expected",
+    [
+        ({}, True),
+        ({"SGLANG_OPT_FLASHINFER_MEGAMOE_FUSED_EPILOGUE": False}, False),
+        # The handoff carries no routed scale.
+        ({"fuses_routed_scale": False}, False),
+        ({"SGLANG_FLASHINFER_MEGAMOE_SM107_VARIANT": ""}, False),
+        ({"capability": (10, 0)}, False),
+    ],
+)
+def test_fused_epilogue_needs_the_variant_and_a_folded_routed_scale(
+    monkeypatch, overrides, expected
+):
+    module = _load_megamoe_module(monkeypatch)
+    _capture_warnings_once(monkeypatch)
+    overrides = dict(overrides)
+    capability = overrides.pop("capability", (10, 7))
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda: capability)
+    layer = types.SimpleNamespace(
+        moe_ep_size=16,
+        should_fuse_routed_scaling_factor_in_topk=overrides.pop(
+            "fuses_routed_scale", True
+        ),
+    )
+    env_values = {
+        "SGLANG_FLASHINFER_MEGAMOE_SM107_VARIANT": "inference",
+        "SGLANG_FLASHINFER_MEGAMOE_MAX_TOKENS_PER_RANK": 256,
+        "SGLANG_OPT_FLASHINFER_MEGAMOE_FUSED_EPILOGUE": True,
+    }
+    env_values.update(overrides)
+    _set_envs(monkeypatch, module, **env_values)
+
+    assert module.flashinfer_megamoe_hands_off_epilogue(layer) is expected
+
+
+@pytest.mark.parametrize("fused_epilogue", [False, True])
+def test_fused_epilogue_layer_returns_an_owned_output(monkeypatch, fused_epilogue):
+    module = _load_megamoe_module(monkeypatch)
+    _capture_warnings_once(monkeypatch)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda: (10, 7))
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    _set_envs(
+        monkeypatch,
+        module,
+        SGLANG_FLASHINFER_MEGAMOE_SM107_VARIANT="inference",
+        SGLANG_FLASHINFER_MEGAMOE_MAX_TOKENS_PER_RANK=256,
+        SGLANG_OPT_FLASHINFER_MEGAMOE_FUSED_EPILOGUE=fused_epilogue,
+    )
+    fake_moe_ep = types.ModuleType("flashinfer.moe_ep")
+    fake_moe_ep.Sm107_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig = types.SimpleNamespace
+    fake_moe_ep.BootstrapConfig = types.SimpleNamespace
+    fake_moe_ep.FleetParams = types.SimpleNamespace
+    fake_moe_ep.MegaConfig = types.SimpleNamespace
+    fake_moe_ep.MoEEpMegaLayer = types.SimpleNamespace
+    monkeypatch.setitem(sys.modules, "flashinfer.moe_ep", fake_moe_ep)
+    monkeypatch.setattr(
+        sys.modules["sglang.srt.runtime_context"],
+        "get_parallel",
+        lambda: types.SimpleNamespace(
+            moe_ep_group=types.SimpleNamespace(device_group=None)
+        ),
+        raising=False,
+    )
+    layer = types.SimpleNamespace(
+        layer_id=0,
+        hidden_size=128,
+        num_experts=4,
+        moe_ep_size=2,
+        moe_ep_rank=1,
+        intermediate_size_per_partition=128,
+        top_k=2,
+        should_fuse_routed_scaling_factor_in_topk=True,
+        moe_runner_config=types.SimpleNamespace(
+            is_gated=True, activation="silu", swiglu_limit=8.0
+        ),
+        w13_weight=torch.zeros(1),
+        w2_weight=torch.zeros(1),
+        w13_weight_scale=torch.zeros(1),
+        w2_weight_scale=torch.zeros(1),
+    )
+    module._init_flashinfer_megamoe_layer_state(layer)
+    layer._flashinfer_megamoe_sm107_variant = "inference"
+    layer._flashinfer_megamoe_input_norm_const = 2.0
+
+    module.ensure_nvfp4_moe_layer_for_flashinfer_megamoe(layer)
+
+    if not fused_epilogue:
+        assert layer._flashinfer_megamoe_forward is module.forward_megamoe
+        return
+    assert layer._flashinfer_megamoe_forward is module._forward_megamoe_owned
+    calls = []
+    mega = types.SimpleNamespace(
+        forward=lambda tensors, **kwargs: calls.append((tensors, kwargs)) or "out"
+    )
+    # Neither a workspace view nor a caller workspace: FlashInfer allocates [T, H].
+    assert layer._flashinfer_megamoe_forward(mega, "tensors") == "out"
+    assert calls == [("tensors", {})]
+
+
+def _fake_route_stage_module(monkeypatch, **attrs):
+    route_stage = types.ModuleType(
+        "sglang.srt.layers.moe.flashinfer_megamoe_route_stage"
+    )
+    for name, value in attrs.items():
+        setattr(route_stage, name, value)
+    monkeypatch.setitem(sys.modules, route_stage.__name__, route_stage)
+
+
+@pytest.mark.parametrize(
+    "variant,version,installs",
+    [
+        ("inference", "0.7.4", True),
+        ("inference", "0.7.5.post1", True),
+        ("genphase", "0.7.4", False),
+        (None, "0.7.4", False),
+        ("inference", "0.7.6", False),
+    ],
+)
+def test_fused_route_stage_installs_only_on_the_inference_kernel(
+    monkeypatch, variant, version, installs
+):
+    module = _load_megamoe_module(monkeypatch)
+    warnings = _capture_warnings_once(monkeypatch)
+    _set_envs(monkeypatch, module, SGLANG_OPT_FLASHINFER_MEGAMOE_FUSED_ROUTE_QUANT=True)
+    fake_flashinfer = types.ModuleType("flashinfer")
+    fake_flashinfer.__version__ = version
+    monkeypatch.setitem(sys.modules, "flashinfer", fake_flashinfer)
+    installed = []
+    _fake_route_stage_module(
+        monkeypatch, install_fused_route_stage=lambda: installed.append(True)
+    )
+
+    module._install_fused_route_stage(variant)
+
+    if installs:
+        assert installed == [True] and warnings == []
+    else:
+        assert installed == []
+        assert len(warnings) == 1
+        assert "FUSED_ROUTE_QUANT is ignored" in warnings[0]
+
+
+def test_fused_route_stage_off_imports_nothing(monkeypatch):
+    module = _load_megamoe_module(monkeypatch)
+    # Importing FlashInfer would fail.
+    monkeypatch.setitem(sys.modules, "flashinfer", None)
+    module._install_fused_route_stage("inference")
+
+
+def _input_stage_fixture(monkeypatch, hidden=128, top_k=2, capacity=8):
+    module = _load_megamoe_module(monkeypatch)
+    _fake_route_stage_module(monkeypatch, fused_route_stage_installed=lambda: True)
+    monkeypatch.delenv("FLASHINFER_MEGA_FUSED_STAGE", raising=False)
+    workspace = types.SimpleNamespace(
+        x=torch.zeros(capacity, hidden // 2, dtype=torch.uint8),
+        x_sf=torch.zeros(capacity, hidden // 16, dtype=torch.float8_e4m3fn),
+        topk_idx=torch.full((capacity, top_k), -1, dtype=torch.int32),
+        topk_weights=torch.zeros(capacity, top_k),
+    )
+    kernel = types.SimpleNamespace(
+        _kernel_config=types.SimpleNamespace(input_norm_const=1.5)
+    )
+    mega = types.SimpleNamespace(
+        _mega_config=types.SimpleNamespace(quantize_input=True),
+        _default_workspace_handle=None,
+        _workspace=workspace,
+        _kernel=kernel,
+    )
+    layer = types.SimpleNamespace(
+        top_k=top_k,
+        _flashinfer_megamoe_layer=mega,
+        _flashinfer_megamoe_sm107_variant="inference",
+    )
+    x = torch.zeros(3, hidden, dtype=torch.bfloat16)
+    return module, layer, mega, workspace, x
+
+
+def test_input_stage_exposes_the_workspace_flashinfer_stages_into(monkeypatch):
+    module, layer, mega, workspace, x = _input_stage_fixture(monkeypatch)
+
+    stage = module.flashinfer_megamoe_input_stage(layer, x)
+
+    assert stage.workspace is workspace
+    assert stage.x_q.dtype == stage.x_sf.dtype == torch.uint8
+    assert stage.x_q.data_ptr() == workspace.x.data_ptr()
+    assert stage.x_sf.data_ptr() == workspace.x_sf.data_ptr()
+    assert stage.topk_idx is workspace.topk_idx
+    assert stage.topk_weights is workspace.topk_weights
+    assert stage.norm_const == 1.5
+    assert stage.scale_multiplier == 1.5 / 6.0
+
+    # A default workspace handle owns the workspace and kernel the forward uses.
+    handle_workspace = types.SimpleNamespace(**vars(workspace))
+    handle_kernel = types.SimpleNamespace(
+        _kernel_config=types.SimpleNamespace(input_norm_const=0.5)
+    )
+    mega._default_workspace_handle = types.SimpleNamespace(
+        _backend_workspace=handle_workspace, _kernel=handle_kernel
+    )
+    stage = module.flashinfer_megamoe_input_stage(layer, x)
+    assert stage.workspace is handle_workspace
+    assert stage.norm_const == 0.5
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "not_installed",
+        "genphase",
+        "no_layer",
+        "pre_quantized_input",
+        "no_workspace_yet",
+        "torch_staging",
+        "fp16_rows",
+        "strided_rows",
+        "no_rows",
+        "over_capacity",
+        "hidden_mismatch",
+        "int64_routes",
+        "top_k_mismatch",
+    ],
+)
+def test_input_stage_declines_where_flashinfer_would_not_fuse(monkeypatch, case):
+    module, layer, mega, workspace, x = _input_stage_fixture(monkeypatch)
+    if case == "not_installed":
+        _fake_route_stage_module(monkeypatch, fused_route_stage_installed=lambda: False)
+    elif case == "genphase":
+        layer._flashinfer_megamoe_sm107_variant = "genphase"
+    elif case == "no_layer":
+        layer._flashinfer_megamoe_layer = None
+    elif case == "pre_quantized_input":
+        mega._mega_config.quantize_input = False
+    elif case == "no_workspace_yet":
+        mega._workspace = None
+    elif case == "torch_staging":
+        monkeypatch.setenv("FLASHINFER_MEGA_FUSED_STAGE", "0")
+    elif case == "fp16_rows":
+        x = x.half()
+    elif case == "strided_rows":
+        x = torch.zeros(x.shape[1], x.shape[0], dtype=torch.bfloat16).t()
+    elif case == "no_rows":
+        x = x[:0]
+    elif case == "over_capacity":
+        x = torch.zeros(9, x.shape[1], dtype=torch.bfloat16)
+    elif case == "hidden_mismatch":
+        x = torch.zeros(3, 64, dtype=torch.bfloat16)
+    elif case == "int64_routes":
+        workspace.topk_idx = workspace.topk_idx.long()
+    elif case == "top_k_mismatch":
+        layer.top_k = 4
+
+    assert module.flashinfer_megamoe_input_stage(layer, x) is None
+
+
+def _load_route_quant_handoff(monkeypatch):
+    name = "sglang_route_quant_handoff_test"
+    path = (
+        Path(__file__).resolve().parents[5]
+        / "python/sglang/srt/layers/moe/route_quant_handoff.py"
+    )
+    spec = importlib.util.spec_from_file_location(name, path)
+    module = importlib.util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, name, module)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _route_stage_fixture(monkeypatch, *, covered=True, stage_available=True):
+    """The handoff with the route + stage kernel and the workspace lookup replaced."""
+    handoff = _load_route_quant_handoff(monkeypatch)
+    x = torch.zeros(3, 128, dtype=torch.bfloat16)
+    weights = torch.ones(3, 2)
+    ids = torch.zeros(3, 2, dtype=torch.int32)
+    stage = types.SimpleNamespace(
+        workspace=object(),
+        x_q="x_q",
+        x_sf="x_sf",
+        topk_idx="stage_ids",
+        topk_weights="stage_weights",
+        norm_const=1.5,
+        scale_multiplier=0.25,
+    )
+    launches = []
+
+    def route_nvfp4_stage(*args, **kwargs):
+        launches.append(kwargs)
+        return weights, ids
+
+    kernel_ops = types.ModuleType("sglang.kernels.ops.moe")
+    kernel_ops.moe_route_nvfp4_stage = types.SimpleNamespace(
+        covered=lambda scores, bias, topk: covered,
+        route_nvfp4_stage=route_nvfp4_stage,
+    )
+    monkeypatch.setitem(sys.modules, kernel_ops.__name__, kernel_ops)
+    megamoe = types.ModuleType("sglang.srt.layers.moe.flashinfer_megamoe")
+    megamoe.flashinfer_megamoe_input_stage = lambda layer, rows: (
+        stage if stage_available and layer == "experts" and rows is x else None
+    )
+    monkeypatch.setitem(sys.modules, megamoe.__name__, megamoe)
+    return types.SimpleNamespace(
+        handoff=handoff, x=x, weights=weights, ids=ids, stage=stage, launches=launches
+    )
+
+
+def _route(p, rows=None):
+    return p.handoff.try_route_stage_megamoe(
+        p.x if rows is None else rows,
+        torch.zeros(3, 256),
+        torch.zeros(256, dtype=torch.bfloat16),
+        2,
+        renormalize=True,
+        routed_scaling_factor=2.5,
+        apply_routed_scaling_factor_on_output=True,
+    )
+
+
+def test_route_stage_megamoe_routes_and_stages_the_staged_layer(monkeypatch):
+    p = _route_stage_fixture(monkeypatch)
+    num_token_non_padded = torch.tensor([2], dtype=torch.int32)
+    p.handoff.stage(p.x, layer="experts")
+    p.handoff.bind_select_experts(num_token_non_padded, fused_routing_ok=True)
+
+    weights, ids = _route(p)
+
+    assert weights is p.weights and ids is p.ids
+    (launch,) = p.launches
+    assert launch["num_token_non_padded"] is num_token_non_padded
+    assert (launch["x_q"], launch["x_sf"]) == ("x_q", "x_sf")
+    assert (launch["stage_ids"], launch["stage_weights"]) == (
+        "stage_ids",
+        "stage_weights",
+    )
+    assert (launch["norm_const"], launch["scale_multiplier"]) == (1.5, 0.25)
+    # The router masked the padded rows itself.
+    assert p.handoff.take_padded_rows_masked()
+    # FlashInfer's staging takes the record once, for these rows, routes and workspace.
+    assert p.handoff.take_megamoe_staged(p.x, p.ids, p.stage.workspace)
+    assert not p.handoff.take_megamoe_staged(p.x, p.ids, p.stage.workspace)
+
+
+@pytest.mark.parametrize(
+    "case",
+    ["unstaged", "other_rows", "routing_overridden", "uncovered", "no_workspace"],
+)
+def test_route_stage_megamoe_falls_back_to_the_router(monkeypatch, case):
+    p = _route_stage_fixture(
+        monkeypatch,
+        covered=case != "uncovered",
+        stage_available=case != "no_workspace",
+    )
+    if case != "unstaged":
+        p.handoff.stage(p.x, layer="experts")
+        p.handoff.bind_select_experts(
+            None, fused_routing_ok=case != "routing_overridden"
+        )
+    rows = p.x.clone() if case == "other_rows" else None
+
+    assert _route(p, rows) is None
+    assert p.launches == []
+    assert not p.handoff.take_padded_rows_masked()
+    assert not p.handoff.take_megamoe_staged(p.x, p.ids, p.stage.workspace)
+
+
+@pytest.mark.parametrize("mismatch", ["workspace", "rows", "routes"])
+def test_megamoe_staging_record_matches_only_what_was_staged(monkeypatch, mismatch):
+    p = _route_stage_fixture(monkeypatch)
+    p.handoff.stage(p.x, layer="experts")
+    p.handoff.bind_select_experts(None, fused_routing_ok=True)
+    _route(p)
+    rows, ids, workspace = p.x, p.ids, p.stage.workspace
+    if mismatch == "workspace":
+        workspace = object()
+    elif mismatch == "rows":
+        rows = p.x.clone()
+    else:
+        ids = p.ids.clone()
+
+    assert not p.handoff.take_megamoe_staged(rows, ids, workspace)
+    # Any call ends the record: FlashInfer stages the next forward itself.
+    assert not p.handoff.take_megamoe_staged(p.x, p.ids, p.stage.workspace)
+
+
+def test_route_stage_backend_skips_only_the_staged_call(monkeypatch):
+    calls = []
+
+    class Backend:
+        def stage_inputs(self, t, workspace, *, quantize_input):
+            calls.append(("stock", quantize_input))
+
+        def _stage_scalars(self, t, workspace):
+            calls.append(("scalars",))
+
+    staged = []
+    fakes = {
+        "flashinfer.moe_ep.backends.mega.kernel.sm107.nvfp4_nvfp4_bf16_cutedsl.backend": {
+            "Sm107Nvfp4BlockScaledMegaKernelBackend": Backend
+        },
+        "flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe": {
+            "note_staged_tokens": lambda topk_idx, n: calls.append(("memo", n))
+        },
+        "sglang.srt.layers.moe": {
+            "route_quant_handoff": types.SimpleNamespace(
+                take_megamoe_staged=lambda x, topk_ids, workspace: staged.pop()
+            )
+        },
+    }
+    for name, attrs in fakes.items():
+        fake = types.ModuleType(name)
+        for attr, value in attrs.items():
+            setattr(fake, attr, value)
+        monkeypatch.setitem(sys.modules, name, fake)
+    name = "sglang_flashinfer_megamoe_route_stage_test"
+    path = (
+        Path(__file__).resolve().parents[5]
+        / "python/sglang/srt/layers/moe/flashinfer_megamoe_route_stage.py"
+    )
+    spec = importlib.util.spec_from_file_location(name, path)
+    route_stage = importlib.util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, name, route_stage)
+    spec.loader.exec_module(route_stage)
+
+    assert not route_stage.fused_route_stage_installed()
+    route_stage.install_fused_route_stage()
+    assert route_stage.fused_route_stage_installed()
+    workspace = types.SimpleNamespace(
+        topk_idx="topk_idx", note_staged_tokens=lambda n: calls.append(("live", n))
+    )
+    tensors = types.SimpleNamespace(hidden_states=torch.zeros(3, 8), topk_ids="ids")
+
+    staged.append(True)
+    Backend().stage_inputs(tensors, workspace, quantize_input=True)
+    # The router already wrote the rows: scalars and live-count memos only.
+    assert calls == [("scalars",), ("memo", 3), ("live", 3)]
+
+    calls.clear()
+    staged.append(False)
+    Backend().stage_inputs(tensors, workspace, quantize_input=True)
+    assert calls == [("stock", True)]
+
+    calls.clear()
+    Backend().stage_inputs(tensors, workspace, quantize_input=False)
+    assert calls == [("stock", False)]
 
 
 if __name__ == "__main__":

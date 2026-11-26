@@ -409,6 +409,16 @@ SGLang supports various environment variables that can be used to configure its 
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>"false"</code></td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_OPT_FLASHINFER_MEGAMOE_FUSED_EPILOGUE</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>On layers that run the compute capability 10.7 kernel with the routed scaling factor folded into the top-k weights, write only the live rows of the top-k reduce. On DeepSeek-V2/V3-style models with <code>--moe-a2a-backend flashinfer_megamoe</code>, replicated shared experts and no attention TP or CP, decode and target-verify batches then hand the routed and shared-expert outputs to the next layer, where one kernel adds them, adds the residual and applies the input RMSNorm. Outputs are bitwise equal.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>"false"</code></td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_OPT_FLASHINFER_MEGAMOE_FUSED_ROUTE_QUANT</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>On the compute capability 10.7 <code>inference</code> kernel, let DeepSeek-V2/V3-style models with single-group sigmoid routing route and quantize the MoE input to NVFP4 in one launch that writes the MegaMoE workspace; FlashInfer then skips its own input staging for that call. Routes and staged inputs are unchanged. Applies with FlashInfer 0.7.4 or 0.7.5 and is ignored with a warning otherwise.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>"false"</code></td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`SGLANG_DEEPEP_LL_COMBINE_SEND_NUM_SMS`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Number of SMs used for DeepEP combine when single batch overlap is enabled</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`"32"`</td>

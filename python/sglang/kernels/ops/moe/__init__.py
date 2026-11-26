@@ -270,6 +270,17 @@ register_kernel(
     )
 )
 
+# Single-group sigmoid routing with FlashInfer MegaMoE's NVFP4 input staging in one
+# launch (E2M1 conversions: SM100+).
+register_kernel(
+    KernelSpec(
+        op="moe.route_nvfp4_stage",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.moe.moe_route_nvfp4_stage:route_nvfp4_stage",
+        capabilities=frozenset({CapabilityRequirement.cuda(min_sm=(10, 0))}),
+    )
+)
+
 
 # Public entry points inventoried by logical operator group (RFC #29630).
 register_kernel(

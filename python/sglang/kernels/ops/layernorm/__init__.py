@@ -96,6 +96,17 @@ register_kernel(
     )
 )
 
+# A MegaMoE layer's shared-expert add with the next layer's residual add and input
+# RMSNorm; reproduces the JIT fused add's 32-byte-vector schedule (SM100+).
+register_kernel(
+    KernelSpec(
+        op="layernorm.megamoe_shared_add_rmsnorm",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.layernorm.megamoe_epilogue:megamoe_shared_add_rmsnorm",
+        capabilities=frozenset({CapabilityRequirement.cuda(min_sm=(10, 0))}),
+    )
+)
+
 # Muse Spark and Beam fused norms. The per-layer ops are inventoried through
 # their class methods; the NVFP4 quant op through its module-level instance.
 for _op, _target, _backends in (

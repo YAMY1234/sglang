@@ -1446,6 +1446,13 @@ class Envs:
     SGLANG_OPT_FLASHINFER_MEGAMOE_SM107_TAGGED_DISPATCH = EnvBool(False)
     # Let each router push warp compute its routes' destinations, not wait for a table.
     SGLANG_OPT_FLASHINFER_MEGAMOE_SM107_PER_CTA_PUSH_LAYOUT = EnvBool(False)
+    # On that kernel, write only the live rows of the top-k reduce, and at decode and
+    # verify run the shared-expert add with the next layer's residual add and input
+    # RMSNorm in one kernel. Bitwise equal.
+    SGLANG_OPT_FLASHINFER_MEGAMOE_FUSED_EPILOGUE = EnvBool(False)
+    # On that kernel's "inference" variant, run the single-group router and the NVFP4
+    # input staging as one launch. Routes and staged inputs are unchanged.
+    SGLANG_OPT_FLASHINFER_MEGAMOE_FUSED_ROUTE_QUANT = EnvBool(False)
     # Enable per-token FP32 activation scaling for serialized ModelOpt FP4 with
     # FlashInfer TRT-LLM or CuTe DSL v2 MoE.
     SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION = EnvBool(False)

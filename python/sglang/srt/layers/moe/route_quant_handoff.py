@@ -18,6 +18,12 @@ consume-once stash instead of new signatures:
                                     moe_fused_gate call on a hit
     Mxfp4MoEMethod.apply (situ)     take(x) skips the quant and the pack
 
+FlashInfer's compute capability 10.7 MegaMoE takes the same bracket from
+DeepseekV2MoE (SGLANG_OPT_FLASHINFER_MEGAMOE_FUSED_ROUTE_QUANT): the single-group
+router calls try_route_stage_megamoe(), which routes and writes the NVFP4 inputs
+and routes straight into the layer's MegaMoE workspace, and FlashInfer's input
+staging skips its launch for that workspace (take_megamoe_staged).
+
 Every step is fallback-safe: if the routing dispatch never consumes the staged
 request (different model, uncovered shape, triton fallback) or the runner's
 ``take`` misses (activations re-viewed or copied), the unfused chain runs as
@@ -49,6 +55,10 @@ class _Handoff(msgspec.Struct):
     da_body: Optional[Any] = None
     x_q: Optional[torch.Tensor] = None
     x_s: Optional[torch.Tensor] = None
+    # published by the MegaMoE route + stage launch: what it wrote into which workspace
+    megamoe_x: Optional[torch.Tensor] = None
+    megamoe_ids: Optional[torch.Tensor] = None
+    megamoe_workspace: Optional[Any] = None
 
 
 _handoff = _Handoff()
@@ -164,6 +174,77 @@ def _publish(x, weights, ids, packed, x_q, x_s):
     _handoff.x_q = x_q
     _handoff.x_s = x_s
     return weights, ids
+
+
+def try_route_stage_megamoe(
+    hidden_states: torch.Tensor,
+    gating_output: torch.Tensor,
+    correction_bias: torch.Tensor,
+    topk: int,
+    *,
+    renormalize: bool,
+    routed_scaling_factor: Optional[float],
+    apply_routed_scaling_factor_on_output: bool,
+) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+    """Single-group sigmoid routing of the staged FlashInfer MegaMoE layer with its
+    NVFP4 input staging in the same launch. Returns (weights, ids) on a hit, with
+    padded rows masked; None otherwise (caller runs the unfused router)."""
+    x = _handoff.request_x
+    if x is None or x is not hidden_states or not _handoff.fused_routing_ok:
+        return None
+
+    from sglang.kernels.ops.moe import moe_route_nvfp4_stage
+    from sglang.srt.layers.moe.flashinfer_megamoe import flashinfer_megamoe_input_stage
+
+    bias = correction_bias.to(torch.float32)
+    if not moe_route_nvfp4_stage.covered(gating_output, bias, topk):
+        return None
+    stage = flashinfer_megamoe_input_stage(_handoff.request_layer, x)
+    if stage is None:
+        return None
+    weights, ids = moe_route_nvfp4_stage.route_nvfp4_stage(
+        gating_output,
+        bias,
+        topk,
+        renormalize=renormalize,
+        routed_scaling_factor=routed_scaling_factor,
+        apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
+        num_token_non_padded=_handoff.num_token_non_padded,
+        x=x,
+        x_q=stage.x_q,
+        x_sf=stage.x_sf,
+        stage_ids=stage.topk_idx,
+        stage_weights=stage.topk_weights,
+        norm_const=stage.norm_const,
+        scale_multiplier=stage.scale_multiplier,
+    )
+    _handoff.request_x = None
+    _handoff.padded_rows_masked = True
+    _handoff.megamoe_x = x
+    _handoff.megamoe_ids = ids
+    _handoff.megamoe_workspace = stage.workspace
+    return weights, ids
+
+
+def take_megamoe_staged(
+    x: torch.Tensor, topk_ids: torch.Tensor, workspace: Any
+) -> bool:
+    """Consume the route + stage launch's record: True when it staged these exact
+    rows and routes into ``workspace``. Any call ends the record."""
+    staged_x, staged_ids = _handoff.megamoe_x, _handoff.megamoe_ids
+    hit = (
+        staged_x is not None
+        and _handoff.megamoe_workspace is workspace
+        and staged_x.data_ptr() == x.data_ptr()
+        and staged_x.shape == x.shape
+        and staged_x.stride() == x.stride()
+        and staged_ids.data_ptr() == topk_ids.data_ptr()
+        and staged_ids.shape == topk_ids.shape
+    )
+    _handoff.megamoe_x = None
+    _handoff.megamoe_ids = None
+    _handoff.megamoe_workspace = None
+    return hit
 
 
 def take_prepared_routing(ids: torch.Tensor) -> Optional[Tuple[Any, Any]]:

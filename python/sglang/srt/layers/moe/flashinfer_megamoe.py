@@ -24,11 +24,13 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from collections.abc import Callable, Generator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
+import msgspec
 import torch
 
 from sglang.srt.environ import envs
@@ -253,6 +255,25 @@ def _flashinfer_megamoe_sm107_variant(layer: FusedMoE) -> str | None:
     return variant
 
 
+def flashinfer_megamoe_hands_off_epilogue(layer: FusedMoE) -> bool:
+    """Whether this MegaMOE layer runs the compute capability 10.7 kernel with its
+    fused epilogue (SGLANG_OPT_FLASHINFER_MEGAMOE_FUSED_EPILOGUE): the top-k reduce
+    writes only the live rows, which may go with the shared-expert output to the
+    next layer's input norm."""
+    return (
+        envs.SGLANG_OPT_FLASHINFER_MEGAMOE_FUSED_EPILOGUE.get()
+        # The handoff applies no routed scale; it is folded into the top-k weights.
+        and layer.should_fuse_routed_scaling_factor_in_topk
+        and _flashinfer_megamoe_sm107_variant(layer) is not None
+    )
+
+
+def _forward_megamoe_owned(mega: Any, tensors: Any) -> torch.Tensor:
+    # An owned [T, H] output: the top-k reduce then covers the T live rows,
+    # not the workspace's whole token capacity.
+    return mega.forward(tensors)
+
+
 def _layer_ep_world_rank(layer: FusedMoE) -> tuple[int, int]:
     world_size = int(layer.moe_ep_size)
     rank = int(layer.moe_ep_rank)
@@ -407,6 +428,11 @@ def _ensure_flashinfer_megamoe_layer(
                 else 0
             ),
         )
+    elif (
+        layer._flashinfer_megamoe_sm107_variant is not None
+        and flashinfer_megamoe_hands_off_epilogue(layer)
+    ):
+        layer._flashinfer_megamoe_forward = _forward_megamoe_owned
     else:
         layer._flashinfer_megamoe_forward = forward_megamoe
     return mega
@@ -561,6 +587,96 @@ def _install_sm107_kernel_options(sm107_variant: str | None, top_k: int) -> None
     )
 
 
+def _install_fused_route_stage(sm107_variant: str | None) -> None:
+    if not envs.SGLANG_OPT_FLASHINFER_MEGAMOE_FUSED_ROUTE_QUANT.get():
+        return
+
+    import flashinfer
+
+    from sglang.srt.utils import print_warning_once
+
+    # The router reproduces the NVFP4 stager and workspace layout of these releases.
+    if (
+        sm107_variant != "inference"
+        or flashinfer.__version__ not in _SM107_KERNEL_OPTIONS_FLASHINFER_VERSIONS
+    ):
+        print_warning_once(
+            "SGLANG_OPT_FLASHINFER_MEGAMOE_FUSED_ROUTE_QUANT is ignored: it stages "
+            "the compute capability 10.7 inference kernel's inputs as FlashInfer "
+            f"{'/'.join(_SM107_KERNEL_OPTIONS_FLASHINFER_VERSIONS)} does, found the "
+            f"{sm107_variant or 'default'} kernel on FlashInfer {flashinfer.__version__}."
+        )
+        return
+
+    from sglang.srt.layers.moe.flashinfer_megamoe_route_stage import (
+        install_fused_route_stage,
+    )
+
+    install_fused_route_stage()
+
+
+class FlashInferMegaMoeInputStage(msgspec.Struct, frozen=True):
+    workspace: Any
+    x_q: torch.Tensor  # [capacity, hidden // 2] uint8 view of the NVFP4 rows
+    x_sf: torch.Tensor  # [capacity, hidden // 16] uint8 view of the E4M3 scales
+    topk_idx: torch.Tensor  # [capacity, top_k] int32
+    topk_weights: torch.Tensor  # [capacity, top_k] fp32
+    norm_const: float
+    scale_multiplier: float
+
+
+def flashinfer_megamoe_input_stage(
+    layer: FusedMoE, x: torch.Tensor
+) -> FlashInferMegaMoeInputStage | None:
+    """The compute capability 10.7 workspace views a router may stage ``layer``'s
+    next forward on ``x`` into, as FlashInfer's fused NVFP4 stager would, or None
+    where that stager would not run (SGLANG_OPT_FLASHINFER_MEGAMOE_FUSED_ROUTE_QUANT)."""
+    from sglang.srt.layers.moe.flashinfer_megamoe_route_stage import (
+        fused_route_stage_installed,
+    )
+
+    mega = _get_or_init_flashinfer_megamoe_layer_state(layer)
+    if (
+        mega is None
+        or not fused_route_stage_installed()
+        or layer._flashinfer_megamoe_sm107_variant != "inference"
+        or not mega._mega_config.quantize_input
+    ):
+        return None
+    # The workspace and backend MoEEpMegaLayer._prepare_inputs resolves.
+    handle = mega._default_workspace_handle
+    workspace = mega._workspace if handle is None else handle._backend_workspace
+    if workspace is None:
+        return None
+    kernel = mega._kernel if handle is None else handle._kernel
+    num_tokens, hidden = x.shape
+    # stage_mega_moe_inputs' conditions for its fused stager; otherwise it quantizes in torch.
+    if not (
+        os.environ.get("FLASHINFER_MEGA_FUSED_STAGE", "1") != "0"
+        and 0 < num_tokens <= workspace.x.shape[0]
+        and x.dtype == torch.bfloat16
+        and x.is_contiguous()
+        and x.data_ptr() % 16 == 0
+        and hidden % 64 == 0
+        and workspace.x.shape[1] * 2 == hidden
+        and workspace.x_sf.shape[1] == hidden // 16
+        and workspace.topk_idx.dtype == torch.int32
+        and workspace.topk_idx.shape[1] == layer.top_k
+    ):
+        return None
+    input_norm_const = kernel._kernel_config.input_norm_const
+    return FlashInferMegaMoeInputStage(
+        workspace=workspace,
+        x_q=workspace.x.view(torch.uint8),
+        x_sf=workspace.x_sf.view(torch.uint8),
+        topk_idx=workspace.topk_idx,
+        topk_weights=workspace.topk_weights,
+        norm_const=input_norm_const,
+        # The stager's scale_multiplier, rounded to fp32 at launch as there.
+        scale_multiplier=input_norm_const / 6.0,
+    )
+
+
 def ensure_nvfp4_moe_layer_for_flashinfer_megamoe(layer: FusedMoE) -> Any:
     mega = _get_or_init_flashinfer_megamoe_layer_state(layer)
     if mega is not None:
@@ -568,6 +684,7 @@ def ensure_nvfp4_moe_layer_for_flashinfer_megamoe(layer: FusedMoE) -> Any:
 
     # Before the layer's first forward, which compiles the kernel.
     _install_sm107_kernel_options(layer._flashinfer_megamoe_sm107_variant, layer.top_k)
+    _install_fused_route_stage(layer._flashinfer_megamoe_sm107_variant)
     activation_kwargs = _nvfp4_megamoe_activation_kwargs(layer.moe_runner_config)
     if envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16.get():
         from flashinfer.moe_ep import Sm100_Bf16_Nvfp4_Bf16_Cutedsl_MegaMoeConfig
