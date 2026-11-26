@@ -570,6 +570,14 @@ def use_bf16_indexer_logits() -> bool:
 
 
 def fp8_mqa_logits_bf16(q_fp8, kv_fp8, weights, ks, ke):
+    return fp8_mqa_logits_scheduled(
+        q_fp8, kv_fp8, weights.to(torch.bfloat16), ks, ke, torch.bfloat16
+    )
+
+
+def fp8_mqa_logits_scheduled(
+    q_fp8, kv_fp8, weights, ks, ke, logits_dtype=torch.float32
+):
     import deep_gemm
 
     schedule_meta = deep_gemm.get_mqa_logits_metadata_legacy(
@@ -578,11 +586,11 @@ def fp8_mqa_logits_bf16(q_fp8, kv_fp8, weights, ks, ke):
     return deep_gemm.fp8_fp4_mqa_logits_legacy(
         q_fp8,
         kv_fp8,
-        weights.to(torch.bfloat16),
+        weights,
         ks,
         ke,
         False,
         0,
-        torch.bfloat16,
+        logits_dtype,
         schedule_meta,
     )

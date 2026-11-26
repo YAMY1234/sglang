@@ -7,6 +7,9 @@ chunking is a correctness bound there and not only an out-of-memory guard.
 
 `Indexer` decides that with a budget; `IndexerKPool` splits the query rows
 around its aiter call. Both are stubbed down to CPU-sized inputs.
+
+`Indexer._mqa_logits` then picks the DeepGEMM call for each chunk;
+`SGLANG_DSA_MQA_LOGITS_BALANCED` changes only that call, not the chunking.
 """
 
 import sys
@@ -17,7 +20,9 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
+from sglang.srt.environ import envs  # noqa: E402
 from sglang.srt.layers.attention.dsa import dsa_indexer_kpool  # noqa: E402
+from sglang.srt.layers.attention.dsa.dsa_indexer import Indexer  # noqa: E402
 from sglang.srt.layers.attention.mqa_logits_utils import (  # noqa: E402
     MQA_LOGITS_MAX_BYTES_ROCM,
     mqa_logits_row_bytes,
@@ -111,6 +116,81 @@ def test_kpool_splits_the_query_rows_to_stay_under_the_aiter_cap():
     assert rows_per_call == [3, 3, 2]
     rows = torch.arange(num_q, dtype=torch.float32)
     assert torch.equal(logits, (rows + rows * 10).unsqueeze(1).expand(-1, num_k))
+
+
+def _route_mqa_logits(balanced, bf16=False, num_heads=16):
+    """Run `Indexer._mqa_logits` over a stub DeepGEMM and record which kernel
+    it calls, with the arguments that pick the compiled variant."""
+    calls = []
+
+    def _stock(q, kv, weights, ks, ke, *, clean_logits):
+        calls.append(("stock", q.shape[1], weights.dtype, clean_logits))
+        return "stock"
+
+    def _metadata(ks, ke, num_kv_tokens, heads):
+        calls.append(("metadata", num_kv_tokens, heads))
+        return "schedule"
+
+    def _scheduled(q, kv, weights, ks, ke, clean, max_seqlen_k, dtype, meta):
+        calls.append(
+            ("scheduled", q.shape[1], weights.dtype, clean, max_seqlen_k, dtype, meta)
+        )
+        return "scheduled"
+
+    deep_gemm = types.ModuleType("deep_gemm")
+    deep_gemm.get_mqa_logits_metadata_legacy = _metadata
+    deep_gemm.fp8_fp4_mqa_logits_legacy = _scheduled
+
+    num_q, num_k = 8, 64
+    ks = torch.zeros(num_q, dtype=torch.int32)
+    indexer = Indexer.__new__(Indexer)
+    module = Indexer.__module__
+    with (
+        mock.patch.dict(sys.modules, {"deep_gemm": deep_gemm}),
+        mock.patch(f"{module}.resolve_fp8_mqa_logits_fn", lambda: _stock),
+        mock.patch(f"{module}.use_bf16_indexer_logits", lambda: bf16),
+        envs.SGLANG_DSA_MQA_LOGITS_BALANCED.override(balanced),
+    ):
+        out = indexer._mqa_logits(
+            torch.zeros(num_q, num_heads, 8),
+            (torch.zeros(num_k, 8), torch.ones(num_k)),
+            torch.ones(num_q, num_heads),
+            ks,
+            ks + num_k,
+        )
+    return out, calls
+
+
+def test_mqa_logits_keep_the_stock_kernel_when_balanced_is_off():
+    assert _route_mqa_logits(balanced=False) == (
+        "stock",
+        [("stock", 32, torch.float32, False)],
+    )
+
+
+def test_balanced_mqa_logits_only_add_a_schedule():
+    """Same padded heads, fp32 weights and logits, no cleaning: only the
+    schedule built from the chunk's own ks / ke is new."""
+    assert _route_mqa_logits(balanced=True) == (
+        "scheduled",
+        [
+            ("metadata", 64, 32),
+            ("scheduled", 32, torch.float32, False, 0, torch.float32, "schedule"),
+        ],
+    )
+
+
+def test_bf16_logits_take_precedence_over_balanced():
+    _, calls = _route_mqa_logits(balanced=True, bf16=True)
+    assert calls[-1] == (
+        "scheduled",
+        32,
+        torch.bfloat16,
+        False,
+        0,
+        torch.bfloat16,
+        "schedule",
+    )
 
 
 if __name__ == "__main__":

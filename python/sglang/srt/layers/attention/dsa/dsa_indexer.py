@@ -53,6 +53,7 @@ from sglang.srt.layers.attention.dsa.paged_mqa_logits_backend import (
 from sglang.srt.layers.attention.dsa.utils import (
     aiter_can_use_preshuffle_paged_mqa,
     fp8_mqa_logits_bf16,
+    fp8_mqa_logits_scheduled,
     gfx950_fused_indexer_runtime_ok,
     gfx950_model_shape_supported,
     hadamard_preserved,
@@ -376,6 +377,8 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             self.logits_with_pp_recv = (
                 pp_size > 1 and not get_parallel().pp_group.is_last_rank
             )
+            if envs.SGLANG_DSA_MQA_LOGITS_BALANCED.get():
+                self._warmup_mqa_logits_balanced()
         else:
             self.logits_with_pp_recv = False
 
@@ -1389,6 +1392,8 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         q_padded, w_padded, _ = self._pad_heads_for_deep_gemm(q_fp8, weights)
         if use_bf16_indexer_logits():
             return fp8_mqa_logits_bf16(q_padded, kv_fp8, w_padded, ks, ke)
+        if envs.SGLANG_DSA_MQA_LOGITS_BALANCED.get():
+            return fp8_mqa_logits_scheduled(q_padded, kv_fp8, w_padded, ks, ke)
         return resolve_fp8_mqa_logits_fn()(
             q_padded,
             kv_fp8,
@@ -1397,6 +1402,28 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             ke,
             clean_logits=False,
         )
+
+    def _warmup_mqa_logits_balanced(self) -> None:
+        # JIT-compile the scheduled kernels at startup instead of on the first
+        # long prefill. Their compile keys do not depend on the shape.
+        device = torch.device("cuda", torch.cuda.current_device())
+        rows, cols = 128, 1024
+        q_fp8 = torch.zeros(
+            (rows, self.n_heads, self.head_dim),
+            dtype=torch.float8_e4m3fn,
+            device=device,
+        )
+        kv_fp8 = (
+            torch.zeros(
+                (cols, self.head_dim), dtype=torch.float8_e4m3fn, device=device
+            ),
+            torch.ones(cols, dtype=torch.float32, device=device),
+        )
+        weights = torch.zeros((rows, self.n_heads), dtype=torch.float32, device=device)
+        ks = torch.zeros(rows, dtype=torch.int32, device=device)
+        ke = torch.full((rows,), cols, dtype=torch.int32, device=device)
+        with self._with_real_sm_count():
+            self._mqa_logits(q_fp8, kv_fp8, weights, ks, ke)
 
     def _mask_init_and_local_tokens(
         self,

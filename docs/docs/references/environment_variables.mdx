@@ -648,6 +648,11 @@ SGLang supports various environment variables that can be used to configure its 
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Fraction of free memory the MQA-logits step may use on the DSA path.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>0.2</code></td>
     </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_DSA_MQA_LOGITS_BALANCED</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Compute the prefill indexer's fp32 MQA logits with DeepGEMM's SM-balanced schedule, which splits long KV spans across SMs (SM100 only). The logits and the row chunking set by <code>SGLANG_DSA_MQA_LOGITS_FREE_MEM_FRACTION</code> are unchanged.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
+    </tr>
   </tbody>
 </table>
 
