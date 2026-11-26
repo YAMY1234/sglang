@@ -1,7 +1,12 @@
 # This file is copied from https://github.com/deepseek-ai/EPLB/blob/main/eplb.py since that one is not a pypi package
+import logging
 from typing import Tuple
 
 import torch
+
+from sglang.srt.environ import envs
+
+logger = logging.getLogger(__name__)
 
 
 def balanced_packing(
@@ -168,6 +173,35 @@ def rebalance_experts_hierarchical(
     return pphy2log, pphyrank, logcnt
 
 
+def order_local_slots_cold_first(
+    weight: torch.Tensor,
+    phy2log: torch.Tensor,
+    phyrank: torch.Tensor,
+    logcnt: torch.Tensor,
+    num_gpus: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Reorder each GPU's local slots by ascending expected load (weight / replica count).
+
+    The expert-to-GPU assignment and the replica ranks are unchanged; MegaMoE pulls rows and issues
+    tiles in local-slot order, so the hottest experts go last instead of first.
+    """
+    num_layers, num_phy = phy2log.shape
+    load = (weight / logcnt).gather(-1, phy2log).view(num_layers, num_gpus, -1)
+    order = load.argsort(dim=-1, stable=True)
+    perm = (
+        order
+        + torch.arange(0, num_phy, num_phy // num_gpus, dtype=order.dtype).view(
+            1, -1, 1
+        )
+    ).flatten(-2)
+    logger.info(
+        "EPLB local slots ordered cold-first (%d layers x %d GPUs)",
+        num_layers,
+        num_gpus,
+    )
+    return phy2log.gather(-1, perm), phyrank.gather(-1, perm)
+
+
 def rebalance_experts(
     weight: torch.Tensor,
     num_replicas: int,
@@ -203,6 +237,10 @@ def rebalance_experts(
         # use global load-balance policy
         phy2log, phyrank, logcnt = rebalance_experts_hierarchical(
             weight, num_replicas, 1, 1, num_gpus
+        )
+    if envs.SGLANG_OPT_EPLB_LOCAL_SLOTS_COLD_FIRST.get():
+        phy2log, phyrank = order_local_slots_cold_first(
+            weight, phy2log, phyrank, logcnt, num_gpus
         )
     maxlogcnt = logcnt.max().item()
     log2phy: torch.Tensor = torch.full(
