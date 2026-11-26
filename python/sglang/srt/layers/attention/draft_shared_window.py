@@ -5,6 +5,7 @@ import torch
 
 from sglang.kernels.ops.attention.mla_shared_window import (
     merge_shared_window,
+    merge_shared_window_edges,
     mla_shared_window_indices,
 )
 from sglang.srt.layers.attention.dsa.dsa_dcp import dcp_trtllm_sparse_attention
@@ -46,6 +47,7 @@ def shared_window_sparse_attention(
     indices: tuple[torch.Tensor, ...],
     group: int,
     row_indptr: torch.Tensor,
+    edges_in_merge: bool = True,
     **attention_kwargs,
 ) -> torch.Tensor:
     """[bs * q_len, heads, kv_lora_rank]: each row's window attention, from the
@@ -53,7 +55,9 @@ def shared_window_sparse_attention(
 
     ``query`` is [bs, q_len, heads, head_dim]; ``indices`` come from
     ``shared_window_indices``; ``attention_kwargs`` are the trtllm-gen sparse MLA
-    arguments the per-row path passes (kv_cache, workspace, scales, ...).
+    arguments the per-row path passes (kv_cache, workspace, scales, ...). With
+    ``edges_in_merge`` the merge kernel attends the edge keys itself (FP32 dot
+    products of the FP8 rows) instead of a second sparse call.
     """
     bs, q_len, heads, head_dim = query.shape
     rows, groups = bs * q_len, bs * q_len // group
@@ -68,6 +72,17 @@ def shared_window_sparse_attention(
         need_lse=True,
         **attention_kwargs,
     )
+    if edges_in_merge:
+        return merge_shared_window_edges(
+            common_out.view(groups, group * heads, -1),
+            common_lse,
+            query.view(rows, heads, head_dim),
+            attention_kwargs["kv_cache"].view(-1, head_dim),
+            edge,
+            edge_counts,
+            group=group,
+            softmax_scale=attention_kwargs["bmm1_scale"],
+        )
     edge_out, edge_lse = dcp_trtllm_sparse_attention(
         query=query.view(rows, 1, heads, head_dim),
         block_tables=edge.unsqueeze(1),

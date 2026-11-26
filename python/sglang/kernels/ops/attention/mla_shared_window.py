@@ -202,3 +202,103 @@ def merge_shared_window(
             num_warps=4,
         )
     return out
+
+
+@triton.jit
+def _merge_edges_kernel(
+    COMMON_OUT,
+    common_row_stride,
+    COMMON_LSE,
+    common_lse_stride,
+    QUERY,
+    KV,
+    kv_row_stride,
+    EDGE,
+    EDGE_COUNTS,
+    OUT,
+    scale_log2,
+    HEADS: tl.constexpr,
+    GROUP: tl.constexpr,
+    DIM: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    BLOCK_HEAD_DIM: tl.constexpr,
+    EDGE_K: tl.constexpr,
+):
+    row = tl.program_id(0)
+    head = tl.program_id(1)
+    group = row // GROUP
+    common_head = (row % GROUP) * HEADS + head
+    top = tl.load(COMMON_LSE + group * common_lse_stride + common_head)
+    dim = tl.arange(0, DIM)
+    acc = tl.load(COMMON_OUT + group * common_row_stride + common_head * DIM + dim)
+    acc = acc.to(tl.float32)
+    total = tl.where(top == float("-inf"), 0.0, 1.0)
+    acc = acc * total
+    qdim = tl.arange(0, BLOCK_HEAD_DIM)
+    query = tl.load(
+        QUERY + (row * HEADS + head) * HEAD_DIM + qdim, mask=qdim < HEAD_DIM, other=0.0
+    ).to(tl.float32)
+    count = tl.load(EDGE_COUNTS + row)
+    # Online softmax over the row's few edge keys, in the kernel's log2 units;
+    # a key's value is the first DIM entries of its cache row.
+    for e in tl.static_range(EDGE_K):
+        if e < count:
+            key_row = KV + tl.load(EDGE + row * EDGE_K + e).to(tl.int64) * kv_row_stride
+            key = tl.load(key_row + qdim, mask=qdim < HEAD_DIM, other=0.0).to(
+                tl.float32
+            )
+            score = tl.sum(query * key, axis=0) * scale_log2
+            new_top = tl.maximum(top, score)
+            carry = tl.exp2(top - new_top)
+            weight = tl.exp2(score - new_top)
+            value = tl.load(key_row + dim).to(tl.float32)
+            acc = acc * carry + weight * value
+            total = total * carry + weight
+            top = new_top
+    out = tl.where(total > 0.0, acc / total, 0.0)
+    tl.store(OUT + (row * HEADS + head) * DIM + dim, out.to(OUT.dtype.element_ty))
+
+
+def merge_shared_window_edges(
+    common_out: torch.Tensor,
+    common_lse: torch.Tensor,
+    query: torch.Tensor,
+    kv_rows: torch.Tensor,
+    edge: torch.Tensor,
+    edge_counts: torch.Tensor,
+    *,
+    group: int,
+    softmax_scale: float,
+) -> torch.Tensor:
+    """``merge_shared_window`` with each row's edge attention computed here, from
+    ``query`` [rows, heads, head_dim] and the cache rows ``kv_rows`` [N, head_dim]
+    (a key's value is its first ``dim`` entries) instead of a second sparse call.
+    ``common_lse`` is log2-based; ``softmax_scale`` is the kernel's bmm1 scale."""
+    rows, heads, head_dim = query.shape
+    dim = common_out.shape[-1]
+    assert query.is_contiguous() and kv_rows.stride(-1) == 1
+    assert common_out.stride(-1) == 1 and common_out.stride(-2) == dim
+    assert edge.shape[0] == rows and edge_counts.shape == (rows,)
+    out = torch.empty((rows, heads, dim), dtype=torch.bfloat16, device=query.device)
+    if rows:
+        _merge_edges_kernel[(rows, heads)](
+            common_out,
+            common_out.stride(0),
+            common_lse,
+            common_lse.stride(0),
+            query,
+            kv_rows,
+            kv_rows.stride(0),
+            edge,
+            edge_counts,
+            out,
+            softmax_scale * 1.4426950408889634,
+            HEADS=heads,
+            GROUP=group,
+            DIM=dim,
+            HEAD_DIM=head_dim,
+            BLOCK_HEAD_DIM=triton.next_power_of_2(head_dim),
+            EDGE_K=edge.shape[1],
+            num_warps=4,
+        )
+    return out
