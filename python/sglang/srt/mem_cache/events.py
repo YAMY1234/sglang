@@ -20,9 +20,15 @@ it; the recorder owns the queue and needs nothing back from its owner.
 
 from __future__ import annotations
 
+import functools
 import logging
+from array import array
 from collections import OrderedDict
-from typing import TYPE_CHECKING, Any, Iterable, Optional
+from itertools import pairwise
+from typing import TYPE_CHECKING, Any, Callable, Iterable, Optional
+
+import msgspec
+import numpy as np
 
 from sglang.srt.disaggregation.kv_events import (
     AllBlocksCleared,
@@ -32,6 +38,7 @@ from sglang.srt.disaggregation.kv_events import (
     kv_event_namespace_seed,
     namespaced_block_hash,
 )
+from sglang.srt.environ import envs
 from sglang.srt.managers.req_types import MM_PAD_SHIFT_VALUE
 from sglang.srt.mem_cache.utils import (
     compute_node_event_hash_values,
@@ -267,6 +274,100 @@ def event_namespace_seed(
     )
 
 
+# Shorter bigram runs keep the tuple list, which is cheaper to build than the
+# numpy encoding below about this many tokens.
+_RAW_MIN_TOKENS = 1024
+# Token ids below 2**18 are encoded through a lookup table.
+_RAW_TABLE_BITS = 18
+
+
+def _msgpack_array_header(n: int) -> bytes:
+    if n < 16:
+        return bytes((0x90 | n,))
+    if n < 1 << 16:
+        return b"\xdc" + n.to_bytes(2, "big")
+    return b"\xdd" + n.to_bytes(4, "big")
+
+
+def _uint_msgpack_rows(v: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Per value in [0, 2**32): its msgpack uint encoding (fixint, 0xcc, 0xcd or
+    0xce, big-endian) left-aligned in 5 bytes, and the mask of the bytes used."""
+    v = v.astype(np.uint64)
+    length = np.where(v < 128, 1, np.where(v < 256, 2, np.where(v < 65536, 3, 5)))
+    cols = np.empty((v.size, 5), np.uint8)
+    cols[:, 0] = np.where(
+        length == 1,
+        v,
+        np.where(length == 2, 0xCC, np.where(length == 3, 0xCD, 0xCE)),
+    )
+    cols[:, 1] = np.where(length == 2, v, np.where(length == 3, v >> 8, v >> 24)) & 255
+    cols[:, 2] = np.where(length == 3, v, v >> 16) & 255
+    cols[:, 3] = (v >> 8) & 255
+    cols[:, 4] = v & 255
+    return cols, np.arange(5)[None, :] < length[:, None]
+
+
+@functools.lru_cache(maxsize=1)
+def _uint_msgpack_table() -> tuple[np.ndarray, np.ndarray]:
+    return _uint_msgpack_rows(np.arange(1 << _RAW_TABLE_BITS))
+
+
+def _bigram_pairs_body(token_ids, start: int, end: int) -> Optional[bytes]:
+    """msgpack encoding of ``list(pairwise(token_ids[start : end + 1]))`` without
+    its array header, as msgspec encodes it; None if a token is outside [0, 2**32)."""
+    if (
+        isinstance(token_ids, array)
+        and token_ids.itemsize == 8
+        and token_ids.typecode in "lq"
+    ):
+        v = np.frombuffer(token_ids, dtype=np.int64)[start : end + 1]
+    else:
+        v = np.asarray(token_ids[start : end + 1], dtype=np.int64)
+    if v.min() < 0 or v.max() >= 1 << 32:
+        return None
+    if v.max() < 1 << _RAW_TABLE_BITS:
+        table, table_used = _uint_msgpack_table()
+        cols, cols_used = table[v], table_used[v]
+    else:
+        cols, cols_used = _uint_msgpack_rows(v)
+    n = v.size - 1
+    rows = np.empty((n, 11), np.uint8)
+    used = np.empty((n, 11), bool)
+    rows[:, 0] = 0x92  # each bigram is a 2-element array
+    used[:, 0] = True
+    rows[:, 1:6], used[:, 1:6] = cols[:-1], cols_used[:-1]
+    rows[:, 6:11], used[:, 6:11] = cols[1:], cols_used[1:]
+    return rows[used].tobytes()
+
+
+class _RawTokenParts:
+    """token_ids of a queued BlockStored that coalesced a pre-encoded run: the
+    msgpack array bodies of each part, joined into one msgspec.Raw by take()."""
+
+    __slots__ = ("count", "parts")
+
+    def __init__(self, token_ids) -> None:
+        data = (
+            bytes(token_ids)
+            if isinstance(token_ids, msgspec.Raw)
+            else msgspec.msgpack.encode(token_ids)
+        )
+        if (data[0] & 0xF0) == 0x90:
+            self.count, head = data[0] & 0x0F, 1
+        else:
+            head = 3 if data[0] == 0xDC else 5
+            self.count = int.from_bytes(data[1:head], "big")
+        self.parts = [data[head:]]
+
+    def extend(self, token_ids) -> None:
+        other = _RawTokenParts(token_ids)
+        self.count += other.count
+        self.parts.extend(other.parts)
+
+    def raw(self) -> msgspec.Raw:
+        return msgspec.Raw(_msgpack_array_header(self.count) + b"".join(self.parts))
+
+
 class KVCacheEventRecorder:
     """Collects KV placement events for one cache.
 
@@ -289,6 +390,12 @@ class KVCacheEventRecorder:
         self.dynamo_format = dynamo_format
         self.lora_names = lora_names if lora_names is not None else KvEventLoraNames()
         self._queue: list = []
+        # Opt-in cheaper construction of the same events; see environ.py.
+        self._batch_events = envs.SGLANG_HICACHE_BATCH_EVENTS.get()
+        self._raw_tokens = self._batch_events and envs.SGLANG_KV_EVENTS_RAW_TOKENS.get()
+        self._lazy = self._batch_events and envs.SGLANG_KV_EVENTS_LAZY.get()
+        # Lazy mode: (build, args) recorded in order, run by take().
+        self._pending: list[tuple[Callable, tuple]] = []
 
     def enqueue(self, event) -> None:
         """Append an event, coalescing it with a compatible queue tail.
@@ -325,10 +432,23 @@ class KVCacheEventRecorder:
                             event.mm_routing_spans or [[] for _ in event.block_hashes]
                         )
                     tail.block_hashes.extend(event.block_hashes)
-                    tail.token_ids.extend(event.token_ids)
+                    if self._raw_tokens:
+                        self._extend_token_ids(tail, event.token_ids)
+                    else:
+                        tail.token_ids.extend(event.token_ids)
                     return
 
         self._queue.append(event)
+
+    @staticmethod
+    def _extend_token_ids(tail: BlockStored, token_ids) -> None:
+        if isinstance(tail.token_ids, list) and isinstance(token_ids, list):
+            tail.token_ids.extend(token_ids)
+            return
+        # A pre-encoded run is involved: keep encoded parts until take().
+        if not isinstance(tail.token_ids, _RawTokenParts):
+            tail.token_ids = _RawTokenParts(tail.token_ids)
+        tail.token_ids.extend(token_ids)
 
     def _node_event_hash_values(self, node: Any) -> list:
         """Hash values to publish for ``node``, computing them if not yet set."""
@@ -391,6 +511,26 @@ class KVCacheEventRecorder:
             else self.lora_names.get(node.key.extra_key)
         )
 
+        if self._batch_events:
+            key = node.key
+            # Labels can change before take(), so a store that may carry spans
+            # is built now even in lazy mode.
+            with_spans = (
+                self.dynamo_format and not key.is_bigram and bool(MM_ROUTING_LABELS)
+            )
+            args = (
+                key,
+                medium,
+                session_id,
+                event_hash_values,
+                namespace_seed,
+                parent_block_hash,
+                lora_name,
+                with_spans,
+            )
+            self._build(self._enqueue_store_runs, args, defer=not with_spans)
+            return
+
         page_index = 0
         logical_len = len(node.key)
         is_bigram = node.key.is_bigram
@@ -432,6 +572,70 @@ class KVCacheEventRecorder:
             parent_block_hash = block_hash
             page_index += 1
 
+    def _enqueue_store_runs(
+        self,
+        key: Any,
+        medium,
+        session_id: Optional[str],
+        event_hash_values: list,
+        namespace_seed: Optional[bytes],
+        parent_block_hash: Optional[int],
+        lora_name: Optional[str],
+        with_spans: bool,
+    ) -> None:
+        """One BlockStored per run of equal-size pages: the full pages, then a short
+        last page. These are the events enqueue() coalesces the per-page ones into."""
+        logical_len = len(key)
+        raw = key.token_ids
+        full_end = logical_len // self.page_size * self.page_size
+        page_index = 0
+        for start, end, block_size in (
+            (0, full_end, self.page_size),
+            (full_end, logical_len, logical_len - full_end),
+        ):
+            if end <= start:
+                continue
+            num_pages = (end - start) // block_size
+            if key.is_bigram:
+                page_tokens = self._bigram_token_ids(raw, start, end)
+            else:
+                page_tokens = list(raw[start:end])
+            block_hashes = [
+                namespaced_block_hash(
+                    hash_str_to_int64(event_hash_values[i]),
+                    namespace_seed=namespace_seed,
+                )
+                for i in range(page_index, page_index + num_pages)
+            ]
+            self.enqueue(
+                BlockStored(
+                    block_hashes=block_hashes,
+                    parent_block_hash=parent_block_hash,
+                    token_ids=page_tokens,
+                    block_size=block_size,
+                    lora_id=None,
+                    medium=medium,
+                    cache_salt=key.cache_salt,
+                    session_id=session_id,
+                    lora_name=lora_name,
+                    mm_routing_spans=(
+                        mm_routing_spans(page_tokens, block_size, num_pages)
+                        if with_spans
+                        else None
+                    ),
+                )
+            )
+            parent_block_hash = block_hashes[-1]
+            page_index += num_pages
+
+    def _bigram_token_ids(self, raw, start: int, end: int):
+        # Same payload as the per-page tuples; long runs as pre-encoded msgpack.
+        if self._raw_tokens and end - start >= _RAW_MIN_TOKENS:
+            body = _bigram_pairs_body(raw, start, end)
+            if body is not None:
+                return msgspec.Raw(_msgpack_array_header(end - start) + body)
+        return list(pairwise(raw[start : end + 1]))
+
     def record_remove(self, node: Any, medium=None) -> None:
         # One BlockRemoved per radix node.
         # ``medium`` defaults to StorageMedium.GPU but callers may override for
@@ -444,9 +648,17 @@ class KVCacheEventRecorder:
         # Hash values must match what was stored.
         event_hash_values = self._node_event_hash_values(node)
         namespace_seed = self._namespace_seed(node)
+        args = (event_hash_values, namespace_seed, len(node.key), medium)
+        self._build(self._enqueue_remove, args, defer=True)
 
+    def _enqueue_remove(
+        self,
+        event_hash_values: list,
+        namespace_seed: Optional[bytes],
+        logical_len: int,
+        medium,
+    ) -> None:
         block_hashes = []
-        logical_len = len(node.key)
         page_index = 0
         for start in range(0, logical_len, self.page_size):
             end = min(start + self.page_size, logical_len)
@@ -467,7 +679,26 @@ class KVCacheEventRecorder:
     def record_all_cleared(self) -> None:
         if not self.enabled:
             return
+        self._flush_pending()
         self.enqueue(AllBlocksCleared())
+
+    def _build(self, build: Callable, args: tuple, *, defer: bool) -> None:
+        """Run ``build(*args)`` now, or in take() when lazy and ``defer``.
+
+        Inputs are captured at record time, so a deferred build enqueues the
+        events an immediate one would, in the same order.
+        """
+        if self._lazy and defer:
+            self._pending.append((build, args))
+            return
+        self._flush_pending()
+        build(*args)
+
+    def _flush_pending(self) -> None:
+        if self._pending:
+            pending, self._pending = self._pending, []
+            for build, args in pending:
+                build(*args)
 
     def take(self) -> list:
         """Atomically takes all events and clears the queue.
@@ -477,6 +708,13 @@ class KVCacheEventRecorder:
         """
         if not self.enabled:
             return []
+        self._flush_pending()
         events = self._queue
         self._queue = []
+        if self._raw_tokens:
+            for event in events:
+                if isinstance(event, BlockStored) and isinstance(
+                    event.token_ids, _RawTokenParts
+                ):
+                    event.token_ids = event.token_ids.raw()
         return events

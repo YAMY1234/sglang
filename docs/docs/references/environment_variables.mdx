@@ -1309,6 +1309,21 @@ SGLang supports various environment variables that can be used to configure its 
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Storage directory for the HiCache NIXL backend.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Not set</td>
     </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_HICACHE_BATCH_EVENTS</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>With <code>--kv-events-config</code>, build one <code>BlockStored</code> event per run of equal-size pages instead of one per page followed by coalescing. The published events are byte-identical. Applies to the Python radix tree (the Rust tree core builds its own events).</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_KV_EVENTS_RAW_TOKENS</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Requires <code>SGLANG_HICACHE_BATCH_EVENTS</code>. Encode the bigram (EAGLE) <code>token_ids</code> of long runs to msgpack once with numpy and hand them to the publisher as <code>msgspec.Raw</code>; the published bytes are unchanged. In-process consumers of <code>BlockStored.token_ids</code> then see pre-encoded bytes, so use it with msgpack publishers such as <code>zmq</code>.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_KV_EVENTS_LAZY</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Requires <code>SGLANG_HICACHE_BATCH_EVENTS</code>. Record the inputs of each KV event at cache-update time and build the events when the scheduler takes them for publishing. Event order and bytes are unchanged.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
+    </tr>
   </tbody>
 </table>
 

@@ -832,6 +832,14 @@ class Envs:
     # Once decode passes the sliding window, drop the SWA part of the prefill's
     # tree lock; its SWA KV becomes evictable rather than freed.
     SGLANG_OPT_RELEASE_PREFILL_SWA = EnvBool(False)
+    # KV events (--kv-events-config): build one BlockStored per run of pages
+    # instead of one per page and coalescing them. Published bytes are unchanged.
+    SGLANG_HICACHE_BATCH_EVENTS = EnvBool(False)
+    # With batching: long bigram (EAGLE) token_ids reach the publisher as
+    # pre-encoded msgpack (msgspec.Raw) with the same bytes.
+    SGLANG_KV_EVENTS_RAW_TOKENS = EnvBool(False)
+    # With batching: build queued KV events when they are taken for publishing.
+    SGLANG_KV_EVENTS_LAZY = EnvBool(False)
 
     # ===================================================================
     # PD disaggregation runtime
