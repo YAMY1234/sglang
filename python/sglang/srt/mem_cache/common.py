@@ -69,9 +69,9 @@ def suffix_page_indices(
 ) -> np.ndarray:
     """Pages of a request's tokens [prefix_len, seq_len).
 
-    PD prefill and decode both call this with the same page-aligned prefix
-    (decode_prefix_len), so their lists pair up page by page even though their
-    rows point at different physical pages.
+    PD decode calls this, and prefill takes the same pages, with the same
+    page-aligned prefix (decode_prefix_len), so their lists pair up page by
+    page even though their rows point at different physical pages.
     """
     return kv_to_page_indices(req_to_token[req_pool_idx, prefix_len:seq_len], page_size)
 

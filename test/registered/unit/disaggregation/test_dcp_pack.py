@@ -14,8 +14,10 @@ from sglang.srt.disaggregation.common.dcp_pack import (
 from sglang.srt.disaggregation.common.utils import build_dcp_token_transfer_plan
 from sglang.srt.disaggregation.nixl.conn import NixlKVManager, NixlKVSender
 from sglang.srt.disaggregation.prefill import SchedulerDisaggregationPrefillMixin
+from sglang.srt.mem_cache.common import suffix_page_indices
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpace
 from sglang.srt.runtime_context import get_context
+from sglang.srt.utils.device import async_d2h
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -276,6 +278,88 @@ class TestHostTensorIndicesEvent(CustomTestCase):
         self.assertIsInstance(sender.send.call_args.args[0], np.ndarray)
         np.testing.assert_array_equal(sender.send.call_args.args[0], [5])
         self.assertNotIn("indices_event", sender.send.call_args.kwargs)
+
+    def test_dsa_state_pages_take_the_async_copy_before_the_last_event(self):
+        # The last chunk's DSA suffix pages are copied to the host before the
+        # event the transfer worker waits on, and equal the blocking copy's pages.
+        page_size, total, prefix, sent = 4, 14, 4, 8
+        stream = object()
+        log = []
+
+        class _Event:
+            def record(self, recorded_on):
+                log.append("event")
+
+        def logged_async_d2h(tensor):
+            log.append(tensor.tolist())
+            return async_d2h(tensor)
+
+        manager = SimpleNamespace(
+            enable_all_cp_ranks_for_transfer=False,
+            kv_shard_size=1,
+            kv_args=SimpleNamespace(
+                state_types=[StateType.DSA], state_sub_pools=[None]
+            ),
+        )
+        sender = SimpleNamespace(
+            supports_host_tensor_indices=True,
+            kv_mgr=manager,
+            get_max_transfer_tokens=lambda: None,
+            should_send_kv_chunk=lambda num_pages, is_last: True,
+            send=Mock(),
+        )
+        # Pages 6, 2, 9, 3 hold the tokens; decode cached the first page and an
+        # earlier chunk sent the second.
+        req_to_token = (
+            (torch.tensor([6, 2, 9, 3])[:, None] * page_size + torch.arange(page_size))
+            .flatten()[:total]
+            .reshape(1, -1)
+        )
+        req = SimpleNamespace(
+            rid="dsa-host-indices",
+            kv=SimpleNamespace(req_pool_idx=0),
+            origin_input_ids=[0] * total,
+            extend_end=total,
+            start_send_idx=sent,
+            disagg_decode_prefix_len=prefix,
+            disagg_kv_sender=sender,
+        )
+        scheduler = SimpleNamespace(
+            enable_staging=False,
+            device_module=SimpleNamespace(Event=_Event, current_stream=lambda: stream),
+            token_to_kv_pool_allocator=SimpleNamespace(
+                page_size=page_size,
+                translate_kv_indices_for_transfer=lambda x: x,
+                storage=None,
+            ),
+            req_to_token_pool=SimpleNamespace(req_to_token=req_to_token),
+            disagg_metadata_buffers=Mock(),
+            disagg_prefill_bootstrap_queue=SimpleNamespace(kv_manager=manager),
+        )
+        with (
+            patch(
+                "sglang.srt.disaggregation.prefill.async_d2h",
+                side_effect=logged_async_d2h,
+            ),
+            patch(
+                "sglang.srt.disaggregation.prefill.kv_to_page_indices",
+                side_effect=AssertionError(
+                    "a host-index send must not block on a copy"
+                ),
+            ),
+        ):
+            SchedulerDisaggregationPrefillMixin._send_kv_chunk(
+                scheduler, req, last_chunk=True
+            )
+
+        expected = suffix_page_indices(req_to_token, 0, prefix, total, page_size)
+        np.testing.assert_array_equal(expected, [2, 9, 3])
+        # The DSA state copy, then the KV page copy, then the event.
+        self.assertEqual(log, [[2, 9, 3], [9, 3], "event"])
+        pages, state = sender.send.call_args.args
+        np.testing.assert_array_equal(pages, [9, 3])
+        self.assertIsInstance(state[0], np.ndarray)
+        np.testing.assert_array_equal(state[0], expected)
 
 
 class TestDcpPackBufferBytes(CustomTestCase):

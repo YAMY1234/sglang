@@ -95,7 +95,6 @@ from sglang.srt.mem_cache.common import (
     kv_to_page_indices,
     kv_to_page_num,
     release_kv_cache,
-    suffix_page_indices,
 )
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
@@ -1957,12 +1956,10 @@ class SchedulerDisaggregationPrefillMixin:
                 # (decode_prefix_len, page-aligned), and its rows for a prefix
                 # still being restored point at no page yet: send only the
                 # suffix, positionally matching decode's _dsa_pages_payload.
-                return suffix_page_indices(
-                    self.req_to_token_pool.req_to_token,
-                    req.kv.req_pool_idx,
-                    req.disagg_decode_prefix_len,
-                    seq_len,
-                    page_size,
+                return state_page_indices(
+                    self.req_to_token_pool.req_to_token[
+                        req.kv.req_pool_idx, req.disagg_decode_prefix_len : seq_len
+                    ]
                 )
 
             def _dsa_tail_payload():
