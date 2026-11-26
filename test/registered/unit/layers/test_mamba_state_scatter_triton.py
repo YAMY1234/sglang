@@ -566,5 +566,90 @@ class TestScatterAfterVerifyZeroWidthConv(CustomTestCase):
         )
 
 
+@unittest.skipUnless(
+    DEVICE is not None,
+    f"verify scatter needs one of {TRITON_DEVICES}",
+)
+class TestMambaStateScatterPersistentGrid(CustomTestCase):
+    """The persistent-grid scatter writes the same bytes as the dense grid."""
+
+    L, C, B, D = 4, 64, 24, 4
+    # Crosses the persistent kernel's chunk boundary and leaves a partial last block.
+    ELEMS = 20003
+
+    def _inputs(self, dtype):
+        torch.manual_seed(0)
+        dst = torch.randn(self.L, self.C, self.ELEMS, device=DEVICE).to(dtype)
+        src = torch.randn(self.L, self.B, self.D, self.ELEMS, device=DEVICE).to(dtype)
+        dst_rows = torch.randperm(self.C, device=DEVICE)[: self.B].to(torch.int32)
+        return dst, src, dst_rows
+
+    def test_persistent_matches_dense_grid(self):
+        for dtype in (torch.bfloat16, torch.float32):
+            dst0, src, dst_rows = self._inputs(dtype)
+            for valid_rows in ([], [7], list(range(0, self.B, 3)), list(range(self.B))):
+                steps = torch.full((self.B,), -1, dtype=torch.int32, device=DEVICE)
+                steps[valid_rows] = torch.randint(
+                    0, self.D, (len(valid_rows),), dtype=torch.int32, device=DEVICE
+                )
+                for src_rows in (None, torch.randperm(self.B, device=DEVICE)):
+                    with self.subTest(
+                        dtype=dtype, valid=len(valid_rows), src=src_rows is not None
+                    ):
+                        persistent, dense = dst0.clone(), dst0.clone()
+                        fused_mamba_state_scatter_with_mask(
+                            persistent,
+                            src,
+                            dst_rows,
+                            steps,
+                            src_rows,
+                            persistent_grid=True,
+                        )
+                        fused_mamba_state_scatter_with_mask(
+                            dense, src, dst_rows, steps, src_rows
+                        )
+                        self.assertTrue(torch.equal(persistent, dense))
+                        ref = dst0.clone()
+                        rows = (
+                            torch.arange(self.B, device=DEVICE)
+                            if src_rows is None
+                            else src_rows
+                        )
+                        keep = steps >= 0
+                        ref[:, dst_rows[keep].long()] = src[
+                            :, rows[keep].long(), steps[keep].long()
+                        ]
+                        self.assertTrue(torch.equal(persistent, ref))
+
+    def test_track_snapshot_after_verify(self):
+        """At a crossing the track slot holds exactly the crossing step's state."""
+        dst0, src, dst_rows = self._inputs(torch.bfloat16)
+        caches = MambaPool.SpeculativeState(
+            conv=[],
+            temporal=dst0.clone(),
+            intermediate_ssm=src,
+            intermediate_conv_window=[],
+        )
+        n = self.B // 2
+        state_slots, track_slots = dst_rows[:n], dst_rows[n:]
+        last_steps = torch.randint(0, self.D, (n,), dtype=torch.int32, device=DEVICE)
+        track_steps = torch.full((n,), -1, dtype=torch.int32, device=DEVICE)
+        track_steps[[2, 9]] = torch.tensor([1, 3], dtype=torch.int32, device=DEVICE)
+        scatter_mamba_states_after_mtp_verify(
+            mamba_caches=caches,
+            state_indices_tensor=state_slots,
+            last_correct_step_indices=last_steps,
+            mamba_track_indices=track_slots,
+            mamba_steps_to_track=track_steps,
+        )
+        expected = dst0.clone()
+        expected[:, state_slots.long()] = src[
+            :, torch.arange(n, device=DEVICE), last_steps.long()
+        ]
+        for row, step in ((2, 1), (9, 3)):
+            expected[:, track_slots[row].long()] = src[:, row, step]
+        self.assertTrue(torch.equal(caches.temporal, expected))
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()

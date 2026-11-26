@@ -134,6 +134,11 @@ def track_mamba_state_if_needed_kernel(
 _TRACK_BLOCK_SIZE = 8192
 _TRACK_CHUNK_BYTES = 32768
 _TRACK_PROGRAMS_PER_SM = 4
+# The compact scatter reduces a [next_pow2(rows)] step vector for every work item.
+_COMPACT_SCATTER_MAX_ROWS = 1024
+# Enough resident warps for the all-rows-valid copy to match the dense grid on GB300.
+_COMPACT_SCATTER_PROGRAMS_PER_SM = 32
+_COMPACT_SCATTER_CHUNK_BYTES = 65536
 
 
 @functools.lru_cache(maxsize=None)
@@ -299,6 +304,70 @@ def _fused_mamba_state_scatter_with_mask_kernel(
     tl.store(dst_ptr + dst_offset + offsets, data, mask=mask)
 
 
+@triton.jit(do_not_specialize=["batch_size", "num_layers"])
+def _fused_mamba_state_scatter_compact_kernel(
+    src_ptr,
+    dst_ptr,
+    dst_indices_raw_ptr,
+    step_indices_raw_ptr,
+    src_indices_raw_ptr,
+    src_layer_stride,
+    src_req_stride,
+    src_step_stride,
+    dst_layer_stride,
+    dst_req_stride,
+    src_req_size,
+    src_step_size,
+    dst_req_size,
+    batch_size,
+    num_layers,
+    elem_per_entry: tl.constexpr,
+    CHUNK: tl.constexpr,
+    NUM_CHUNKS: tl.constexpr,
+    BS_POW2: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """_fused_mamba_state_scatter_with_mask_kernel on a persistent grid: as in
+    track_mamba_state_if_needed_kernel, the valid rows are compacted in-kernel, so
+    rows with step -1 cost no programs."""
+    pid = tl.program_id(0)
+    num_programs = tl.num_programs(0)
+    rows = tl.arange(0, BS_POW2)
+    steps = tl.load(step_indices_raw_ptr + rows, mask=rows < batch_size, other=-1)
+    valid = (steps >= 0).to(tl.int32)
+    num_valid = tl.sum(valid, axis=0)
+    valid_rank = tl.cumsum(valid, axis=0)
+
+    items_per_row = NUM_CHUNKS * num_layers
+    for item in range(pid, num_valid * items_per_row, num_programs):
+        rank = item // items_per_row
+        rem = item - rank * items_per_row
+        layer_idx = (rem // NUM_CHUNKS).to(tl.int64)
+        chunk = rem % NUM_CHUNKS
+        req = tl.sum(tl.where((valid_rank == rank + 1) & (valid != 0), rows, 0), axis=0)
+        step_idx = tl.load(step_indices_raw_ptr + req).to(tl.int64)
+        dst_idx = tl.load(dst_indices_raw_ptr + req).to(tl.int64)
+        src_idx = tl.load(src_indices_raw_ptr + req).to(tl.int64)
+        if (
+            (dst_idx >= 0)
+            & (dst_idx < dst_req_size)
+            & (src_idx >= 0)
+            & (src_idx < src_req_size)
+            & (step_idx < src_step_size)
+        ):
+            src_offset = (
+                layer_idx * src_layer_stride
+                + src_idx * src_req_stride
+                + step_idx * src_step_stride
+            )
+            dst_offset = layer_idx * dst_layer_stride + dst_idx * dst_req_stride
+            for off in tl.static_range(0, CHUNK, BLOCK_SIZE):
+                offsets = chunk * CHUNK + off + tl.arange(0, BLOCK_SIZE)
+                mask = offsets < elem_per_entry
+                data = tl.load(src_ptr + src_offset + offsets, mask=mask)
+                tl.store(dst_ptr + dst_offset + offsets, data, mask=mask)
+
+
 def _prepare_src_rows(src: torch.Tensor | None, steps: torch.Tensor) -> torch.Tensor:
     if src is None:
         src = torch.arange(steps.shape[0], dtype=torch.int32, device=steps.device)
@@ -315,6 +384,8 @@ def fused_mamba_state_scatter_with_mask(
     dst_indices_raw: torch.Tensor,  # [total_requests] - raw indices (e.g., state_indices_tensor)
     step_indices_raw: torch.Tensor,  # [total_requests] - raw step indices (step >= 0 means valid)
     src_indices_raw: torch.Tensor | None = None,  # [total_requests] - scratch rows
+    *,
+    persistent_grid: bool = False,
 ):
     """
     Fully fused gather-scatter with built-in masking for mamba state updates.
@@ -331,6 +402,9 @@ def fused_mamba_state_scatter_with_mask(
         src: Source tensor [num_layers, spec_size, draft_tokens, *state_shape]
         dst_indices_raw: Raw destination indices for all requests [total_requests]
         step_indices_raw: Raw step indices; entry >= 0 means valid [total_requests]
+        persistent_grid: copy on a fixed number of programs per SM that skip rows
+            with step -1; for the large per-slot SSM states (the PLE side states are
+            launch-bound and keep the dense grid).
     """
     total_requests = step_indices_raw.shape[0]
     if total_requests == 0:
@@ -386,6 +460,43 @@ def fused_mamba_state_scatter_with_mask(
     _require_entry_contiguous_dst(dst, 2, "fused_mamba_state_scatter_with_mask")
     if not src.is_contiguous():
         raise ValueError("src tensor must be contiguous")
+
+    if persistent_grid and total_requests <= _COMPACT_SCATTER_MAX_ROWS:
+        chunk = max(
+            _TRACK_BLOCK_SIZE, _COMPACT_SCATTER_CHUNK_BYTES // dst.element_size()
+        )
+        num_chunks = triton.cdiv(elem_per_entry, chunk)
+        max_items = total_requests * num_layers * num_chunks
+        grid = (
+            min(
+                max_items,
+                _COMPACT_SCATTER_PROGRAMS_PER_SM * _num_sms(dst.device.index or 0),
+            ),
+        )
+        _fused_mamba_state_scatter_compact_kernel[grid](
+            src,
+            dst,
+            dst_indices_raw,
+            step_indices_raw,
+            src_indices_raw,
+            src_layer_stride,
+            src_req_stride,
+            src_step_stride,
+            dst_layer_stride,
+            dst_req_stride,
+            src_req_size,
+            src_step_size,
+            dst_req_size,
+            total_requests,
+            num_layers,
+            elem_per_entry,
+            chunk,
+            num_chunks,
+            max(16, triton.next_power_of_2(total_requests)),
+            _TRACK_BLOCK_SIZE,
+            num_warps=16,
+        )
+        return
 
     # Block size for copying elements
     BLOCK_SIZE = 1024
@@ -808,6 +919,7 @@ def scatter_mamba_states_after_mtp_verify(
             state_indices_tensor,
             last_correct_step_indices,
             src_indices_raw,
+            persistent_grid=True,
         )
         if mamba_track_indices is not None:
             assert mamba_steps_to_track is not None
@@ -817,6 +929,7 @@ def scatter_mamba_states_after_mtp_verify(
                 mamba_track_indices,
                 mamba_steps_to_track,
                 src_indices_raw,
+                persistent_grid=True,
             )
 
     pairs = [
