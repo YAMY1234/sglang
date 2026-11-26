@@ -1309,6 +1309,16 @@ SGLang supports various environment variables that can be used to configure its 
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Storage directory for the HiCache NIXL backend.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Not set</td>
     </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_PREFETCH_VERDICT_RELAY</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Pipeline-parallel PD prefill with HiCache storage and the <code>timeout</code> prefetch policy: the first stage's per-tick prefetch verdicts travel to later stages with the relayed requests instead of over the HiCache PP-sync send/recv chain. Not used with attention DP.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_PREFETCH_PP0_MISS_SHORTCUT</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>With the <code>timeout</code> prefetch policy, stop a storage prefetch as soon as the first pipeline stage's own storage query finds nothing, instead of waiting for every rank's query and the rank-agreed hit. The request is retired like any other storage miss (it may be retried).</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
+    </tr>
   </tbody>
 </table>
 

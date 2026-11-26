@@ -950,6 +950,12 @@ class Envs:
     # Buffer mode: store only the SWA window ending at each node (what a
     # prefetch ending there restores) instead of every SWA page.
     SGLANG_ENABLE_HICACHE_SWA_TAIL_ONLY_BACKUP = EnvBool(False)
+    # PP PD prefill: PP0's per-tick prefetch timeout verdicts ride the request
+    # relay to later stages instead of the HiCache PP-sync send/recv chain.
+    SGLANG_PREFETCH_VERDICT_RELAY = EnvBool(False)
+    # Timeout prefetch policy: PP0 stops a prefetch its own storage query found
+    # empty, since the rank-agreed (MIN) hit can then only be zero.
+    SGLANG_PREFETCH_PP0_MISS_SHORTCUT = EnvBool(False)
     SGLANG_HICACHE_NIXL_BACKEND_STORAGE_DIR = EnvStr(None)
     # Enable O_DIRECT when opening NIXL POSIX backend files (bypasses OS page cache).
     # Disable with SGLANG_HICACHE_NIXL_USE_DIRECT_IO=0 or via the

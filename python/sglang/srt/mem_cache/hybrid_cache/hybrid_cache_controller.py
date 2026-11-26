@@ -216,6 +216,12 @@ class PrefetchOperation(StorageOperation):
         self._lock = threading.Lock()
         self._terminated_flag = False
         self.storage_hit_count = 0
+        # This rank's own storage query result, before the rank MIN; None until
+        # the query ran (prefetch_thread_func).
+        self.local_query_tokens: Optional[int] = None
+        # Stopped on PP0's own miss (SGLANG_PREFETCH_PP0_MISS_SHORTCUT); its
+        # drained, rank-agreed hit still feeds the outcome stats.
+        self.local_miss_terminated = False
         # KV pages the hit-time plan skips in front of the KV transfer: the
         # device trim, then the span head a component's block groups serve.
         self.prefetch_kv_page_offset = 0

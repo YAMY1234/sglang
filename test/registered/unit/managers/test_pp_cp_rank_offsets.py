@@ -1,4 +1,5 @@
 import unittest
+from collections import deque
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -23,6 +24,7 @@ from sglang.srt.managers.scheduler_components.request_receiver import (  # noqa:
 )
 from sglang.srt.managers.scheduler_pp_mixin import (  # noqa: E402
     PPBatchMetadata,
+    PPPrefetchVerdicts,
     SchedulerPPMixin,
 )
 from sglang.srt.runtime_context import get_parallel  # noqa: E402
@@ -330,6 +332,30 @@ class TestReleaseVerdictRing(CustomTestCase):
         SchedulerPPMixin._pp_pass_verdict(stage, self.RELEASED, self.REQUEST)
 
         stage._pp_send_pyobj_to_next_stage.assert_not_called()
+
+
+class TestPrefetchVerdictRelay(CustomTestCase):
+    def test_verdicts_ride_the_request_relay_and_are_not_dispatched(self):
+        """A stage appends its tick's HiCache prefetch verdicts to the requests it
+        relays; the next stage hands them to its cache before dispatch."""
+        sender = SimpleNamespace(
+            _pp_prefetch_verdict_relay=True,
+            tree_cache=SimpleNamespace(pp_prefetch_verdicts_out=[[1, 0]]),
+        )
+        relayed = SchedulerPPMixin._pp_with_prefetch_verdicts(sender, ["req"])
+        self.assertEqual(relayed, ["req", PPPrefetchVerdicts([[1, 0]])])
+        self.assertEqual(sender.tree_cache.pp_prefetch_verdicts_out, [])
+        # A tick without a vote adds nothing to the relay.
+        self.assertEqual(
+            SchedulerPPMixin._pp_with_prefetch_verdicts(sender, ["req"]), ["req"]
+        )
+
+        receiver = SimpleNamespace(
+            tree_cache=SimpleNamespace(pp_prefetch_verdicts_in=deque())
+        )
+        kept = SchedulerPPMixin._pp_take_prefetch_verdicts(receiver, relayed)
+        self.assertEqual(kept, ["req"])
+        self.assertEqual(list(receiver.tree_cache.pp_prefetch_verdicts_in), [[1, 0]])
 
 
 if __name__ == "__main__":

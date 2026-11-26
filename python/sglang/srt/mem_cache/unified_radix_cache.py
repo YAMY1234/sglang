@@ -186,6 +186,10 @@ COMPONENT_REGISTRY: dict[str, type[TreeComponent]] = {
 logger = logging.getLogger(__name__)
 device_module = get_device_module()
 
+# PP0's per-tick vote on a live prefetch under the timeout policy, MAX-reduced:
+# a local miss outranks a deadline (a miss may retry, a spent budget may not).
+_PREFETCH_WAIT, _PREFETCH_DEADLINE, _PREFETCH_LOCAL_MISS = 0, 1, 2
+
 
 class _OngoingWriteThrough(NamedTuple):
     """Tracks an in-flight D→H write-through operation."""
@@ -230,6 +234,11 @@ class UnifiedRadixCache(BasePrefixCache):
     # Whether storage can hold Full KV past its last SWA window, a gap the cache
     # then heals: a buffer-mode Full + SWA cache, resolved in init_hicache.
     _heals_storage_swa_gap: bool = False
+    # SGLANG_PREFETCH_PP0_MISS_SHORTCUT, resolved in init_hicache.
+    prefetch_pp0_miss_shortcut: bool = False
+    # Set by the PP PD prefill loop (SGLANG_PREFETCH_VERDICT_RELAY); see
+    # _exchange_prefetch_verdicts.
+    prefetch_verdict_relay: bool = False
 
     def __init__(
         self,
@@ -669,6 +678,12 @@ class UnifiedRadixCache(BasePrefixCache):
                 )
         self.load_back_threshold = 10
         self.prefetch_stop_policy = get_memory().hicache_storage_prefetch_policy
+        # A healed SWA gap is recorded from the drained per-pool hit, which an
+        # early stop on a local miss would skip.
+        self.prefetch_pp0_miss_shortcut = (
+            envs.SGLANG_PREFETCH_PP0_MISS_SHORTCUT.get()
+            and not self._heals_storage_swa_gap
+        )
 
         # Runtime attach/detach of the L3 backend (startup, admin API, atexit).
         atexit.register(self.shutdown)
@@ -3013,22 +3028,65 @@ class UnifiedRadixCache(BasePrefixCache):
         contributes 0 until the next tick. An expired operation is terminated
         here so the transfer worker and the hit drain stop spending on it;
         its retirement stays with the admission poll or the drain.
+
+        With prefetch_pp0_miss_shortcut, PP0 also votes to stop an operation
+        its own storage query found empty: the agreed hit is a MIN over every
+        rank's, PP0's included, so it can only be zero. Such an operation is
+        retired like a drained zero hit (a miss may retry), not as a deadline.
         """
         if self.prefetch_stop_policy != "timeout" or not self.ongoing_prefetch:
             return
         operations = [info.operation for info in self.ongoing_prefetch.values()]
-        expired = [0] * len(operations)
+        votes = [_PREFETCH_WAIT] * len(operations)
         if self.pp_rank == 0:
-            expired = [
-                int(self._prefetch_deadline_expired(operation))
-                for operation in operations
-            ]
-        verdicts = torch.tensor(expired, dtype=torch.int, device="cpu")
-        self._all_reduce(verdicts, torch.distributed.ReduceOp.MAX)
+            votes = [self._prefetch_stop_vote(operation) for operation in operations]
+        verdicts = torch.tensor(votes, dtype=torch.int, device="cpu")
+        self._exchange_prefetch_verdicts(verdicts)
         for operation, verdict in zip(operations, verdicts.tolist()):
-            if verdict:
+            if verdict == _PREFETCH_WAIT:
+                continue
+            if verdict == _PREFETCH_LOCAL_MISS and not operation.deadline_expired:
+                operation.local_miss_terminated = True
+            else:
                 self._mark_prefetch_deadline_expired(operation)
-                self.cache_controller.terminate_prefetch(operation)
+            self.cache_controller.terminate_prefetch(operation)
+
+    def _prefetch_stop_vote(self, operation: PrefetchOperation) -> int:
+        if self.prefetch_pp0_miss_shortcut and operation.local_query_tokens == 0:
+            return _PREFETCH_LOCAL_MISS
+        if self._prefetch_deadline_expired(operation):
+            return _PREFETCH_DEADLINE
+        return _PREFETCH_WAIT
+
+    def _exchange_prefetch_verdicts(self, verdicts: torch.Tensor) -> None:
+        """MAX over PP0's attention ranks, then PP0's result on every stage.
+
+        By default _all_reduce relays it along the HiCache PP-sync chain. With
+        prefetch_verdict_relay, the PP PD prefill loop carries it instead: a
+        stage sends its requests after its tick, so the next stage receives
+        this tick's verdicts before running its own tick of the same iteration,
+        and every stage applies the same values to the same `ongoing_prefetch`.
+        """
+        if not self.prefetch_verdict_relay:
+            self._all_reduce(verdicts, torch.distributed.ReduceOp.MAX)
+            return
+        if self.pp_rank == 0:
+            self._all_reduce_attn_groups(verdicts, torch.distributed.ReduceOp.MAX)
+        else:
+            assert self.pp_prefetch_verdicts_in, "prefetch verdicts missing from relay"
+            relayed = self.pp_prefetch_verdicts_in.popleft()
+            assert len(relayed) == len(verdicts), (relayed, verdicts.tolist())
+            verdicts.copy_(torch.tensor(relayed, dtype=verdicts.dtype))
+        if self.pp_rank + 1 < self.pp_size:
+            self.pp_prefetch_verdicts_out.append(verdicts.tolist())
+
+    def enable_prefetch_verdict_relay(self) -> None:
+        """Called by the PP PD prefill loop under SGLANG_PREFETCH_VERDICT_RELAY."""
+        self.prefetch_verdict_relay = True
+        # One verdict list per voting tick: from the previous stage's relay,
+        # and for the next stage's.
+        self.pp_prefetch_verdicts_in: deque[list[int]] = deque()
+        self.pp_prefetch_verdicts_out: list[list[int]] = []
 
     def _hicache_sync_digest(self) -> int:
         """Value piggybacked on the ready-count MIN sync: equal on every rank
@@ -4003,6 +4061,13 @@ class UnifiedRadixCache(BasePrefixCache):
                 if info is None:
                     if hit_tokens > 0:
                         self.discard_storage_prefetch_accounting(request)
+                    if (
+                        self.prefetch_pp0_miss_shortcut
+                        and operation.local_miss_terminated
+                    ):
+                        # Retired at admission on PP0's own miss: this agreed
+                        # (zero) hit is the L3 verdict a drained miss records.
+                        self._account_prefetch_outcome(operation, revoked=True)
                     continue
                 self._record_storage_swa_gap(operation)
                 if hit_tokens > 0:

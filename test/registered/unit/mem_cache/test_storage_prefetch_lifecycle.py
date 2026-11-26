@@ -978,6 +978,43 @@ class TestStagedPrefetchLifecycle(unittest.TestCase):
         self.assertEqual(retries.pop_ready([head, req], 1, 8), [])
         self.assertEqual(retries.pop_ready([head, req], 1, 8), [(req, None)])
 
+    def test_local_miss_retired_at_admission_still_counts_as_an_l3_miss(self):
+        """A prefetch stopped on PP0's own miss and retired by its admission
+        poll drains after it left ongoing_prefetch; its agreed (zero) hit still
+        feeds the L3-miss counters once. Another retired query does not."""
+        cache = _hit_drain_fixture()
+        cache.prefetch_pp0_miss_shortcut = True
+        for rid, local_miss in (("local_miss", True), ("aborted", False)):
+            cache.cache_controller.prefetch_hit_queue.put(
+                SimpleNamespace(
+                    request_id=rid,
+                    handle=CacheRequestHandle(rid, 0),
+                    storage_hit_count=0,
+                    stats_requested_tokens=8,
+                    all_hash_values=None,
+                    deadline_expired=False,
+                    local_miss_terminated=local_miss,
+                )
+            )
+        cache._drain_storage_control_queues_impl(
+            n_storage_hit=2,
+            n_ack_prefetch=0,
+            n_backup=0,
+            n_release=0,
+            extra_release_counts={},
+            log_metrics=False,
+        )
+        stats = cache._prefetch_outcome_stats
+        self.assertEqual(
+            (
+                stats["revoked_full_miss"],
+                stats["l3_demand_requests"],
+                stats["l3_miss_tokens"],
+            ),
+            (1, 1, 8),
+        )
+        cache.revoke_pending_prefetch.assert_not_called()
+
     def test_unservable_anchor_declines_before_any_staging(self):
         """A resident but unreadable device prefix must decline the fetch
         outright: nothing is allocated or parked for a retry, and the loss is

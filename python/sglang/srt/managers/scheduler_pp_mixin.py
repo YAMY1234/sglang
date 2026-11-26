@@ -133,6 +133,14 @@ class PPBatchMetadata:
     forward_done: Optional[torch.cuda.Event] = None
 
 
+@dataclass
+class PPPrefetchVerdicts:
+    """PP0's HiCache prefetch verdicts of one iteration, appended to the
+    request relay (SGLANG_PREFETCH_VERDICT_RELAY)."""
+
+    verdicts: List[List[int]]
+
+
 class SchedulerPPMixin:
     # Gated PP+spec relay flow. Class-level default so schedulers that never
     # ran init_pp_loop_state (plain TP, unit-test doubles) read False;
@@ -147,6 +155,8 @@ class SchedulerPPMixin:
     _pp_reqs_awaiting_verdict: Tuple[
         Union[ReleaseMemoryOccupationReqInput, RpcReqInput], ...
     ] = ()
+    # SGLANG_PREFETCH_VERDICT_RELAY, resolved at the PP PD prefill loop's entry.
+    _pp_prefetch_verdict_relay: bool = False
 
     @DynamicGradMode()
     def event_loop_pp(self: Scheduler):
@@ -300,6 +310,7 @@ class SchedulerPPMixin:
         ====================================================================
         """
         self.init_pp_loop_state()
+        self._pp_init_prefetch_verdict_relay()
 
         while True:
             server_is_idle = True
@@ -382,7 +393,9 @@ class SchedulerPPMixin:
 
                 self.process_disagg_prefill_transfer_queue()
                 if not self.pp_group.is_last_rank:
-                    self.send_req_work = self._pp_send_reqs_to_next_stage(recv_reqs)
+                    self.send_req_work = self._pp_send_reqs_to_next_stage(
+                        self._pp_with_prefetch_verdicts(recv_reqs)
+                    )
                     self._pp_send_capacity_digest()
                     if cur_batch:
                         self._pp_send_proxy_to_next_stage(result)
@@ -619,7 +632,58 @@ class SchedulerPPMixin:
         """Hold a pause, and the inputs after it, until no micro-batch is
         unprocessed."""
         has_unprocessed_mb = any(mb is not None for mb in self.mbs)
+        if self._pp_prefetch_verdict_relay and not self.pp_group.is_first_rank:
+            return self.ingest_requests(
+                stop_at_pause=has_unprocessed_mb,
+                take_relay_extras=self._pp_take_prefetch_verdicts,
+            )
         return self.ingest_requests(stop_at_pause=has_unprocessed_mb)
+
+    def _pp_init_prefetch_verdict_relay(self: Scheduler) -> None:
+        """This loop sends a stage's requests after its HiCache tick, so they can
+        carry PP0's prefetch verdicts to the next stage before its own tick."""
+        if not envs.SGLANG_PREFETCH_VERDICT_RELAY.get():
+            return
+        from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+
+        # The attention-DP work/control split and the input blocker could hold
+        # or reorder a relayed item that is not a request.
+        if (
+            get_parallel().attn_dp_enabled
+            or self.input_blocker is not None
+            or not isinstance(self.tree_cache, UnifiedRadixCache)
+        ):
+            logger.warning(
+                "SGLANG_PREFETCH_VERDICT_RELAY declined: needs a UnifiedRadixCache, "
+                "no attention DP and no input blocker"
+            )
+            return
+        self._pp_prefetch_verdict_relay = True
+        self.tree_cache.enable_prefetch_verdict_relay()
+        logger.info("HiCache prefetch verdicts ride the PP request relay")
+
+    def _pp_take_prefetch_verdicts(self: Scheduler, reqs: List) -> List:
+        """Hand the relayed prefetch verdicts to the cache; return the rest."""
+        kept = []
+        for req in reqs:
+            if isinstance(req, PPPrefetchVerdicts):
+                # The previous iteration's tick took every verdict it received.
+                assert not self.tree_cache.pp_prefetch_verdicts_in
+                self.tree_cache.pp_prefetch_verdicts_in.extend(req.verdicts)
+            else:
+                kept.append(req)
+        return kept
+
+    def _pp_with_prefetch_verdicts(self: Scheduler, recv_reqs: List) -> List:
+        """The requests to relay, plus this iteration's prefetch verdicts (taken
+        on every rank, so none carry over to the next iteration)."""
+        if not self._pp_prefetch_verdict_relay:
+            return recv_reqs
+        verdicts = self.tree_cache.pp_prefetch_verdicts_out
+        self.tree_cache.pp_prefetch_verdicts_out = []
+        if not verdicts:
+            return recv_reqs
+        return recv_reqs + [PPPrefetchVerdicts(verdicts)]
 
     def _pp_apply_war_barrier(self: Scheduler) -> None:
         """Order later schedule-stream writes after the launched forward's reads.

@@ -306,6 +306,9 @@ class PrefetchOperation(StorageOperation):
         self._lock = threading.Lock()
         self._terminated_flag = False
         self.storage_hit_count = 0
+        # This rank's own storage query result, before the rank MIN; None until
+        # the query ran (prefetch_thread_func).
+        self.local_query_tokens: Optional[int] = None
         self.start_time = time.monotonic()
 
         super().__init__(None, token_ids, last_hash, prefix_keys=prefix_keys)
@@ -1622,6 +1625,7 @@ class HiCacheController:
                     hash_value, storage_hit_count = [], 0
                 else:
                     hash_value, storage_hit_count = self._storage_hit_query(operation)
+                    operation.local_query_tokens = storage_hit_count
             except Exception:
                 logger.exception(
                     "HiCache storage query failed for request %s",

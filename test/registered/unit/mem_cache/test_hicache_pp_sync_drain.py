@@ -176,8 +176,8 @@ class TestUnifiedPPSyncBatching(CustomTestCase):
         )
         return cache
 
-    def _arm_live_prefetch(self, cache):
-        """Cache-mode storage with one live prefetch on this PP stage."""
+    def _arm_live_prefetch(self, cache, rid="r", **fields):
+        """Cache-mode storage with one more live prefetch on this PP stage."""
         cache.tree_core.enable_storage = True
         cache._drain_storage_control_queues_impl = MagicMock()
         cache.storage_prefetch_retries = StoragePrefetchRetries()
@@ -192,13 +192,14 @@ class TestUnifiedPPSyncBatching(CustomTestCase):
             setattr(cc, name, Queue())
         cc.extra_host_mem_release_queues = {}
         cc.terminate_prefetch = MagicMock()
-        handle = CacheRequestHandle("r", 0)
+        handle = CacheRequestHandle(rid, 0)
         operation = SimpleNamespace(
             handle=handle,
             deadline_expired=False,
             host_indices=None,
             hash_value=[],
             completed_tokens=0,
+            **fields,
         )
         cache.ongoing_prefetch[handle] = _OngoingPrefetch(
             0, None, None, operation, None, {}
@@ -248,6 +249,95 @@ class TestUnifiedPPSyncBatching(CustomTestCase):
         self.assertTrue(operation.deadline_expired)
         follower.cache_controller.terminate_prefetch.assert_called_once_with(operation)
         follower.writing_check.assert_called_once_with(finish_count=1)
+
+    def test_request_relay_carries_the_deadline_vote_instead_of_pp_sync(self):
+        """With the verdict relay, PP0 reduces its vote over its own attention
+        ranks and queues it for the request relay; the next stage adopts it
+        from there in the same iteration, so the vote sends no PP-sync message
+        and both stages mark and terminate the same operation."""
+        leader = self._make_cache(0, [True], [True])
+        leader.enable_prefetch_verdict_relay()
+        leader._all_reduce_attn_groups = MagicMock()
+        handle, operation = self._arm_live_prefetch(leader)
+        wait = _StoragePrefetchWait(timeout_s=1.0)
+        with patch("time.perf_counter", return_value=100.0):
+            wait.timer.observe(ready=False)
+        leader._storage_prefetch_wait[handle] = wait
+        with patch("time.perf_counter", return_value=103.0):
+            leader.check_hicache_events()
+
+        (counts,) = leader._all_reduce.call_args_list
+        self.assertIs(counts.args[1], torch.distributed.ReduceOp.MIN)
+        (vote,) = leader._all_reduce_attn_groups.call_args_list
+        self.assertEqual(vote.args[0].tolist(), [1])
+        self.assertIs(vote.args[1], torch.distributed.ReduceOp.MAX)
+        self.assertEqual(leader.pp_prefetch_verdicts_out, [[1]])
+        self.assertTrue(operation.deadline_expired)
+        leader.cache_controller.terminate_prefetch.assert_called_once_with(operation)
+
+        follower = self._make_cache(1, [True], [True])
+        follower.pp_size = 3  # a middle stage passes the verdict on
+        follower.enable_prefetch_verdict_relay()
+        handle, operation = self._arm_live_prefetch(follower)
+        follower._prefetch_deadline_expired = MagicMock()
+        follower.pp_prefetch_verdicts_in.extend(leader.pp_prefetch_verdicts_out)
+        follower.check_hicache_events()
+
+        follower._all_reduce.assert_called_once()  # the counts only
+        follower._prefetch_deadline_expired.assert_not_called()
+        self.assertEqual(list(follower.pp_prefetch_verdicts_in), [])
+        self.assertEqual(follower.pp_prefetch_verdicts_out, [[1]])
+        self.assertTrue(follower._storage_prefetch_wait[handle].expired)
+        self.assertTrue(operation.deadline_expired)
+        follower.cache_controller.terminate_prefetch.assert_called_once_with(operation)
+
+    def test_pp0_local_miss_stops_the_prefetch_on_every_stage(self):
+        """PP0's own empty storage query stops that prefetch at the next tick,
+        before the rank-agreed hit drains; every stage applies PP0's verdict
+        (not its own query result) and none marks a deadline, so the miss may
+        retry. A prefetch whose query is still pending keeps waiting."""
+        leader = self._make_cache(0, [True], [True])
+        leader.prefetch_pp0_miss_shortcut = True
+        miss_handle, miss = self._arm_live_prefetch(
+            leader, "miss", local_query_tokens=0, local_miss_terminated=False
+        )
+        _, pending = self._arm_live_prefetch(
+            leader, "pending", local_query_tokens=None, local_miss_terminated=False
+        )
+        leader.check_hicache_events()
+
+        _, vote = leader._all_reduce.call_args_list
+        self.assertEqual(vote.args[0].tolist(), [2, 0])
+        self.assertIs(vote.args[1], torch.distributed.ReduceOp.MAX)
+        self.assertTrue(miss.local_miss_terminated)
+        self.assertFalse(miss.deadline_expired)
+        self.assertNotIn(miss_handle, leader._storage_prefetch_wait)
+        self.assertFalse(pending.local_miss_terminated)
+        leader.cache_controller.terminate_prefetch.assert_called_once_with(miss)
+
+        follower = self._make_cache(1, [True], [True])
+        follower.prefetch_pp0_miss_shortcut = True
+        _, miss = self._arm_live_prefetch(
+            follower, "miss", local_query_tokens=None, local_miss_terminated=False
+        )
+        _, pending = self._arm_live_prefetch(
+            follower, "pending", local_query_tokens=0, local_miss_terminated=False
+        )
+        relayed = []
+
+        def relay_from_pp0(data, _):
+            relayed.append(data.tolist())
+            if len(relayed) == 2:
+                data.copy_(torch.tensor([2, 0]))  # PP0's verdict
+
+        follower._all_reduce.side_effect = relay_from_pp0
+        follower.check_hicache_events()
+
+        self.assertEqual(relayed[1], [0, 0])
+        self.assertTrue(miss.local_miss_terminated)
+        self.assertFalse(miss.deadline_expired)
+        self.assertFalse(pending.local_miss_terminated)
+        follower.cache_controller.terminate_prefetch.assert_called_once_with(miss)
 
     def test_pp_batches_write_and_load_counts_once(self):
         leader = self._make_cache(0, [True, False], [True, True])
