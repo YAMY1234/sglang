@@ -1774,6 +1774,9 @@ class Envs:
     SGLANG_OPT_DEEPGEMM_FP4_ACTS_PDL = EnvBool(False)
     # FP4-act MegaMoE: size a light or idle DP rank's tiles for the EP-average batch.
     SGLANG_OPT_DEEPGEMM_MEGA_MOE_TILE_BY_EP_AVERAGE = EnvBool(False)
+    # FP4-act MegaMoE: force this BLOCK_M (0 = the DeepGEMM heuristic) for batches of at least MIN_TOKENS rows per rank.
+    SGLANG_OPT_DEEPGEMM_MEGA_MOE_BLOCK_M = EnvInt(0)
+    SGLANG_OPT_DEEPGEMM_MEGA_MOE_BLOCK_M_MIN_TOKENS = EnvInt(0)
 
     # ===================================================================
     # Top-k kernels

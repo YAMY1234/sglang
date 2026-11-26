@@ -173,6 +173,21 @@ def _get_block_m_for_mega_moe(
     )
 
 
+@functools.lru_cache(maxsize=None)
+def _tiling_tokens_for_block_m(
+    num_ranks: int, num_experts: int, num_max_tokens: int, num_topk: int, mma_type: str, block_m: int
+) -> Optional[int]:
+    """The smallest token count for which the FP4-act heuristic picks `block_m` (the kernel's
+    config depends on the count only through BLOCK_M), or None if no count does."""
+    dg = _mega_moe_dg(mma_type)
+    for t in range(1, num_max_tokens + 1):
+        if dg.get_block_m_for_mega_moe(num_ranks, num_experts, num_max_tokens, t, num_topk, mma_type) == block_m:
+            logger.info("MegaMoE FP4-act BLOCK_M forced to %d (tiling tokens %d)", block_m, t)
+            return t
+    logger.warning("MegaMoE FP4-act BLOCK_M %d is not reachable; keeping the heuristic", block_m)
+    return None
+
+
 def _mega_moe_tiling_tokens(
     buf, num_tokens: int, global_num_tokens: Optional[int]
 ) -> int:
@@ -181,6 +196,13 @@ def _mega_moe_tiling_tokens(
     Every rank's experts receive tokens from all EP ranks, so a light or idle rank
     tiling for its own rows runs the busy ranks' tokens on tiny tiles.
     """
+    block_m = envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_BLOCK_M.get()
+    if block_m and num_tokens >= envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_BLOCK_M_MIN_TOKENS.get():
+        forced = _tiling_tokens_for_block_m(
+            buf.group.size(), buf.num_experts, buf.num_max_tokens_per_rank, buf.num_topk, buf.mma_type, block_m
+        )
+        if forced is not None:
+            return forced
     if not envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_TILE_BY_EP_AVERAGE.get() or not global_num_tokens:
         return num_tokens
     average = -(-global_num_tokens // buf.group.size())
