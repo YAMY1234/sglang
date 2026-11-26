@@ -33,9 +33,14 @@ REFERENCE_SHA = {
     "hcb_prefill_trt_port_107.so": "a9e170741b75255bdf35cfcd84043ecf77872eff56e7442d1bedaeb7d9a16b64",
 }
 # Expected shas: the overflow op's accepted shas are TOPK_MANIFEST's (the first image build and the
-# reference, same SASS); the selector port's is the first image build's.
+# reference, same SASS). The selector port's: the published image build's (validated; preferred: put it in
+# the pinned directory), the reference (same SASS as the published one), and the first image build's.
 TOPK_MANIFEST = "python/sglang/srt/layers/attention/dsa/topk_overflow_native.sha256"
-HCB_EXPECTED_SHA = "40f43eeb177ba788c37e7a34c53b652acc6d042524f66c972240265470a5cf94"
+HCB_EXPECTED_SHA = (
+    "baec77212d51d9f1d1a662a9bb8a78e20c6d54ff8da35f2f7d3c538a99101eb7",
+    "a9e170741b75255bdf35cfcd84043ecf77872eff56e7442d1bedaeb7d9a16b64",
+    "40f43eeb177ba788c37e7a34c53b652acc6d042524f66c972240265470a5cf94",
+)
 # The overflow op's sources as the reference build compiled them (native_binding.cc only
 # gained a license header; its TORCH_LIBRARY_FRAGMENT line, which the binary records, is unchanged).
 TOPK_SOURCES = {
@@ -219,7 +224,7 @@ def main():
               "natives": {}}
     lines = [l.split() for l in (repo / TOPK_MANIFEST).read_text().splitlines() if l.strip()]
     expected = {"topk_overflow_prefix_v2_545e00d5_sm107.so": {s for s, n in lines if n == "topk_overflow_prefix_v2_545e00d5_sm107.so"},
-                "hcb_prefill_trt_port_107.so": {HCB_EXPECTED_SHA}}
+                "hcb_prefill_trt_port_107.so": set(HCB_EXPECTED_SHA)}
     for name, build in (
         ("topk_overflow_prefix_v2_545e00d5_sm107.so", build_topk_overflow),
         ("hcb_prefill_trt_port_107.so", build_hcb),
