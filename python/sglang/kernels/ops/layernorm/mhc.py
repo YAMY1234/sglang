@@ -2651,7 +2651,8 @@ def _hc_mix_reduce_sinkhorn_rows_hc4_kernel(
     c01, c11, c21, c31 = _sk_norm4(c01, c11, c21, c31, EPS)
     c02, c12, c22, c32 = _sk_norm4(c02, c12, c22, c32, EPS)
     c03, c13, c23, c33 = _sk_norm4(c03, c13, c23, c33, EPS)
-    for _ in tl.static_range(ITERS - 1):
+    # A runtime loop: unrolled, the 16 values x 19 iterations take minutes to compile.
+    for _ in range(ITERS - 1):
         c00, c01, c02, c03 = _sk_norm4(c00, c01, c02, c03, EPS)
         c10, c11, c12, c13 = _sk_norm4(c10, c11, c12, c13, EPS)
         c20, c21, c22, c23 = _sk_norm4(c20, c21, c22, c23, EPS)
