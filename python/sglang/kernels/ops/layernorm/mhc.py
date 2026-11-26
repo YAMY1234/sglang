@@ -2669,6 +2669,7 @@ def _hc_mix_reduce_sinkhorn_rows_hc4_kernel(
 
 
 _HC_FAST_SINKHORN_NUM_WARPS = 2
+_HC_FAST_SINKHORN_LOGGED = False
 
 
 def hc_mix_reduce_sinkhorn_rows_hc4(
@@ -2989,6 +2990,10 @@ def hc_mix_stats_sinkhorn_deepgemm(
         # values; overwriting it avoids a throwaway (slices, m) scratch, 4 MiB at m=65536.
         tf32_hc_prenorm_gemm(x_flat, low, mix_lo, sq, slices)
     if hc_mult == 4 and envs.SGLANG_OPT_MHC_FAST_SINKHORN.get():
+        global _HC_FAST_SINKHORN_LOGGED
+        if not _HC_FAST_SINKHORN_LOGGED:
+            _HC_FAST_SINKHORN_LOGGED = True
+            logger.info("mHC fast Sinkhorn on (one row per thread, rows=%d)", m)
         hc_mix_reduce_sinkhorn_rows_hc4(
             mix_hi,
             sq,
