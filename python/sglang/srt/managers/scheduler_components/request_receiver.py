@@ -56,6 +56,7 @@ from sglang.srt.utils import (
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
+    from sglang.srt.disaggregation.late_binding import DecodeLateBinding
     from sglang.srt.managers.scheduler_components.request_retirer import (
         RequestRetirer,
     )
@@ -83,6 +84,8 @@ class SchedulerRequestReceiver:
     rust_server_mode: bool
     scripted_scheduler_hook: Optional[ScriptedSchedulerHook] = None
     scheduler_stage_metrics: Optional[SchedulerStageMetricsRecorder] = None
+    # PD decode late binding: handoffs from other DP ranks ride local_reqs.
+    late_binding: Optional[DecodeLateBinding] = None
 
     def recv_limit_reached(self, num_recv_reqs: int) -> bool:
         return self.max_recv_per_poll >= 0 and num_recv_reqs >= self.max_recv_per_poll
@@ -111,9 +114,13 @@ class SchedulerRequestReceiver:
         if self.scripted_scheduler_hook is not None:
             self.scripted_scheduler_hook.step()
 
+        if self.late_binding is not None:
+            self.late_binding.poll()
         if self.recv_skipper is not None:
             if not self.recv_skipper.handle(self.get_last_batch()):
                 return []
+        if self.late_binding is not None:
+            local_reqs = [*(local_reqs or []), *self.late_binding.take_arrivals()]
 
         recv_reqs = self._recv_and_broadcast(local_reqs)
 

@@ -63,6 +63,10 @@ from sglang.srt.disaggregation.decode_hicache_mixin import (
     HiCacheRestoreGatedKVReceiver,
     HiCacheRestoreResult,
 )
+from sglang.srt.disaggregation.late_binding import (
+    DecodeLateBinding,
+    LateBindingHandoff,
+)
 from sglang.srt.disaggregation.minimax import minimax_index_transfer_pages
 from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.disaggregation.utils import (
@@ -452,6 +456,8 @@ class DecodeRequest:
     # When a page move first saw this rank's receive fail (`time.monotonic()`);
     # the release timeout of a later hold starts there.
     receive_failed_at: Optional[float] = None
+    # Decode late binding: 1 once another DP rank handed this request here.
+    late_binding_hops: int = 0
 
     # HiCache Status
     prefix_match: Optional[DecodePrefixMatch] = None
@@ -488,6 +494,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
     """
 
     _defer_publish: bool = False
+    late_binding: Optional[DecodeLateBinding] = None
 
     def __init__(
         self,
@@ -585,6 +592,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         self.kv_manager = self._init_kv_manager()
         if self.enable_staging:
             self.transfer_queue._init_staging_handler(self.kv_manager)
+        if get_disagg().disaggregation_decode_late_binding:
+            self.late_binding = self._init_late_binding()
 
         if (
             self.scheduler.tp_worker.is_hybrid_swa
@@ -615,6 +624,102 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             )
         else:
             self.scheduler.kv_checksum_computer = None
+
+    def _init_late_binding(self) -> DecodeLateBinding:
+        parallel = get_parallel()
+        late_binding = DecodeLateBinding(
+            dp_rank=parallel.attn_dp_rank,
+            num_dp_ranks=parallel.num_dp_ranks,
+            threshold=get_disagg().disaggregation_decode_late_binding_threshold,
+            local_ip=self.kv_manager.local_ip,
+            ack_timeout=get_disagg().disaggregation_decode_late_binding_ack_timeout,
+            get_limits=(
+                self._late_binding_limits
+                if envs.SGLANG_D_LATEBIND_DOMINANT.get()
+                else None
+            ),
+        )
+        late_binding.on_timeout = self._late_binding_timeout_abort
+        late_binding.connect_peers(parallel.tp_group.cpu_group)
+        logger.info(
+            f"Decode late binding on: DP rank {late_binding.dp_rank} of "
+            f"{late_binding.num_dp_ranks}, threshold {late_binding.threshold}"
+        )
+        return late_binding
+
+    def _late_binding_limits(self) -> Tuple[int, int]:
+        return self.scheduler.max_running_requests, self.scheduler.max_total_num_tokens
+
+    def late_binding_committed(self) -> int:
+        """Requests this rank is committed to: running, waiting with their KV,
+        receiving into allocated KV, and handed here but not yet allocated, so
+        an in-flight handoff does not count as zero."""
+        scheduler = self.scheduler
+        return (
+            len(scheduler.running_reqs)
+            + len(scheduler.waiting_queue)
+            + len(self.transfer_queue.queue)
+            + sum(1 for d in self.queue.items() if d.late_binding_hops)
+        )
+
+    def _late_binding_eligible(self, decode_req: DecodeRequest) -> bool:
+        req = decode_req.req
+        return not (
+            decode_req.is_rebootstrap
+            or _is_fake_transfer(req)
+            or req.late_binding_recv_req is None
+            or req.multimodal_inputs is not None
+            or isinstance(req.finished_reason, FINISH_ABORT)
+            # State this scheduler keeps for the request: a streaming session
+            # or radix-native session references.
+            or req.session is not None
+            or (
+                req.session_id is not None and self.scheduler.enable_session_radix_cache
+            )
+        )
+
+    def _late_binding_hand_off(self, decode_req: DecodeRequest, target: int) -> bool:
+        """Move a ready, unallocated request to DP rank ``target`` without an
+        ABORT. The payload is queued (non-blocking) first, and only then is the
+        request detached and dropped here; False changes nothing."""
+        req = decode_req.req
+        receiver = decode_req.kv_receiver
+        if not receiver.can_detach_for_handoff():
+            return False
+        handoff = LateBindingHandoff(
+            # The target skips the prefill DP-rank lookup done here.
+            recv_req=msgspec.structs.replace(
+                req.late_binding_recv_req,
+                disagg_prefill_dp_rank=req.disagg_prefill_dp_rank,
+            ),
+            room=req.bootstrap_room,
+            old_endpoint=(self.kv_manager.local_ip, self.kv_manager.rank_port),
+            source_dp_rank=self.late_binding.dp_rank,
+            target_dp_rank=target,
+            sent_at=time.time(),
+            handoff_id=self.late_binding.new_handoff_id(req.bootstrap_room),
+        )
+        if not self.late_binding.send_handoff(handoff, decode_req):
+            return False
+        receiver.detach_for_handoff()
+        self.scheduler.request_retirer.hand_off(req)
+        self.scheduler.invariant_checker.forget_output(req)
+        return True
+
+    def _late_binding_timeout_abort(
+        self, handoff: LateBindingHandoff, decode_req: DecodeRequest
+    ) -> None:
+        """No ack in time: fail the request here and release prefill's KV with
+        an ABORT from the old endpoint."""
+        decode_req.kv_receiver.send_abort_after_handoff_timeout()
+        req = decode_req.req
+        prepare_abort(
+            req,
+            f"Late binding handoff to DP rank {handoff.target_dp_rank} not "
+            f"acknowledged within {self.late_binding.ack_timeout}s",
+            status_code=HTTPStatus.SERVICE_UNAVAILABLE,
+        )
+        self.scheduler.request_retirer.retire_unadmitted(req)
 
     def _uses_swa_tail_prealloc(self) -> bool:
         return (
@@ -1246,6 +1351,12 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         decode_req = DecodeRequest(
             req=req, kv_receiver=kv_receiver, is_rebootstrap=is_rebootstrap
         )
+        if self.late_binding is not None:
+            handoff = self.late_binding.incoming.pop(req.rid, None)
+            if handoff is not None:
+                # Bind the room here with REBIND (see CommonKVReceiver.init).
+                kv_receiver.rebind_from = handoff.old_endpoint
+                decode_req.late_binding_hops = 1
         move([decode_req], self.queue)
         return decode_req
 
@@ -1317,6 +1428,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         return False
 
     def _abort_prealloc(self, recv_req: AbortReq) -> None:
+        if self.late_binding is not None:
+            # A request being handed off is in no list on either DP rank.
+            self.late_binding.note_abort(recv_req)
         for decode_req in self.queue.items():
             if recv_req.matches(decode_req.req.rid):
                 logger.debug(f"Abort prealloc queue request. {decode_req.req.rid=}")
@@ -1496,6 +1610,17 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             if poll == KVPoll.Bootstrapping:
                 pass
             elif poll == KVPoll.WaitingForInput:
+                if (
+                    self.late_binding is not None
+                    and not decode_req.waiting_for_input
+                    and self._late_binding_eligible(decode_req)
+                ):
+                    # First readiness, before any allocation: keep or hand off.
+                    target = self.late_binding.decide(decode_req)
+                    if target is not None and self._late_binding_hand_off(
+                        decode_req, target
+                    ):
+                        continue
                 decode_req.waiting_for_input = True
                 decode_req.req.time_stats.set_bootstrap_done_time()
             elif poll == KVPoll.Failed:

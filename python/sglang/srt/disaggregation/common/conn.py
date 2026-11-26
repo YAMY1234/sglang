@@ -962,11 +962,13 @@ class CommonKVManager(BaseKVManager):
     def _handle_bootstrap_message(self, msg: List[bytes]) -> bool:
         if self.deferred_bootstrap is None or not msg:
             return False
-        if msg[0] not in (b"BOOTSTRAP", b"ABORT"):
+        if msg[0] not in (b"BOOTSTRAP", b"ABORT", b"REBIND"):
             return False
         try:
             room = int(msg[1])
             endpoint = (msg[2].decode("ascii"), int(msg[3]))
+            if msg[0] == b"REBIND":
+                old_endpoint = (msg[4].decode("ascii"), int(msg[5]))
         except (IndexError, ValueError, UnicodeDecodeError):
             logger.warning("Dropping malformed bootstrap control message")
             return True
@@ -975,9 +977,20 @@ class CommonKVManager(BaseKVManager):
                 room, self.deferred_bootstrap.register(room, endpoint)
             )
             return True
+        if msg[0] == b"REBIND":
+            # Decode late binding moved the request to another DP rank.
+            notification = self.deferred_bootstrap.rebind(room, endpoint, old_endpoint)
+            if notification is not None and notification[1]:
+                logger.error(
+                    f"Rejected REBIND of room {room} from {old_endpoint} to {endpoint}"
+                )
+            self._notify_bootstrap(room, notification)
+            return True
         # Retain cancellation even if it beats source creation. Let the backend
         # process ABORT normally as well, including ACK/draining after allocation.
-        self.deferred_bootstrap.fail(room)
+        if not self.deferred_bootstrap.cancel(room, endpoint):
+            # From a decode rank that handed the request to another rank.
+            return True
         if room in self.request_status and self.request_status[room] != KVPoll.Success:
             self.update_status(room, KVPoll.Failed)
         return False
@@ -2826,6 +2839,9 @@ class CommonKVSender(BaseKVSender):
 class CommonKVReceiver(BaseKVReceiver):
     _prefill_wait_start: Optional[float] = None
     _owns_bootstrap_room: bool = True
+    # Decode late binding: the endpoint of the decode rank that handed this
+    # request here; init() sends REBIND from it instead of BOOTSTRAP.
+    rebind_from: Optional[Tuple[str, int]] = None
     _lifecycle_lock = nullcontext()
 
     _ctx = zmq.Context()
@@ -2925,18 +2941,23 @@ class CommonKVReceiver(BaseKVReceiver):
             self.kv_mgr.update_status(self.bootstrap_room, KVPoll.WaitingForInput)
             return
         self._prefill_wait_start = time.time()
+        message = [
+            b"BOOTSTRAP",
+            str(self.bootstrap_room).encode("ascii"),
+            self.kv_mgr.local_ip.encode("ascii"),
+            str(self.kv_mgr.rank_port).encode("ascii"),
+        ]
+        if self.rebind_from is not None:
+            message[0] = b"REBIND"
+            message += [
+                self.rebind_from[0].encode("ascii"),
+                str(self.rebind_from[1]).encode("ascii"),
+            ]
         try:
             for info in self.bootstrap_infos:
                 sock, lock = self._connect_to_bootstrap_server(info)
                 with lock:
-                    sock.send_multipart(
-                        [
-                            b"BOOTSTRAP",
-                            str(self.bootstrap_room).encode("ascii"),
-                            self.kv_mgr.local_ip.encode("ascii"),
-                            str(self.kv_mgr.rank_port).encode("ascii"),
-                        ]
-                    )
+                    sock.send_multipart(message)
         except zmq.ZMQError:
             self.abort()
 
@@ -3298,6 +3319,36 @@ class CommonKVReceiver(BaseKVReceiver):
         )
         if self.kv_mgr.defer_decode_allocation:
             self._owns_bootstrap_room = False
+
+    def can_detach_for_handoff(self) -> bool:
+        """Whether decode late binding may move this request to another DP rank:
+        it owns its room, is not concluded and sent no destination yet."""
+        return (
+            self._owns_bootstrap_room
+            and self.conclude_state is None
+            and self.init_time is None
+        )
+
+    def detach_for_handoff(self) -> None:
+        """Drop this rank's room state without an ABORT, so the DP rank the
+        request is handed to can REBIND the room."""
+        with self._lifecycle_lock:
+            if not self.can_detach_for_handoff():
+                raise RuntimeError(
+                    f"Room {self.bootstrap_room} cannot be handed off "
+                    f"(conclude_state={self.conclude_state})"
+                )
+            # No later abort() or clear() of this receiver may reach prefill.
+            self.abort_notified = True
+            self._clear()
+            with self.kv_mgr.failure_lock:
+                self.kv_mgr.failure_records.pop(self.bootstrap_room, None)
+
+    def send_abort_after_handoff_timeout(self) -> None:
+        """The handoff was never acknowledged: release prefill's KV from this
+        (old) endpoint. Prefill ignores it if the target's REBIND landed."""
+        if getattr(self, "bootstrap_infos", None) is not None:
+            self._send_abort_notification()
 
     def failure_exception(self):
         self.conclude_state = KVPoll.Failed

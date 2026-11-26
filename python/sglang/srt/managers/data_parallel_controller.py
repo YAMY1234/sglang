@@ -125,7 +125,10 @@ class DPBudget:
         self.num_dp_ranks = num_dp_ranks
         self.total_requests = [0] * num_dp_ranks
         self.total_tokens = [0] * num_dp_ranks
+        self.max_running = [0] * num_dp_ranks
+        self.max_tokens = [0] * num_dp_ranks
         self.last_timestamp = [0.0] * num_dp_ranks
+        self.dominant_resource = envs.SGLANG_DP_DOMINANT_RESOURCE.get()
 
     def update_budget(self, loads):
         """Update budget from shm snapshots, skipping stale reads."""
@@ -137,9 +140,28 @@ class DPBudget:
                 load.num_running_reqs + load.num_waiting_reqs
             )
             self.total_tokens[load.dp_rank] = load.num_total_tokens
+            self.max_running[load.dp_rank] = load.max_running_requests
+            self.max_tokens[load.dp_rank] = load.max_total_num_tokens
 
     def dispatch(self, method: LoadBalanceMethod, estimated_tokens: int = 0):
-        if method == LoadBalanceMethod.TOTAL_REQUESTS:
+        if (
+            method == LoadBalanceMethod.TOTAL_REQUESTS
+            and self.dominant_resource
+            and min(self.max_running) > 0
+            and min(self.max_tokens) > 0
+        ):
+            # The rank whose binding resource stays lowest after this request.
+            target_rank = min(
+                range(self.num_dp_ranks),
+                key=lambda i: (
+                    max(
+                        (self.total_requests[i] + 1) / self.max_running[i],
+                        (self.total_tokens[i] + estimated_tokens) / self.max_tokens[i],
+                    ),
+                    self.total_requests[i],
+                ),
+            )
+        elif method == LoadBalanceMethod.TOTAL_REQUESTS:
             target_rank = self.total_requests.index(min(self.total_requests))
         elif method == LoadBalanceMethod.TOTAL_TOKENS:
             # Use total_requests as a tie-breaker when total_tokens are equal
@@ -902,7 +924,17 @@ class DataParallelController:
     def total_requests_scheduler(self, req: Req):
         if self.maybe_external_dp_rank_routing(req):
             return
-        target_worker = self.dp_budget.dispatch(LoadBalanceMethod.TOTAL_REQUESTS)
+        estimated_tokens = 0
+        if self.dp_budget.dominant_resource:
+            # input_embeds requests carry input_ids=None.
+            estimated_tokens = (
+                len(req.input_ids)
+                if req.input_ids is not None
+                else len(req.input_embeds)
+            )
+        target_worker = self.dp_budget.dispatch(
+            LoadBalanceMethod.TOTAL_REQUESTS, estimated_tokens=estimated_tokens
+        )
         sock_send(self.workers[target_worker], req)
 
     def total_tokens_scheduler(self, req: Req):

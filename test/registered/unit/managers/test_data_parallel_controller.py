@@ -28,6 +28,7 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
+from sglang.srt.environ import envs
 from sglang.srt.managers import io_struct
 from sglang.srt.managers.data_parallel_controller import (
     DataParallelController,
@@ -628,6 +629,24 @@ class TestTotalRequestsScheduler(CustomTestCase):
             [5, 3, 1, 4],
             "external routing must not mutate DPBudget state",
         )
+
+    def test_dominant_resource_weighs_kv_pool(self):
+        with envs.SGLANG_DP_DOMINANT_RESOURCE.override(True):
+            ctl = _make_controller(num_dp_ranks=2)
+        ctl.dp_budget.update_budget(
+            [
+                _load(
+                    dp_rank=0, timestamp=1.0, num_running_reqs=1, num_total_tokens=3500
+                ),
+                _load(dp_rank=1, timestamp=1.0, num_running_reqs=2),
+            ]
+        )
+        # Rank 0 runs fewer requests, but its KV pool is nearly full.
+        ctl.total_requests_scheduler(_req(input_ids=[1] * 100))
+        ctl.workers[1].send_pyobj.assert_called_once()
+        ctl.workers[0].send_pyobj.assert_not_called()
+        self.assertEqual(ctl.dp_budget.total_requests, [1, 3])
+        self.assertEqual(ctl.dp_budget.total_tokens, [3500, 100])
 
 
 class TestTotalTokensScheduler(CustomTestCase):

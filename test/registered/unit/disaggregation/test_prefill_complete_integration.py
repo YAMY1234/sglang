@@ -98,6 +98,39 @@ class TestAllocationConfiguration(CustomTestCase):
                 with self.assertRaisesRegex(ValueError, "prefill_complete"):
                     handle_pd_disaggregation(ServerArgs(**values))
 
+    def test_decode_late_binding_requirements(self):
+        valid = dict(
+            model_path="dummy",
+            disaggregation_mode="decode",
+            disaggregation_decode_allocation_policy="prefill_complete",
+            tp_size=2,
+            attn_dp_size=2,
+            disaggregation_decode_late_binding=True,
+        )
+        handle_pd_disaggregation(ServerArgs(**valid))
+        for changed in (
+            {"disaggregation_mode": "prefill"},
+            {"tp_size": 1, "attn_dp_size": 1},
+            {"disaggregation_decode_late_binding_threshold": 0},
+            {"disaggregation_decode_late_binding_ack_timeout": 0.0},
+        ):
+            with self.subTest(changed=changed):
+                values = dict(valid, **changed)
+                with self.assertRaisesRegex(
+                    ValueError, "--disaggregation-decode-late-binding requires"
+                ):
+                    handle_pd_disaggregation(ServerArgs(**values))
+        with self.assertRaisesRegex(
+            ValueError, "--disaggregation-decode-late-binding requires"
+        ):
+            handle_pd_disaggregation(
+                ServerArgs(
+                    model_path="dummy",
+                    disaggregation_mode="decode",
+                    disaggregation_decode_late_binding=True,
+                )
+            )
+
 
 class TestAllocationIntegration(CustomTestCase):
     def setUp(self):
@@ -164,10 +197,12 @@ class TestAllocationIntegration(CustomTestCase):
     def sender(self, room=1):
         return MooncakeKVSender(self.prefill, "prefill:8998", room)
 
-    def receiver(self, room=1, policy="prefill_complete"):
-        receiver = MooncakeKVReceiver(self.decode, "prefill:8998", room)
+    def receiver(self, room=1, policy="prefill_complete", mgr=None, rebind_from=None):
+        mgr = mgr or self.decode
+        receiver = MooncakeKVReceiver(mgr, "prefill:8998", room)
+        receiver.rebind_from = rebind_from
         receiver.bootstrap_infos = [{"rank_ip": "prefill", "rank_port": 1}]
-        self.decode.prefill_info_table = {
+        mgr.prefill_info_table = {
             receiver.bootstrap_addr: PrefillServerInfo(
                 attn_tp_size=1,
                 attn_cp_size=1,
@@ -256,6 +291,79 @@ class TestAllocationIntegration(CustomTestCase):
                 self.assertNotIn(1, self.prefill.request_status)
                 self.assertEqual(list(self.wire), [])
                 retired.append((sender, receiver))
+
+    def test_late_binding_rebind_moves_ready_room_to_another_decode_rank(self):
+        target = self.manager("decode", 3)
+        self.decode.enable_deferred_decode_kv_release = False
+        sender, source = self.sender(), self.receiver()
+        # Without a handoff the control message is the plain BOOTSTRAP.
+        self.assertEqual(
+            list(self.wire),
+            [("tcp://prefill:1", [b"BOOTSTRAP", b"1", b"decode", b"2"])],
+        )
+        self.flush()
+        sender.mark_prefill_complete()
+        self.flush()
+        self.assertEqual(source.poll(), KVPoll.WaitingForInput)
+
+        self.assertTrue(source.can_detach_for_handoff())
+        source.detach_for_handoff()
+        self.assertFalse(source.can_detach_for_handoff())
+        self.assertNotIn(1, self.decode.request_status)
+        source.abort()
+        source.clear()
+        self.assertEqual(list(self.wire), [])
+
+        moved = self.receiver(mgr=target, rebind_from=("decode", 2))
+        self.assertEqual(
+            list(self.wire),
+            [
+                (
+                    "tcp://prefill:1",
+                    [b"REBIND", b"1", b"decode", b"3", b"decode", b"2"],
+                )
+            ],
+        )
+        self.prefill._handle_bootstrap_message(self.wire.popleft()[1])
+        endpoint, msg = self.wire.popleft()
+        self.assertEqual(endpoint, "tcp://decode:3")
+        room, status, rank, reason = target.parse_kv_status_message(msg)
+        target.apply_prefill_status(
+            bootstrap_room=room, status=status, prefill_rank=rank, failure_reason=reason
+        )
+        self.assertEqual(moved.poll(), KVPoll.WaitingForInput)
+        self.assertEqual(list(self.wire), [])
+
+        # An ABORT from the rank the request left is consumed, not applied.
+        source.send_abort_after_handoff_timeout()
+        _, abort = self.wire.popleft()
+        self.assertTrue(self.prefill._handle_bootstrap_message(abort))
+        self.assertFalse(self.prefill.deferred_bootstrap.rooms[1].failed)
+        self.assertNotEqual(sender.poll(), KVPoll.Failed)
+        # The owner's ABORT still fails the room and reaches the backend.
+        owner_abort = [b"ABORT", b"1", b"decode", b"3"]
+        self.assertFalse(self.prefill._handle_bootstrap_message(owner_abort))
+        self.assertTrue(self.prefill.deferred_bootstrap.rooms[1].failed)
+        self.assertEqual(sender.poll(), KVPoll.Failed)
+
+    def test_late_binding_rebind_after_cancel_fails_target(self):
+        target = self.manager("decode", 3)
+        sender, source = self.sender(), self.receiver()
+        self.flush()
+        sender.mark_prefill_complete()
+        self.flush()
+        source.detach_for_handoff()
+        # The old rank's ABORT lands before the REBIND: the room is cancelled.
+        self.prefill._handle_bootstrap_message([b"ABORT", b"1", b"decode", b"2"])
+        moved = self.receiver(mgr=target, rebind_from=("decode", 2))
+        self.prefill._handle_bootstrap_message(self.wire.popleft()[1])
+        endpoint, msg = self.wire.popleft()
+        self.assertEqual(endpoint, "tcp://decode:3")
+        room, status, rank, reason = target.parse_kv_status_message(msg)
+        target.apply_prefill_status(
+            bootstrap_room=room, status=status, prefill_rank=rank, failure_reason=reason
+        )
+        self.assertEqual(moved.poll(), KVPoll.Failed)
 
     def test_sender_abort_fails_decoder_before_metadata(self):
         sender, receiver = self.sender(), self.receiver()

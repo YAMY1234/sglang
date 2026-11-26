@@ -162,6 +162,7 @@ if TYPE_CHECKING:
     from sglang.srt.dllm.config import DllmConfig
     from sglang.srt.layers.engram_staging import StagedRows
     from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
+    from sglang.srt.managers.io_struct import TokenizedGenerateReqInput
     from sglang.srt.managers.scheduler_components.metrics_reporter import PrefillStats
     from sglang.srt.managers.scheduler_components.request_list import ReqList
     from sglang.srt.managers.scheduler_components.request_retirer import (
@@ -444,6 +445,8 @@ class Req(ReqDllmMixin):
 
     # The scheduler list holding the request; `ReqList` keeps it.
     owner_list: Optional[ReqList] = None
+    # PD decode late binding: the request as received, re-sent on a handoff.
+    late_binding_recv_req: Optional[TokenizedGenerateReqInput] = None
 
     def __init__(
         self,

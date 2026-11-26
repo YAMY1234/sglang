@@ -103,6 +103,10 @@ from sglang.srt.disaggregation.decode_kvcache_offload_manager import (
 )
 from sglang.srt.disaggregation.encoder.receiver import create_mm_receiver
 from sglang.srt.disaggregation.kv_events import uses_dynamo_format
+from sglang.srt.disaggregation.late_binding import (
+    DecodeLateBinding,
+    LateBindingHandoff,
+)
 from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.disaggregation.prefill import (
     PrefillBootstrapQueue,
@@ -533,6 +537,8 @@ class Scheduler(
     kv_checksum_computer: Optional[KvChecksumComputer] = None
     # Unlimited-OCR collaborators; None for every other model.
     uocr_runtime: Optional[UocrSchedulerRuntime] = None
+    # PD decode late binding (--disaggregation-decode-late-binding); else None.
+    decode_late_binding: Optional[DecodeLateBinding] = None
     resolve_forward_inputs = staticmethod(resolve_forward_inputs)
     # Class-level defaults so stub schedulers built via __new__ skip the log.
     log_schedule_decisions: bool = False
@@ -1765,6 +1771,7 @@ class Scheduler(
                 transfer_backend=self.transfer_backend,
                 draft_kv_ring=draft_kv_ring,
             )
+            self.decode_late_binding = self.disagg_decode_prealloc_queue.late_binding
 
         elif self.disaggregation_mode == DisaggregationMode.PREFILL:
             # *2 for the headroom.
@@ -2010,6 +2017,7 @@ class Scheduler(
                 (AttachHiCacheStorageReqInput, self.attach_hicache_storage_wrapped),
                 (DetachHiCacheStorageReqInput, self.detach_hicache_storage_wrapped),
                 (AbortReq, self.abort_request),
+                (LateBindingHandoff, self.handle_late_binding_handoff),
                 (OpenSessionReqInput, self.open_session),
                 (CloseSessionReqInput, self.close_session),
                 (ReleaseUocrDocReqInput, self.release_uocr_doc),
@@ -2772,6 +2780,7 @@ class Scheduler(
             rust_server_mode=envs.SGLANG_RUST_SERVER.get(),
             scripted_scheduler_hook=self.scripted_scheduler_hook,
             scheduler_stage_metrics=self.scheduler_stage_metrics,
+            late_binding=self.decode_late_binding,
         )
 
     def init_dp_attn_adapter(self) -> None:
@@ -2788,6 +2797,36 @@ class Scheduler(
             get_shutting_down=lambda: self.gracefully_exit,
             on_peer_shutdown=self.handle_peer_shutdown,
             **self._dp_drain_column_callbacks(),
+            **self._late_binding_column_callbacks(),
+        )
+
+    def _late_binding_column_callbacks(self) -> dict:
+        """This rank's decode late-binding load row for the MLP-sync gather, and
+        what to do with every DP rank's (init_disaggregation runs before this)."""
+        late_binding = self.decode_late_binding
+        if late_binding is None:
+            return {}
+        queue = self.disagg_decode_prealloc_queue
+        return dict(
+            get_late_binding_row=lambda: late_binding.local_row(
+                queue.late_binding_committed(),
+                self.pool_stats_observer.get_pool_stats().full_token_usage,
+            ),
+            on_late_binding_rows=late_binding.on_rows,
+        )
+
+    def handle_late_binding_handoff(self, handoff: LateBindingHandoff) -> None:
+        """Target side of a decode late-binding handoff: enqueue the request
+        through the normal generate path; its receiver then sends REBIND."""
+        self.decode_late_binding.admit(
+            handoff,
+            rid_present=lambda rid: any(
+                req.rid == rid
+                for request_list in self.request_lists().values()
+                for req in request_list
+            ),
+            enqueue=self.handle_generate_request,
+            abort=self.disagg_decode_prealloc_queue.queue.abort,
         )
 
     def _dp_drain_column_callbacks(self) -> dict:
@@ -3476,6 +3515,9 @@ class Scheduler(
                 filler_seed=recv_req.filler_seed,
             )
             req.tokenizer = self.tokenizer
+            if self.decode_late_binding is not None:
+                # Decode late binding may re-send it to another DP rank.
+                req.late_binding_recv_req = recv_req
 
             if radix_native_session:
                 req.session_generation = self.tree_cache.ensure_session_generation(

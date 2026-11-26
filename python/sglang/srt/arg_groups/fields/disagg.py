@@ -62,6 +62,26 @@ class Disagg(msgspec.Struct):
         "prefill_complete retains KV on prefill until prefill finishes, then "
         "admits it on decode. Set the same policy on both roles. Default: early.",
     ] = "early"
+    disaggregation_decode_late_binding: A[
+        bool,
+        "On a prefill_complete decode server with DP attention, settle a "
+        "request's decode DP rank when prefill reports it ready instead of at "
+        "arrival: a rank whose committed request count is at least the minimum "
+        "plus --disaggregation-decode-late-binding-threshold hands the ready, "
+        "unallocated request to a less committed rank, which re-binds the "
+        "prefill bootstrap room. Both roles need a build that supports it.",
+    ] = False
+    disaggregation_decode_late_binding_threshold: A[
+        int,
+        "Committed-request gap (this DP rank minus the least committed one) at "
+        "or above which --disaggregation-decode-late-binding hands a request off.",
+    ] = 2
+    disaggregation_decode_late_binding_ack_timeout: A[
+        float,
+        "Seconds the source DP rank waits for the target's acknowledgement of a "
+        "late-binding handoff before it fails the request and releases its "
+        "prefill KV.",
+    ] = 10.0
     disaggregation_transfer_backend: A[
         str,
         Arg(

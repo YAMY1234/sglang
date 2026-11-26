@@ -54,6 +54,9 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
                 server_args, "handle_pd_disaggregation", optimistic_prefill_attempts=1
             )
 
+    if cfg.disaggregation_decode_late_binding:
+        _validate_decode_late_binding(server_args)
+
     if cfg.disaggregation_mode == "prefill" and cfg.dcp_size > 1:
         logger.warning(
             "DCP on a PD prefill server is supported when prefill and decode "
@@ -248,6 +251,27 @@ def _validate_prefill_complete(server_args: ServerArgs) -> None:
         raise ValueError(
             "--disaggregation-decode-allocation-policy prefill_complete does not "
             "yet support " + ", ".join(unsupported)
+        )
+
+
+def _validate_decode_late_binding(server_args: ServerArgs) -> None:
+    # prefill_complete already limits the rest: Mooncake, one attention TP/CP
+    # rank per DP rank, no pipeline parallelism.
+    cfg = resolving_view(server_args)
+    unmet = []
+    if cfg.disaggregation_mode != "decode":
+        unmet.append("--disaggregation-mode decode")
+    if cfg.disaggregation_decode_allocation_policy != "prefill_complete":
+        unmet.append("--disaggregation-decode-allocation-policy prefill_complete")
+    if cfg.attn_dp_size < 2:
+        unmet.append("DP attention with more than one DP rank")
+    if cfg.disaggregation_decode_late_binding_threshold < 1:
+        unmet.append("--disaggregation-decode-late-binding-threshold of at least 1")
+    if cfg.disaggregation_decode_late_binding_ack_timeout <= 0:
+        unmet.append("a positive --disaggregation-decode-late-binding-ack-timeout")
+    if unmet:
+        raise ValueError(
+            "--disaggregation-decode-late-binding requires " + ", ".join(unmet)
         )
 
 

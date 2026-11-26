@@ -81,11 +81,74 @@ class TestDeferredBootstrap(unittest.TestCase):
         self.table.close(1, self.owner, success=True)
         self.assertEqual(self.table.register(1, self.endpoint), (self.endpoint, True))
 
+    def test_rebind_renotifies_ready_room_at_new_endpoint(self):
+        new = ("decode", 5678)
+        self.table.open(1, self.owner)
+        self.table.register(1, self.endpoint)
+        self.assertEqual(self.table.complete(1, self.owner), (self.endpoint, False))
+        self.assertEqual(self.table.rebind(1, new, self.endpoint), (new, False))
+        self.assertEqual(self.table.rooms[1].endpoint, new)
+        # A repeated REBIND neither notifies again nor changes the room.
+        self.assertIsNone(self.table.rebind(1, new, self.endpoint))
+        self.assertFalse(self.table.rooms[1].failed)
+
+    def test_rebind_before_ready_waits_for_completion(self):
+        new = ("decode", 5678)
+        for registered in (True, False):
+            with self.subTest(registered=registered):
+                table = DeferredBootstrap(10)
+                table.open(1, self.owner)
+                if registered:
+                    table.register(1, self.endpoint)
+                self.assertIsNone(table.rebind(1, new, self.endpoint))
+                self.assertEqual(table.complete(1, self.owner), (new, False))
+
+    def test_rebind_of_failed_or_foreign_room_fails_new_endpoint(self):
+        new, other = ("decode", 5678), ("decode", 9999)
+        failed = DeferredBootstrap(10)
+        failed.open(1, self.owner)
+        failed.register(1, self.endpoint)
+        failed.fail(1)
+        self.assertEqual(failed.rebind(1, new, self.endpoint), (new, True))
+        self.table.open(1, self.owner)
+        self.table.register(1, other)
+        self.assertEqual(self.table.rebind(1, new, self.endpoint), (new, True))
+        self.assertEqual(self.table.rooms[1].endpoint, other)
+        self.assertFalse(self.table.rooms[1].failed)
+
+    def test_cancel_from_rebound_endpoint_is_ignored(self):
+        new = ("decode", 5678)
+        self.table.open(1, self.owner)
+        self.table.register(1, self.endpoint)
+        self.table.complete(1, self.owner)
+        self.table.rebind(1, new, self.endpoint)
+        self.assertFalse(self.table.cancel(1, self.endpoint))
+        self.assertFalse(self.table.rooms[1].failed)
+        self.assertTrue(self.table.cancel(1, new))
+        self.assertTrue(self.table.rooms[1].failed)
+        self.assertIsNone(self.table.complete(1, self.owner))
+
+    def test_cancel_without_rebind_fails_room_like_fail(self):
+        for opened in (True, False):
+            with self.subTest(opened=opened):
+                table = DeferredBootstrap(10)
+                if opened:
+                    table.open(1, self.owner)
+                    table.register(1, self.endpoint)
+                # Any endpoint cancels a room nobody was rebound away from.
+                self.assertTrue(table.cancel(1, ("other", 1)))
+                self.assertTrue(table.rooms[1].failed)
+                self.assertEqual(
+                    table.register(1, self.endpoint), (self.endpoint, True)
+                )
+
     def test_no_lock_escapes_any_operation(self):
         for operation in (
             lambda: self.table.open(1, self.owner),
             lambda: self.table.register(1, self.endpoint),
             lambda: self.table.complete(1, self.owner),
+            lambda: self.table.rebind(1, ("decode", 5678), self.endpoint),
+            lambda: self.table.cancel(1, self.endpoint),
             lambda: self.table.fail(1),
             lambda: self.table.close(1, self.owner),
         ):

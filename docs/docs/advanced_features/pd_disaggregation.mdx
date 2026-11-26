@@ -74,6 +74,37 @@ destination registration. Older decode workers do not enforce this check. Keep
 `early` on both sides until every worker has been upgraded, then enable the new
 policy on both sides.
 
+### Decode late binding
+
+With `prefill_complete` and DP attention on decode, the DP controller still picks
+a request's decode DP rank when the request arrives, long before decode reserves
+KV for it. Ranks that drew several long prefills can then hold more work than
+the others when those requests become ready. To settle the rank at readiness
+instead, add on the **decode** server:
+
+```bash
+--disaggregation-decode-late-binding
+--disaggregation-decode-late-binding-threshold 2
+```
+
+When prefill reports a request ready, and before decode reserves KV, a DP rank
+whose committed request count (running, waiting, receiving, or handed to it) is
+at least the lowest count plus the threshold hands the request to the least
+committed rank. Every rank reads the counts from the same MLP-sync gather, so no
+new collective is added. The target rank re-binds the prefill bootstrap room
+with a `REBIND` message and continues the normal handshake. A request moves at
+most once. If the target does not acknowledge the handoff within
+`--disaggregation-decode-late-binding-ack-timeout` seconds, the source rank fails
+the request and releases its prefill KV.
+
+Late binding requires each DP rank to have attention TP and CP size one, which
+`prefill_complete` already requires. Prefill needs no flag, but it must run a
+version that understands `REBIND`. Multimodal requests, retraction recomputes,
+and requests with session state on their rank are never moved.
+`SGLANG_D_LATEBIND_DOMINANT=1` scores each rank by its binding resource,
+max(committed requests, KV usage × running-request cap), instead of the request
+count.
+
 ## Profiling in PD Disaggregation Mode
 
 When you need to profile prefill or decode workers in PD disaggregation mode, please refer to the [Profile In PD Disaggregation Mode](../developer_guide/benchmark_and_profiling#profile-in-pd-disaggregation-mode) section in the Benchmark and Profiling guide. Due to torch profiler limitations, prefill and decode workers must be profiled separately using dedicated command-line options.

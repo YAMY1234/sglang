@@ -168,6 +168,11 @@ class RequestRetirer:
         _leave_owner_list(req)
         record_exit(req, "abandon")
 
+    def hand_off(self, req: Req) -> None:
+        """Take out a request that holds nothing here and that another scheduler
+        took over; it ends and sends its output there."""
+        _leave_owner_list(req)
+
     def settle_output(self, req: Req) -> None:
         """Take a released request out of the list holding its final output;
         its release already recorded the exit."""

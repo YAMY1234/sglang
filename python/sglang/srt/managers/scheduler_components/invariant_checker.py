@@ -706,6 +706,10 @@ class SchedulerInvariantChecker:
         if envs.SGLANG_ENABLE_RUNNING_REQS_CHECK.get():
             self.unended.add(req)
 
+    def forget_output(self, req: Req) -> None:
+        """Record that `req` moved to another scheduler, which owes its output."""
+        self.unended.discard(req)
+
     def _check_ended_requests(self) -> None:
         """At idle, every request the scheduler kept is in a list (held, parked,
         deferred, offloading) or has sent its final output and exited through

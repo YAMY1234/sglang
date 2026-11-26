@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 BootstrapNotification = tuple[tuple[str, int], bool] | None
 
@@ -22,6 +22,9 @@ class BootstrapRoom:
     ready_notified: bool = False
     failed: bool = False
     expires_at: float = 0.0
+    # Decode endpoints the request was moved away from (REBIND); their ABORT
+    # no longer cancels the room.
+    stale_endpoints: set[tuple[str, int]] = field(default_factory=set)
 
 
 class DeferredBootstrap:
@@ -82,6 +85,38 @@ class DeferredBootstrap:
                 return None
             state.ready = True
             return self._notification(state)
+
+    def rebind(
+        self,
+        room: int,
+        endpoint: tuple[str, int],
+        old_endpoint: tuple[str, int],
+    ) -> BootstrapNotification:
+        """Move the room to the decode endpoint its request was handed to before
+        decode sent any destination. A ready room is notified again at the new
+        endpoint; a failed room, or one bound to a third endpoint, notifies the
+        new endpoint Failed."""
+        with self.lock:
+            state = self._room(room)
+            if state.endpoint == endpoint and old_endpoint in state.stale_endpoints:
+                return None
+            if state.failed or state.endpoint not in (None, old_endpoint):
+                return endpoint, True
+            # The old endpoint may already have been notified; the new one not.
+            state.stale_endpoints.add(old_endpoint)
+            state.endpoint = endpoint
+            state.ready_notified = False
+            return self._notification(state)
+
+    def cancel(self, room: int, endpoint: tuple[str, int]) -> bool:
+        """Record decode's ABORT. Returns False, changing nothing, for an ABORT
+        from an endpoint the room was rebound away from."""
+        with self.lock:
+            state = self._room(room)
+            if endpoint in state.stale_endpoints:
+                return False
+            state.failed = True
+            return True
 
     def fail(self, room: int) -> BootstrapNotification:
         with self.lock:

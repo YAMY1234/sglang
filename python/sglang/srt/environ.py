@@ -869,6 +869,12 @@ class Envs:
     # Under overlap, publish decode KV destinations one iteration later instead of
     # reading them back inline; False restores the inline publish.
     SGLANG_ENABLE_DISAGG_DECODE_DEFERRED_PUBLISH = EnvBool(True)
+    # --disaggregation-decode-late-binding scores each DP rank by its binding
+    # resource, max(committed requests, KV usage x running cap), not the count.
+    SGLANG_D_LATEBIND_DOMINANT = EnvBool(False)
+    # total_requests DP dispatch picks the rank with the lowest binding resource,
+    # max((requests + 1) / running cap, (tokens + new) / KV pool).
+    SGLANG_DP_DOMINANT_RESOURCE = EnvBool(False)
 
     # ===================================================================
     # Distributed and model-parallel runtime

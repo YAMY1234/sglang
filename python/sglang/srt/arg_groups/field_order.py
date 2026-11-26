@@ -593,5 +593,8 @@ POSITIONAL_FIELD_ORDER = (
     "inkling2_loop_num_passes",
     "inkling2_loop_share_cache",
     "inkling2_tool_call_author_name_mode",
+    "disaggregation_decode_late_binding",
+    "disaggregation_decode_late_binding_threshold",
+    "disaggregation_decode_late_binding_ack_timeout",
 )
 # fmt: on
