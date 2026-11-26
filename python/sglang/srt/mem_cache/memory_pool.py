@@ -5775,7 +5775,7 @@ class DSAFp8RopeRecordTokenToKVPool(DSATokenToKVPool):
         cache_k_nope: torch.Tensor,
         cache_k_rope: torch.Tensor,
     ) -> None:
-        from sglang.kernels.ops.attention.dsa.fp8rope_record_writer import (
+        from sglang.kernels.ops.attention.dsa.nvfp4_fp8rope_d import (
             write_fp8rope_records,
         )
 
@@ -5784,7 +5784,10 @@ class DSAFp8RopeRecordTokenToKVPool(DSATokenToKVPool):
             cache_k_nope = cache_k_nope.to(torch.bfloat16)
         if cache_k_rope.dtype != torch.bfloat16:
             cache_k_rope = cache_k_rope.to(torch.bfloat16)
-        write_fp8rope_records(dst_buffer, loc, cache_k_nope, cache_k_rope)
+        # Slot 0 is the reserved dummy slot, as in set_mla_kv_buffer_triton.
+        write_fp8rope_records(
+            dst_buffer.view(-1, self.kv_cache_dim), loc, cache_k_nope, cache_k_rope, skip_index=0
+        )
 
     def get_mla_kv_buffer(self, *args, **kwargs):
         raise NotImplementedError(
