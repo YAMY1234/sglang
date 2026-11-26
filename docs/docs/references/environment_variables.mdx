@@ -587,6 +587,11 @@ SGLang supports various environment variables that can be used to configure its 
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>unset</code></td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_DSA_GVR2_PREFILL_TOPK</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>With <code>--dsa-topk-backend=flashinfer_gvr2</code> or <code>--speculative-dsa-topk-backend=flashinfer_gvr2</code>, also run the prefill top-k (per-row key windows) on FlashInfer GVR V2's windowed mode instead of <code>sgl-kernel</code>; the paged transform maps only the selected positions through the page table. Layouts GVR V2 does not accept stay on <code>sgl-kernel</code>. Needs FlashInfer 0.7.3 or newer.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>When the maximum kv len in current prefill batch exceeds this value, the sparse mla kernel will be applied, else it falls back to dense MHA implementation. Default to the index topk of model (2048 for DeepSeek V3.2).</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>2048</code></td>

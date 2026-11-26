@@ -2145,6 +2145,9 @@ class Envs:
     SGLANG_DSA_FUSE_TOPK = EnvBool(True)
     SGLANG_DSA_TOPK_FLASHINFER_DETERMINISTIC = EnvBool(False)
     SGLANG_DSA_TOPK_FLASHINFER_TIE_BREAK = EnvStr(None)
+    # --dsa-topk-backend flashinfer_gvr2: also run the prefill (row_starts) top-k
+    # on GVR V2's windowed mode instead of the sgl-kernel fallback.
+    SGLANG_DSA_GVR2_PREFILL_TOPK = EnvBool(False)
     SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD = EnvInt(2048)
     SGLANG_DSA_HIP_DISABLE_PRESHUFFLE = EnvBool(False)
     SGLANG_DSA_MQA_LOGITS_FREE_MEM_FRACTION = EnvFloat(0.2)

@@ -89,8 +89,17 @@ class DSATopKBackend(Enum):
     ) -> torch.Tensor:
         if self.is_gvr2():
             # GVR V2 takes rows that start at column 0; prefill's per-row
-            # offsets (row_starts) run on the fallback.
+            # offsets (row_starts) run on the fallback, or on GVR V2's windowed
+            # mode with SGLANG_DSA_GVR2_PREFILL_TOPK when it takes the layout.
             if row_starts is not None:
+                if envs.SGLANG_DSA_GVR2_PREFILL_TOPK.get():
+                    from sglang.kernels.ops.attention.dsa.gvr2_topk import (
+                        gvr2_topk_windowed,
+                        gvr2_windowed_supports,
+                    )
+
+                    if gvr2_windowed_supports(score, topk):
+                        return gvr2_topk_windowed(score, lengths, topk, row_starts)
                 return self.fallback().topk_func(
                     score, lengths, topk, row_starts=row_starts
                 )
@@ -150,6 +159,34 @@ class DSATopKBackend(Enum):
             return self.topk_func(logits, lengths, topk, row_starts=row_starts)
 
         if self.is_gvr2():
+            # Row-chunked PAGED prefill rows (windows at row_starts, mapped to
+            # their request by batch_idx_list) run on GVR V2's windowed mode with
+            # SGLANG_DSA_GVR2_PREFILL_TOPK when it takes the layout.
+            if (
+                envs.SGLANG_DSA_GVR2_PREFILL_TOPK.get()
+                and topk_transform_method == TopkTransformMethod.PAGED
+                and row_starts is not None
+            ):
+                from sglang.kernels.ops.attention.dsa.gvr2_topk import (
+                    gvr2_topk_transform_paged_windowed,
+                    gvr2_windowed_supports,
+                )
+
+                row_to_batch = batch_idx_list
+                if (
+                    isinstance(row_to_batch, torch.Tensor)
+                    and row_to_batch.shape[0] == logits.shape[0]
+                    and gvr2_windowed_supports(logits, topk)
+                ):
+                    return gvr2_topk_transform_paged_windowed(
+                        logits,
+                        lengths,
+                        topk,
+                        row_starts,
+                        attn_metadata.real_page_table,
+                        attn_metadata.page_size,
+                        row_to_batch,
+                    )
             # GVR V2 takes PAGED rows that start at column 0, one per page-table
             # row (decode, spec verify, draft extend); other layouts, as prefill
             # produces, run on the fallback.

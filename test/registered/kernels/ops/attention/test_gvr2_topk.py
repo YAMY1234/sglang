@@ -5,6 +5,9 @@
 ties, with ``-1`` padding for rows shorter than ``k``; also under CUDA graph
 replay with changed lengths and scores.
 ``gvr2_topk`` (unfused) must return the same selection as row-local positions.
+Prefill rows (``row_starts`` windows of packed scores) must select the same way
+in GVR V2's windowed mode, with only the selected positions mapped through
+each row's request in the page table.
 """
 
 from __future__ import annotations
@@ -20,8 +23,11 @@ from sglang.kernels.ops.attention.dsa.gvr2_topk import (
     gvr2_supports,
     gvr2_topk,
     gvr2_topk_transform_paged,
+    gvr2_topk_windowed,
+    gvr2_windowed_available,
 )
 from sglang.kernels.ops.attention.dsa.paged_mqa_logits import _restore_storage_extent
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.dsa_topk_backend import (
     DSATopKBackend,
     TopkTransformMethod,
@@ -229,6 +235,8 @@ def test_gvr2_topk_rejects_unsupported():
     assert not gvr2_supports(scores, 256)
     assert not gvr2_supports(scores.bfloat16(), 2048)
     assert not gvr2_supports(scores[:, 1:], 2048)
+    # One row: FlashInfer takes the pitch from the width, not stride(0).
+    assert not gvr2_supports(scores[:1, :8190], 2048)
 
 
 @pytest.mark.parametrize("k", [2048])
@@ -376,6 +384,167 @@ def test_gvr2_backend_check_config():
     for backend in (DSATopKBackend.SGL_KERNEL, DSATopKBackend.FLASHINFER):
         backend.check_config("cuda", 256)
         backend.check_config("cuda", 2048, deterministic=True)
+
+
+def _make_prefill_inputs(kv_lens, extend_lens, seed=0):
+    """Packed prefill scores: request q's rows rank causal windows of its keys."""
+    g = torch.Generator(device="cuda").manual_seed(seed)
+    scores = torch.randn(sum(extend_lens), sum(kv_lens), device="cuda", generator=g)
+    row_starts, lengths, row_to_batch = [], [], []
+    k_offset = 0
+    for q, (kv_len, extend_len) in enumerate(zip(kv_lens, extend_lens)):
+        for t in range(extend_len):
+            row_starts.append(k_offset)
+            lengths.append(kv_len - extend_len + t + 1)
+            row_to_batch.append(q)
+        k_offset += kv_len
+    num_pages = (max(kv_lens) + PAGE_SIZE - 1) // PAGE_SIZE
+    page_table = torch.stack(
+        [
+            torch.randperm(num_pages * 4, device="cuda", generator=g)[:num_pages]
+            for _ in kv_lens
+        ]
+    ).to(torch.int32)
+
+    def as_tensor(values):
+        return torch.tensor(values, dtype=torch.int32, device="cuda")
+
+    return (
+        scores,
+        as_tensor(lengths),
+        as_tensor(row_starts),
+        page_table,
+        as_tensor(row_to_batch),
+    )
+
+
+def _window_scores(scores, lengths, row_starts):
+    """Each row's window moved to column 0, for the column-0 reference."""
+    cols = row_starts.long()[:, None] + torch.arange(int(lengths.max()), device="cuda")
+    return scores.gather(1, cols.clamp(max=scores.shape[1] - 1))
+
+
+# A cached prefix (long windows), a short request, and a fresh prompt whose
+# early rows are shorter than k (identity + -1 tail).
+_PREFILL_KV_LENS = [40000, 3000, 600]
+_PREFILL_EXTEND_LENS = [48, 16, 600]
+
+_needs_windowed = pytest.mark.skipif(
+    not gvr2_windowed_available(), reason="FlashInfer gvr_2 without windowed mode"
+)
+
+
+@_needs_windowed
+@pytest.mark.parametrize("k", [512, 2048])
+def test_gvr2_topk_windowed_positions(k):
+    scores, lengths, row_starts, _, _ = _make_prefill_inputs(
+        _PREFILL_KV_LENS, _PREFILL_EXTEND_LENS, seed=k
+    )
+    assert gvr2_supports(scores, k)
+    out = gvr2_topk_windowed(scores, lengths, k, row_starts)
+    windows = _window_scores(scores, lengths, row_starts)
+    _assert_matches_reference(
+        windows, lengths, _identity_page_table(len(lengths), windows.shape[1]), k, out
+    )
+
+
+@_needs_windowed
+@pytest.mark.parametrize("chunk", [(0, None), (40, 80)])
+def test_gvr2_backend_prefill_windowed_paged(chunk):
+    k = 2048
+    scores, lengths, row_starts, page_table, row_to_batch = _make_prefill_inputs(
+        _PREFILL_KV_LENS, _PREFILL_EXTEND_LENS, seed=3
+    )
+    metadata = SimpleNamespace(real_page_table=page_table, page_size=PAGE_SIZE)
+    # DSAIndexer's row-chunked call: the chunk's own row -> request map.
+    rows = slice(*chunk)
+    scores, lengths, row_starts = scores[rows], lengths[rows], row_starts[rows]
+    row_to_batch = row_to_batch[rows]
+    with envs.SGLANG_DSA_GVR2_PREFILL_TOPK.override(True):
+        out = DSATopKBackend.FLASHINFER_GVR2.topk_transform(
+            scores,
+            lengths,
+            k,
+            TopkTransformMethod.PAGED,
+            metadata,
+            row_starts=row_starts,
+            batch_idx_list=row_to_batch,
+        )
+    windows = _window_scores(scores, lengths, row_starts)
+    request_tables = page_table[row_to_batch.long()]
+    _assert_matches_reference(windows, lengths, request_tables, k, out)
+
+    # The same slots as looking the positions up in the page_size=1 table.
+    positions = gvr2_topk_windowed(scores, lengths, k, row_starts).long()
+    page_table_1 = (
+        page_table.long()[:, :, None] * PAGE_SIZE
+        + torch.arange(PAGE_SIZE, device="cuda")
+    ).flatten(1)
+    expected = torch.where(
+        positions >= 0,
+        page_table_1[row_to_batch.long()[:, None], positions.clamp(min=0)],
+        -1,
+    )
+    assert torch.equal(out.long().sort(dim=1).values, expected.sort(dim=1).values)
+
+
+@_needs_windowed
+def test_gvr2_backend_prefill_windowed_unfused():
+    k = 2048
+    scores, lengths, row_starts, _, _ = _make_prefill_inputs(
+        _PREFILL_KV_LENS, _PREFILL_EXTEND_LENS, seed=4
+    )
+    # Draft extend on a PD prefill worker: unfused, no page table.
+    with envs.SGLANG_DSA_GVR2_PREFILL_TOPK.override(True):
+        out = DSATopKBackend.FLASHINFER_GVR2.topk_transform(
+            scores,
+            lengths,
+            k,
+            TopkTransformMethod.PAGED,
+            SimpleNamespace(real_page_table=None, page_size=PAGE_SIZE),
+            row_starts=row_starts,
+            force_unfused_topk=True,
+        )
+    windows = _window_scores(scores, lengths, row_starts)
+    _assert_matches_reference(
+        windows, lengths, _identity_page_table(len(lengths), windows.shape[1]), k, out
+    )
+
+
+@pytest.mark.parametrize(
+    "case", ["one_row_unaligned", "request_list", "whole_batch", "ragged"]
+)
+def test_gvr2_backend_prefill_windowed_falls_back(monkeypatch, case):
+    delegated = _spy_on_fallback(monkeypatch, "topk_transform")
+    batch, width = 4, 8192
+    scores, lengths, page_table = _make_inputs(batch, width, [width] * batch)
+    row_to_batch = torch.zeros(batch, dtype=torch.int32, device="cuda")
+    method = TopkTransformMethod.PAGED
+    kwargs = {"row_starts": torch.zeros_like(lengths), "batch_idx_list": row_to_batch}
+    if case == "one_row_unaligned":
+        # GVR V2 refuses a one-row chunk whose width is not a multiple of 4.
+        scores, lengths = scores[:1, : width - 2], lengths[:1] - 2
+        kwargs = {"row_starts": lengths * 0, "batch_idx_list": row_to_batch[:1]}
+    elif case == "request_list":
+        kwargs["batch_idx_list"] = [0] * batch
+    elif case == "whole_batch":
+        del kwargs["batch_idx_list"]
+    else:
+        method = TopkTransformMethod.RAGGED
+        kwargs["topk_indices_offset"] = torch.zeros_like(lengths)
+    with envs.SGLANG_DSA_GVR2_PREFILL_TOPK.override(True):
+        out = DSATopKBackend.FLASHINFER_GVR2.topk_transform(
+            scores,
+            lengths,
+            2048,
+            method,
+            SimpleNamespace(real_page_table=page_table, page_size=PAGE_SIZE),
+            **kwargs,
+        )
+    assert out == "sgl-kernel"
+    assert len(delegated) == 1
+    for name, value in kwargs.items():
+        assert delegated[0][name] is value
 
 
 if __name__ == "__main__":
