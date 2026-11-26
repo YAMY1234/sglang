@@ -2676,7 +2676,7 @@ def _hc_mix_reduce_sinkhorn_rows_hc4_kernel(
     tl.store(out + 12, _rows4(c30, c31, c32, c33), rm)
 
 
-_HC_FAST_SINKHORN_NUM_WARPS = 2
+_HC_FAST_SINKHORN_NUM_WARPS = 1
 _HC_FAST_SINKHORN_LOGGED = False
 
 
