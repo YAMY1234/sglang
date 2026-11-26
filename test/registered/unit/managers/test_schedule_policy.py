@@ -2,6 +2,7 @@ import unittest
 from array import array
 from unittest.mock import patch
 
+from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.schedule_policy import (
     CacheAgnosticPolicy,
@@ -353,6 +354,89 @@ class TestShortestPrefillFirst(CustomTestCase):
                         schedule_low_priority_values_first=False,
                         shortest_prefill_aging_factor=factor,
                     )
+
+
+class TestShortRequestReserve(CustomTestCase):
+    make_req = TestShortestPrefillFirst.make_req
+
+    def setUp(self):
+        # The chunk reservation reads the encoder replay flag.
+        override = get_context().override_server_args()
+        override.install()
+        self.addCleanup(override.restore)
+
+    def make_policy(self, reserve, policy="fcfs"):
+        with envs.SGLANG_PREFILL_SHORT_RESERVE_TOKENS.override(reserve):
+            return SchedulePolicy(
+                policy=policy,
+                tree_cache=RadixCache.create_simulated(),
+                enable_hierarchical_cache=True,
+                enable_priority_scheduling=False,
+                schedule_low_priority_values_first=False,
+            )
+
+    def test_reserve_passes_over_requests_that_do_not_fit(self):
+        waiting = [
+            self.make_req("large", 5000),
+            self.make_req("a", 512),
+            self.make_req("b", 1024),
+            # 3072 more would exceed the 4096 reserve.
+            self.make_req("mid", 3000),
+            self.make_req("c", 1),
+        ]
+        # a, b and c take 512 + 1024 + 256 of the 8192-token pass.
+        self.assertEqual(
+            self.make_policy(4096).short_reserve_chunk_limit(
+                self.make_req("continuation", 16384), waiting, 8192, 256
+            ),
+            6400,
+        )
+
+    def test_cached_prefix_is_not_charged(self):
+        self.assertEqual(
+            self.make_policy(4096).short_reserve_chunk_limit(
+                self.make_req("continuation", 16384),
+                [self.make_req("hit", 512, cached=65536)],
+                8192,
+                256,
+            ),
+            7680,
+        )
+
+    def test_reserve_rounds_to_pages_and_keeps_continuation_progress(self):
+        continuation = self.make_req("continuation", 16384)
+        for reserve, short, limit in ((4096, 257, 3584), (8192, 3840, 256)):
+            with self.subTest(reserve=reserve, short=short):
+                self.assertEqual(
+                    self.make_policy(reserve).short_reserve_chunk_limit(
+                        continuation, [self.make_req("short", short)], 4096, 256
+                    ),
+                    limit,
+                )
+
+    def test_no_cap(self):
+        fcfs = self.make_policy(4096)
+        for name, policy, rest, waiting, budget in (
+            ("empty queue", fcfs, 8192, 0, 4096),
+            ("not shorter than the rest", fcfs, 1024, 1024, 4096),
+            ("above the reserve", fcfs, 8192, 4097, 16384),
+            ("budget below two pages", fcfs, 8192, 1, 256),
+            ("reserve off", self.make_policy(0), 8192, 1, 4096),
+            (
+                "not fcfs",
+                self.make_policy(4096, "shortest-prefill-first"),
+                8192,
+                1,
+                4096,
+            ),
+        ):
+            with self.subTest(name):
+                queue = [self.make_req("short", waiting)] if waiting else []
+                self.assertIsNone(
+                    policy.short_reserve_chunk_limit(
+                        self.make_req("continuation", rest), queue, budget, 256
+                    )
+                )
 
 
 class TestAdmissionMatchedPrefixTokens(CustomTestCase):

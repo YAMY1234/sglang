@@ -4785,6 +4785,7 @@ class Scheduler(
 
         # The request between two chunks: in chunked_reqs, not in waiting_queue.
         resumed_req = self.chunked_req
+        short_reserve_capped = False
         if resumed_req is not None:
             resumed_req.init_next_round_input()
             adder.chunked_req_limit = self.policy.shortest_prefill_chunk_limit(
@@ -4794,6 +4795,17 @@ class Scheduler(
                 self.page_size,
                 processed_tokens=self.processed_tokens_counter,
             )
+            # A capped chunk keeps its whole rest committed (`commit_unfinished`):
+            # cap only when free KV also holds the reserve beside that rest.
+            short_reserve = self.policy.short_reserve_tokens
+            if short_reserve > 0 and adder.fits_chunk_rest(resumed_req, short_reserve):
+                adder.chunked_req_limit = self.policy.short_reserve_chunk_limit(
+                    resumed_req,
+                    self.waiting_queue,
+                    adder.rem_chunk_tokens or 0,
+                    self.page_size,
+                )
+                short_reserve_capped = adder.chunked_req_limit is not None
             if adder.add_chunked_req(resumed_req) is None:
                 # Its last chunk is in this batch.
                 move([resumed_req], self.prefill_launched_reqs)
@@ -4950,6 +4962,20 @@ class Scheduler(
                     if bounded_active:
                         self.policy.mark_admission_skipped(req)
                     continue
+            if (
+                short_reserve_capped
+                and self.chunked_req is not None
+                and adder.ceil_paged_tokens(
+                    len(req.full_untruncated_fill_ids)
+                    - req.prefix_len
+                    - req.host_hit_length
+                )
+                > adder.rem_chunk_tokens
+            ):
+                # Beside a capped chunk a request that does not fit whole waits;
+                # shorter ones behind it may still take the reserve.
+                self._drop_unadmitted_match(req)
+                continue
             res = adder.add_one_req(
                 req,
                 has_chunked_req=(self.chunked_req is not None),

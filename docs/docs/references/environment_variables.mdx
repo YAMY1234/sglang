@@ -1477,6 +1477,11 @@ SGLang supports various environment variables that can be used to configure its 
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>0.75</code></td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_PREFILL_SHORT_RESERVE_TOKENS</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Under the <code>fcfs</code> schedule policy, cap each continuing chunk of a chunked prefill so that up to this many prefill tokens of the pass go to waiting requests that are shorter than the chunked request's remaining prompt and fit whole. Applied only while free KV memory also holds the chunked request's whole remaining prompt and decode plus the reserve, and not with <code>--enable-unified-memory</code>. <code>0</code> disables.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>0</code></td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_SWA_EVICTION_INTERVAL_MULTIPLIER</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Multiplier applied to the sliding-window-attention eviction interval.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>1.0</code></td>

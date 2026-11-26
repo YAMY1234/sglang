@@ -1,9 +1,10 @@
 """A request that already holds a req_to_token row is not counted twice at admission (#38118, #35537),
-a parked chunked request lets no one be admitted ahead of it, and the shortest-prefill-first
-load scaling reaches admission."""
+a parked chunked request lets no one be admitted ahead of it, the shortest-prefill-first
+load scaling reaches admission, and a short-request reserve beside a chunk reaches admission."""
 
 import inspect
 import unittest
+from functools import partial
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -13,6 +14,7 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 maybe_stub_sgl_kernel()
 
 from sglang.srt.disaggregation.mode import DisaggregationMode
+from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.schedule_policy import (
     AddReqResult,
@@ -37,6 +39,7 @@ NUM_ROWS = 4
 
 class _Req:
     owner_list = None
+    host_hit_length = 0
 
     def __init__(self, holds_row, rid=None, input_len=0, prefix_len=0):
         self.rid = rid
@@ -100,6 +103,32 @@ class _LimitsAdder(_Adder):
         return req if self.chunk_continues else None
 
 
+class _ReserveAdder(_LimitsAdder):
+    """Charges the chunk budget, and prices the chunk's rest against free KV."""
+
+    def __init__(self, free_tokens, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.page_size = 1
+        # None: a budget over shared memory, which has no free token count.
+        self.memory_budget = SimpleNamespace(
+            prices_by_demand=free_tokens is None, remaining_total=free_tokens
+        )
+
+    def add_chunked_req(self, req):
+        rest = len(req.full_untruncated_fill_ids) - req.prefix_len
+        self.rem_chunk_tokens -= min(rest, self.chunked_req_limit or rest)
+        return super().add_chunked_req(req)
+
+    def budget_state(self):
+        if self.rem_chunk_tokens <= 0:
+            return AddReqResult.OTHER
+        return AddReqResult.CONTINUE
+
+    def add_one_req(self, req, has_chunked_req, truncation_align_size):
+        self.rem_chunk_tokens -= len(req.full_untruncated_fill_ids) - req.prefix_len
+        return super().add_one_req(req, has_chunked_req, truncation_align_size)
+
+
 class _BatchBuilt(Exception):
     pass
 
@@ -122,6 +151,7 @@ class TestHeldRowAdmission(CustomTestCase):
             _bounded_active=False,
             calc_priority=lambda waiting, *args, **kwargs: list(waiting),
             admission_candidates=lambda waiting: iter(waiting),
+            short_reserve_tokens=0,
         )
         s.policy.shortest_prefill_chunk_limit.return_value = None
         s.policy.prefill_token_budget.return_value = None
@@ -222,11 +252,11 @@ class TestHeldRowAdmission(CustomTestCase):
         self.assertIs(s.chunked_req, parked)
         self.assertEqual(list(s.waiting_queue), [waiting])
 
-    def _build_batch(self, s, running_batch, chunk_continues):
+    def _build_batch(self, s, running_batch, chunk_continues, adder_class=_LimitsAdder):
         adders = []
 
         def make_adder(*args, **kwargs):
-            adders.append(_LimitsAdder(chunk_continues, *args, **kwargs))
+            adders.append(adder_class(chunk_continues, *args, **kwargs))
             return adders[-1]
 
         def capture(can_run_list, *args, **kwargs):
@@ -286,6 +316,41 @@ class TestHeldRowAdmission(CustomTestCase):
         ):
             with self.subTest(chunk_continues=chunk_continues):
                 self.assertEqual(self._admit_beside_chunk(chunk_continues)[0], admitted)
+
+    def test_short_reserve_admits_requests_that_fit_beside_the_chunk(self):
+        # The chunk has 18000 tokens and 100 decode tokens left; capping it
+        # needs that plus the 4096-token reserve free.
+        for reserve, free_tokens, admitted, limit in (
+            (4096, 22196, ["chunk", "small"], 8192 - 1000),
+            (4096, 22195, ["chunk"], None),
+            (4096, None, ["chunk"], None),
+            (0, 1 << 20, ["chunk"], None),
+        ):
+            with self.subTest(reserve=reserve, free_tokens=free_tokens):
+                chunk = _Req(True, rid="chunk", input_len=20000, prefix_len=2000)
+                chunk.sampling_params = SimpleNamespace(max_new_tokens=100)
+                mid = _Req(False, rid="mid", input_len=6000)
+                mid.kv.holds_mamba = False
+                small = _Req(False, rid="small", input_len=1000)
+                s = self._scheduler(DisaggregationMode.NULL, [], chunk, [mid, small])
+                with envs.SGLANG_PREFILL_SHORT_RESERVE_TOKENS.override(reserve):
+                    s.policy = SchedulePolicy(
+                        "fcfs", RadixCache.create_simulated(), False, False, False
+                    )
+                with patch.object(
+                    s.policy,
+                    "calc_priority",
+                    side_effect=lambda waiting, *args, **kwargs: list(waiting),
+                ):
+                    can_run_list, adder = self._build_batch(
+                        s,
+                        ScheduleBatch(reqs=[]),
+                        True,
+                        adder_class=partial(_ReserveAdder, free_tokens),
+                    )
+                # The mid-size request does not fit the reserve and is passed over.
+                self.assertEqual([req.rid for req in can_run_list], admitted)
+                self.assertEqual(adder.chunked_req_limit, limit)
 
     def test_mixed_decode_rows_do_not_come_out_of_the_budget(self):
         """With mixed chunk the adder takes the decode rows out of its limits, so a

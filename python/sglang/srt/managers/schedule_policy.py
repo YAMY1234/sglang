@@ -256,6 +256,12 @@ class SchedulePolicy:
         self.shortest_prefill_class_boundary = math.inf
         self._shortest_prefill_calls = 0
         self._waiting_prefix_refresh_calls = 0
+        # FCFS only: the reserve `short_reserve_chunk_limit` keeps beside a chunk.
+        self.short_reserve_tokens = (
+            envs.SGLANG_PREFILL_SHORT_RESERVE_TOKENS.get()
+            if self.policy == CacheAgnosticPolicy.FCFS
+            else 0
+        )
 
         # It is used to find the matching prefix for in-batch prefix caching.
         self.waiting_queue_radix_tree = RadixCache.create_simulated()
@@ -797,6 +803,35 @@ class SchedulePolicy:
         # Page alignment keeps continuation boundaries allocator-compatible.
         return (budget - reserved) // page_size * page_size
 
+    def short_reserve_chunk_limit(
+        self,
+        chunked_req: Req,
+        waiting_queue: List[Req],
+        budget: int,
+        page_size: int,
+    ) -> Optional[int]:
+        """Cap the active prefill chunk to reserve up to `short_reserve_tokens`
+        for waiting requests shorter than its rest that fit whole, in queue order;
+        a request that does not fit is passed over, not waited for."""
+        if self.short_reserve_tokens <= 0 or budget < 2 * page_size:
+            return None
+        remaining = len(chunked_req.full_untruncated_fill_ids) - chunked_req.prefix_len
+        room = min(self.short_reserve_tokens, budget - page_size)
+        reserved = 0
+        for req in waiting_queue:
+            if reserved + page_size > room:
+                break
+            work = self._shortest_prefill_work(req)
+            charge = _ceil_div(work, page_size) * page_size
+            # Admission charges the chunk a hit's encoder replay rows too.
+            cached = len(req.origin_input_ids) + len(req.output_ids) - work
+            charge += PrefillAdder._replay_len(req, cached)
+            if work < remaining and reserved + charge <= room:
+                reserved += charge
+        if not reserved:
+            return None
+        return (budget - reserved) // page_size * page_size
+
     @staticmethod
     def _sort_by_longest_prefix(
         waiting_queue: List[Req], temporary_deprioritized: Set[int]
@@ -1256,6 +1291,19 @@ class PrefillAdder:
     @property
     def cur_rem_tokens(self):
         return self.memory_budget.remaining_current
+
+    def fits_chunk_rest(self, req: Req, extra_tokens: int) -> bool:
+        """Whether free KV holds the rest of ``req``'s prompt and its decode plus
+        ``extra_tokens``; a budget over shared memory has no token count, so no."""
+        if self.memory_budget.prices_by_demand:
+            return False
+        rest = self.ceil_paged_tokens(
+            len(req.full_untruncated_fill_ids) - req.prefix_len
+        )
+        decode = beam_decode_budget(
+            req, min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS)
+        )
+        return self.rem_total_tokens >= rest + decode + extra_tokens
 
     def _swa_new_tokens(self, req: Req) -> int:
         """Tokens a request may still decode, for SWA headroom sizing. Mirrors
