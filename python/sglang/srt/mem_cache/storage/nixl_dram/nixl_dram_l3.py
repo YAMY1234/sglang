@@ -20,7 +20,10 @@ expire after the client's lease.
 
 Readiness: once it serves, the service writes its record to --registry-dir (if set), where clients discover it,
 and prints `L3B_READY ... endpoint IP:PORT`. Exit (SIGTERM or SIGINT): stop serving, remove the registry record,
-deregister the pool from NIXL and free it.
+deregister the pool from NIXL and free it, then wait until every NUMA node's available memory (MemFree + clean file
+LRU + SReclaimable) is back to >= --teardown-pct % of this service's own start baseline. Each node prints
+`L3B_TEARDOWN ok|FAIL host H numa M avail_kb A base_kb B`; any FAIL exits 1, so a launcher can tell that a node did
+not get its memory back.
 
 NICs: the pool is published on --ucx-devices (UCX NET_DEVICES), always ports of ONE link layer. `auto` (the
 default) takes every port 1 that is ACTIVE (state 4; ACTIVE_DEFER and the rest are not, as UCX and NCCL skip
@@ -115,7 +118,7 @@ def meminfo(sysfs=SYSFS_NODE):
 
 
 def available_kb(m):
-    """What a node can still hand out: free pages, clean file LRU and reclaimable slab."""
+    """What a node can still hand out: free pages, clean file LRU and reclaimable slab (the exit check's measure)."""
     cache = (
         m.get("Active(file)", 0)
         + m.get("Inactive(file)", 0)
@@ -782,6 +785,40 @@ class Service:
         self.ctx.term()
 
 
+# --------------------------------------------------------------------------------------------- teardown
+
+
+def teardown_check(
+    host,
+    baseline,
+    pct,
+    timeout_s,
+    sysfs=SYSFS_NODE,
+    interval_s=1.0,
+    clock=time.monotonic,
+    sleep=time.sleep,
+):
+    """Poll until every baseline NUMA node's available memory is >= pct % of its start value (or the deadline);
+    print one L3B_TEARDOWN line per node; 0 if all are back, else 1."""
+    deadline = clock() + timeout_s
+    while True:
+        now = meminfo(sysfs)
+        low = [
+            n
+            for n, b in baseline.items()
+            if n in now and available_kb(now[n]) < pct / 100.0 * b
+        ]
+        if not low or clock() >= deadline:
+            break
+        sleep(interval_s)
+    for n in sorted(baseline):
+        a = available_kb(now[n]) if n in now else 0
+        say(
+            f"L3B_TEARDOWN {'FAIL' if n in low else 'ok'} host {host} numa {n} avail_kb {a} base_kb {baseline[n]}"
+        )
+    return 1 if low else 0
+
+
 # --------------------------------------------------------------------------------------------- NICs
 
 
@@ -965,6 +1002,18 @@ def parse_args(argv=None):
         help="fail if less of the resident pool is on --numa",
     )
     p.add_argument("--stats-interval-s", type=float, default=60.0)
+    p.add_argument(
+        "--teardown-pct",
+        type=float,
+        default=95.0,
+        help="exit check: every NUMA node's available memory must be back to this %% of its value at start",
+    )
+    p.add_argument(
+        "--teardown-timeout-s",
+        type=float,
+        default=20.0,
+        help="time for release plus the exit memory check; keep it below the launcher's grace period before SIGKILL",
+    )
     return p.parse_args(argv)
 
 
@@ -984,6 +1033,9 @@ def main(argv=None):
     say(
         f"L3B_SERVICE pid {pid} host {host} numa {args.numa} port {args.port} segment_bytes {nbytes}"
     )
+    baseline = {n: available_kb(m) for n, m in meminfo().items()}
+    for n in sorted(baseline):
+        say(f"L3B_BASELINE host {host} numa {n} avail_kb {baseline[n]}")
 
     try:
         mode, nodes = bind_to(args.numa)
@@ -1075,6 +1127,7 @@ def main(argv=None):
         say(f"L3B_ERROR {e!r}\n{traceback.format_exc()}")
         rc = 1
     finally:
+        t0 = time.monotonic()
         for what, fn in (
             ("service", service and service.close),
             ("export", export and export.close),
@@ -1083,11 +1136,14 @@ def main(argv=None):
             if fn:
                 try:
                     fn()
-                except Exception as e:  # keep releasing the rest
-                    say(f"L3B_ERROR release of the {what} failed: {e!r}")
+                except Exception as e:
+                    # Keep going: the memory check below is the verdict.
+                    say(f"L3B_TEARDOWN FAIL {what}: {e!r}")
                     rc = rc or 1
-        say(f"L3B_EXIT host {host} numa {args.numa} rc {rc}")
-    return rc
+        left = max(1.0, args.teardown_timeout_s - (time.monotonic() - t0))
+        trc = teardown_check(host, baseline, args.teardown_pct, left)
+        say(f"L3B_EXIT host {host} numa {args.numa} rc {rc or trc}")
+    return rc or trc
 
 
 if __name__ == "__main__":

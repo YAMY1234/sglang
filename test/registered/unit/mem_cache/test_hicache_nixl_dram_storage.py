@@ -1,11 +1,13 @@
 """Unit tests for the nixl_dram HiCache L3 backend -- no NIXL, no GPU.
 
-The pool service's slab index and NIC selection, the client's settings, discovery and routing,
-a client against two in-process pool services over their real ZMQ control plane (an in-memory
-transport stands in for NIXL), and the store's Mooncake key layout.
+The pool service's slab index, NIC selection and exit memory check; the client's settings,
+discovery and routing; a client against two in-process pool services over their real ZMQ
+control plane (an in-memory transport stands in for NIXL); and the store's Mooncake key layout.
 """
 
+import contextlib
 import ctypes
+import io
 import itertools
 import json
 import os
@@ -198,6 +200,92 @@ class TestPoolServiceDevices(CustomTestCase):
     def test_devices_default_to_auto(self):
         args = l3.parse_args(["--numa", "1", "--segment-gib", "8"])
         self.assertEqual(args.ucx_devices, "auto")
+
+
+class TestPoolServiceTeardown(CustomTestCase):
+    """The exit check reads per-node meminfo the way /sys/devices/system/node does."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.sysfs = tmp.name
+        self._meminfo(0, free_kb=900_000)  # available: 950000 kB
+        self._meminfo(1, free_kb=950_000)  # available: 1000000 kB
+        self._meminfo(2, free_kb=0, total_kb=0)  # a GPU-memory node: not counted
+
+    def _meminfo(self, node, free_kb, total_kb=1_000_000):
+        # available = MemFree + Active(file) + Inactive(file) - Dirty - Writeback + SReclaimable
+        rows = {
+            "MemTotal": total_kb,
+            "MemFree": free_kb,
+            "Active(file)": 30_000,
+            "Inactive(file)": 20_000,
+            "Dirty": 5_000,
+            "Writeback": 0,
+            "SReclaimable": 5_000,
+        }
+        os.makedirs(os.path.join(self.sysfs, f"node{node}"), exist_ok=True)
+        with open(os.path.join(self.sysfs, f"node{node}", "meminfo"), "w") as f:
+            for field, kb in rows.items():
+                f.write(f"Node {node} {field}:{' ' * 8}{kb} kB\n")
+
+    def _check(self, baseline, timeout_s=0, sleep=None):
+        clock = _Clock()
+
+        def advance(seconds):
+            clock.now += seconds
+            if sleep is not None:
+                sleep()
+
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            rc = l3.teardown_check(
+                "n1", baseline, 95.0, timeout_s, self.sysfs, clock=clock, sleep=advance
+            )
+        return rc, out.getvalue().splitlines(), clock.now
+
+    def test_memory_back_at_exit_is_ok(self):
+        self.assertEqual(
+            {n: l3.available_kb(m) for n, m in l3.meminfo(self.sysfs).items()},
+            {0: 950_000, 1: 1_000_000},
+        )
+        rc, lines, _ = self._check({0: 960_000, 1: 1_000_000})
+        self.assertEqual(rc, 0)
+        self.assertEqual(
+            lines,
+            [
+                "L3B_TEARDOWN ok host n1 numa 0 avail_kb 950000 base_kb 960000",
+                "L3B_TEARDOWN ok host n1 numa 1 avail_kb 1000000 base_kb 1000000",
+            ],
+        )
+
+    def test_memory_still_held_at_the_deadline_fails(self):
+        rc, lines, waited = self._check({0: 960_000, 1: 1_100_000}, timeout_s=3)
+        self.assertEqual(rc, 1)
+        self.assertEqual(waited, 3)
+        self.assertEqual(
+            lines,
+            [
+                "L3B_TEARDOWN ok host n1 numa 0 avail_kb 950000 base_kb 960000",
+                "L3B_TEARDOWN FAIL host n1 numa 1 avail_kb 1000000 base_kb 1100000",
+            ],
+        )
+
+    def test_waits_until_the_memory_comes_back(self):
+        rc, lines, waited = self._check(
+            {0: 1_050_000},
+            timeout_s=20,
+            sleep=lambda: self._meminfo(0, free_kb=960_000),
+        )
+        self.assertEqual(rc, 0)
+        self.assertEqual(waited, 1)
+        self.assertEqual(
+            lines, ["L3B_TEARDOWN ok host n1 numa 0 avail_kb 1010000 base_kb 1050000"]
+        )
+
+    def test_defaults(self):
+        args = l3.parse_args(["--numa", "0", "--segment-gib", "8"])
+        self.assertEqual((args.teardown_pct, args.teardown_timeout_s), (95.0, 20.0))
 
 
 class TestNixlDramClientConfig(CustomTestCase):
