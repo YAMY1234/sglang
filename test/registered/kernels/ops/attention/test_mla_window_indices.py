@@ -183,5 +183,86 @@ def test_merge_shared_window_matches_softmax_merge(base2):
     torch.testing.assert_close(out[3].float(), c_out[3], rtol=0, atol=0)
 
 
+@pytest.mark.skipif(
+    torch.cuda.get_device_capability()[0] < 10, reason="trtllm-gen sparse MLA"
+)
+def test_shared_window_attention_matches_per_row():
+    """The shared-window draft attention equals the per-row window attention up to
+    the BF16 rounding of the two partial outputs it merges."""
+    from sglang.srt.layers.attention.draft_shared_window import (
+        shared_window_indices,
+        shared_window_sparse_attention,
+    )
+    from sglang.srt.layers.attention.dsa.dsa_dcp import dcp_trtllm_sparse_attention
+    from sglang.srt.layers.attention.trtllm_mla_backend import (
+        make_persistent_multi_ctas_kv_counter_buffer,
+    )
+    from sglang.srt.mem_cache.layout.paged_view import paged_row_view
+
+    q_len, heads, head_dim, window_left, ring_rows, group = 6, 24, 576, 127, 134, 2
+    slots, positions, min_pos = _ring_case(q_len, window_left, ring_rows, 11)
+    bs, rows = slots.numel(), positions.numel()
+    torch.manual_seed(0)
+    cache_rows = -(-(1 + int(slots.max() + 1) * ring_rows) // PAGE) * PAGE
+    kv = (torch.randn(cache_rows, 1, head_dim, device="cuda") * 0.5).to(
+        torch.float8_e4m3fn
+    )
+    query = (torch.randn(bs, q_len, heads, head_dim, device="cuda") * 0.5).to(
+        torch.float8_e4m3fn
+    )
+    kwargs = dict(
+        kv_cache=paged_row_view(kv, PAGE).unsqueeze(1),
+        workspace_buffer=torch.zeros(128 << 20, dtype=torch.int8, device="cuda"),
+        qk_nope_head_dim=128,
+        kv_lora_rank=512,
+        qk_rope_head_dim=64,
+        max_seq_len=4 * window_left,
+        bmm1_scale=192**-0.5,
+        backend="trtllm-gen",
+        skip_softmax_threshold_scale_factor=None,
+        multi_ctas_kv_counter_buffer=make_persistent_multi_ctas_kv_counter_buffer(
+            torch.device("cuda"), 128, max_batch_size=rows
+        ),
+    )
+    indptr = torch.arange(rows + 1, dtype=torch.int32, device="cuda")
+    indices, counts = mla_window_sparse_indices(
+        req_to_token=torch.zeros(1, 1, dtype=torch.int32, device="cuda"),
+        req_pool_indices=slots,
+        positions=positions,
+        window_left=window_left,
+        dcp_size=1,
+        dcp_rank=0,
+        page_size=PAGE,
+        ring_rows_per_req=ring_rows,
+        min_pos=min_pos,
+    )
+    ref, _ = dcp_trtllm_sparse_attention(
+        query=query.view(rows, 1, heads, head_dim),
+        block_tables=indices.unsqueeze(1),
+        seq_lens=counts,
+        cu_seqlens_q=indptr,
+        sparse_mla_top_k=indices.shape[1],
+        need_lse=True,
+        **kwargs,
+    )
+    out = shared_window_sparse_attention(
+        query=query,
+        indices=shared_window_indices(
+            req_pool_indices=slots,
+            positions=positions,
+            min_pos=min_pos,
+            window_left=window_left,
+            ring_rows_per_req=ring_rows,
+            group=group,
+        ),
+        group=group,
+        row_indptr=indptr,
+        **kwargs,
+    )
+    torch.testing.assert_close(
+        out.float(), ref.view(rows, heads, -1).float(), rtol=2e-2, atol=2e-2
+    )
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
