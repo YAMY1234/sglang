@@ -1590,6 +1590,11 @@ SGLang supports various environment variables that can be used to configure its 
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Force querying the prefill DP rank for routing.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
     </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_DISAGG_DECODE_PREALLOC_MAX_OVERTAKES</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>On a decode server, how many later requests the preallocation queue may admit ahead of a request whose KV does not fit yet. Once a request has been passed this many times, the queue waits for it. <code>0</code> keeps strict FIFO.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>0</code></td>
+    </tr>
   </tbody>
 </table>
 

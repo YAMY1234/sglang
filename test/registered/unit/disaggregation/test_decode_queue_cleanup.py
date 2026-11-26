@@ -1002,5 +1002,125 @@ class TestPreallocRequired(CustomTestCase):
                 self.assertEqual(windows, {"window_16": 12 + window_reserved})
 
 
+class TestPreallocOvertakes(CustomTestCase):
+    def setUp(self):
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(ServerArgs(model_path="dummy"), role="tokenizer")
+        # A request whose tokens plus max_new_tokens exceed this does not fit yet.
+        self.free_tokens = 10
+
+    def _queue(self, decode_reqs, max_overtakes):
+        queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
+        queue.prealloc_max_overtakes = max_overtakes
+        queue.pp_size = 1
+        queue.queue = decode_queue(ListKind.PD_PREALLOC, decode_reqs)
+        queue.num_reserved_decode_tokens = 0
+        queue._num_published_destinations = 0
+        queue._resolve_pending_reqs = MagicMock()
+        queue._update_handshake_waiters = MagicMock()
+        queue._uses_swa_tail_prealloc = MagicMock(return_value=False)
+        queue._uses_swa_reservation = MagicMock(return_value=False)
+        queue._allocatable_token_budgets = MagicMock(return_value=1000)
+        queue._prealloc_reservation_fits = MagicMock(
+            side_effect=lambda demand, **_: demand.full_tokens <= self.free_tokens
+        )
+        queue._pre_alloc = MagicMock(return_value=torch.arange(4))
+        queue._publish_destination = MagicMock()
+        queue.draft_kv_ring = None
+        queue.req_to_token_pool = MagicMock()
+        queue.req_to_token_pool.available_size.return_value = 100
+        queue.req_to_token_pool.holds_state_slots = False
+        queue.req_to_metadata_buffer_idx_allocator = ReqToMetadataIdxAllocator(100)
+        queue.token_to_kv_pool_allocator = SimpleNamespace(
+            page_size=1,
+            state=None,
+            window_pool_names=lambda: (),
+            request_allocators={},
+        )
+        queue.transfer_queue = SimpleNamespace(
+            queue=decode_queue(ListKind.PD_RECEIVING)
+        )
+        queue.tree_cache = MagicMock()
+        queue.scheduler = MagicMock(
+            enable_priority_scheduling=False,
+            enable_hisparse=False,
+            enable_lora=False,
+            enable_decode_hicache=False,
+        )
+        queue.scheduler.running_batch.reqs = []
+        return queue
+
+    @staticmethod
+    def _decode_req(rid, num_tokens):
+        req = FakeReq(
+            rid=rid,
+            origin_input_ids=[1] * num_tokens,
+            output_ids=[],
+            kv=ReqKvInfo(),
+            finished_reason=None,
+            sampling_params=SimpleNamespace(max_new_tokens=4),
+            time_stats=MagicMock(),
+        )
+        return DecodeRequest(
+            req=req, kv_receiver=_PollingReceiver(), waiting_for_input=True
+        )
+
+    def _admit(self, queue):
+        preallocated, failed = queue.move_preallocated(queue.transfer_queue.queue)
+        self.assertEqual(failed, [])
+        return [decode_req.req.rid for decode_req in preallocated]
+
+    @staticmethod
+    def _waiting(queue):
+        return [decode_req.req.rid for decode_req in queue.queue.items()]
+
+    def test_zero_keeps_strict_fifo(self):
+        reqs = [self._decode_req("big", 20), self._decode_req("small", 2)]
+        queue = self._queue(reqs, max_overtakes=0)
+
+        self.assertEqual(self._admit(queue), [])
+        self.assertEqual(self._waiting(queue), ["big", "small"])
+        self.assertEqual(reqs[0].num_prealloc_overtakes, 0)
+
+    def test_overtakes_are_bounded_per_waiting_request(self):
+        reqs = [self._decode_req("big", 20)] + [
+            self._decode_req(f"small-{i}", 2) for i in range(4)
+        ]
+        queue = self._queue(reqs, max_overtakes=2)
+
+        # Two later requests pass the one that does not fit; the pass then stops.
+        self.assertEqual(self._admit(queue), ["small-0", "small-1"])
+        self.assertEqual(reqs[0].num_prealloc_overtakes, 2)
+        self.assertEqual(self._waiting(queue), ["big", "small-2", "small-3"])
+
+        # At its limit, it blocks every later request until it fits.
+        self.assertEqual(self._admit(queue), [])
+        self.assertEqual(self._waiting(queue), ["big", "small-2", "small-3"])
+
+        # Once it fits, admission resumes in queue order.
+        self.free_tokens = 100
+        self.assertEqual(self._admit(queue), ["big", "small-2", "small-3"])
+        self.assertEqual(self._waiting(queue), [])
+
+    def test_each_waiting_request_counts_its_own_overtakes(self):
+        big, bigger = self._decode_req("big", 20), self._decode_req("bigger", 30)
+        small = [self._decode_req(f"small-{i}", 2) for i in range(3)]
+        queue = self._queue(
+            [big, small[0], bigger, small[1], small[2]], max_overtakes=2
+        )
+
+        # small-0 passes big; small-1 passes both and brings big to the limit.
+        self.assertEqual(self._admit(queue), ["small-0", "small-1"])
+        self.assertEqual(big.num_prealloc_overtakes, 2)
+        self.assertEqual(bigger.num_prealloc_overtakes, 1)
+
+        # big now fits and goes first; bigger may still be passed once.
+        self.free_tokens = 24
+        self.assertEqual(self._admit(queue), ["big", "small-2"])
+        self.assertEqual(bigger.num_prealloc_overtakes, 2)
+        self.assertEqual(self._waiting(queue), ["bigger"])
+
+
 if __name__ == "__main__":
     unittest.main()

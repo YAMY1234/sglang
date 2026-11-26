@@ -869,6 +869,9 @@ class Envs:
     # Under overlap, publish decode KV destinations one iteration later instead of
     # reading them back inline; False restores the inline publish.
     SGLANG_ENABLE_DISAGG_DECODE_DEFERRED_PUBLISH = EnvBool(True)
+    # Decode preallocation may admit a later request past one whose KV does not
+    # fit yet, at most this many times per waiting request; 0 keeps strict FIFO.
+    SGLANG_DISAGG_DECODE_PREALLOC_MAX_OVERTAKES = EnvInt(0)
 
     # ===================================================================
     # Distributed and model-parallel runtime

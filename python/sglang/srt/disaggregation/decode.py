@@ -452,6 +452,8 @@ class DecodeRequest:
     # When a page move first saw this rank's receive fail (`time.monotonic()`);
     # the release timeout of a later hold starts there.
     receive_failed_at: Optional[float] = None
+    # Later requests preallocated ahead of this one while its KV did not fit.
+    num_prealloc_overtakes: int = 0
 
     # HiCache Status
     prefix_match: Optional[DecodePrefixMatch] = None
@@ -488,6 +490,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
     """
 
     _defer_publish: bool = False
+    prealloc_max_overtakes: int = 0
 
     def __init__(
         self,
@@ -558,6 +561,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             ListKind.PD_PREALLOC,
             abort=self._abort_prealloc,
             req_of=lambda x: x.req,
+        )
+        self.prealloc_max_overtakes = (
+            envs.SGLANG_DISAGG_DECODE_PREALLOC_MAX_OVERTAKES.get()
         )
         self.retracted_queue = IndexedReqList(
             ListKind.PD_RETRACTED, abort=self._abort_retracted
@@ -1669,6 +1675,24 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         for decode_req, prefill_dp_rank in resolved:
             self._init_receiver(decode_req, prefill_dp_rank)
 
+    def _may_pass_over(self, decode_req: DecodeRequest) -> bool:
+        """Whether a later request may be preallocated ahead of ``decode_req``,
+        whose KV does not fit yet."""
+        return (
+            self.prealloc_max_overtakes > 0
+            and decode_req.num_prealloc_overtakes < self.prealloc_max_overtakes
+        )
+
+    def _note_overtake(self, passed_over: List[DecodeRequest]) -> bool:
+        """Count one admission ahead of each request in ``passed_over``. True once
+        one of them reaches the limit: the pass stops, so it is not passed again."""
+        for decode_req in passed_over:
+            decode_req.num_prealloc_overtakes += 1
+        return any(
+            decode_req.num_prealloc_overtakes >= self.prealloc_max_overtakes
+            for decode_req in passed_over
+        )
+
     def move_preallocated(
         self,
         dst: ReqList,
@@ -1776,6 +1800,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
         # Then, preallocate the remaining requests if possible
         self.host_pool_blocked = False
+        passed_over: List[DecodeRequest] = []
         for i, decode_req in enumerate(queue):
             if rids_to_check is not None and decode_req.req.rid not in rids_to_check:
                 continue
@@ -1809,6 +1834,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 indices_to_remove.add(i)
                 if self.scheduler.enable_lora:
                     running_loras.add(decode_req.req.lora_id)
+                if passed_over and self._note_overtake(passed_over):
+                    break
                 continue
 
             if self.req_to_token_pool.available_size() <= 0:
@@ -1921,7 +1948,10 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 if prefix_match is not None and prefix_match.l1_prefix_len > 0:
                     self.tree_cache.unlock(decode_req.req.lock)
                     decode_req.req.lock = None
-                break
+                if not self._may_pass_over(decode_req):
+                    break
+                passed_over.append(decode_req)
+                continue
 
             if window_allocatable_tokens is not None:
                 reclaim_error = self._reclaim_prealloc_capacity(
@@ -2047,6 +2077,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             indices_to_remove.add(i)
             if self.scheduler.enable_lora:
                 running_loras.add(decode_req.req.lora_id)
+            if passed_over and self._note_overtake(passed_over):
+                break
 
         for decode_req in failed_reqs:
             self.scheduler.request_retirer.release(decode_req.req, checkpoint=False)
