@@ -1522,7 +1522,12 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         use_dg_native = (
             not use_cute_dsl
             and _is_cuda
-            and forward_batch.forward_mode.is_target_verify()
+            and (
+                forward_batch.forward_mode.is_target_verify()
+                # The backend builds a [B, next_n] draft-extend layout only
+                # under SGLANG_OPT_DSA_DRAFT_EXTEND_NATIVE_MQA_LOGITS.
+                or forward_batch.forward_mode.is_draft_extend_v2()
+            )
             and next_n >= 2
             and ctx_2d is not None
             and ctx_2d.shape == (B, next_n)

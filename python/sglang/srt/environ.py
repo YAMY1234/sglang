@@ -2388,6 +2388,10 @@ class Envs:
     SGLANG_DSA_MQA_LOGITS_FREE_MEM_FRACTION = EnvFloat(0.2)
     # Prefill indexer: bf16 instead of fp32 MQA logits, read by a bf16 top-k.
     SGLANG_DSA_INDEXER_BF16_LOGITS = EnvBool(False)
+    # MTP draft extend (SM100, DeepGEMM): score each request's next_n rows as one
+    # paged-MQA request (q = [bs, next_n, H, D]), as target verify does, instead of
+    # one request per row, which rereads the index-K cache next_n times.
+    SGLANG_OPT_DSA_DRAFT_EXTEND_NATIVE_MQA_LOGITS = EnvBool(False)
     SGLANG_ENABLE_PCG_DSV2_DUAL_STREAM = EnvBool(False)
     SGLANG_DSA_TOPK_BROADCAST = EnvBool(False)
     # DCP8 decode: the indexer's local top-k, candidate exchange, merge and
