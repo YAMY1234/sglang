@@ -8,6 +8,7 @@ from typing import Any
 
 from sglang.srt.arg_groups.model_override_base import resolving_view, use_mla_backend
 from sglang.srt.arg_groups.overrides import declare_resolution
+from sglang.srt.environ import envs
 
 logger = logging.getLogger(__name__)
 
@@ -367,6 +368,19 @@ def resolve_unified_memory_layout_io(server_args: Any):
         "--enable-unified-memory: the direct io backend cannot copy the unified "
         "pool's strided KV rows, switching to the page_first layout with the "
         "kernel io backend"
+    )
+
+
+def hicache_l3_victim_tier_requested(cfg: Any) -> bool:
+    """Whether SGLANG_OPT_HICACHE_L3_VICTIM_TIER is set with the server args it
+    needs: cache-mode host memory, write_back and a storage backend. The tier
+    checks the backend and cache layout itself when storage is attached."""
+    return (
+        envs.SGLANG_OPT_HICACHE_L3_VICTIM_TIER.get()
+        and cfg.enable_hierarchical_cache
+        and cfg.hicache_storage_backend is not None
+        and cfg.hicache_host_memory_mode == "cache"
+        and cfg.hicache_write_policy == "write_back"
     )
 
 

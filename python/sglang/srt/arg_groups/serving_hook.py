@@ -10,6 +10,7 @@ import random
 import socket
 from typing import Any
 
+from sglang.srt.arg_groups.hicache_hook import hicache_l3_victim_tier_requested
 from sglang.srt.arg_groups.model_override_base import model_config_of, resolving_view
 from sglang.srt.arg_groups.overrides import declare_resolution
 from sglang.srt.environ import envs
@@ -439,10 +440,15 @@ def handle_other_validations(server_args: Any):
                 and cfg.hicache_host_memory_mode == "buffer_only"
                 and cfg.hicache_write_policy == "write_through"
             )
+            or (
+                cfg.disaggregation_decode_allocation_policy == "prefill_complete"
+                and hicache_l3_victim_tier_requested(cfg)
+            )
         ):
             logger.warning(
-                "Optimistic prefill supports L2 write-back/write-through or "
-                "L3 buffer-only write-through hierarchical cache"
+                "Optimistic prefill supports L2 write-back/write-through, "
+                "L3 buffer-only write-through, or with prefill_complete the "
+                "L3 victim tier hierarchical cache"
             )
             declare_resolution(
                 server_args,

@@ -70,7 +70,8 @@ for transfer.
 The option does not support staging buffers, runtime PD role switching,
 encoder disaggregation, decoupled speculation, HiSparse, decode radix cache, decode
 HiCache, or non-DSA auxiliary state pools. Prefill HiCache is limited to L2 with
-`write_back` and no storage backend. Unsupported configurations fail validation.
+`write_back`, with no storage backend unless `SGLANG_OPT_HICACHE_L3_VICTIM_TIER`
+is set with cache-mode host memory. Unsupported configurations fail validation.
 
 All communicating workers must use the same revision and enable the same policy. This
 version of the decode worker rejects policy or peer-layout mismatches before

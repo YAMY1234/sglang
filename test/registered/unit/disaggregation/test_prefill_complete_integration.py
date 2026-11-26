@@ -38,6 +38,7 @@ from sglang.srt.disaggregation.prefill import (
 from sglang.srt.disaggregation.utils import poll_and_all_reduce_prefill_pp_sections
 from sglang.srt.distributed.communication_tags import P2PTag
 from sglang.srt.distributed.pp_sync_window import PPSyncSendWindow
+from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components.request_list import (
@@ -107,6 +108,45 @@ class TestAllocationConfiguration(CustomTestCase):
                 )
                 handle_pd_disaggregation(args)
                 handle_other_validations(args)
+                self.assertEqual(
+                    resolving_view(args).optimistic_prefill_attempts, attempts
+                )
+
+    def test_prefill_hicache_storage_needs_the_l3_victim_tier(self):
+        # (victim tier switch, policy, overrides, resolved attempts or None: rejected)
+        cases = [
+            (False, "prefill_complete", {}, None),
+            (True, "prefill_complete", {}, 1),
+            (True, "prefill_complete", {"hicache_write_policy": "write_through"}, None),
+            (
+                True,
+                "prefill_complete",
+                {"hicache_host_memory_mode": "buffer_only"},
+                None,
+            ),
+            (True, "early", {}, 0),
+        ]
+        for victim_tier, policy, overrides, attempts in cases:
+            with self.subTest(victim_tier=victim_tier, policy=policy, **overrides):
+                values = dict(
+                    model_path="dummy",
+                    disaggregation_mode="prefill",
+                    disaggregation_decode_allocation_policy=policy,
+                    optimistic_prefill_attempts=1,
+                    enable_hierarchical_cache=True,
+                    hicache_storage_backend="file",
+                    hicache_host_memory_mode="cache",
+                    hicache_write_policy="write_back",
+                )
+                values.update(overrides)
+                args = ServerArgs(**values)
+                with envs.SGLANG_OPT_HICACHE_L3_VICTIM_TIER.override(victim_tier):
+                    if attempts is None:
+                        with self.assertRaisesRegex(ValueError, "prefill_complete"):
+                            handle_pd_disaggregation(args)
+                        continue
+                    handle_pd_disaggregation(args)
+                    handle_other_validations(args)
                 self.assertEqual(
                     resolving_view(args).optimistic_prefill_attempts, attempts
                 )

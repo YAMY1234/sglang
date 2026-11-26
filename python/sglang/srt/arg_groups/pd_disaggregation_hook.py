@@ -5,6 +5,7 @@ import os
 from typing import TYPE_CHECKING, Any
 
 from sglang.srt.arg_groups.arg_utils import record_fields
+from sglang.srt.arg_groups.hicache_hook import hicache_l3_victim_tier_requested
 from sglang.srt.arg_groups.model_override_base import (
     model_config_of,
     resolved_view,
@@ -238,15 +239,22 @@ def _validate_prefill_complete(server_args: ServerArgs) -> None:
         cfg.disaggregation_decode_enable_radix_cache or cfg.enable_hierarchical_cache
     ):
         unsupported.append("decode radix cache or decode HiCache")
+    # Storage only as the L3 victim tier: host pages are written to storage when
+    # they leave the host tier, not when they land in it.
     if (
         cfg.disaggregation_mode == "prefill"
         and cfg.enable_hierarchical_cache
         and (
-            cfg.hicache_storage_backend is not None
+            (
+                cfg.hicache_storage_backend is not None
+                and not hicache_l3_victim_tier_requested(cfg)
+            )
             or cfg.hicache_write_policy != "write_back"
         )
     ):
-        unsupported.append("prefill HiCache other than L2 write_back")
+        unsupported.append(
+            "prefill HiCache other than L2 write_back or the L3 victim tier"
+        )
     if envs.SGLANG_DISAGG_STAGING_BUFFER.get():
         unsupported.append("staging buffers")
     if envs.SGLANG_RUST_SERVER.get():
