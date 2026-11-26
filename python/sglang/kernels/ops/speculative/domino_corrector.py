@@ -18,6 +18,7 @@ from typing import Optional
 import torch
 import triton
 import triton.language as tl
+from triton.language.extra import libdevice
 
 # Arbitrary: any finite value below every real score keeps the running maximum finite.
 _MASKED = tl.constexpr(-1e30)
@@ -305,6 +306,67 @@ def _pool_max_kernel(
         logits = tl.load(row + step * step_stride, mask=inside)
         top = tl.maximum(top, logits, propagate_nan=tl.PropagateNan.ALL)
     tl.store(OUT + request * VOCAB + column, top, mask=inside)
+
+
+@triton.jit
+def _norm_matmul_kernel(
+    X,
+    NORM,
+    W,
+    OUT,
+    rows,
+    eps,
+    K: tl.constexpr,
+    N: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    row = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)
+    column = tl.program_id(1) * BLOCK_N + tl.arange(0, BLOCK_N)
+    inside = row < rows
+    dim = tl.arange(0, K)
+    x = tl.load(X + row[:, None] * K + dim[None, :], mask=inside[:, None], other=0.0)
+    x = x.to(tl.float32)
+    # rmsnorm_fp32's arithmetic, rounded once to the activation dtype.
+    inv_rms = tl.rsqrt(tl.sum(x * x, axis=1) / K + eps)
+    normed = (x * inv_rms[:, None]) * tl.load(NORM + dim).to(tl.float32)[None, :]
+    weight = tl.load(W + dim[:, None] * N + column[None, :])
+    out = tl.dot(normed.to(weight.dtype), weight)
+    tl.store(
+        OUT + row[:, None] * N + column[None, :],
+        out.to(OUT.dtype.element_ty),
+        mask=inside[:, None],
+    )
+
+
+@triton.jit
+def _act_down_residual_kernel(
+    GATE_UP,
+    W,
+    RESIDUAL,
+    rows,
+    K: tl.constexpr,
+    N: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    row = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)
+    column = tl.program_id(1) * BLOCK_N + tl.arange(0, BLOCK_N)
+    inside = row < rows
+    acc = tl.zeros([BLOCK_M, BLOCK_N], tl.float32)
+    for start in tl.static_range(0, K, BLOCK_K):
+        dim = start + tl.arange(0, BLOCK_K)
+        # [row, gate | up], each K wide: SiluAndMul in FP32, rounded once.
+        gate_up = GATE_UP + row[:, None] * 2 * K + dim[None, :]
+        gate = tl.load(gate_up, mask=inside[:, None], other=0.0).to(tl.float32)
+        up = tl.load(gate_up + K, mask=inside[:, None], other=0.0).to(tl.float32)
+        hidden = gate / (1.0 + libdevice.exp(-gate)) * up
+        weight = tl.load(W + dim[:, None] * N + column[None, :])
+        acc = tl.dot(hidden.to(weight.dtype), weight, acc)
+    out = RESIDUAL + row[:, None] * N + column[None, :]
+    residual = tl.load(out, mask=inside[:, None], other=0.0).to(tl.float32)
+    tl.store(out, (acc + residual).to(RESIDUAL.dtype.element_ty), mask=inside[:, None])
 
 
 # BF16 exponent and mantissa bits.
@@ -676,6 +738,90 @@ def corrector_candidate_scores(
             num_warps=num_warps or _CANDIDATE_WARPS,
         )
     return out
+
+
+# Rows and columns per program of the block GEMMs; arbitrary, re-tune with the shapes.
+_NORM_MM_BLOCK, _ACT_DOWN_BLOCK = (32, 64), (32, 64, 64)
+
+
+def corrector_norm_matmul(
+    x: torch.Tensor,
+    norm_weight: torch.Tensor,
+    eps: float,
+    weight: torch.Tensor,
+    *,
+    block: Optional[tuple[int, int]] = None,
+) -> torch.Tensor:
+    """``rmsnorm_fp32(x) @ weight`` in one launch: [rows, N] in ``x``'s dtype.
+
+    ``x`` is [rows, K] BF16 (K a power of two), ``weight`` [K, N] BF16 input-major;
+    the norm rounds to BF16 as ``rmsnorm_fp32`` does and the product accumulates
+    in FP32 on the tensor cores.
+    """
+    rows, k = x.shape
+    n = weight.shape[1]
+    assert x.is_contiguous() and weight.is_contiguous() and norm_weight.is_contiguous()
+    assert x.dtype == weight.dtype == torch.bfloat16 and weight.shape[0] == k
+    assert k & (k - 1) == 0 and norm_weight.shape == (k,)
+    block_m, block_n = block or _NORM_MM_BLOCK
+    block_n = min(block_n, n)
+    assert n % block_n == 0
+    out = x.new_empty((rows, n))
+    if rows:
+        _norm_matmul_kernel[(triton.cdiv(rows, block_m), n // block_n)](
+            x,
+            norm_weight,
+            weight,
+            out,
+            rows,
+            eps,
+            K=k,
+            N=n,
+            BLOCK_M=block_m,
+            BLOCK_N=block_n,
+            num_warps=4,
+            # The norm then rounds as rmsnorm_fp32 does.
+            enable_fp_fusion=False,
+        )
+    return out
+
+
+def corrector_act_down_residual(
+    gate_up: torch.Tensor,
+    weight: torch.Tensor,
+    residual: torch.Tensor,
+    *,
+    block: Optional[tuple[int, int, int]] = None,
+) -> None:
+    """``residual += silu_and_mul(gate_up) @ weight`` in one launch, in place.
+
+    ``gate_up`` is [rows, 2K] BF16 (gate, then up), ``weight`` [K, N] BF16
+    input-major, ``residual`` [rows, N] BF16; the activation rounds to BF16 and
+    the product and the residual add accumulate in FP32, like ``addmm_``.
+    """
+    rows, n = residual.shape
+    k = weight.shape[0]
+    assert gate_up.shape == (rows, 2 * k) and weight.shape == (k, n)
+    assert (
+        gate_up.is_contiguous() and weight.is_contiguous() and residual.is_contiguous()
+    )
+    assert gate_up.dtype == weight.dtype == residual.dtype == torch.bfloat16
+    block_m, block_n, block_k = block or _ACT_DOWN_BLOCK
+    block_n, block_k = min(block_n, n), min(block_k, k)
+    assert n % block_n == 0 and k % block_k == 0
+    if rows:
+        _act_down_residual_kernel[(triton.cdiv(rows, block_m), n // block_n)](
+            gate_up,
+            weight,
+            residual,
+            rows,
+            K=k,
+            N=n,
+            BLOCK_M=block_m,
+            BLOCK_N=block_n,
+            BLOCK_K=block_k,
+            num_warps=4,
+        )
 
 
 def corrector_output_head(

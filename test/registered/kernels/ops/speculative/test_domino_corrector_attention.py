@@ -7,10 +7,12 @@ import torch.nn.functional as F
 from torch import nn
 
 from sglang.kernels.ops.speculative.domino_corrector import (
+    corrector_act_down_residual,
     corrector_candidate_scores,
     corrector_context_attention,
     corrector_draw,
     corrector_history_attention,
+    corrector_norm_matmul,
     corrector_output_head,
     corrector_pool_max,
     corrector_ring_context_attention,
@@ -208,6 +210,42 @@ def test_topk_lays_out_like_torch(kind, bs, n, k):
     ref = torch.topk(x, k, dim=-1, sorted=False)
     assert torch.equal(values.view(torch.int16), ref.values.view(torch.int16))
     assert torch.equal(ids, ref.indices)
+
+
+def _bf16_close(out, ref):
+    # Both round FP32 sums of the same products to BF16: at most a final ulp apart.
+    torch.testing.assert_close(out.float().cpu(), ref.float(), rtol=1e-2, atol=1e-2)
+
+
+@pytest.mark.parametrize(
+    "rows,n", [(232, 768), (232, 256), (232, 2048), (5, 768), (0, 256)]
+)
+def test_norm_matmul_matches_reference(rows, n):
+    gen = torch.Generator(device="cuda").manual_seed(rows + n)
+    k, eps = 256, 1e-5
+    x = _randn((rows, k), torch.bfloat16, gen) * 3
+    norm_weight = _randn((k,), torch.bfloat16, gen)
+    weight = _randn((k, n), torch.bfloat16, gen) * k**-0.5
+    out = corrector_norm_matmul(x, norm_weight, eps, weight)
+    wide = x.float().cpu()
+    normed = wide * torch.rsqrt(wide.square().mean(-1, keepdim=True) + eps)
+    normed = (normed * norm_weight.float().cpu()).bfloat16().double()
+    _bf16_close(out, (normed @ weight.double().cpu()).bfloat16())
+
+
+@pytest.mark.parametrize("rows", [232, 7, 0])
+def test_act_down_residual_matches_reference(rows):
+    gen = torch.Generator(device="cuda").manual_seed(rows)
+    k, n = 1024, 256
+    gate_up = _randn((rows, 2 * k), torch.bfloat16, gen)
+    weight = _randn((k, n), torch.bfloat16, gen) * k**-0.5
+    residual = _randn((rows, n), torch.bfloat16, gen)
+    expected_in = residual.clone()
+    corrector_act_down_residual(gate_up, weight, residual)
+    gate, up = gate_up.double().cpu().chunk(2, dim=-1)
+    hidden = (F.silu(gate) * up).bfloat16().double()
+    ref = hidden @ weight.double().cpu() + expected_in.double().cpu()
+    _bf16_close(residual, ref.bfloat16())
 
 
 def _rollout_case(dtype):

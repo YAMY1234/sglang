@@ -46,6 +46,28 @@ def _rms_norm(x: torch.Tensor, norm: nn.RMSNorm) -> torch.Tensor:
     return (wide * norm.weight).to(x.dtype)
 
 
+def _fused_block_gemms(x: torch.Tensor) -> bool:
+    """Whether a block's norm + GEMM and activation + down GEMM run as one launch each."""
+    width = x.shape[-1]
+    return x.is_cuda and x.dtype == torch.bfloat16 and width & (width - 1) == 0
+
+
+def _norm_matmul(
+    x: torch.Tensor, norm: nn.RMSNorm, weight: torch.Tensor, *, fused: bool
+) -> torch.Tensor:
+    """``_rms_norm(x, norm) @ weight``; the contract is ``corrector_norm_matmul``'s."""
+    if fused:
+        from sglang.kernels.ops.speculative.domino_corrector import (
+            corrector_norm_matmul,
+        )
+
+        out = corrector_norm_matmul(
+            x.view(-1, x.shape[-1]), norm.weight, norm.eps, weight
+        )
+        return out.view(*x.shape[:-1], -1)
+    return torch.matmul(_rms_norm(x, norm), weight)
+
+
 def _fused_attention(x: torch.Tensor, head_dim: int) -> bool:
     """Whether the one-launch attention kernels serve these activations."""
     return _on_kernels(x) and head_dim >= 2 and head_dim & (head_dim - 1) == 0
@@ -364,6 +386,7 @@ class TransformerCorrector(nn.Module):
         context_valid = None if context_mask is None else context_mask.to(torch.uint8)
         # [batch, slots, 2 streams, width]: what each stream adds to the token.
         hidden_query = self.input_hidden(hidden)
+        fused_gemms = _fused_block_gemms(hidden_query)
         slot_inputs = torch.stack((torch.zeros_like(hidden_query), hidden_query), dim=2)
         # [batch, heads, slots, 2 * head_dim]: a slot's key, then its value.
         history = [
@@ -376,18 +399,26 @@ class TransformerCorrector(nn.Module):
             streams = token_inputs[previous][:, None, :] + slot_inputs[:, i]
             flat = streams.view(bs * 2, width)
             for j, (block, norms) in enumerate(zip(plan.blocks, self.blocks)):
-                inputs = _rms_norm(streams, norms.self_norm)
                 attended = _history_attention(
-                    torch.matmul(inputs, block.query_key_value_t[i]),
+                    _norm_matmul(
+                        streams,
+                        norms.self_norm,
+                        block.query_key_value_t[i],
+                        fused=fused_gemms,
+                    ),
                     history[j],
                     i,
                     heads,
                 )
                 flat.addmm_(attended.reshape(bs * 2, width), block.self_out_t)
 
-                inputs = _rms_norm(streams, norms.cross_norm)
                 attended = _context_attention(
-                    torch.matmul(inputs, block.cross_query_t[i]),
+                    _norm_matmul(
+                        streams,
+                        norms.cross_norm,
+                        block.cross_query_t[i],
+                        fused=fused_gemms,
+                    ),
                     context_kv,
                     context_valid,
                     plan.context_cos,
@@ -398,15 +429,12 @@ class TransformerCorrector(nn.Module):
                 )
                 flat.addmm_(attended.reshape(bs * 2, width), block.cross_out_t)
 
-                inputs = _rms_norm(streams, norms.mlp_norm)
-                gate_up = torch.matmul(inputs, block.gate_up_t)
-                # The fused op picks its backend by machine, not by tensor.
-                hidden_mlp = (
-                    self.mlp_act(gate_up)
-                    if _on_kernels(gate_up)
-                    else self.mlp_act.forward_native(gate_up)
+                gate_up = _norm_matmul(
+                    streams, norms.mlp_norm, block.gate_up_t, fused=fused_gemms
                 )
-                flat.addmm_(hidden_mlp.view(bs * 2, -1), block.down_t)
+                self._mlp_down(
+                    flat, gate_up.view(bs * 2, -1), block.down_t, fused=fused_gemms
+                )
             if i < num_unary_slots:
                 previous = unary_picks[:, i]
             else:
@@ -430,6 +458,30 @@ class TransformerCorrector(nn.Module):
                         q_rows.append(q)
             picks.append(previous)
         return torch.stack(picks, dim=1), torch.stack(q_rows, dim=1) if q_rows else None
+
+    def _mlp_down(
+        self,
+        flat: torch.Tensor,
+        gate_up: torch.Tensor,
+        down_t: torch.Tensor,
+        *,
+        fused: bool,
+    ) -> None:
+        """``flat += act(gate_up) @ down_t`` in place."""
+        if fused:
+            from sglang.kernels.ops.speculative.domino_corrector import (
+                corrector_act_down_residual,
+            )
+
+            corrector_act_down_residual(gate_up, down_t, flat)
+            return
+        # The fused op picks its backend by machine, not by tensor.
+        hidden_mlp = (
+            self.mlp_act(gate_up)
+            if _on_kernels(gate_up)
+            else self.mlp_act.forward_native(gate_up)
+        )
+        flat.addmm_(hidden_mlp, down_t)
 
     def _correction(
         self,
