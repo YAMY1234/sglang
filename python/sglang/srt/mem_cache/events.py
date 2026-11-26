@@ -394,6 +394,9 @@ class KVCacheEventRecorder:
         self._batch_events = envs.SGLANG_HICACHE_BATCH_EVENTS.get()
         self._raw_tokens = self._batch_events and envs.SGLANG_KV_EVENTS_RAW_TOKENS.get()
         self._lazy = self._batch_events and envs.SGLANG_KV_EVENTS_LAZY.get()
+        self._raw_verify_left = (
+            envs.SGLANG_KV_EVENTS_RAW_TOKENS_VERIFY.get() if self._raw_tokens else 0
+        )
         # Lazy mode: (build, args) recorded in order, run by take().
         self._pending: list[tuple[Callable, tuple]] = []
 
@@ -633,8 +636,24 @@ class KVCacheEventRecorder:
         if self._raw_tokens and end - start >= _RAW_MIN_TOKENS:
             body = _bigram_pairs_body(raw, start, end)
             if body is not None:
-                return msgspec.Raw(_msgpack_array_header(end - start) + body)
+                token_ids = msgspec.Raw(_msgpack_array_header(end - start) + body)
+                if self._raw_verify_left > 0:
+                    self._verify_raw(token_ids, raw, start, end)
+                return token_ids
         return list(pairwise(raw[start : end + 1]))
+
+    def _verify_raw(self, token_ids: msgspec.Raw, raw, start: int, end: int) -> None:
+        want = msgspec.msgpack.encode(list(pairwise(raw[start : end + 1])))
+        if bytes(token_ids) != want:
+            raise RuntimeError(
+                "KV event Raw token_ids differ from the tuple encoding: "
+                f"tokens {start}-{end}"
+            )
+        self._raw_verify_left -= 1
+        if self._raw_verify_left == 0:
+            logger.info(
+                "KV event Raw token_ids matched the tuple encoding in all verified runs"
+            )
 
     def record_remove(self, node: Any, medium=None) -> None:
         # One BlockRemoved per radix node.

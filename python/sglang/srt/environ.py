@@ -838,6 +838,9 @@ class Envs:
     # With batching: long bigram (EAGLE) token_ids reach the publisher as
     # pre-encoded msgpack (msgspec.Raw) with the same bytes.
     SGLANG_KV_EVENTS_RAW_TOKENS = EnvBool(False)
+    # With raw token_ids: compare the first N pre-encoded runs with the tuple
+    # encoding and raise on a difference; 0 disables the check.
+    SGLANG_KV_EVENTS_RAW_TOKENS_VERIFY = EnvInt(0)
     # With batching: build queued KV events when they are taken for publishing.
     SGLANG_KV_EVENTS_LAZY = EnvBool(False)
 

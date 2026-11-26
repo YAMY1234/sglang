@@ -53,11 +53,12 @@ def ids(values, count):
 
 
 def make_recorder(
-    page_size, *, dynamo_format=False, batch=False, raw=False, lazy=False
+    page_size, *, dynamo_format=False, batch=False, raw=False, lazy=False, verify=0
 ):
     with (
         envs.SGLANG_HICACHE_BATCH_EVENTS.override(batch),
         envs.SGLANG_KV_EVENTS_RAW_TOKENS.override(raw),
+        envs.SGLANG_KV_EVENTS_RAW_TOKENS_VERIFY.override(verify),
         envs.SGLANG_KV_EVENTS_LAZY.override(lazy),
     ):
         return events.KVCacheEventRecorder(
@@ -226,6 +227,36 @@ class TestKVEventConstructionModes(CustomTestCase):
             msgspec.msgpack.decode(event.token_ids),
             [list(pair) for pair in pairwise(tokens)],
         )
+
+    def test_verify_checks_the_first_pre_encoded_runs(self):
+        root = Node("root", None, [], 64)
+        runs = [
+            Node(name, root, ids(WIDE, 20 * 64 + 1), 64, is_bigram=True)
+            for name in ("a", "b")
+        ]
+        encode = events._bigram_pairs_body
+
+        def corrupted(token_ids, start, end):
+            body = bytearray(encode(token_ids, start, end))
+            body[-1] ^= 1
+            return bytes(body)
+
+        with mock.patch.object(events, "_bigram_pairs_body", corrupted):
+            # Off: the corrupted encoding is published unchecked.
+            recorder = make_recorder(64, batch=True, raw=True)
+            recorder.record_store(runs[0])
+            self.assertIsInstance(recorder.take()[0].token_ids, msgspec.Raw)
+            # On: the first corrupted run raises.
+            recorder = make_recorder(64, batch=True, raw=True, verify=2)
+            with self.assertRaisesRegex(RuntimeError, "differ from the tuple"):
+                recorder.record_store(runs[0])
+
+        # Only the first N runs are checked: a corrupted second run passes
+        # once one correct run used up a count of 1.
+        recorder = make_recorder(64, batch=True, raw=True, verify=1)
+        recorder.record_store(runs[0])
+        with mock.patch.object(events, "_bigram_pairs_body", corrupted):
+            recorder.record_store(runs[1])
 
     def test_batching_enqueues_one_event_per_run(self):
         root = Node("root", None, [], 64)

@@ -1320,6 +1320,11 @@ SGLang supports various environment variables that can be used to configure its 
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_KV_EVENTS_RAW_TOKENS_VERIFY</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>With <code>SGLANG_KV_EVENTS_RAW_TOKENS</code>, also build the tuple encoding of the first N pre-encoded runs, compare the bytes, and raise <code>RuntimeError</code> on a difference. <code>0</code> disables the check.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>0</code></td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_KV_EVENTS_LAZY</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Requires <code>SGLANG_HICACHE_BATCH_EVENTS</code>. Record the inputs of each KV event at cache-update time and build the events when the scheduler takes them for publishing. Event order and bytes are unchanged.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
