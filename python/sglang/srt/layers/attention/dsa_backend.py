@@ -422,6 +422,9 @@ class DSAMetadata:
     # schedule for the fixed-eight CuTe DSL kernel (DG's [B, 8] schedule is not its ABI).
     cap8_paged_mqa_context_lens: Optional[torch.Tensor] = None
     cap8_paged_mqa_schedule_metadata: Optional[torch.Tensor] = None
+    # Capture stores one extend length per query row; this records the rows per
+    # request for the cap8 gate. Eager metadata keeps per-request lengths (None).
+    cap8_graph_query_group_size: Optional[int] = None
     # Precomputed once per forward batch and reused across layers: the
     # DeepSeek-V4 top-k v2 plan (cluster-threshold metadata) for the folded
     # decode top-k transform. None unless the SGL top-k v2 path is enabled.
@@ -1448,14 +1451,13 @@ class DeepseekSparseAttnBackend(
     def _build_cap8_paged_mqa_metadata(
         self, ctx_lens_2d: Optional[torch.Tensor]
     ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
-        # Only the SM100 DG-native verify layout [B, 8] qualifies. Its rows all carry
-        # the request's full length; the top-k masks each row to its own length.
+        # Only the DG-native verify layout [B, 8] qualifies. Its rows all carry the
+        # request's full length; the top-k masks each row to its own length.
         if (
             not envs.SGLANG_DSA_DECODE_CAP8_LOGITS.get()
-            or not get_platform().is_sm100
             or ctx_lens_2d is None
+            or ctx_lens_2d.dim() != 2
             or ctx_lens_2d.shape[1] != 8
-            or self.attn_dcp_size > 1
             or self.dsa_shards_index_k
             or self.dsa_index_kpool != 1
         ):
@@ -2387,6 +2389,11 @@ class DeepseekSparseAttnBackend(
             dsa_seqlens_expanded=seqlens_expanded,
             real_page_table=real_page_table,
             dsa_extend_seq_lens_list=dsa_extend_seq_lens_list,
+            cap8_graph_query_group_size=(
+                self.speculative_num_draft_tokens
+                if forward_mode.is_target_verify() or forward_mode.is_draft_extend_v2()
+                else None
+            ),
             topk_v2_plan=self._build_topk_v2_plan(seqlens_expanded),
             dcp_topk_length=self._dcp_topk_length_buffer(
                 forward_mode, seqlens_expanded

@@ -127,18 +127,21 @@ def _run_cutedsl_paged_mqa_logits_cap8(data, batch_size, max_model_len):
     # One block-table row per query row, as the indexer receives it in verify.
     block_tables_expanded = data["block_table"].repeat_interleave(next_n, dim=0)
     context_lens = data["context_lens"]
+    schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
+        context_lens.unsqueeze(-1), BLOCK_KV, num_sms
+    )
     assert can_use_cutedsl_paged_mqa_logits_cap8(
         q,
         data["kv_fused"],
         data["weights"],
         context_lens,
+        schedule_metadata,
         block_tables_expanded,
+        max_model_len,
         q_offset=batch_size * next_n,
         B=batch_size,
         next_n=next_n,
-    )
-    schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
-        context_lens.unsqueeze(-1), BLOCK_KV, num_sms
+        extend_lens=[next_n] * batch_size,
     )
     cap8_logits = cutedsl_paged_mqa_logits_cap8(
         q,
@@ -148,7 +151,6 @@ def _run_cutedsl_paged_mqa_logits_cap8(data, batch_size, max_model_len):
         block_tables_expanded,
         schedule_metadata,
         max_model_len,
-        q_offset=batch_size * next_n,
         B=batch_size,
     )
 
@@ -211,6 +213,7 @@ def _cap8_gate_inputs(
     num_heads=32,
     page_size=BLOCK_KV,
     q_dtype=torch.float8_e4m3fn,
+    num_blocks=4,
 ):
     rows = batch_size * next_n
     return dict(
@@ -218,27 +221,100 @@ def _cap8_gate_inputs(
         kv_cache_fp8=torch.empty(16, page_size, 1, HEAD_DIM + 4, dtype=torch.uint8),
         weights=torch.empty(rows, num_heads, dtype=torch.float32),
         context_lens=torch.empty(batch_size, dtype=torch.int32),
-        block_tables=torch.empty(rows, 4, dtype=torch.int32),
+        schedule_metadata=torch.empty(149, 2, dtype=torch.int32),
+        block_tables=torch.empty(rows, num_blocks, dtype=torch.int32),
+        max_seq_len=num_blocks * BLOCK_KV,
         q_offset=rows,
         B=batch_size,
         next_n=next_n,
+        extend_lens=[next_n] * batch_size,
     )
 
 
+def _strided_kv_pages(num_pages=16):
+    page_bytes = BLOCK_KV * (HEAD_DIM + 4)
+    buf = torch.empty(num_pages, 2 * page_bytes, dtype=torch.uint8)
+    return buf[:, :page_bytes].view(num_pages, BLOCK_KV, 1, HEAD_DIM + 4)
+
+
+_FP8 = torch.float8_e4m3fn
+
+# (id, _cap8_gate_inputs kwargs, replacements computed from the inputs, expected)
+_CAP8_GATE_CASES = [
+    ("eager", {}, None, True),
+    (
+        "cuda_graph",
+        {},
+        lambda a: dict(extend_lens=[1] * a["q_offset"], graph_query_group_size=8),
+        True,
+    ),
+    ("next_n_6", {"next_n": 6}, None, False),
+    ("heads_64", {"num_heads": 64}, None, False),
+    ("batch_33", {"batch_size": 33}, None, False),
+    ("page_32", {"page_size": 32}, None, False),
+    ("q_bf16", {"q_dtype": torch.bfloat16}, None, False),
+    (
+        "padded_q",
+        {},
+        lambda a: dict(q_fp8=torch.empty(a["q_offset"] + 8, 32, HEAD_DIM, dtype=_FP8)),
+        False,
+    ),
+    (
+        "padded_weights",
+        {},
+        lambda a: dict(weights=torch.empty(a["q_offset"] + 8, 32)),
+        False,
+    ),
+    (
+        "padded_block_tables",
+        {},
+        lambda a: dict(
+            block_tables=torch.empty(a["q_offset"] + 8, 4, dtype=torch.int32)
+        ),
+        False,
+    ),
+    ("strided_kv_pages", {}, lambda a: dict(kv_cache_fp8=_strided_kv_pages()), False),
+    ("max_seq_len_0", {"num_blocks": 0}, None, False),
+    ("max_seq_len_over_1048704", {"num_blocks": 16387}, None, False),
+    (
+        "block_table_width_mismatch",
+        {},
+        lambda a: dict(max_seq_len=a["max_seq_len"] + BLOCK_KV),
+        False,
+    ),
+    ("no_context_lens", {}, lambda a: dict(context_lens=None), False),
+    ("no_schedule", {}, lambda a: dict(schedule_metadata=None), False),
+    (
+        "schedule_int64",
+        {},
+        lambda a: dict(schedule_metadata=torch.empty(149, 2, dtype=torch.int64)),
+        False,
+    ),
+    (
+        "uneven_extend_lens",
+        {},
+        lambda a: dict(extend_lens=[7, 9] + [8] * (a["B"] - 2)),
+        False,
+    ),
+    (
+        "graph_lens_without_group",
+        {},
+        lambda a: dict(extend_lens=[1] * a["q_offset"]),
+        False,
+    ),
+]
+
+
 @pytest.mark.parametrize(
-    "overrides, expected",
-    [
-        ({}, True),
-        ({"next_n": 6}, False),
-        ({"num_heads": 64}, False),
-        ({"batch_size": 33}, False),
-        ({"page_size": 32}, False),
-        ({"q_dtype": torch.bfloat16}, False),
-    ],
+    "kwargs, replace, expected",
+    [case[1:] for case in _CAP8_GATE_CASES],
+    ids=[case[0] for case in _CAP8_GATE_CASES],
 )
-def test_cutedsl_paged_mqa_logits_cap8_gate(overrides, expected):
-    """Shapes outside the fixed-eight kernel keep the DeepGEMM route."""
-    inputs = _cap8_gate_inputs(**overrides)
+def test_cutedsl_paged_mqa_logits_cap8_gate(kwargs, replace, expected):
+    """Calls outside the fixed-eight kernel's shapes keep the DeepGEMM route."""
+    inputs = _cap8_gate_inputs(**kwargs)
+    if replace is not None:
+        inputs.update(replace(inputs))
     assert can_use_cutedsl_paged_mqa_logits_cap8(**inputs) is expected
 
 

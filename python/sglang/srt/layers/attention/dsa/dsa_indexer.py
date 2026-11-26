@@ -1492,7 +1492,8 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         assert len(q_fp8.shape) == 3
         # attn_tp_size > 1 or MAX_LEN padding mode can leave padding in the
         # hidden states; q_offset is the real (unpadded) q length.
-        q_offset = sum(metadata.get_dsa_extend_len_cpu())
+        extend_lens = metadata.get_dsa_extend_len_cpu()
+        q_offset = sum(extend_lens)
 
         B = metadata.get_seqlens_int32().shape[0]
         next_n = q_offset // B if B > 0 else 0
@@ -1623,21 +1624,27 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 )
             return torch.cat(logits_chunks, dim=0)
 
-        # The backend builds the cap8 metadata only for the SM100 DeepGEMM-native
-        # [B, 8] verify layout without DCP or an index-K pool.
+        # The backend builds the cap8 metadata only for the DeepGEMM-native [B, 8]
+        # verify layout; any other call keeps the DeepGEMM-native path.
         use_cap8 = (
             use_dg_native
             and envs.SGLANG_DSA_DECODE_CAP8_LOGITS.get()
-            and metadata.attn_metadata.cap8_paged_mqa_schedule_metadata is not None
+            and dcp_size == 1
+            and getattr(metadata, "dcp_size", 1) == 1
+            and get_platform().is_sm100
             and can_use_cutedsl_paged_mqa_logits_cap8(
                 q_fp8,
                 kv_cache_fp8,
                 weights,
                 metadata.attn_metadata.cap8_paged_mqa_context_lens,
+                metadata.attn_metadata.cap8_paged_mqa_schedule_metadata,
                 block_tables,
+                max_seq_len,
                 q_offset=q_offset,
                 B=B,
                 next_n=next_n,
+                extend_lens=extend_lens,
+                graph_query_group_size=metadata.attn_metadata.cap8_graph_query_group_size,
             )
         )
 
@@ -1722,7 +1729,6 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 block_tables,
                 metadata.attn_metadata.cap8_paged_mqa_schedule_metadata,
                 max_seq_len,
-                q_offset=q_offset,
                 B=B,
             )
         elif use_dg_native:

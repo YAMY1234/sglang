@@ -248,37 +248,61 @@ def can_use_cutedsl_paged_mqa_logits_cap8(
     q_fp8: torch.Tensor,
     kv_cache_fp8: torch.Tensor,
     weights: torch.Tensor,
-    context_lens: torch.Tensor,
+    context_lens: torch.Tensor | None,
+    schedule_metadata: torch.Tensor | None,
     block_tables: torch.Tensor,
+    max_seq_len: int,
     *,
     q_offset: int,
     B: int,
     next_n: int,
+    extend_lens: list[int],
+    graph_query_group_size: int | None = None,
 ) -> bool:
-    """Whether cutedsl_paged_mqa_logits_cap8 covers this call: 8 query rows per
-    request, 32 FP8 heads of dim 128 and FP8 index-K pages of 64 tokens, for at most
-    32 requests (the batch range its fixed epilogue config is tuned for). Checks
-    shapes, dtypes and strides only (no device reads)."""
+    """Whether cutedsl_paged_mqa_logits_cap8 covers this call: exactly 8 query rows
+    per request for at most 32 requests (the range its fixed epilogue config is tuned
+    for), 32 FP8 heads of dim 128, unpadded rows and compact 64-token FP8 index-K
+    pages. Reads shapes, dtypes and strides only (no device reads).
+
+    extend_lens is one entry of 8 per request in eager metadata; CUDA-graph capture
+    stores one entry of 1 per row and passes graph_query_group_size=8."""
     return (
         next_n == 8
         and 0 < B <= 32
-        and q_offset == B * next_n
+        and q_offset == B * 8
+        and (
+            (
+                graph_query_group_size is None
+                and len(extend_lens) == B
+                and all(n == 8 for n in extend_lens)
+            )
+            or (
+                graph_query_group_size == 8
+                and len(extend_lens) == B * 8
+                and all(n == 1 for n in extend_lens)
+            )
+        )
+        and q_fp8.shape == (q_offset, 32, 128)
         and q_fp8.dtype == torch.float8_e4m3fn
-        and q_fp8.shape[0] >= q_offset
-        and q_fp8.shape[1:] == (32, 128)
         and q_fp8.is_contiguous()
-        and weights.dtype == torch.float32
-        and weights.shape[0] >= q_offset
-        and weights.shape[1:] == (32,)
-        and weights.is_contiguous()
-        and kv_cache_fp8.dtype == torch.uint8
         and kv_cache_fp8.shape[1:] == (64, 1, 132)
-        and kv_cache_fp8.stride(0) % 16 == 0
-        and context_lens.dtype == torch.int32
+        and kv_cache_fp8.dtype == torch.uint8
+        and kv_cache_fp8.is_contiguous()
+        and weights.shape == (q_offset, 32)
+        and weights.dtype == torch.float32
+        and weights.is_contiguous()
+        and context_lens is not None
         and context_lens.shape == (B,)
+        and context_lens.dtype == torch.int32
         and context_lens.is_contiguous()
+        and schedule_metadata is not None
+        and schedule_metadata.dim() == 2
+        and schedule_metadata.shape[1] == 2
+        and schedule_metadata.dtype == torch.int32
+        and schedule_metadata.is_contiguous()
+        and 64 <= max_seq_len <= 1048704
+        and block_tables.shape == (q_offset, max_seq_len // 64)
         and block_tables.dtype == torch.int32
-        and block_tables.shape[0] >= q_offset
         and block_tables.stride(1) == 1
     )
 
@@ -292,7 +316,6 @@ def cutedsl_paged_mqa_logits_cap8(
     schedule_metadata: torch.Tensor,
     max_seq_len: int,
     *,
-    q_offset: int,
     B: int,
 ) -> torch.Tensor:
     """Logits of 8 query rows per request from one CuTe DSL launch that reads each
@@ -305,13 +328,13 @@ def cutedsl_paged_mqa_logits_cap8(
     )
 
     # Keep 8 head weights per row in registers and read the rest from SMEM; all
-    # 8 x 32 would spill. [:q_offset:8] de-expands the per-row block table, no copy.
+    # 8 x 32 would spill. [::8] de-expands the per-row block table without a copy.
     return CuteDSLPagedMQALogitsRunner.forward(
-        q_fp8[:q_offset].view(B, 8, q_fp8.shape[1], q_fp8.shape[2]),
+        q_fp8.view(B, 8, q_fp8.shape[1], q_fp8.shape[2]),
         kv_cache_fp8,
-        weights[:q_offset],
+        weights,
         context_lens,
-        block_tables[:q_offset:8],
+        block_tables[::8],
         schedule_metadata,
         max_seq_len,
         num_epi_subtiles=1,
