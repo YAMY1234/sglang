@@ -1309,6 +1309,11 @@ SGLang supports various environment variables that can be used to configure its 
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Storage directory for the HiCache NIXL backend.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Not set</td>
     </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_HICACHE_EXISTENCE_BELIEF_TTL_STEPS</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>With <code>--hicache-host-memory-mode buffer_only</code>, the number of batches a belief that a page is in L3 storage stays valid after its last evidence (a write ack, a storage fill or a hit query). A valid belief skips that page's write-back; an expired one is dropped, so a page the backend has since evicted is written again. <code>0</code> keeps beliefs until they are LRU-evicted or invalidated by a hit-query shortfall.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>0</code></td>
+    </tr>
   </tbody>
 </table>
 

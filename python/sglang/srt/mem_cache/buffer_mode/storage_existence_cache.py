@@ -15,6 +15,9 @@ Semantics are advisory, not authoritative:
   one cold recompute, the same as any cache miss.
 - A miss (entry LRU-evicted or never seen) just costs one redundant write
   (idempotent: storage keys are content-addressed).
+- With a TTL (``SGLANG_HICACHE_EXISTENCE_BELIEF_TTL_STEPS``), a belief also
+  expires once more than that many steps passed since its last evidence (ack,
+  fill, hit query), which bounds how long a stale positive skips write-backs.
 
 Keys are the content-chained page hashes already computed at insert time, so
 lookups never hash anything and entries survive node deletion, splits, and
@@ -28,8 +31,8 @@ on the chain (a component may supply one via ``buffer_belief_policy``).
 
 TP determinism: replicas stay identical because every mutation happens on the
 scheduler thread at lockstep points with cross-rank-reduced inputs
-(storage-ack drain, prefetch-hit drain, fill commit). Do not touch it from
-anywhere else.
+(storage-ack drain, prefetch-hit drain, fill commit), and the TTL clock counts
+batches, not wall time. Do not touch it from anywhere else.
 """
 
 from __future__ import annotations
@@ -126,18 +129,84 @@ class PoolExistenceBeliefs:
         self._inflight.clear()
 
 
-class StorageExistenceCache:
-    """The beliefs of every storage pool, created on first use."""
+class ExpiringPoolExistenceBeliefs(PoolExistenceBeliefs):
+    """Beliefs that live ``ttl_steps`` steps past their last evidence (an
+    ``add``); an LRU touch does not refresh them. An expired belief reads as
+    absent and is dropped."""
 
-    def __init__(self, max_entries: int = HICACHE_EXISTENCE_CACHE_MAX_ENTRIES):
+    def __init__(self, max_entries: int, ttl_steps: int, step: int = 0):
+        super().__init__(max_entries)
+        self.ttl_steps = ttl_steps
+        # The clock; ``_entries`` maps each hash to the step of its last evidence.
+        self.step = step
+
+    def add(self, hashes: Iterable[str]) -> None:
+        entries = self._entries
+        move_to_end = entries.move_to_end
+        step = self.step
+        for h in hashes:
+            entries[h] = step
+            move_to_end(h)
+        pop_oldest = entries.popitem
+        for _ in range(len(entries) - self.max_entries):
+            pop_oldest(last=False)
+
+    def contains(self, page_hash: str) -> bool:
+        entries = self._entries
+        stamp = entries.get(page_hash)
+        if stamp is None:
+            return False
+        if self.step - stamp > self.ttl_steps:
+            del entries[page_hash]
+            return False
+        entries.move_to_end(page_hash)
+        return True
+
+    def contains_all(self, hashes: Iterable[str]) -> bool:
+        contains = self.contains
+        return all(contains(h) for h in hashes)
+
+    def covered(self, hashes: Iterable[str]) -> bool:
+        """Every page believed stored (and not expired) or in flight."""
+        contains = self.contains
+        inflight = self._inflight
+        return all(contains(h) or h in inflight for h in hashes)
+
+
+class StorageExistenceCache:
+    """The beliefs of every storage pool, created on first use. With
+    ``ttl_steps > 0`` a belief lives that many ``advance_step`` calls past its
+    last evidence; otherwise beliefs never expire."""
+
+    def __init__(
+        self,
+        max_entries: int = HICACHE_EXISTENCE_CACHE_MAX_ENTRIES,
+        ttl_steps: int = 0,
+    ):
         self.max_entries = max_entries
+        self.ttl_steps = ttl_steps
+        self.step = 0
         self._pools: dict[str, PoolExistenceBeliefs] = {}
 
     def pool(self, name: str) -> PoolExistenceBeliefs:
         beliefs = self._pools.get(name)
         if beliefs is None:
-            beliefs = self._pools[name] = PoolExistenceBeliefs(self.max_entries)
+            if self.ttl_steps > 0:
+                beliefs = ExpiringPoolExistenceBeliefs(
+                    self.max_entries, self.ttl_steps, self.step
+                )
+            else:
+                beliefs = PoolExistenceBeliefs(self.max_entries)
+            self._pools[name] = beliefs
         return beliefs
+
+    def advance_step(self) -> None:
+        """Age the beliefs by one step; call at a rank-lockstep point."""
+        if self.ttl_steps <= 0:
+            return
+        self.step += 1
+        for beliefs in self._pools.values():
+            beliefs.step = self.step
 
     def clear(self) -> None:
         for beliefs in self._pools.values():

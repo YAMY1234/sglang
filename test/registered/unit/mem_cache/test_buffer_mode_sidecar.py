@@ -10,12 +10,14 @@ from unittest.mock import MagicMock, patch
 import msgspec
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
 from sglang.srt.mem_cache.buffer_mode.pipeline import (
     BufferModePipeline,
     validate_buffer_only_stack,
 )
 from sglang.srt.mem_cache.buffer_mode.storage_existence_cache import (
+    PoolExistenceBeliefs,
     StorageExistenceCache,
 )
 from sglang.srt.mem_cache.hicache_storage import (
@@ -32,6 +34,7 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
 )
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
+from sglang.srt.mem_cache.unified_cache.storage_attachment import StorageAttachment
 from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import (
     BufferBackupSnapshot,
     BufferBackupState,
@@ -661,6 +664,97 @@ class TestBufferModeSidecar(unittest.TestCase):
             cache.prefetch_loaded_tokens_by_reqid[req_id], len(host_indices)
         )
         self.assertEqual(cache.prefetch_loaded_storage_start_by_reqid[req_id], 0)
+
+
+class TestStorageExistenceBeliefTTL(unittest.TestCase):
+    @staticmethod
+    def _cache(ttl_steps):
+        """A cache whose ``ready_to_load_host_cache`` only ticks the beliefs."""
+        cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
+        cache.linker = None
+        cache.cache_controller = None
+        cache.storage_existence_cache = StorageExistenceCache(ttl_steps=ttl_steps)
+        return cache
+
+    def _advance(self, cache, steps):
+        for _ in range(steps):
+            self.assertEqual(cache.ready_to_load_host_cache(), 0)
+
+    def test_belief_expires_after_ttl_steps(self):
+        cache = self._cache(ttl_steps=2)
+        beliefs = cache.storage_existence_cache.pool(PoolName.KV)
+        chain = ["page-0", "page-1", "page-2"]
+        beliefs.add(chain)
+        self._advance(cache, 2)
+        # Lookups touch the LRU but are not evidence: they do not extend a belief.
+        self.assertTrue(beliefs.contains_all(chain))
+        self.assertTrue(beliefs.covered(chain))
+        self._advance(cache, 1)
+        self.assertFalse(beliefs.contains(chain[0]))
+        self.assertFalse(beliefs.contains_all(chain))
+        self.assertFalse(beliefs.covered(chain))
+        # Content past a D2H launch still covers an expired page.
+        beliefs.track_inflight(chain)
+        self.assertTrue(beliefs.covered(chain))
+        beliefs.untrack_inflight(chain)
+        # New evidence (a storage ack) restarts the belief.
+        beliefs.add(chain)
+        self._advance(cache, 2)
+        self.assertTrue(beliefs.contains_all(chain))
+
+    def test_pool_created_later_runs_on_the_shared_clock(self):
+        cache = self._cache(ttl_steps=2)
+        cache.storage_existence_cache.pool(PoolName.KV)
+        self._advance(cache, 5)
+        swa = cache.storage_existence_cache.pool(PoolName.SWA)
+        swa.add(["page-0"])
+        self._advance(cache, 2)
+        self.assertTrue(swa.contains("page-0"))
+        self._advance(cache, 1)
+        self.assertFalse(swa.contains("page-0"))
+
+    def test_zero_ttl_never_expires(self):
+        self.assertEqual(envs.SGLANG_HICACHE_EXISTENCE_BELIEF_TTL_STEPS.get(), 0)
+        cache = self._cache(ttl_steps=0)
+        beliefs = cache.storage_existence_cache.pool(PoolName.KV)
+        # No TTL keeps the plain beliefs, so lookups take the non-expiring path.
+        self.assertIs(type(beliefs), PoolExistenceBeliefs)
+        chain = ["page-0", "page-1"]
+        beliefs.add(chain)
+        self._advance(cache, 1000)
+        self.assertTrue(beliefs.contains_all(chain))
+        self.assertTrue(beliefs.covered(chain))
+        self.assertEqual(cache.storage_existence_cache.step, 0)
+
+    def test_attach_clears_unexpired_beliefs(self):
+        """Beliefs about the previous backend are dropped on attach even
+        though their TTL has not run out."""
+        existence = StorageExistenceCache(ttl_steps=8)
+        existence.pool(PoolName.KV).add(["page-0"])
+        existence.pool(PoolName.SWA).track_inflight(["page-0"])
+        cache = SimpleNamespace(
+            host_memory_mode="buffer_only",
+            cache_controller=MagicMock(),
+            token_to_kv_pool_allocator=None,
+            is_write_back=False,
+            enable_storage=False,
+            sidecar_pool_specs=[],
+            host_pool_group=SimpleNamespace(entry_map={}),
+            component_of=lambda _: None,
+            components={},
+            window_slots=lambda: (),
+            tree_core=SimpleNamespace(backfill_missing_hash_values=lambda: 0),
+            page_size=2,
+            prefetch_stop_policy="best_effort",
+            write_through_threshold=1,
+            _enable_metrics_flag=False,
+            extra_metric_labels=None,
+            storage_existence_cache=existence,
+        )
+        ok, message = StorageAttachment(cache).attach(storage_backend="file")
+        self.assertTrue(ok, message)
+        self.assertFalse(existence.pool(PoolName.KV).contains("page-0"))
+        self.assertFalse(existence.pool(PoolName.SWA).covered(["page-0"]))
 
 
 if __name__ == "__main__":
