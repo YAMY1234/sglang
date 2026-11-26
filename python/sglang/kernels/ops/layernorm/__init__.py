@@ -53,6 +53,14 @@ for _fn in ("fused_dual_residual_rmsnorm", "fused_rmsnorm"):
     )
 del _fn
 
+register_kernel(
+    KernelSpec(
+        op="layernorm.mla_qkv_a_rmsnorm",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.layernorm.mla_qkv_a_rmsnorm:mla_qkv_a_rmsnorm",
+    )
+)
+
 
 # Public entry points inventoried by logical operator group (RFC #29630).
 # The rmsnorm family: one JIT template for plain / fused residual-add / fp8 per-tensor quant.

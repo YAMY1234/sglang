@@ -1752,6 +1752,9 @@ class Envs:
     SGLANG_FORCE_FUSED_OP_BACKEND = EnvStr(None)
     USE_TRITON_W8A8_FP8_KERNEL = EnvBool(False)
     SGLANG_MOE_PADDING = EnvBool(False)
+    # MLA decode, target verify and draft extend: one Triton launch for the q_a and
+    # kv_a RMSNorms. Same math in another reduction order, so default off.
+    SGLANG_OPT_FUSED_MLA_QKV_A_NORM = EnvBool(False)
 
     # ===================================================================
     # Logits and log-probability processing
