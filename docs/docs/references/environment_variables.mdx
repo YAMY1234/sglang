@@ -1314,6 +1314,16 @@ SGLang supports various environment variables that can be used to configure its 
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>With <code>--hicache-host-kv-dtype nvfp4</code>, also store DSA index keys as NVFP4 in the host tier (76 instead of 132 bytes per token and layer); their FP32 scales stay exact. Off keeps the index keys FP8 on the host.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
     </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_HICACHE_PAGEWISE_LOAD</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>With <code>--hicache-io-backend direct</code> and <code>--hicache-mem-layout page_first_direct</code>, load host KV back page by page: one copy per page and run of consecutive layers into a device stage, then each layer placed on the device. Applies to the NVFP4 MLA KV host pool (<code>--hicache-host-kv-dtype nvfp4</code>) and to the DSA index-key host pool when it keeps raw device pages, whose pages are then also written back page by page. Other host pools keep the per-layer load.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_HICACHE_PAGEWISE_LOAD_GROUPS</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Number of layer groups a page-wise load is split into. A group's layers become ready for the forward together, so fewer groups mean fewer, larger copies but less overlap with compute. When a group spans every layer of a host page (for example with <code>1</code>), runs of consecutive host pages are copied as one range.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>4</code></td>
+    </tr>
   </tbody>
 </table>
 

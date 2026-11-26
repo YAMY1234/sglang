@@ -27,6 +27,11 @@ from sglang.srt.mem_cache.device_pool_info import (
 )
 from sglang.srt.mem_cache.pool_host.dsa import DSAIndexerPoolHost
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
+from sglang.srt.mem_cache.pool_host.pagewise_l2 import (
+    chunk_pages,
+    copy_page_runs_to_stage,
+    layer_runs,
+)
 from sglang.srt.utils import is_cuda
 
 _is_cuda = is_cuda()
@@ -81,9 +86,13 @@ class NVFP4RowCodec:
             src, rows, out, self.global_scale, dim=self.dim, page_size=page_size
         )
 
-    def decode_rows(self, src, rows, dst) -> None:
-        """Decode NVFP4 rows src[i] ([n, row_bytes]) into dst[rows[i]] (FP8 bytes)."""
-        decode_nvfp4_rows_to_fp8(src, rows, dst, self.global_scale, dim=self.dim)
+    def decode_rows(self, src, rows, dst, *, page_size: int = 1) -> None:
+        """Decode NVFP4 rows into dst[rows[i]] (FP8 bytes): row i is src[i]
+        ([n, row_bytes]), or src[i // page_size, i % page_size] of a strided
+        [pages, page_size, row_bytes] view."""
+        decode_nvfp4_rows_to_fp8(
+            src, rows, dst, self.global_scale, dim=self.dim, page_size=page_size
+        )
 
 
 class IndexKeyPageCodec:
@@ -517,6 +526,50 @@ class MLATokenToKVPoolNVFP4Host(MLATokenToKVPoolHost):
             arange=self._arange,
         )
 
+    def pagewise_load_ok(self, io_backend: str) -> bool:
+        # Only the Triton codec decodes whole pages in one call.
+        return io_backend == "direct" and self._codec.backend == "triton"
+
+    def load_to_device_layers_pagewise(
+        self, device_pool, host_indices, device_indices, layer_ids, *, is_draft=False
+    ):
+        """load_to_device_per_layer for several layers: one copy per page and run
+        of consecutive host layers into a page-major stage, then each layer
+        decoded from the stage in place."""
+        layer_ids = [
+            layer_id
+            for layer_id in layer_ids
+            if is_draft or layer_id in self._target_layer_indices
+        ]
+        if not layer_ids or host_indices.numel() == 0:
+            return
+        units = self.page_size
+        host_pages = host_indices[::units] // units
+        host_layers = [self._host_layer_by_controller[i] for i in layer_ids]
+        for first, nseg, positions in layer_runs(host_layers):
+            step = chunk_pages(nseg * units * self.kv_cache_dim)
+            for start in range(0, host_pages.numel(), step):
+                pages = host_pages[start : start + step]
+                n = pages.numel()
+                stage = torch.empty(
+                    (n, nseg, units, self.kv_cache_dim),
+                    dtype=torch.uint8,
+                    device=self._transfer_device,
+                )
+                copy_page_runs_to_stage(self.kv_buffer, pages, first, nseg, stage)
+                rows = device_indices[start * units : (start + n) * units]
+                for k, pos in enumerate(positions):
+                    self._codec.decode_rows(
+                        stage[:, k],
+                        rows,
+                        self.device_kv_buffers[
+                            self._buffer_index_by_layer[layer_ids[pos]]
+                        ],
+                        page_size=units,
+                    )
+                # Free it before the next chunk's stage: the peak stays one stage.
+                del stage
+
 
 class DSAIndexerPoolNVFP4Host(DSAIndexerPoolHost):
     """DSA index-key pages ([FP8 keys | FP32 scales], 132 B per token) kept as
@@ -558,6 +611,10 @@ class DSAIndexerPoolNVFP4Host(DSAIndexerPoolHost):
         self._arange = torch.arange(
             max(self._load_chunk_pages, self._backup_chunk_pages)
         )
+
+    def pagewise_load_ok(self, io_backend: str) -> bool:
+        # Host pages hold encoded keys; the page-wise path moves raw pages.
+        return False
 
     def _initialize_host_buffers(self):
         # Host pages hold the encoded page, not the device page.

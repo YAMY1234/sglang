@@ -9,6 +9,10 @@ import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.pool_host.base import shared_host_layout_domains
+from sglang.srt.mem_cache.pool_host.pagewise_l2 import (
+    split_layer_groups,
+    uses_pagewise_load,
+)
 from sglang.srt.utils import get_device_module
 
 logger = logging.getLogger(__name__)
@@ -232,22 +236,22 @@ class L2TransferEngine:
             transfers,
             completion,
         ):
+            pagewise = [
+                uses_pagewise_load(t.host_pool, self.io_backend) for t in transfers
+            ]
+            if any(pagewise):
+                self._load_pagewise(
+                    transfers, pagewise, transfer_layer_id_max, on_layer_done
+                )
+                return completion
             primary = transfers[0] if transfers else None
             delay_cycles = envs.SGLANG_TEST_HICACHE_H2D_DELAY_CYCLES.get()
             for layer_id in range(transfer_layer_id_max):
                 if delay_cycles:
                     torch.cuda._sleep(delay_cycles)
                 for transfer in transfers:
-                    local_layer_id = (
-                        transfer.layer_mapper(layer_id)
-                        if transfer.layer_mapper is not None
-                        else layer_id
-                    )
-                    if local_layer_id is None or (
-                        transfer is not primary
-                        and transfer.layer_mapper is None
-                        and layer_id >= transfer.host_pool.layer_num
-                    ):
+                    local_layer_id = self._local_layer_id(transfer, primary, layer_id)
+                    if local_layer_id is None:
                         continue
                     transfer.host_pool.load_to_device_per_layer_physical(
                         transfer.device_pool,
@@ -260,6 +264,71 @@ class L2TransferEngine:
                 if on_layer_done is not None:
                     on_layer_done(layer_id)
         return completion
+
+    @staticmethod
+    def _local_layer_id(
+        transfer: L2Transfer, primary: L2Transfer, layer_id: int
+    ) -> Optional[int]:
+        """The transfer's layer for controller layer ``layer_id``, or None if it
+        has none."""
+        if transfer.layer_mapper is not None:
+            return transfer.layer_mapper(layer_id)
+        if transfer is not primary and layer_id >= transfer.host_pool.layer_num:
+            return None
+        return layer_id
+
+    def _load_pagewise(
+        self,
+        transfers: list[L2Transfer],
+        pagewise: list[bool],
+        transfer_layer_id_max: int,
+        on_layer_done,
+    ) -> None:
+        """Load the layers in SGLANG_HICACHE_PAGEWISE_LOAD_GROUPS groups: a
+        page-wise host pool copies each page's run of a group's layers at once,
+        and the group's layers are reported done after its copies."""
+        primary = transfers[0]
+        local = [
+            [self._local_layer_id(t, primary, layer_id) for t in transfers]
+            for layer_id in range(transfer_layer_id_max)
+        ]
+        active = [
+            layer_id
+            for layer_id, ids in enumerate(local)
+            if any(i is not None for i in ids)
+        ]
+        done = 0
+        groups = envs.SGLANG_HICACHE_PAGEWISE_LOAD_GROUPS.get()
+        for group in split_layer_groups(active, groups):
+            for i, transfer in enumerate(transfers):
+                layer_ids = [local[l][i] for l in group if local[l][i] is not None]
+                if not layer_ids:
+                    continue
+                if pagewise[i]:
+                    transfer.host_pool.load_to_device_layers_pagewise(
+                        transfer.device_pool,
+                        transfer.host_indices,
+                        transfer.device_indices,
+                        layer_ids,
+                        is_draft=transfer.is_draft,
+                    )
+                    continue
+                for layer_id in layer_ids:
+                    transfer.host_pool.load_to_device_per_layer_physical(
+                        transfer.device_pool,
+                        transfer.host_indices,
+                        transfer.device_indices,
+                        layer_id,
+                        self.io_backend,
+                        is_draft=transfer.is_draft,
+                    )
+            if on_layer_done is not None:
+                for layer_id in range(done, group[-1] + 1):
+                    on_layer_done(layer_id)
+            done = group[-1] + 1
+        if on_layer_done is not None:
+            for layer_id in range(done, transfer_layer_id_max):
+                on_layer_done(layer_id)
 
     @staticmethod
     def _start_event(start_event):

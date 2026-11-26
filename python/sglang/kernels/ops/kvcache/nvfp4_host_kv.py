@@ -101,8 +101,10 @@ def _decode_nvfp4_rows_to_fp8_kernel(
     dst_ptr,
     gs_ptr,
     n_blocks,
+    src_page_stride,
     src_row_stride,
     dst_row_stride,
+    PAGE_SIZE: tl.constexpr,
     BLOCKS_PER_ROW: tl.constexpr,
     DATA_BYTES: tl.constexpr,
     BLOCK_B: tl.constexpr,
@@ -111,15 +113,16 @@ def _decode_nvfp4_rows_to_fp8_kernel(
     valid = b < n_blocks
     row = (b // BLOCKS_PER_ROW).to(tl.int64)
     blk = (b % BLOCKS_PER_ROW).to(tl.int64)
+    src_row = (row // PAGE_SIZE) * src_page_stride + (row % PAGE_SIZE) * src_row_stride
     k = tl.arange(0, 8)
     packed = tl.load(
-        src_ptr + row[:, None] * src_row_stride + blk[:, None] * 8 + k[None, :],
+        src_ptr + src_row[:, None] + blk[:, None] * 8 + k[None, :],
         mask=valid[:, None],
         other=0,
     ).to(tl.int32)
     code = tl.reshape(tl.join(packed & 0xF, packed >> 4), (BLOCK_B, 16))
     sf = (
-        tl.load(src_ptr + row * src_row_stride + DATA_BYTES + blk, mask=valid, other=0)
+        tl.load(src_ptr + src_row + DATA_BYTES + blk, mask=valid, other=0)
         .to(tl.float8e4nv, bitcast=True)
         .to(tl.float32)
     )
@@ -185,8 +188,11 @@ def decode_nvfp4_rows_to_fp8(
     global_scale: torch.Tensor,
     *,
     dim: int,
+    page_size: int = 1,
 ) -> None:
-    """Decode NVFP4 rows src[i] ([n, row_bytes]) into dst[rows[i]] (FP8 bytes, [N, ..., dim])."""
+    """Decode NVFP4 rows into dst[rows[i]] (FP8 bytes, [N, ..., dim]). Row i is
+    src[i] ([n, row_bytes]), or src[i // page_size, i % page_size] of a
+    [pages, page_size, row_bytes] source whose pages may be strided."""
     n_blocks = rows.numel() * (dim // 16)
     if n_blocks == 0:
         return
@@ -197,7 +203,9 @@ def decode_nvfp4_rows_to_fp8(
         global_scale,
         n_blocks,
         src.stride(0),
+        src.stride(1),
         dst.stride(0),
+        PAGE_SIZE=page_size,
         BLOCKS_PER_ROW=dim // 16,
         DATA_BYTES=dim // 2,
         BLOCK_B=_BLOCKS_PER_PROGRAM,

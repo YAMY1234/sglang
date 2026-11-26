@@ -953,6 +953,12 @@ class Envs:
     # --hicache-host-kv-dtype nvfp4: also store DSA index keys as NVFP4 (off keeps
     # them FP8 on the host).
     SGLANG_ENABLE_HICACHE_NVFP4_HOST_INDEXER = EnvBool(False)
+    # Direct IO with page_first_direct: load the NVFP4 MLA KV and raw DSA index
+    # host pools back with one copy per page and run of layers instead of one per
+    # page and layer; raw DSA index pages are also written back page by page.
+    SGLANG_HICACHE_PAGEWISE_LOAD = EnvBool(False)
+    # Layer groups of a page-wise load; a group's layers become ready together.
+    SGLANG_HICACHE_PAGEWISE_LOAD_GROUPS = EnvInt(4)
     SGLANG_HICACHE_NIXL_BACKEND_STORAGE_DIR = EnvStr(None)
     # Enable O_DIRECT when opening NIXL POSIX backend files (bypasses OS page cache).
     # Disable with SGLANG_HICACHE_NIXL_USE_DIRECT_IO=0 or via the

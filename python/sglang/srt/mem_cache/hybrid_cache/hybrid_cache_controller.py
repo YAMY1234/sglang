@@ -46,6 +46,7 @@ from sglang.srt.mem_cache.pool_host import HostPoolGroup, PoolEntry
 from sglang.srt.mem_cache.pool_host.base import uses_shared_host_layout
 from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
 from sglang.srt.mem_cache.pool_host.page_interleave import PageInterleaveHostPool
+from sglang.srt.mem_cache.pool_host.pagewise_l2 import uses_pagewise_load
 from sglang.srt.mem_cache.pool_host.unified import UnifiedPageEnvelopeHostPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.observability.trace import (
@@ -1797,7 +1798,10 @@ class HybridCacheController(BaseHiCacheController):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if uses_shared_host_layout(host_pool):
             return host_indices, device_indices
-        if write_back_jit and host_pool.can_use_write_back_jit:
+        # These paths index device rows on the device: no blocking .cpu().
+        if (write_back_jit and host_pool.can_use_write_back_jit) or uses_pagewise_load(
+            host_pool, self.io_backend
+        ):
             if host_indices.is_cuda:
                 host_indices = host_indices.cpu()
             return host_indices, device_indices

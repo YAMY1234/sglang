@@ -222,6 +222,74 @@ class TestNVFP4HostTier(CustomTestCase):
                     )
                 )
 
+    def test_pagewise_load_matches_per_layer_load(self):
+        """The page-wise load (SGLANG_HICACHE_PAGEWISE_LOAD) decodes the same FP8
+        bytes as the per-layer load, from whole pages or from runs of layers."""
+        layer_num = 3
+        device_pool = DSATokenToKVPool(
+            size=_PAGE_SIZE * 20,
+            page_size=_PAGE_SIZE,
+            kv_lora_rank=128,
+            dtype=torch.float8_e4m3fn,
+            qk_rope_head_dim=32,
+            layer_num=layer_num,
+            device="cuda",
+            enable_memory_saver=False,
+            kv_cache_dim=160,
+            index_head_dim=128,
+        )
+        kv_host = MLATokenToKVPoolNVFP4Host(
+            device_pool.get_device_pool_infos()[0].buffer_info,
+            2.0,
+            0,
+            _PAGE_SIZE,
+            "page_first_direct",
+            pin_memory=True,
+            device="cpu",
+            override_kv_cache_dim=device_pool.kv_cache_dim,
+            device_capacity_tokens=device_pool.size,
+            start_layer=device_pool.start_layer,
+            end_layer=device_pool.end_layer,
+            target_layer_num=layer_num,
+        )
+        self.addCleanup(kv_host.destroy)
+        self.assertTrue(kv_host.pagewise_load_ok("direct"))
+        # Every row starts random, so a load that misses a row is caught.
+        for kv in device_pool.kv_buffer:
+            kv.copy_(_random_fp8(kv.shape, "cuda"))
+
+        host = _token_indices([0, 1, 2, 5], "cpu")
+        per_layer_pages = [4, 5, 6, 7]
+        # Destination pages -> the layer lists of the page-wise loads into them.
+        pagewise_loads = {
+            (8, 9, 10, 11): [[0, 1, 2]],
+            (12, 13, 14, 15): [[2, 0], [1]],
+        }
+        with torch.cuda.stream(torch.cuda.Stream()):
+            h, d = kv_host.prepare_transfer_indices(
+                host, _token_indices([1, 2, 3, 16], "cuda"), "direct"
+            )
+            kv_host.backup_from_device_all_layer(device_pool, h, d, "direct")
+            h, d = kv_host.prepare_transfer_indices(
+                host, _token_indices(per_layer_pages, "cuda"), "direct"
+            )
+            for layer_id in range(layer_num):
+                kv_host.load_to_device_per_layer(device_pool, h, d, layer_id, "direct")
+            for pages, layer_lists in pagewise_loads.items():
+                h, d = kv_host.prepare_transfer_indices(
+                    host, _token_indices(pages, "cuda"), "direct"
+                )
+                for layer_ids in layer_lists:
+                    kv_host.load_to_device_layers_pagewise(device_pool, h, d, layer_ids)
+        torch.cuda.synchronize()
+
+        for layer in range(layer_num):
+            kv = device_pool.kv_buffer[layer].cpu()
+            want = kv[_token_indices(per_layer_pages, "cpu")]
+            for pages in pagewise_loads:
+                got = kv[_token_indices(pages, "cpu")]
+                self.assertTrue(torch.equal(got, want), (layer, pages))
+
 
 if __name__ == "__main__":
     unittest.main()

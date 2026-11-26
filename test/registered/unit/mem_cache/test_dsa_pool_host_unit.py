@@ -5,6 +5,7 @@ from unittest import mock
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
 from sglang.srt.mem_cache.pool_host.dsa import (
     DSAIndexerPoolHost,
@@ -320,6 +321,114 @@ class TestDSAHiCacheTransfer(unittest.TestCase):
             raw = torch.as_strided(buffer, (buffer.shape[0], step), (step, 1))
             padding = raw.view(torch.uint8)[:, page_bytes:]
             self.assertEqual(padding.count_nonzero().item(), 0)
+
+    @unittest.skipIf(is_hip(), "The page-wise L2 path is CUDA-only.")
+    def test_pagewise_index_transfers_match_per_layer(self):
+        """With SGLANG_HICACHE_PAGEWISE_LOAD, index pages are written back and
+        loaded page by page into the same host and device bytes as the per-layer
+        path, for packed and for padded host pages."""
+        page_size, layer_num = 64, 3
+        device_pool = DSATokenToKVPool(
+            size=page_size * 20,
+            page_size=page_size,
+            kv_lora_rank=128,
+            dtype=torch.float8_e4m3fn,
+            qk_rope_head_dim=32,
+            layer_num=layer_num,
+            device="cuda",
+            enable_memory_saver=False,
+            kv_cache_dim=160,
+            index_head_dim=128,
+        )
+        index_layers = device_pool.index_k_with_scale_buffer
+        src = self._token_indices_for_pages(
+            torch.tensor([1, 2, 3, 16]), page_size, "cuda"
+        )
+        per_layer_host_pages, pagewise_host_pages = [0, 1, 2, 5], [8, 9, 10, 13]
+        per_layer_dst_pages = [4, 5, 6, 7]
+        # Destination pages -> the layer lists of the page-wise loads into them.
+        pagewise_loads = {
+            (8, 9, 10, 11): [[0, 1, 2]],
+            (12, 13, 14, 15): [[2, 0], [1]],
+        }
+        for allocator_type in ("default", "nixl"):
+            with self.subTest(allocator_type=allocator_type):
+                with (
+                    mock.patch.dict(
+                        os.environ, {"SGLANG_HICACHE_NIXL_USE_DIRECT_IO": "1"}
+                    ),
+                    get_context().override_server_args(),
+                ):
+                    mla_host, indexer_host = self._host_pools(
+                        device_pool,
+                        layout="page_first_direct",
+                        pin_memory=True,
+                        allocator_type=allocator_type,
+                    )
+                self.addCleanup(indexer_host.destroy)
+                self.addCleanup(mla_host.destroy)
+                self.assertTrue(indexer_host.pagewise_load_ok("direct"))
+                # 3 x 8,448-byte page-layers, padded to 7 blocks of 4 KiB for NIXL.
+                self.assertEqual(
+                    indexer_host.page_stride_bytes,
+                    7 * 4096 if allocator_type == "nixl" else 3 * 8448,
+                )
+                # Every page starts random, so a copy that misses one is caught.
+                for raw in index_layers:
+                    raw.copy_(
+                        torch.randint(
+                            0, 256, raw.shape, device="cuda", dtype=torch.uint8
+                        )
+                    )
+
+                def host_indices(pages):
+                    return self._token_indices_for_pages(
+                        torch.tensor(pages), page_size, "cpu"
+                    )
+
+                def dst_indices(pages):
+                    return self._token_indices_for_pages(
+                        torch.tensor(pages), page_size, "cuda"
+                    )
+
+                # cudaMemcpyBatchAsync refuses the legacy default stream.
+                with torch.cuda.stream(torch.cuda.Stream()):
+                    indexer_host.backup_from_device_all_layer(
+                        device_pool, host_indices(per_layer_host_pages), src, "direct"
+                    )
+                    for layer_id in range(layer_num):
+                        indexer_host.load_to_device_per_layer(
+                            device_pool,
+                            host_indices(per_layer_host_pages),
+                            dst_indices(per_layer_dst_pages),
+                            layer_id,
+                            "direct",
+                        )
+                    with envs.SGLANG_HICACHE_PAGEWISE_LOAD.override(True):
+                        indexer_host.backup_from_device_all_layer(
+                            device_pool,
+                            host_indices(pagewise_host_pages),
+                            src,
+                            "direct",
+                        )
+                    for dst_pages, layer_lists in pagewise_loads.items():
+                        for layer_ids in layer_lists:
+                            indexer_host.load_to_device_layers_pagewise(
+                                device_pool,
+                                host_indices(pagewise_host_pages),
+                                dst_indices(dst_pages),
+                                layer_ids,
+                            )
+                torch.cuda.synchronize()
+
+                host_buffer = indexer_host.index_k_with_scale_buffer
+                for want, got in zip(per_layer_host_pages, pagewise_host_pages):
+                    self.assertTrue(torch.equal(host_buffer[got], host_buffer[want]))
+                for buffer in index_layers:
+                    want = buffer[per_layer_dst_pages].cpu()
+                    for dst_pages in pagewise_loads:
+                        got = buffer[list(dst_pages)].cpu()
+                        self.assertTrue(torch.equal(got, want), dst_pages)
 
 
 if __name__ == "__main__":
