@@ -356,6 +356,92 @@ def test_deepgemm_prenorm_dual_matches_two_calls(num_tokens):
         assert torch.equal(a, b)
 
 
+def _stock_reduce_sinkhorn(part, sq, scale, base, k, slices, residual):
+    m = part.shape[1]
+    pre = torch.empty(m, 4, device="cuda")
+    post = torch.empty_like(pre)
+    comb = torch.empty(m, 4, 4, device="cuda")
+    mhc._hc_mix_reduce_sinkhorn_kernel[(m,)](
+        part,
+        sq,
+        scale,
+        base,
+        pre,
+        post,
+        comb,
+        m,
+        1.0 / k,
+        1e-6,
+        MIX=24,
+        HC=4,
+        NUM_SLICES=slices,
+        ITERS=20,
+        EPS=1e-6,
+        part_mix_residual_ptr=residual,
+        num_warps=1,
+    )
+    return pre, post, comb
+
+
+@pytest.mark.parametrize("num_tokens", [1, 63, 64, 65, 252, 1008, 1024, 1060])
+@pytest.mark.parametrize("slices", [8, 16])
+@pytest.mark.parametrize("with_residual", [False, True])
+@pytest.mark.parametrize("num_warps", [1, 2, 4])
+def test_fast_sinkhorn_bitwise(num_tokens, slices, with_residual, num_warps):
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required")
+    torch.manual_seed(11 + num_tokens + slices)
+    k = 20480
+    # Partial projections at the scale of real mixes, plus a few rows with large
+    # logits so the softmax and the Sinkhorn see saturated and tiny entries.
+    part = torch.randn(slices, num_tokens, 24, device="cuda") * 8
+    part[:, ::7] *= 50
+    residual = torch.randn_like(part) * 1e-3 if with_residual else None
+    sq = torch.rand(slices, num_tokens, device="cuda") * k / slices
+    scale = torch.tensor([0.5, 0.25, 0.25], device="cuda")
+    base = torch.randn(24, device="cuda")
+    stock = _stock_reduce_sinkhorn(part, sq, scale, base, k, slices, residual)
+    fast = [torch.empty_like(t) for t in stock]
+    mhc.hc_mix_reduce_sinkhorn_rows_hc4(
+        part,
+        sq,
+        scale,
+        base,
+        *fast,
+        num_tokens,
+        k,
+        1e-6,
+        slices,
+        20,
+        1e-6,
+        part_mix_residual=residual,
+        num_warps=num_warps,
+    )
+    for a, b in zip(fast, stock):
+        assert torch.equal(a.view(torch.int32), b.view(torch.int32))
+
+
+@pytest.mark.parametrize("num_tokens", [32, 252, 1024])
+def test_deepgemm_fast_sinkhorn_matches_stock(num_tokens):
+    from sglang.srt.environ import envs
+
+    if not (torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 10):
+        pytest.skip("SM10x only")
+    torch.manual_seed(7 + num_tokens)
+    x = torch.randn(num_tokens, 20480, device="cuda", dtype=torch.bfloat16)
+    w = torch.randn(24, 20480, device="cuda") * 0.01
+    high = w.bfloat16().float()
+    low = (w - high).contiguous()
+    scale = torch.tensor([0.5, 0.25, 0.25], device="cuda")
+    base = torch.randn(24, device="cuda")
+    args = (x, (high, low), scale, base, 20, 1e-6, 1e-6)
+    stock = mhc.hc_mix_stats_sinkhorn_deepgemm(*args)
+    with envs.SGLANG_OPT_MHC_FAST_SINKHORN.override(True):
+        fast = mhc.hc_mix_stats_sinkhorn_deepgemm(*args)
+    for a, b in zip(fast, stock):
+        assert torch.equal(a.view(torch.int32), b.view(torch.int32))
+
+
 @pytest.mark.parametrize("num_tokens", [1, 4, 64, 4096])
 def test_hopper_combine_norm(num_tokens):
     from sglang.srt.layers.layernorm import RMSNorm

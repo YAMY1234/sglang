@@ -2503,6 +2503,214 @@ def _hc_mix_reduce_sinkhorn_kernel(
     tl.store(comb_ptr + row * HC * HC + jj * HC + kk, comb)
 
 
+@triton.jit
+def _cols4(x):
+    # [BM, 4] -> its four columns, each [BM].
+    even, odd = tl.split(tl.reshape(x, (x.shape[0], 2, 2)))
+    x0, x2 = tl.split(even)
+    x1, x3 = tl.split(odd)
+    return x0, x1, x2, x3
+
+
+@triton.jit
+def _rows4(x0, x1, x2, x3):
+    # Inverse of _cols4.
+    t = tl.join(tl.join(x0, x2), tl.join(x1, x3))
+    return tl.reshape(t, (x0.shape[0], 4))
+
+
+@triton.jit
+def _sk_norm4(x0, x1, x2, x3, EPS: tl.constexpr):
+    # The single-warp kernel's butterfly (xor 2, then xor 1) sums (x0+x2)+(x1+x3).
+    d = ((x0 + x2) + (x1 + x3)) + EPS
+    return x0 / d, x1 / d, x2 / d, x3 / d
+
+
+@triton.jit
+def _hc_mix_reduce_sinkhorn_rows_hc4_kernel(
+    part_mix_ptr,
+    part_sq_ptr,
+    scale_ptr,
+    base_ptr,
+    pre_ptr,
+    post_ptr,
+    comb_ptr,
+    part_mix_residual_ptr,
+    m,
+    inv_k,
+    rms_eps,
+    MIX: tl.constexpr,
+    NUM_SLICES: tl.constexpr,
+    ITERS: tl.constexpr,
+    EPS: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    HAS_RESIDUAL: tl.constexpr,
+):
+    """_hc_mix_reduce_sinkhorn_kernel for HC=4 with one row per thread.
+
+    Same per-element operations, slice order and sum order as the single-warp
+    kernel (bitwise identical outputs), without its 16 idle lanes and one-warp CTAs.
+    """
+    rows = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)
+    rmask = rows < m
+    rm = rmask[:, None]
+    j = tl.arange(0, 4)
+
+    a_pre = tl.zeros([BLOCK_M, 4], dtype=tl.float32)
+    a_post = tl.zeros([BLOCK_M, 4], dtype=tl.float32)
+    a_c0 = tl.zeros([BLOCK_M, 4], dtype=tl.float32)
+    a_c1 = tl.zeros([BLOCK_M, 4], dtype=tl.float32)
+    a_c2 = tl.zeros([BLOCK_M, 4], dtype=tl.float32)
+    a_c3 = tl.zeros([BLOCK_M, 4], dtype=tl.float32)
+    sq = tl.zeros([BLOCK_M], dtype=tl.float32)
+    for s in tl.static_range(NUM_SLICES):
+        off = ((s * m + rows) * MIX)[:, None] + j[None, :]
+        v_pre = tl.load(part_mix_ptr + off, rm, 0.0)
+        v_post = tl.load(part_mix_ptr + off + 4, rm, 0.0)
+        v_c0 = tl.load(part_mix_ptr + off + 8, rm, 0.0)
+        v_c1 = tl.load(part_mix_ptr + off + 12, rm, 0.0)
+        v_c2 = tl.load(part_mix_ptr + off + 16, rm, 0.0)
+        v_c3 = tl.load(part_mix_ptr + off + 20, rm, 0.0)
+        if HAS_RESIDUAL:
+            v_pre += tl.load(part_mix_residual_ptr + off, rm, 0.0)
+            v_post += tl.load(part_mix_residual_ptr + off + 4, rm, 0.0)
+            v_c0 += tl.load(part_mix_residual_ptr + off + 8, rm, 0.0)
+            v_c1 += tl.load(part_mix_residual_ptr + off + 12, rm, 0.0)
+            v_c2 += tl.load(part_mix_residual_ptr + off + 16, rm, 0.0)
+            v_c3 += tl.load(part_mix_residual_ptr + off + 20, rm, 0.0)
+        a_pre += v_pre
+        a_post += v_post
+        a_c0 += v_c0
+        a_c1 += v_c1
+        a_c2 += v_c2
+        a_c3 += v_c3
+        sq += tl.load(part_sq_ptr + s * m + rows, rmask, 0.0)
+    rsqrt = (1.0 / tl.sqrt(sq * inv_k + rms_eps))[:, None]
+
+    s0 = tl.load(scale_ptr + 0)
+    s1 = tl.load(scale_ptr + 1)
+    s2 = tl.load(scale_ptr + 2)
+
+    pre = tl.sigmoid(a_pre * rsqrt * s0 + tl.load(base_ptr + j)[None, :]) + EPS
+    tl.store(pre_ptr + rows[:, None] * 4 + j[None, :], pre, rm)
+    post = 2.0 * tl.sigmoid(a_post * rsqrt * s1 + tl.load(base_ptr + 4 + j)[None, :])
+    tl.store(post_ptr + rows[:, None] * 4 + j[None, :], post, rm)
+
+    # comb[i][k] as c<i><k>, one [BLOCK_M] value per thread.
+    c00, c01, c02, c03 = _cols4(
+        a_c0 * rsqrt * s2 + tl.load(base_ptr + 8 + j)[None, :]
+    )
+    c10, c11, c12, c13 = _cols4(
+        a_c1 * rsqrt * s2 + tl.load(base_ptr + 12 + j)[None, :]
+    )
+    c20, c21, c22, c23 = _cols4(
+        a_c2 * rsqrt * s2 + tl.load(base_ptr + 16 + j)[None, :]
+    )
+    c30, c31, c32, c33 = _cols4(
+        a_c3 * rsqrt * s2 + tl.load(base_ptr + 20 + j)[None, :]
+    )
+
+    mx = tl.maximum(tl.maximum(c00, c02), tl.maximum(c01, c03))
+    c00, c01, c02, c03 = (
+        tl.exp(c00 - mx),
+        tl.exp(c01 - mx),
+        tl.exp(c02 - mx),
+        tl.exp(c03 - mx),
+    )
+    d = (c00 + c02) + (c01 + c03)
+    c00, c01, c02, c03 = c00 / d + EPS, c01 / d + EPS, c02 / d + EPS, c03 / d + EPS
+    mx = tl.maximum(tl.maximum(c10, c12), tl.maximum(c11, c13))
+    c10, c11, c12, c13 = (
+        tl.exp(c10 - mx),
+        tl.exp(c11 - mx),
+        tl.exp(c12 - mx),
+        tl.exp(c13 - mx),
+    )
+    d = (c10 + c12) + (c11 + c13)
+    c10, c11, c12, c13 = c10 / d + EPS, c11 / d + EPS, c12 / d + EPS, c13 / d + EPS
+    mx = tl.maximum(tl.maximum(c20, c22), tl.maximum(c21, c23))
+    c20, c21, c22, c23 = (
+        tl.exp(c20 - mx),
+        tl.exp(c21 - mx),
+        tl.exp(c22 - mx),
+        tl.exp(c23 - mx),
+    )
+    d = (c20 + c22) + (c21 + c23)
+    c20, c21, c22, c23 = c20 / d + EPS, c21 / d + EPS, c22 / d + EPS, c23 / d + EPS
+    mx = tl.maximum(tl.maximum(c30, c32), tl.maximum(c31, c33))
+    c30, c31, c32, c33 = (
+        tl.exp(c30 - mx),
+        tl.exp(c31 - mx),
+        tl.exp(c32 - mx),
+        tl.exp(c33 - mx),
+    )
+    d = (c30 + c32) + (c31 + c33)
+    c30, c31, c32, c33 = c30 / d + EPS, c31 / d + EPS, c32 / d + EPS, c33 / d + EPS
+
+    c00, c10, c20, c30 = _sk_norm4(c00, c10, c20, c30, EPS)
+    c01, c11, c21, c31 = _sk_norm4(c01, c11, c21, c31, EPS)
+    c02, c12, c22, c32 = _sk_norm4(c02, c12, c22, c32, EPS)
+    c03, c13, c23, c33 = _sk_norm4(c03, c13, c23, c33, EPS)
+    for _ in tl.static_range(ITERS - 1):
+        c00, c01, c02, c03 = _sk_norm4(c00, c01, c02, c03, EPS)
+        c10, c11, c12, c13 = _sk_norm4(c10, c11, c12, c13, EPS)
+        c20, c21, c22, c23 = _sk_norm4(c20, c21, c22, c23, EPS)
+        c30, c31, c32, c33 = _sk_norm4(c30, c31, c32, c33, EPS)
+        c00, c10, c20, c30 = _sk_norm4(c00, c10, c20, c30, EPS)
+        c01, c11, c21, c31 = _sk_norm4(c01, c11, c21, c31, EPS)
+        c02, c12, c22, c32 = _sk_norm4(c02, c12, c22, c32, EPS)
+        c03, c13, c23, c33 = _sk_norm4(c03, c13, c23, c33, EPS)
+
+    out = comb_ptr + rows[:, None] * 16 + j[None, :]
+    tl.store(out, _rows4(c00, c01, c02, c03), rm)
+    tl.store(out + 4, _rows4(c10, c11, c12, c13), rm)
+    tl.store(out + 8, _rows4(c20, c21, c22, c23), rm)
+    tl.store(out + 12, _rows4(c30, c31, c32, c33), rm)
+
+
+_HC_FAST_SINKHORN_NUM_WARPS = 2
+
+
+def hc_mix_reduce_sinkhorn_rows_hc4(
+    part_mix,
+    part_sq,
+    scale,
+    base,
+    pre,
+    post,
+    comb,
+    m: int,
+    k: int,
+    rms_eps: float,
+    num_slices: int,
+    sinkhorn_iters: int,
+    hc_eps: float,
+    part_mix_residual=None,
+    num_warps: int = _HC_FAST_SINKHORN_NUM_WARPS,
+):
+    block_m = 32 * num_warps
+    _hc_mix_reduce_sinkhorn_rows_hc4_kernel[(triton.cdiv(m, block_m),)](
+        part_mix,
+        part_sq,
+        scale,
+        base,
+        pre,
+        post,
+        comb,
+        part_mix if part_mix_residual is None else part_mix_residual,
+        m,
+        1.0 / k,
+        rms_eps,
+        MIX=24,
+        NUM_SLICES=num_slices,
+        ITERS=sinkhorn_iters,
+        EPS=hc_eps,
+        BLOCK_M=block_m,
+        HAS_RESIDUAL=part_mix_residual is not None,
+        num_warps=num_warps,
+    )
+
+
 def hc_mix_stats_sinkhorn(
     x_flat: torch.Tensor,
     hc_fn: torch.Tensor,
@@ -2780,6 +2988,24 @@ def hc_mix_stats_sinkhorn_deepgemm(
         # sq depends only on x_flat, so the second projection recomputes the same
         # values; overwriting it avoids a throwaway (slices, m) scratch, 4 MiB at m=65536.
         tf32_hc_prenorm_gemm(x_flat, low, mix_lo, sq, slices)
+    if hc_mult == 4 and envs.SGLANG_OPT_MHC_FAST_SINKHORN.get():
+        hc_mix_reduce_sinkhorn_rows_hc4(
+            mix_hi,
+            sq,
+            hc_scale,
+            hc_base,
+            pre,
+            post,
+            comb,
+            m,
+            k,
+            rms_eps,
+            slices,
+            sinkhorn_iters,
+            hc_eps,
+            part_mix_residual=mix_lo,
+        )
+        return pre, post, comb
     _hc_mix_reduce_sinkhorn_kernel[(m,)](
         mix_hi,
         sq,
