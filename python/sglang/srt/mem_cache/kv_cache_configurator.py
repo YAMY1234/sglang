@@ -71,6 +71,7 @@ from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
 from sglang.srt.mem_cache.draft_kv_budget import resolve_dflash_draft_cell_size
 from sglang.srt.mem_cache.hisparse_memory_pool import HiSparseDSATokenToKVPool
 from sglang.srt.mem_cache.memory_pool import (
+    DSAFp8RopeRecordTokenToKVPool,
     DSATokenToKVPool,
     HybridLinearKVPool,
     HybridReqToTokenPool,
@@ -2258,6 +2259,16 @@ class KVCacheConfigurator:
             pool_kwargs["layer_shard_size"] = dsa_cp_layer_shard_size
         else:
             PoolCls = dsa_pool_class
+        from sglang.kernels.ops.attention.dsa.fp8rope_record_writer import (
+            dsa_d576_inplace_enabled,
+        )
+
+        if dsa_d576_inplace_enabled():
+            if PoolCls is not DSATokenToKVPool:
+                raise NotImplementedError(
+                    f"SGLANG_DSA_D576_INPLACE does not support {PoolCls.__name__}."
+                )
+            PoolCls = DSAFp8RopeRecordTokenToKVPool
         if self.loc_space_scale > 1:
             pool_kwargs["dcp_replicated"] = True
         if _should_elide_dsa_index_k(is_draft_worker=self.is_draft_worker):
@@ -3510,6 +3521,18 @@ def calculate_mla_kv_cache_dim(
     # For non-DSA models, MLA kv cache dim is simply kv_lora_rank + qk_rope_head_dim
     if not is_dsa_model:
         return kv_cache_dim
+
+    from sglang.kernels.ops.attention.dsa.fp8rope_record_writer import (
+        FP8ROPE_RECORD_BYTES,
+        dsa_d576_inplace_enabled,
+    )
+
+    if dsa_d576_inplace_enabled():
+        # One byte per element: the 352-byte record is also the per-layer token size.
+        assert kv_cache_dtype == torch.float8_e4m3fn, (
+            f"SGLANG_DSA_D576_INPLACE requires an fp8_e4m3 KV cache, got {kv_cache_dtype}"
+        )
+        return FP8ROPE_RECORD_BYTES
 
     # TRTLLM uses the raw MLA KV layout. In disaggregated serving only the
     # backend for the local role determines the local pool layout; the

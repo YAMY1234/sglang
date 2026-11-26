@@ -5748,6 +5748,53 @@ class DSATokenToKVPool(MLATokenToKVPool):
         return kv_size_bytes
 
 
+class DSAFp8RopeRecordTokenToKVPool(DSATokenToKVPool):
+    """Decode-side DSA pool whose MLA rows are 352-byte nvfp4.fp8rope records
+    (SGLANG_DSA_D576_INPLACE). Index-K is kept as in the parent."""
+
+    def __init__(self, *args, **kwargs):
+        from sglang.kernels.ops.attention.dsa.fp8rope_record_writer import (
+            FP8ROPE_RECORD_BYTES,
+        )
+
+        if get_parallel().attn_dcp_size > 1:
+            raise NotImplementedError("SGLANG_DSA_D576_INPLACE does not support DCP.")
+        super().__init__(*args, **kwargs)
+        assert self.kv_cache_dim == FP8ROPE_RECORD_BYTES, self.kv_cache_dim
+        # Records are not the fp8_ds_mla layout: keep consumers on raw-row branches.
+        self.dsa_kv_cache_store_fp8 = False
+        logger.info(
+            f"DSA_D576_INPLACE pool rows={self.size + self.page_size} "
+            f"bytes_per_row={FP8ROPE_RECORD_BYTES} layers={self.layer_num}"
+        )
+
+    def _write_mla_kv_buffer(
+        self,
+        dst_buffer: torch.Tensor,
+        loc: torch.Tensor,
+        cache_k_nope: torch.Tensor,
+        cache_k_rope: torch.Tensor,
+    ) -> None:
+        from sglang.kernels.ops.attention.dsa.fp8rope_record_writer import (
+            write_fp8rope_records,
+        )
+
+        # The trtllm DSA path hands over E4M3 K (mla_quantize_and_rope_for_fp8); E4M3 -> BF16 is exact.
+        if cache_k_nope.dtype != torch.bfloat16:
+            cache_k_nope = cache_k_nope.to(torch.bfloat16)
+        if cache_k_rope.dtype != torch.bfloat16:
+            cache_k_rope = cache_k_rope.to(torch.bfloat16)
+        write_fp8rope_records(dst_buffer, loc, cache_k_nope, cache_k_rope)
+
+    def get_mla_kv_buffer(self, *args, **kwargs):
+        raise NotImplementedError(
+            "SGLANG_DSA_D576_INPLACE stores nvfp4.fp8rope records; raw MLA KV "
+            "reads and combined-row writes are not supported."
+        )
+
+    set_kv_buffer = get_mla_kv_buffer
+
+
 def move_kv_cache_native(
     k_buffer: List[torch.Tensor],
     v_buffer: List[torch.Tensor],

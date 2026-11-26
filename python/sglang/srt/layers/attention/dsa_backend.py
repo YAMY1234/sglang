@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import functools
+import importlib
 import logging
 from dataclasses import dataclass
 from typing import (
@@ -38,6 +40,10 @@ from sglang.kernels.ops.attention.dsa.dequant_k_cache import (
     dequantize_k_cache_paged_dsa,
     gather_cast_kv_fp8_pad_paged,
     gather_dequant_requant_fp8_paged_dsa,
+)
+from sglang.kernels.ops.attention.dsa.fp8rope_record_writer import (
+    FP8ROPE_RECORD_BYTES,
+    dsa_d576_inplace_enabled,
 )
 from sglang.kernels.ops.attention.dsa.transform_index import (
     prepare_trtllm_nope_sparse_metadata,
@@ -293,6 +299,12 @@ def _apply_q_row_plan(
                 ]
             )
     return q, indices
+
+
+@functools.lru_cache(maxsize=None)
+def _d576_primts_mla_decode():
+    """PrimTS mla_decode for SGLANG_DSA_D576_INPLACE, from SGLANG_DSA_D576_PRIMTS_MODULE."""
+    return importlib.import_module(envs.SGLANG_DSA_D576_PRIMTS_MODULE.get())
 
 
 def _restore_live_rows(output: torch.Tensor, plan: Optional[_RowPlan]) -> torch.Tensor:
@@ -859,6 +871,14 @@ class DeepseekSparseAttnBackend(
         self.device_sm_major = self.device_capability[0]
         self.kv_cache_dtype = model_runner.kv_cache_dtype
 
+        # SGLANG_DSA_D576_INPLACE: the trtllm sparse path runs PrimTS on records.
+        self.d576_inplace = dsa_d576_inplace_enabled()
+        if self.d576_inplace:
+            assert self.kv_cache_dim == FP8ROPE_RECORD_BYTES, self.kv_cache_dim
+            assert self.dsa_decode_impl == "trtllm", self.dsa_decode_impl
+            self._d576_primts_plans: Dict[Tuple[int, int, int], tuple] = {}
+            self._d576_primts_workspace: Optional[torch.Tensor] = None
+
         # Unsupported flashmla_sparse_q8 configs must fail at launch, not mid-forward.
         _validate_flashmla_sparse_q8_backend(
             prefill_impl=self.dsa_prefill_impl,
@@ -1116,6 +1136,55 @@ class DeepseekSparseAttnBackend(
             device=page_table_1.device,
         )
         return torch.cat([page_table_1, padding], dim=1), padded_top_k
+
+    def _d576_primts_plan(
+        self, device: torch.device, rows: int, heads: int, topk: int
+    ) -> tuple:
+        """Cached PrimTS wrapper and constant lengths for one shape; planned eagerly
+        (CUDA graph warmup runs each captured shape before capture)."""
+        key = (rows, heads, topk)
+        plan = self._d576_primts_plans.get(key)
+        if plan is not None:
+            return plan
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                f"SGLANG_DSA_D576_INPLACE: PrimTS shape {key} was not planned "
+                "before CUDA graph capture"
+            )
+        mla_decode = _d576_primts_mla_decode()
+        kw = dict(
+            max_topk=topk,
+            max_q_len=1,
+            q_dtype=torch.float8_e4m3fn,
+            qk_rope_head_dim=self.qk_rope_head_dim,
+            kv_cache_format="nvfp4.fp8rope",
+            return_lse=False,
+            assume_valid_prefix=False,
+        )
+        need = int(mla_decode._resolve_sparse_mla_plan(device, rows, heads, **kw)[4])
+        # Plans keep their own buffer reference, so growing never moves a planned one.
+        if (
+            self._d576_primts_workspace is None
+            or self._d576_primts_workspace.numel() < need
+        ):
+            self._d576_primts_workspace = torch.empty(
+                need, dtype=torch.uint8, device=device
+            )
+        wrapper = mla_decode.BatchSparseMLADecodePagedTSWrapper(
+            workspace_buffer=self._d576_primts_workspace
+        )
+        wrapper.plan(device, rows, heads, **kw)
+        # Every row reads all topk entries; -1 holes are masked by the kernel.
+        lengths = torch.full((rows,), topk, dtype=torch.int32, device=device)
+        if not self._d576_primts_plans:
+            import flashinfer
+
+            logger.info(
+                f"DSA_D576_INPLACE primts plan rows={rows} heads={heads} topk={topk} "
+                f"flashinfer={flashinfer.__version__} primts={mla_decode.__file__}"
+            )
+        plan = self._d576_primts_plans[key] = (wrapper, lengths)
+        return plan
 
     def _build_paged_mqa_schedule_2d_ctx_lens(
         self,
@@ -2641,6 +2710,11 @@ class DeepseekSparseAttnBackend(
             )
             else "prefill"
         )
+        if self.d576_inplace and phase == "prefill":
+            raise NotImplementedError(
+                "SGLANG_DSA_D576_INPLACE supports only decode, target verify and "
+                f"draft extend v2, got {forward_batch.forward_mode}"
+            )
         dsa_impl = self._resolve_kpool_tail_backend(topk_indices, dsa_impl)
         self._check_kpool_tail_backend(topk_indices, dsa_impl, phase)
 
@@ -4582,6 +4656,28 @@ class DeepseekSparseAttnBackend(
             else 1.0
         )
         bmm1_scale = q_scale * k_scale * layer.scaling
+
+        if self.d576_inplace:
+            rows, heads, head_dim = q_all.shape
+            wrapper, lengths = self._d576_primts_plan(
+                q_all.device, rows, heads, page_table_1.shape[1]
+            )
+            out = q_all.new_empty(
+                (rows, 1, heads, self.kv_lora_rank), dtype=torch.bfloat16
+            )
+            wrapper.run(
+                q_all.view(rows, 1, heads, head_dim),
+                k_cache.view(torch.uint8).view(-1, 1, self.kv_cache_dim),
+                page_table_1,
+                lengths,
+                softmax_scale=bmm1_scale,
+                output_scale=1.0,
+                out=out,
+                validate=False,
+            )
+            if heads != layer.tp_q_head_num:
+                out = out[..., : layer.tp_q_head_num, :].contiguous()
+            return _restore_live_rows(out, row_plan)
 
         batch_size, num_heads, head_dim = q_all.shape
 

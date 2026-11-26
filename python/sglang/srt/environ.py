@@ -2403,6 +2403,11 @@ class Envs:
     SGLANG_DSA_DECODE_GVR_TOPK = EnvBool(False)
     # Experimental fixed-eight FP8 indexer score; other routes retain DeepGEMM.
     SGLANG_DSA_DECODE_CAP8_LOGITS = EnvBool(False)
+    # PD decode only: store 352-byte nvfp4.fp8rope MLA records and run sparse decode
+    # attention with FlashInfer PrimTS on them instead of trtllm-gen FP8.
+    SGLANG_DSA_D576_INPLACE = EnvBool(False)
+    # Module providing PrimTS mla_decode for SGLANG_DSA_D576_INPLACE.
+    SGLANG_DSA_D576_PRIMTS_MODULE = EnvStr("flashinfer.attention.prims_ts.mla_decode")
     # Warm the out-of-graph replay prep of every captured graph shape at capture time: after
     # each decode / target-verify / draft-decode / draft-extend graph is captured, run that
     # shape's replay metadata prep once on the capture batch, with the device idle, so every
