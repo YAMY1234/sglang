@@ -158,6 +158,22 @@ class Memory(msgspec.Struct):
             ],
         ),
     ] = "page_first"
+    hicache_host_kv_dtype: A[
+        str,
+        Arg(
+            help=(
+                "Data type of the KV the HiCache host pool (and so L3 storage) "
+                "keeps. 'auto' keeps the device KV bytes. 'nvfp4' stores FP8 MLA "
+                "KV rows as NVFP4 (E2M1 values with an E4M3 scale per 16 values, "
+                "1.78x fewer bytes) and decodes them back to FP8 on load; the "
+                "device pool, attention and PD transfer stay FP8. DSA index keys "
+                "stay FP8 unless SGLANG_ENABLE_HICACHE_NVFP4_HOST_INDEXER is set. "
+                "Requires --hicache-io-backend direct and --hicache-mem-layout "
+                "page_first_direct."
+            ),
+            choices=["auto", "nvfp4"],
+        ),
+    ] = "auto"
     hicache_storage_backend: A[
         Optional[str],
         Arg(

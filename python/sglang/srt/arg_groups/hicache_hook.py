@@ -82,6 +82,7 @@ def handle_hicache(server_args: Any):
             and cfg.disaggregation_decode_retraction_backup in (None, "host_pool")
         )
     ):
+        validate_hicache_host_kv_dtype(server_args)
         return
 
     validate_hicache_host_memory_mode(server_args)
@@ -112,6 +113,28 @@ def handle_hicache(server_args: Any):
 
     # Step 3: DCP compatibility for the L2 (device<->host) path.
     resolve_hicache_dcp_compatibility(server_args)
+    validate_hicache_host_kv_dtype(server_args)
+
+
+def validate_hicache_host_kv_dtype(server_args: Any):
+    """Checks the resolved layout and I/O backend, so it runs after their resolution."""
+    cfg = resolving_view(server_args)
+    if cfg.hicache_host_kv_dtype == "auto":
+        return
+    if not cfg.enable_hierarchical_cache or (
+        cfg.hicache_io_backend,
+        cfg.hicache_mem_layout,
+    ) != ("direct", "page_first_direct"):
+        raise ValueError(
+            f"--hicache-host-kv-dtype {cfg.hicache_host_kv_dtype} requires "
+            "--enable-hierarchical-cache with --hicache-io-backend direct and "
+            "--hicache-mem-layout page_first_direct."
+        )
+    if not use_mla_backend(server_args):
+        raise NotImplementedError(
+            f"--hicache-host-kv-dtype {cfg.hicache_host_kv_dtype} supports the FP8 "
+            "KV of MLA models only."
+        )
 
 
 def handle_hicache_ratio_default(server_args: Any):

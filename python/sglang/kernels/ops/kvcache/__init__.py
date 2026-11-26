@@ -65,6 +65,8 @@ _TRITON_KERNELS = [
     ("mla_buffer", "set_mla_kv_buffer_triton"),
     ("mla_buffer", "get_mla_kv_buffer_triton"),
     ("mxfp8_dequant_paged", "mxfp8_dequant_paged"),
+    ("nvfp4_host_kv", "encode_fp8_rows_to_nvfp4"),
+    ("nvfp4_host_kv", "decode_nvfp4_rows_to_fp8"),
 ]
 for _mod, _fn in _TRITON_KERNELS:
     register_kernel(

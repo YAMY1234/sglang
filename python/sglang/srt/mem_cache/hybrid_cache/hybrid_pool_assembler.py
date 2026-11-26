@@ -143,6 +143,21 @@ def _mha_host_inputs(pool, info, drafts=()):
     )
 
 
+def _mla_host_pool_cls(kv_pool: Any, mtp_draft_device_pools: tuple[Any, ...]):
+    if get_memory().hicache_host_kv_dtype != "nvfp4":
+        return MLATokenToKVPoolHost
+    import torch
+
+    from sglang.srt.mem_cache.pool_host.nvfp4_host import MLATokenToKVPoolNVFP4Host
+
+    dtypes = {pool.dtype for pool in (kv_pool, *mtp_draft_device_pools)}
+    if dtypes != {torch.float8_e4m3fn}:
+        raise NotImplementedError(
+            f"--hicache-host-kv-dtype nvfp4 encodes FP8 e4m3 KV, got {dtypes}"
+        )
+    return MLATokenToKVPoolNVFP4Host
+
+
 def build_kv_host_pool(
     *,
     kv_pool: Any,
@@ -154,7 +169,8 @@ def build_kv_host_pool(
     host_input = kv_pool.get_device_pool_infos()[0].buffer_info
     use_mla = isinstance(host_input, MLABufferInfo)
     if use_mla:
-        kv_host_pool_cls, mha_kwargs = MLATokenToKVPoolHost, {}
+        kv_host_pool_cls = _mla_host_pool_cls(kv_pool, mtp_draft_device_pools)
+        mha_kwargs = {}
         # An fp8 DSA store is wider than kv_lora_rank + qk_rope_head_dim. NPU bf16
         # pools report kv_lora_rank here and keep rope rows in a separate buffer.
         override_kv_cache_dim = kv_pool.kv_cache_dim
@@ -1591,6 +1607,22 @@ def build_host_pool_group(*, config: HostPoolGroupConfig) -> HostPoolGroup:
     )
 
 
+def _dsa_indexer_host_pool_cls(root_host_pool: Any) -> type[DSAIndexerPoolHost]:
+    if get_memory().hicache_host_kv_dtype != "nvfp4":
+        return DSAIndexerPoolHost
+    from sglang.srt.mem_cache.pool_host.nvfp4_host import (
+        DSAIndexerPoolNVFP4Host,
+        MLATokenToKVPoolNVFP4Host,
+    )
+
+    if (
+        isinstance(root_host_pool, MLATokenToKVPoolNVFP4Host)
+        and root_host_pool.encode_index_keys
+    ):
+        return DSAIndexerPoolNVFP4Host
+    return DSAIndexerPoolHost
+
+
 def _build_sidecar_host_pool(
     *, config: HostPoolConfig, root: Any, root_host_pool: Any
 ) -> DSAIndexerPoolHost | QSAIndexerPoolHost:
@@ -1598,7 +1630,7 @@ def _build_sidecar_host_pool(
         return _build_qsa_indexer_host_pool(
             config=config, root_host_pool=root_host_pool
         )
-    host = DSAIndexerPoolHost(
+    host = _dsa_indexer_host_pool_cls(root_host_pool)(
         config.buffer_info,
         layer_mapping=config.device_to_host_layer,
         target_device_layer_num=root.layer_num,

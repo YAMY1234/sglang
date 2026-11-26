@@ -2288,6 +2288,12 @@ Combining `--enable-response-store` with `--disaggregation-mode=prefill` or `dec
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>layer_first</code>, <code>page_first</code>, <code>page_first_direct</code>, <code>page_first_kv_split</code>, <code>page_head</code>, <code>page_unified</code></td>
     </tr>
         <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--hicache-host-kv-dtype`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Data type of the KV the HiCache host pool (and so L3 storage) keeps. 'auto' keeps the device KV bytes. 'nvfp4' stores FP8 MLA KV rows as NVFP4 (E2M1 values with an E4M3 scale per 16 values, 1.78x fewer bytes) and decodes them back to FP8 on load; the device pool, attention and PD transfer stay FP8. DSA index keys stay FP8 unless <code>SGLANG_ENABLE_HICACHE_NVFP4_HOST_INDEXER</code> is set. Requires <code>--hicache-io-backend direct</code> and <code>--hicache-mem-layout page_first_direct</code>.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`auto`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>auto</code>, <code>nvfp4</code></td>
+    </tr>
+        <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--hicache-storage-backend`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>The storage backend for hierarchical KV cache. Built-in backends: file, fast_file, mooncake, npu_memcache, hf3fs, nixl, aibrix, tensorcast, seaweedfs. For dynamic backend, use --hicache-storage-backend-extra-config to specify: backend_name (custom name), module_path (Python module path), class_name (backend class name).</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`None`</td>

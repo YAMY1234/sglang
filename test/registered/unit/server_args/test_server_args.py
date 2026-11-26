@@ -3240,6 +3240,51 @@ class TestHiCacheArgs(CustomTestCase):
         self.assertEqual(resolution_result(args, "hicache_mem_layout"), "page_first")
         self.assertIsNone(resolution_result(args, "decode_attention_backend"))
 
+    def test_hicache_host_kv_dtype_nvfp4_needs_direct_page_first_direct(self):
+        nvfp4 = {"enable_hierarchical_cache": True, "hicache_host_kv_dtype": "nvfp4"}
+        accepted = (
+            {"hicache_io_backend": "direct", "hicache_mem_layout": "page_first_direct"},
+            # These two resolve to the direct backend with page_first_direct.
+            {"hicache_io_backend": "direct", "hicache_mem_layout": "page_first"},
+            {"hicache_io_backend": "kernel", "hicache_mem_layout": "page_first_direct"},
+        )
+        for overrides in accepted:
+            with self.subTest(overrides=overrides):
+                args = self._make_args(**nvfp4, **overrides)
+                with patch(
+                    "sglang.srt.arg_groups.hicache_hook.use_mla_backend",
+                    return_value=True,
+                ):
+                    handle_hicache(args)
+                self._assert_hicache_fields(
+                    args,
+                    expected_io_backend="direct",
+                    expected_mem_layout="page_first_direct",
+                )
+
+        rejected = (
+            {"enable_hierarchical_cache": False},
+            {"hicache_io_backend": "kernel", "hicache_mem_layout": "page_first"},
+            {"hicache_io_backend": "direct", "hicache_mem_layout": "layer_first"},
+        )
+        for overrides in rejected:
+            with self.subTest(overrides=overrides):
+                args = self._make_args(**(nvfp4 | overrides))
+                with self.assertRaisesRegex(ValueError, "page_first_direct"):
+                    handle_hicache(args)
+
+        args = self._make_args(
+            **nvfp4, hicache_io_backend="direct", hicache_mem_layout="page_first_direct"
+        )
+        with (
+            patch(
+                "sglang.srt.arg_groups.hicache_hook.use_mla_backend",
+                return_value=False,
+            ),
+            self.assertRaisesRegex(NotImplementedError, "MLA models only"),
+        ):
+            handle_hicache(args)
+
     def test_decode_offload_rejects_host_pool_retraction(self):
         args = self._make_args(
             disaggregation_mode="decode",
