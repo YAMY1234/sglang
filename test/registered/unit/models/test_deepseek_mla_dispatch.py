@@ -19,6 +19,7 @@ from sglang.srt.layers.cp import base as cp_base
 from sglang.srt.layers.cp.zigzag import ZigzagCPStrategy
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.models.deepseek_common import attention_backend_handler as abh
+from sglang.srt.models.deepseek_common.attention_forward_methods import forward_mla
 from sglang.srt.models.deepseek_common.attention_forward_methods.forward_methods import (
     AttnForwardMethod,
 )
@@ -251,6 +252,104 @@ class TestKVShardedMLADispatch(CustomTestCase):
                     ),
                     AttnForwardMethod.MHA_CHUNKED_KV,
                 )
+
+
+class TestDSAVerifyQprepGate(CustomTestCase):
+    """SGLANG_DSA_VERIFY_QPREP_SIDE_STREAM moves the target-verify q-prep, fused
+    RoPE/FP8 quantize and KV store onto alt_stream. The backend then skips its own
+    RoPE and KV write, so the gate must hold only where the backend would have
+    done exactly that work: captured target verify on the raw-FP8 DSA layout."""
+
+    def setUp(self):
+        super().setUp()
+        self.exec_config = SimpleNamespace(
+            kernel=SimpleNamespace(dsa_decode_backend="trtllm")
+        )
+        for patcher in (
+            mock.patch.object(
+                forward_mla, "_ENABLE_DSA_VERIFY_QPREP_SIDE_STREAM", True
+            ),
+            mock.patch.object(forward_mla, "get_exec", return_value=self.exec_config),
+            mock.patch(
+                "sglang.srt.model_executor.runner.get_is_capture_mode",
+                return_value=True,
+            ),
+        ):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    @staticmethod
+    def _attn(**overrides):
+        """An attention module every term accepts, before the caller breaks one."""
+        attn = SimpleNamespace(
+            current_attention_backend="dsa",
+            dcp_size=1,
+            _fuse_rope_for_trtllm_mla=lambda forward_batch: True,
+            _decode_absorb_on_alt_stream=lambda: True,
+        )
+        for k, v in overrides.items():
+            setattr(attn, k, v)
+        return attn
+
+    @staticmethod
+    def _gate(attn, mode=ForwardMode.TARGET_VERIFY, llama_4_scaling=None):
+        return forward_mla.DeepseekMLAForwardMixin._verify_qprep_on_alt_stream(
+            attn, SimpleNamespace(forward_mode=mode), llama_4_scaling
+        )
+
+    def test_captured_target_verify_takes_alt_stream(self):
+        self.assertTrue(self._gate(self._attn()))
+
+    def test_switch_off_keeps_main_path(self):
+        with mock.patch.object(
+            forward_mla, "_ENABLE_DSA_VERIFY_QPREP_SIDE_STREAM", False
+        ):
+            self.assertFalse(self._gate(self._attn()))
+
+    def test_eager_target_verify_keeps_main_path(self):
+        with mock.patch(
+            "sglang.srt.model_executor.runner.get_is_capture_mode",
+            return_value=False,
+        ):
+            self.assertFalse(self._gate(self._attn()))
+
+    def test_only_target_verify_takes_alt_stream(self):
+        # Decode keeps main's own q_b_proj overlap; prefill and draft extend
+        # never reach this path.
+        for mode in (
+            ForwardMode.DECODE,
+            ForwardMode.IDLE,
+            ForwardMode.EXTEND,
+            ForwardMode.MIXED,
+            ForwardMode.DRAFT_EXTEND_V2,
+        ):
+            with self.subTest(mode=mode.name):
+                self.assertFalse(self._gate(self._attn(), mode=mode))
+
+    def test_each_term_alone_turns_it_off(self):
+        for name, broken in (
+            ("current_attention_backend", "trtllm_mla"),
+            ("_fuse_rope_for_trtllm_mla", lambda forward_batch: False),
+            ("_decode_absorb_on_alt_stream", lambda: False),
+            ("dcp_size", 2),
+        ):
+            with self.subTest(term=name):
+                self.assertFalse(self._gate(self._attn(**{name: broken})))
+        with self.subTest(term="llama_4_scaling"):
+            self.assertFalse(self._gate(self._attn(), llama_4_scaling=object()))
+
+    def test_only_raw_fp8_decode_layouts_take_alt_stream(self):
+        # The q_rope=None hand-off exists only in the raw-FP8 backend path.
+        for backend, expected in (
+            ("trtllm", True),
+            ("prims_ts", True),
+            ("flashmla_kv", False),
+            ("flashmla_sparse", False),
+            ("fa3", False),
+        ):
+            with self.subTest(backend=backend):
+                self.exec_config.kernel.dsa_decode_backend = backend
+                self.assertEqual(self._gate(self._attn()), expected)
 
 
 class TestMLUAttentionRouting(CustomTestCase):

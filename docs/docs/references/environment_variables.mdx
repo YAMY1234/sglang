@@ -648,6 +648,11 @@ SGLang supports various environment variables that can be used to configure its 
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Fraction of free memory the MQA-logits step may use on the DSA path.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>0.2</code></td>
     </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_DSA_VERIFY_QPREP_SIDE_STREAM</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>In the speculative target-verify CUDA graph, run the query preparation (<code>q_b_proj</code>, absorbed BMM, fused RoPE/FP8 quantize and KV-cache write) on the side stream, overlapped with the DSA indexer. Applies when the DSA decode backend uses the raw FP8 KV layout (<code>trtllm</code> or <code>prims_ts</code>) with an FP8 KV cache.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
+    </tr>
   </tbody>
 </table>
 

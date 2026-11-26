@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Optional
 import torch
 
 from sglang.kernels.ops.attention.mla_qk_prep import absorbed_bmm_concat_cast_q_fp8
+from sglang.kernels.ops.attention.utils import mla_quantize_and_rope_for_fp8
 from sglang.kernels.ops.quantization.fp8_kernel import (
     per_tensor_quant_mla_fp8,
     per_token_group_quant_mla_deep_gemm_masked_fp8,
@@ -42,6 +43,7 @@ from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import (
     get_attn_backend,
+    get_kv_layers,
     get_token_to_kv_pool,
 )
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
@@ -70,6 +72,7 @@ logger = logging.getLogger(__name__)
 _SGLANG_EXPERIMENTAL_LORA_OPTI = envs.SGLANG_EXPERIMENTAL_LORA_OPTI.get()
 _ENABLE_DSA_Q8KV8_BORN_FP8_Q = envs.SGLANG_ENABLE_DSA_Q8KV8_BORN_FP8_Q.get()
 _ENABLE_DSA_Q8KV8_QPREP_OVERLAP = envs.SGLANG_ENABLE_DSA_Q8KV8_QPREP_OVERLAP.get()
+_ENABLE_DSA_VERIFY_QPREP_SIDE_STREAM = envs.SGLANG_DSA_VERIFY_QPREP_SIDE_STREAM.get()
 
 from sglang.srt.model_executor.runner_utils.forward_batch import get_forward_batch
 from sglang.srt.model_executor.runner_utils.prefill_graph import (
@@ -291,6 +294,59 @@ class DeepseekMLAForwardMixin:
             return False
         return True
 
+    def _verify_qprep_on_alt_stream(
+        self: DeepseekV2AttentionMLA,
+        forward_batch: ForwardBatch,
+        llama_4_scaling: Optional[torch.Tensor],
+    ) -> bool:
+        """SGLANG_DSA_VERIFY_QPREP_SIDE_STREAM: target-verify capture takes the
+        absorb-under-indexer path, and also moves the raw-FP8 backend's fused
+        RoPE/FP8 quantize and KV store there (see _rope_quantize_and_store_fp8)."""
+        from sglang.srt.model_executor.runner import get_is_capture_mode
+
+        return (
+            _ENABLE_DSA_VERIFY_QPREP_SIDE_STREAM
+            and get_is_capture_mode()
+            and forward_batch.forward_mode.is_target_verify()
+            and self.current_attention_backend == "dsa"
+            and uses_raw_fp8_dsa_kv_layout(get_exec().kernel.dsa_decode_backend)
+            and self._fuse_rope_for_trtllm_mla(forward_batch)
+            and self._decode_absorb_on_alt_stream()
+            # The backend scales the fused q by llama_4_scaling; DCP gathers q later.
+            and llama_4_scaling is None
+            and self.dcp_size == 1
+        )
+
+    def _rope_quantize_and_store_fp8(
+        self: DeepseekV2AttentionMLA,
+        q_nope_out: torch.Tensor,
+        q_pe: torch.Tensor,
+        k_nope: torch.Tensor,
+        k_pe: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """The raw-FP8 DSA backend's fused RoPE/FP8 quantize and KV store, with the
+        same calls and arguments; the backend then takes the FP8 q/k (q_rope=None)."""
+        q_fp8, k_fp8, k_rope_fp8 = mla_quantize_and_rope_for_fp8(
+            q_nope_out,
+            q_pe,
+            k_nope.squeeze(1),
+            k_pe.squeeze(1),
+            forward_batch.positions,
+            self.rotary_emb.cos_sin_cache,
+            self.rotary_emb.is_neox_style,
+            self.kv_lora_rank,
+            self.qk_rope_head_dim,
+        )
+        get_kv_layers().layer(self.attn_mqa.layer_id).store_mla(
+            self.attn_mqa,
+            KVWriteLoc.for_layer(forward_batch, self.attn_mqa),
+            k_fp8,
+            k_rope_fp8,
+        )
+        self._kv_cache_saved_early = True
+        return q_fp8, k_fp8, k_rope_fp8
+
     def _split_q_nope_pe(
         self: DeepseekV2AttentionMLA,
         q: torch.Tensor,
@@ -509,6 +565,12 @@ class DeepseekMLAForwardMixin:
                 if q_lora is None:
                     q_lora = q
 
+            # Opt-in: captured target verify also takes the absorb-under-indexer path.
+            verify_qprep = self._verify_qprep_on_alt_stream(
+                forward_batch, llama_4_scaling
+            )
+            absorb_under_indexer = self.dsa_decode_absorb_under_indexer or verify_qprep
+
             # Q projection/absorb is independent of the indexer in decode and verify.
             if (
                 self.alt_stream is not None
@@ -516,16 +578,16 @@ class DeepseekMLAForwardMixin:
                 and (
                     forward_batch.forward_mode.is_decode_or_idle()
                     or (
-                        self.dsa_decode_absorb_under_indexer
+                        absorb_under_indexer
                         and forward_batch.forward_mode.is_target_verify()
                     )
                 )
                 and q_lora is not None
-                and (not q_replicate_active or self.dsa_decode_absorb_under_indexer)
+                and (not q_replicate_active or absorb_under_indexer)
             ):
                 current_stream = torch.cuda.current_stream()
                 self.alt_stream.wait_stream(current_stream)
-                if not self.dsa_decode_absorb_under_indexer:
+                if not absorb_under_indexer:
                     k_nope = k_nope.unsqueeze(1)
                 if self.should_run_indexer(prev_topk_indices):
                     topk_indices = self.run_mla_indexer(
@@ -537,7 +599,7 @@ class DeepseekMLAForwardMixin:
                     topk_indices = maybe_capture_indexer_topk(
                         self.layer_id, prev_topk_indices
                     )
-                if self.dsa_decode_absorb_under_indexer:
+                if absorb_under_indexer:
                     # Captured after the indexer: replay follows the first-captured
                     # parent's stream; alt first would run the layer's rest on a new one.
                     with torch.cuda.stream(self.alt_stream):
@@ -558,6 +620,18 @@ class DeepseekMLAForwardMixin:
                                 q_nope_out_alt = torch.bmm(
                                     q_nope.transpose(0, 1), w_kc
                                 ).transpose(0, 1)
+                                if verify_qprep:
+                                    q_nope_out_alt, k_nope, k_pe = (
+                                        self._rope_quantize_and_store_fp8(
+                                            q_nope_out_alt,
+                                            q_pe,
+                                            k_nope,
+                                            k_pe,
+                                            forward_batch,
+                                        )
+                                    )
+                                    # Attention takes the merged FP8 q as is.
+                                    q_pe = None
                             else:
                                 q_all = q_nope.new_empty(
                                     q_nope.shape[:2]
