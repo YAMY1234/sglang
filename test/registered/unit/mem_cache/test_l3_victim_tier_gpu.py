@@ -8,6 +8,8 @@ FULL + MAMBA fixture.
   producer wrote; the producer itself restores it and records the promoted copy;
 * FULL + MAMBA: the victim put carries the node's state slot, and a restore
   brings back its KV and its state;
+* dedup: a page fetched from storage is believed stored and leaves host
+  without a put;
 * switch unset: the landing is put (inclusive), unchanged, and a storage attach
   reads nothing of the cache's layout;
 * the ranks that move in lockstep agree on the tier's parts at attach;
@@ -161,6 +163,37 @@ class TestL3VictimTierReal(UnifiedRadixCacheStorageFixtures, CustomTestCase):
         )
         self.assertTrue(torch.equal(got[0], expected[0]))
         self.assertTrue(torch.equal(got[1], expected[1]))
+        prod.sanity_check()
+
+    def test_dedup_a_fetched_page_leaves_host_without_a_put(self):
+        d = self._make_storage_dir()
+        prod, palloc, prtp = self._cache(
+            d,
+            SGLANG_OPT_HICACHE_L3_VICTIM_TIER=True,
+            SGLANG_OPT_HICACHE_L3_VICTIM_TIER_DEDUP=True,
+        )
+        vt = prod._l3vt
+        self.assertTrue(prod._l3vt_cfg.dedup)
+        seq = self._make_seq(1, 4)
+        self._insert(prod, palloc, prtp, seq)
+        prod.evict(EvictParams(num_tokens=len(seq)))
+        prod.check_hicache_events()
+        self._victim_pass_all(prod)
+        self.assertEqual(vt.stats["put_kv_pages"], 4)
+
+        # Only the fetch teaches the beliefs: drop the put's, and skip the hit
+        # query's healing.
+        prod.storage_existence_cache.clear()
+        rid = CacheRequestHandle("l3vt-dedup", 0)
+        with mock.patch.object(prod, "_invalidate_absent_from_hit_query"):
+            self._prefetch(prod, rid, prod.root_node_handle(), seq)
+        self.assertEqual(match_prefix(prod, seq).host_hit_length, len(seq))
+        prod.release_l3_pins([type("R", (), {"cache_request_handle": rid})()])
+
+        self._victim_pass_all(prod)
+        self.assertEqual(vt.stats["put_kv_pages"], 4)
+        self.assertEqual(vt.stats["stored_kv_pages"], 4)
+        self.assertEqual(match_prefix(prod, seq).host_hit_length, 0)
         prod.sanity_check()
 
     def test_stock_path_unchanged_when_off(self):

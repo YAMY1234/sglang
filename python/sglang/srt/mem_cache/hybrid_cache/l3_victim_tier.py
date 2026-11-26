@@ -11,7 +11,7 @@ the engaged line with its reason. The tier runs on a PD prefill or an
 aggregated server (``victim_tier_decline``), and every rank of the attention
 TP / CP and PP groups takes the same parts (``L3VictimTierConfig.agreed``).
 
-* Victim tier. Under write_back the host tier is backed up to storage when data
+* Victim tier. The host tier is backed up to storage when data
   *leaves* it, not when it lands. The stock path backs up every host landing,
   so storage holds the newest part of the host tier and, when it is no larger
   than the host tier, serves nothing the host tier does not already hold. Here
@@ -22,6 +22,8 @@ TP / CP and PP groups takes the same parts (``L3VictimTierConfig.agreed``).
   is acked. Keys and bytes are exactly the ones the stock backup writes for that
   node (the record is taken from the node's storage backup spec), so this
   changes only *when* a put happens.
+* Dedup (opt-in): a victim KV page the storage existence beliefs hold is freed
+  without a put.
 * Lease touch (backends with ``l3vt_touch``): once a victim put is written, its
   objects get one batch existence check.
 * Chain close: the stock read path looks a request up from its deepest host /
@@ -66,7 +68,15 @@ logger = logging.getLogger(__name__)
 SWITCH = "SGLANG_OPT_HICACHE_L3_VICTIM_TIER"
 # The parts of L3VictimTierConfig, the tier first; every rank of the lockstep
 # groups must take the same ones (L3VictimTierConfig.agreed).
-_PARTS = ("victim", "lease_touch", "chain_close", "pin", "budget", "wait_bound")
+_PARTS = (
+    "victim",
+    "lease_touch",
+    "chain_close",
+    "pin",
+    "budget",
+    "wait_bound",
+    "dedup",
+)
 
 
 # ---------------------------------------------------------------------------
@@ -81,7 +91,6 @@ def victim_tier_decline(
     pd_role_switch: bool,
     host_memory_mode: str,
     has_linker: bool,
-    is_write_back: bool,
     tree_core_backend: str,
     unsupported: Optional[str],
     has_storage_v2: bool,
@@ -106,8 +115,6 @@ def victim_tier_decline(
         return f"host memory mode {host_memory_mode}"
     if has_linker:
         return "external cache linker"
-    if not is_write_back:
-        return "write policy is not write_back"
     if tree_core_backend != "python":
         return f"the {tree_core_backend} TreeCore"
     if unsupported:
@@ -133,6 +140,7 @@ class L3VictimTierConfig(msgspec.Struct, kw_only=True):
     pin: bool = False
     budget: bool = False
     wait_bound: bool = False
+    dedup: bool = False
     victim_margin: float = 0.05
     state_margin: float = 0.05
     chain_close_cap: float = 0.0
@@ -184,7 +192,6 @@ class L3VictimTierConfig(msgspec.Struct, kw_only=True):
         pd_role_switch: bool,
         host_memory_mode: str,
         has_linker: bool,
-        is_write_back: bool,
         tree_core_backend: str,
         victim_unsupported: Optional[str],
         prefetch_stop_policy: str,
@@ -218,7 +225,6 @@ class L3VictimTierConfig(msgspec.Struct, kw_only=True):
             pd_role_switch=pd_role_switch,
             host_memory_mode=host_memory_mode,
             has_linker=has_linker,
-            is_write_back=is_write_back,
             tree_core_backend=tree_core_backend,
             unsupported=victim_unsupported,
             has_storage_v2=has_storage_v2,
@@ -253,6 +259,7 @@ class L3VictimTierConfig(msgspec.Struct, kw_only=True):
             cfg.ignored["wait_bound"] = f"slack {cfg.wait_slack} < 1"
         else:
             cfg.wait_bound = True
+        cfg.dedup = bool(envs.SGLANG_OPT_HICACHE_L3_VICTIM_TIER_DEDUP.get())
         return cfg
 
 
@@ -437,6 +444,8 @@ class VictimTier:
             "put_states": 0,
             "unkeyed_kv_pages": 0,
             "unkeyed_states": 0,
+            # Dedup: keyed pages freed without a put, believed stored.
+            "stored_kv_pages": 0,
             "acked_ops": 0,
             "acked_kv_pages_ok": 0,
             "acked_states_ok": 0,

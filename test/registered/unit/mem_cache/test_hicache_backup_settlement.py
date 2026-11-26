@@ -1,5 +1,7 @@
 """Storage backup acks settle at the rank-agreed written prefix: beliefs cover
 only what was written, the tail is left for a later write-through to cover.
+The L3 victim tier puts a page when it leaves the host tier; with its dedup, a
+page written in full is believed stored and not put again.
 CPU only: the tree, the controller, its backup thread and the file backend are
 real; the D2H transfer engine is faked (no device streams)."""
 
@@ -19,7 +21,11 @@ import torch
 import sglang.test.kits.unified_radix_cache.fixtures as _fixtures
 from sglang.kernels.ops.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
 from sglang.srt.environ import envs
-from sglang.srt.mem_cache.base_prefix_cache import InsertParams, MatchPrefixParams
+from sglang.srt.mem_cache.base_prefix_cache import (
+    EvictParams,
+    InsertParams,
+    MatchPrefixParams,
+)
 from sglang.srt.mem_cache.hicache_storage import (
     STORAGE_BATCH_SIZE,
     HiCacheStorageConfig,
@@ -109,6 +115,7 @@ def _build_cache(
     host_memory_mode: str,
     storage_dir=None,
     cfg: CacheConfig = _CFG,
+    tree_core_backend=None,
 ):
     """A real UnifiedRadixCache + HybridCacheController on CPU, with the file
     L3 backend when ``storage_dir`` is given and a faked D2H engine. The
@@ -120,7 +127,9 @@ def _build_cache(
     # runner raises unless the CPU engine is selected; these tests only need
     # CPU tensors, so pin the device without touching the engine selection.
     with mock.patch.object(_fixtures, "get_device", return_value="cpu"):
-        cache, allocator, req_to_token_pool = build_fixture(cfg)
+        cache, allocator, req_to_token_pool = build_fixture(
+            cfg, tree_core_backend=tree_core_backend
+        )
     # Host pools pin through CUDA; the CPU fixture keeps them pageable.
     pinned_cls = assembler.get_mha_host_pool_cls
 
@@ -405,6 +414,147 @@ class TestCacheModeShortSettlement(unittest.TestCase):
         # host eviction) sends the span again.
         self.assertTrue(self.cache.tree_core.is_backuped(self.leaf))
         self.cache.sanity_check()
+
+
+# One write batch: a victim put of this span is one storage write.
+_SPAN = 64
+
+
+class _VictimTierCase(unittest.TestCase):
+    """SGLANG_OPT_HICACHE_L3_VICTIM_TIER on the Python tree core, in cache
+    mode under the fixture's write_through policy; storage writes spied."""
+
+    dedup = True
+
+    def setUp(self):
+        self._cleanup = contextlib.ExitStack()
+        self.addCleanup(self._cleanup.close)
+        storage_dir = tempfile.mkdtemp(prefix="hicache-backup-settle-")
+        self.addCleanup(shutil.rmtree, storage_dir, ignore_errors=True)
+        self._cleanup.enter_context(
+            envs.SGLANG_OPT_HICACHE_L3_VICTIM_TIER.override(True)
+        )
+        self._cleanup.enter_context(
+            envs.SGLANG_OPT_HICACHE_L3_VICTIM_TIER_DEDUP.override(self.dedup)
+        )
+        self.cache, self.allocator, _ = _build_cache(
+            self._cleanup,
+            host_memory_mode="cache",
+            storage_dir=storage_dir,
+            tree_core_backend="python",
+        )
+        self.cc = self.cache.cache_controller
+        self.assertEqual(self.cc.write_policy, "write_through")
+        self.vt = self.cache._l3vt
+        self.assertIsNotNone(self.vt, self.cache._l3vt_cfg.decline)
+        self.host = self.cc.mem_pool_host
+        self.host_free = self.host.available_size()
+        self.beliefs = self.cache.storage_existence_cache.pool(PoolName.KV)
+        self.writes = _spy_storage_writes(self.cc)
+
+    def _host_hit(self, num_tokens):
+        tokens = array("q", range(1, 1 + num_tokens))
+        return self.cache.match_prefix(
+            MatchPrefixParams(key=RadixKey(tokens))
+        ).host_hit_length
+
+    def _land(self, num_tokens):
+        """Back a span up to host and demote it, so only the host tier holds
+        it; returns its page keys."""
+        leaf = _insert_span(self.cache, self.allocator, num_tokens)
+        chain = self.cache.tree_core.get_hash_values(leaf)
+        _backup_to_host(self.cache, leaf)
+        self.cache.evict(EvictParams(num_tokens=num_tokens))
+        self.assertEqual(self._host_hit(num_tokens), num_tokens)
+        return chain
+
+    def _victim_pass(self):
+        """One victim pass with the margin raised to the whole host pool, so
+        every host page leaves, then the acks of its puts."""
+        saved = self.vt.kv_target
+        self.vt.kv_target = self.host.size
+        try:
+            self.cache.check_hicache_events()
+        finally:
+            self.vt.kv_target = saved
+        _tick_until(self.cache, lambda: not self.vt.held)
+
+    def _put_keys(self):
+        return [c.kwargs["hash_value"] for c in self.writes.call_args_list]
+
+
+class TestCacheModeVictimTier(_VictimTierCase):
+    def test_write_through_engages_and_puts_a_page_when_it_leaves_host(self):
+        chain = self._land(_SPAN)
+        # A host landing records the keys and writes nothing.
+        self.assertEqual(self.writes.call_count, 0)
+        self.assertEqual(self.vt.stats["recorded_pages"], _SPAN)
+
+        self._victim_pass()
+        self.assertEqual(len(self._put_keys()), 1)
+        self.assertCountEqual(self._put_keys()[0], chain)
+        self.assertEqual(self.vt.stats["acked_kv_pages_ok"], _SPAN)
+        self.assertEqual(self._host_hit(_SPAN), 0)
+        self.assertEqual(self.host.available_size(), self.host_free)
+        self.assertEqual(self.cc.storage_backend.batch_exists(chain), _SPAN)
+        # The agreed written count is the whole span: believed stored.
+        self.assertTrue(self.beliefs.contains_all(chain))
+        self.assertEqual(self.cache._l3vt_put_keys, {})
+        self.cache.sanity_check()
+
+    def test_a_page_believed_stored_leaves_host_without_a_put(self):
+        chain = self._land(_SPAN)
+        self._victim_pass()
+        # The same pages land in host again and leave it again.
+        self.assertEqual(self._land(_SPAN), chain)
+        self._victim_pass()
+        self.assertEqual(self.writes.call_count, 1)
+        self.assertEqual(self.vt.stats["stored_kv_pages"], _SPAN)
+        self.assertEqual(self._host_hit(_SPAN), 0)
+        self.assertEqual(self.host.available_size(), self.host_free)
+        self.cache.sanity_check()
+
+    def test_a_short_put_is_not_believed(self):
+        chain = self._land(_PAGES)
+        backend = _FailingBatchBackend(
+            self.cc.storage_backend,
+            chain[STORAGE_BATCH_SIZE : 2 * STORAGE_BATCH_SIZE],
+            budget=1,
+        )
+        self.cc.storage_backend = backend
+        with self.assertLogs(_CACHE_LOGGER, level="WARNING") as logs:
+            self._victim_pass()
+        self.assertEqual(
+            sum("without a storage copy" in line for line in logs.output), 1
+        )
+        self.assertEqual(backend.batch_exists(chain), STORAGE_BATCH_SIZE)
+        self.assertFalse(self.beliefs.contains(chain[0]))
+
+        # Not believed: the pages are put again the next time they leave host.
+        self._land(_PAGES)
+        self._victim_pass()
+        self.assertEqual(self.writes.call_count, 2)
+        self.assertEqual(self.vt.stats["stored_kv_pages"], 0)
+        self.assertEqual(backend.batch_exists(chain), _PAGES)
+        self.assertTrue(self.beliefs.contains_all(chain))
+        self.cache.sanity_check()
+
+
+class TestCacheModeVictimTierWithoutDedup(_VictimTierCase):
+    """The dedup switch unset: a page is put each time it leaves host and no
+    belief is fed."""
+
+    dedup = False
+
+    def test_a_page_is_put_each_time_it_leaves_host(self):
+        self.assertFalse(self.cache._l3vt_cfg.dedup)
+        chain = self._land(_SPAN)
+        self._victim_pass()
+        self._land(_SPAN)
+        self._victim_pass()
+        self.assertEqual(self.writes.call_count, 2)
+        self.assertEqual(self.vt.stats["stored_kv_pages"], 0)
+        self.assertFalse(self.beliefs.contains(chain[0]))
 
 
 def _two_rank_settlement(rank, rendezvous_dir, skip_rank):

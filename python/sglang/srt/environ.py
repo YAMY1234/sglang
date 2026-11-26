@@ -925,7 +925,7 @@ class Envs:
     SGLANG_HICACHE_HF3FS_CONFIG_PATH = EnvStr(None)
     SGLANG_HICACHE_DECODE_OFFLOAD_STRIDE = EnvInt(None)
     SGLANG_HICACHE_SKIP_HOST_DUPLICATE_RECLAIM = EnvBool(False)
-    # Cache-mode HiCache with an L3 backend under write_back, on a PD prefill or an
+    # Cache-mode HiCache with an L3 backend, on a PD prefill or an
     # aggregated server: storage is a victim tier of the host tier (a node's KV pages
     # and Mamba state are put when they leave the host tier, with the root path's
     # host-resident nodes closed into storage), plus pinned restores, a hit-span
@@ -949,6 +949,9 @@ class Envs:
     SGLANG_OPT_HICACHE_L3_VICTIM_TIER_BUDGET_TOKENS = EnvInt(0)
     # Timeout policy: admission wait <= base + SLACK x span / measured read rate.
     SGLANG_OPT_HICACHE_L3_VICTIM_TIER_WAIT_SLACK = EnvFloat(3.0)
+    # Skip the victim put of a KV page the storage existence beliefs hold (learned at
+    # rank-agreed full writes, fetches and hit queries) and free it at once.
+    SGLANG_OPT_HICACHE_L3_VICTIM_TIER_DEDUP = EnvBool(False)
     # gfx950: override --hicache-ratio for Mamba states in ratio mode; a cached KV
     # prefix cannot be reused after its host state is evicted.
     SGLANG_HICACHE_MAMBA_HOST_RATIO = EnvFloat(None)

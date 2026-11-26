@@ -60,6 +60,7 @@ from sglang.srt.mem_cache.buffer_mode.pipeline import (
 )
 from sglang.srt.mem_cache.buffer_mode.storage_existence_cache import (
     PoolBeliefPolicy,
+    PoolExistenceBeliefs,
     StorageExistenceCache,
     default_belief_policy,
 )
@@ -566,6 +567,9 @@ class UnifiedRadixCache(BasePrefixCache):
         # ongoing_backup: the ack drain settles every write at a rank-agreed
         # written prefix of this span (buffer mode reads it from its entry).
         self._backup_requested_tokens: dict[int, int] = {}
+        # L3 victim tier dedup: the KV keys of each storage write, believed stored
+        # at its ack when the rank-agreed written count is the whole span.
+        self._l3vt_put_keys: dict[int, list[str]] = {}
         # The pools are cleared below: held victim pages and pins go with them.
         if self._l3vt is not None:
             self._l3vt.reset()
@@ -2704,6 +2708,8 @@ class UnifiedRadixCache(BasePrefixCache):
         self._backup_requested_tokens[operation_id] = (
             len(spec.hash_value) * self.page_size
         )
+        if self._l3vt_cfg.dedup:
+            self._l3vt_put_keys[operation_id] = list(spec.hash_value)
         return operation_id
 
     # ---- HiCache L3 victim tier (hybrid_cache/l3_victim_tier.py) ----
@@ -2754,7 +2760,7 @@ class UnifiedRadixCache(BasePrefixCache):
             cc.prefetch_capacity_limit = int(cfg.budget_tokens)
         logger.info(
             "%s engaged: storage is a victim tier of the host tier "
-            "(lease_touch=%s chain_close=%s pin=%s budget=%s wait_bound=%s "
+            "(lease_touch=%s chain_close=%s pin=%s budget=%s wait_bound=%s dedup=%s "
             "kv_margin=%s state_margin=%s kv_target=%s state_target=%s pin_cap=%s "
             "prefetch_cap=%s cc_cap_pages=%s cc_refresh_pages=%s cc_max_pending=%s)%s",
             switch.name,
@@ -2763,6 +2769,7 @@ class UnifiedRadixCache(BasePrefixCache):
             cfg.pin,
             cfg.budget,
             cfg.wait_bound,
+            cfg.dedup,
             cfg.victim_margin,
             cfg.state_margin,
             self._l3vt.kv_target,
@@ -2818,7 +2825,6 @@ class UnifiedRadixCache(BasePrefixCache):
             pd_role_switch=disagg is not None and bool(disagg.enable_pd_role_switch),
             host_memory_mode=self.host_memory_mode,
             has_linker=self.linker is not None,
-            is_write_back=bool(self.is_write_back),
             tree_core_backend=self._tree_core_backend,
             # Off, the tier reads nothing of the cache's layout.
             victim_unsupported=self._l3vt_unsupported() if switch_on else None,
@@ -2849,6 +2855,7 @@ class UnifiedRadixCache(BasePrefixCache):
             for op_id in list(self._l3vt.held):
                 held = self._l3vt.release(op_id)
                 self._l3vt_free_held(held)
+            self._l3vt_put_keys.clear()
         if self._l3pin is not None:
             for handle in list(self._l3pin.pins):
                 self._l3pin_release(handle, "abandon")
@@ -3175,6 +3182,11 @@ class UnifiedRadixCache(BasePrefixCache):
                 free_kv.append(kv)
             else:
                 keyed, kv_keys, unkeyed = vt.keymap.split_kv(pages)
+                if self._l3vt_cfg.dedup:
+                    # Believed stored: go back now, as unkeyed pages do.
+                    keyed, kv_keys, stored = self._l3vt_split_stored(keyed, kv_keys)
+                    vt.stats["stored_kv_pages"] += len(stored)
+                    unkeyed = unkeyed + stored
                 cap = room_kv // ps
                 if len(keyed) > cap:
                     vt.stats["dropped_held_cap_kv_pages"] += len(keyed) - cap
@@ -3254,6 +3266,8 @@ class UnifiedRadixCache(BasePrefixCache):
         )
         # The ack drain settles the op at its rank-agreed written prefix.
         self._backup_requested_tokens[op_id] = len(kv_pages_keyed) * ps
+        if self._l3vt_cfg.dedup and kv_keys:
+            self._l3vt_put_keys[op_id] = kv_keys
         vt.hold(
             op_id,
             HeldVictim(
@@ -3270,6 +3284,33 @@ class UnifiedRadixCache(BasePrefixCache):
         vt.stats["put_states"] += len(slots_keyed)
         if self._l3cc is not None:
             self._l3cc_after_victims(kv_pages_keyed, slots_keyed)
+
+    def _l3vt_belief_pools(self) -> list[PoolExistenceBeliefs]:
+        """Dedup: the beliefs of KV and of each sidecar. The tier engages only with
+        sidecars derived from KV, which are stored under the KV page keys."""
+        beliefs = self.storage_existence_cache
+        return [beliefs.pool(PoolName.KV)] + [
+            beliefs.pool(spec.pool_name) for spec in self.sidecar_pool_specs
+        ]
+
+    def _l3vt_split_stored(
+        self, keyed: list[int], keys: list[str]
+    ) -> tuple[list[int], list[str], list[int]]:
+        """Dedup: (positions to put, their keys, positions believed stored)."""
+        pools = self._l3vt_belief_pools()
+        put, put_keys, stored = [], [], []
+        for i, key in zip(keyed, keys):
+            if all(pool.contains(key) for pool in pools):
+                stored.append(i)
+            else:
+                put.append(i)
+                put_keys.append(key)
+        return put, put_keys, stored
+
+    def _l3vt_believe_stored(self, keys: list[str]) -> None:
+        """Dedup: storage holds these KV pages and their sidecars."""
+        for pool in self._l3vt_belief_pools():
+            pool.add(keys)
 
     def _l3vt_release(self, operation, agreed_tokens: int) -> bool:
         """A victim put was acked (landed or not): free its pages / slots. False:
@@ -3955,6 +3996,10 @@ class UnifiedRadixCache(BasePrefixCache):
         # Apply the host-insert walk's actions before the transfer commit.
         self._apply_cache_actions(insert_result.cache_actions)
 
+        if self._l3vt_cfg.dedup:
+            # The rank-agreed fetch proves storage holds these pages.
+            self._l3vt_believe_stored(hash_value[: completed_tokens // self.page_size])
+
         if insert_result.host_insert_dropped:
             self._resolve_storage_prefetch_tokens(
                 request, insert_result.prefix_len, reason="already_cached"
@@ -4345,7 +4390,10 @@ class UnifiedRadixCache(BasePrefixCache):
         """Heal each pool's beliefs beyond its rank-agreed boundary (a
         chain-page pool also learns presence up to it); a pool without a
         verdict heals from the folded cut."""
-        if self.host_memory_mode != "buffer_only" or operation.deadline_expired:
+        # Cache mode reads the beliefs only for the L3 victim tier's dedup.
+        if (
+            self.host_memory_mode != "buffer_only" and not self._l3vt_cfg.dedup
+        ) or operation.deadline_expired:
             # A cut query's agreed hit may be a MIN over skipped lookups, not a verdict.
             return
         chain = operation.all_hash_values
@@ -4898,6 +4946,11 @@ class UnifiedRadixCache(BasePrefixCache):
                     self._l3cc_note_ack(operation, agreed_tokens)
             elif self._l3vt is not None:
                 victim_put = self._l3vt_release(operation, agreed_tokens)
+            if self._l3vt_cfg.dedup:
+                keys = self._l3vt_put_keys.pop(operation.id, None)
+                # Believed only when the agreed written count is the whole span.
+                if keys and agreed_tokens == requested_tokens:
+                    self._l3vt_believe_stored(keys)
         if short and victim_put:
             # Its pages were freed with the ack: nothing writes the tail later.
             logger.warning(
