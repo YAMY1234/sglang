@@ -126,13 +126,17 @@ _is_xpu = is_xpu()
 if not _is_npu:
     from sglang.kernels.ops.attention.dsa import (
         aiter_paged_mqa_logits,
+        can_use_cutedsl_paged_mqa_logits_cap8,
         cutedsl_paged_mqa_logits,
+        cutedsl_paged_mqa_logits_cap8,
         deepgemm_paged_mqa_logits_native,
         deepgemm_paged_mqa_logits_split,
     )
 else:
     aiter_paged_mqa_logits = None
+    can_use_cutedsl_paged_mqa_logits_cap8 = None
     cutedsl_paged_mqa_logits = None
+    cutedsl_paged_mqa_logits_cap8 = None
     deepgemm_paged_mqa_logits_native = None
     deepgemm_paged_mqa_logits_split = None
 
@@ -1619,6 +1623,24 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 )
             return torch.cat(logits_chunks, dim=0)
 
+        # The backend builds the cap8 metadata only for the SM100 DeepGEMM-native
+        # [B, 8] verify layout without DCP or an index-K pool.
+        use_cap8 = (
+            use_dg_native
+            and envs.SGLANG_DSA_DECODE_CAP8_LOGITS.get()
+            and metadata.attn_metadata.cap8_paged_mqa_schedule_metadata is not None
+            and can_use_cutedsl_paged_mqa_logits_cap8(
+                q_fp8,
+                kv_cache_fp8,
+                weights,
+                metadata.attn_metadata.cap8_paged_mqa_context_lens,
+                block_tables,
+                q_offset=q_offset,
+                B=B,
+                next_n=next_n,
+            )
+        )
+
         # verify_shares_index_k's 64-key pages imply AITER's preshuffled layout
         if _use_aiter_gfx95 and dsa_indexer_hip.verify_shares_index_k(
             forward_batch, q_fp8, block_tables, page_size, q_offset, B, next_n, dcp_size
@@ -1690,6 +1712,18 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 blocksize=blocksize,
                 sm_count=self.sm_count,
                 get_paged_mqa_logits_metadata_fn=resolve_paged_mqa_logits_metadata_fn(),
+            )
+        elif use_cap8:
+            logits = cutedsl_paged_mqa_logits_cap8(
+                q_fp8,
+                kv_cache_fp8,
+                weights,
+                metadata.attn_metadata.cap8_paged_mqa_context_lens,
+                block_tables,
+                metadata.attn_metadata.cap8_paged_mqa_schedule_metadata,
+                max_seq_len,
+                q_offset=q_offset,
+                B=B,
             )
         elif use_dg_native:
             logits = deepgemm_paged_mqa_logits_native(

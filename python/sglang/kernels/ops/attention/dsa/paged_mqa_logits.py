@@ -242,3 +242,79 @@ def cutedsl_paged_mqa_logits(
         schedule_metadata,
         max_seq_len,
     )
+
+
+def can_use_cutedsl_paged_mqa_logits_cap8(
+    q_fp8: torch.Tensor,
+    kv_cache_fp8: torch.Tensor,
+    weights: torch.Tensor,
+    context_lens: torch.Tensor,
+    block_tables: torch.Tensor,
+    *,
+    q_offset: int,
+    B: int,
+    next_n: int,
+) -> bool:
+    """Whether cutedsl_paged_mqa_logits_cap8 covers this call: 8 query rows per
+    request, 32 FP8 heads of dim 128 and FP8 index-K pages of 64 tokens, for at most
+    32 requests (the batch range its fixed epilogue config is tuned for). Checks
+    shapes, dtypes and strides only (no device reads)."""
+    return (
+        next_n == 8
+        and 0 < B <= 32
+        and q_offset == B * next_n
+        and q_fp8.dtype == torch.float8_e4m3fn
+        and q_fp8.shape[0] >= q_offset
+        and q_fp8.shape[1:] == (32, 128)
+        and q_fp8.is_contiguous()
+        and weights.dtype == torch.float32
+        and weights.shape[0] >= q_offset
+        and weights.shape[1:] == (32,)
+        and weights.is_contiguous()
+        and kv_cache_fp8.dtype == torch.uint8
+        and kv_cache_fp8.shape[1:] == (64, 1, 132)
+        and kv_cache_fp8.stride(0) % 16 == 0
+        and context_lens.dtype == torch.int32
+        and context_lens.shape == (B,)
+        and context_lens.is_contiguous()
+        and block_tables.dtype == torch.int32
+        and block_tables.shape[0] >= q_offset
+        and block_tables.stride(1) == 1
+    )
+
+
+def cutedsl_paged_mqa_logits_cap8(
+    q_fp8: torch.Tensor,
+    kv_cache_fp8: torch.Tensor,
+    weights: torch.Tensor,
+    context_lens: torch.Tensor,
+    block_tables: torch.Tensor,
+    schedule_metadata: torch.Tensor,
+    max_seq_len: int,
+    *,
+    q_offset: int,
+    B: int,
+) -> torch.Tensor:
+    """Logits of 8 query rows per request from one CuTe DSL launch that reads each
+    request's index-K pages once (N = 8 rows x 32 heads = 256, the TMEM limit).
+
+    context_lens holds each request's full length (its last row's) and
+    schedule_metadata is built from it; the top-k masks each row to its own length."""
+    from sglang.kernels.ops.attention.dsa.cutedsl_paged_mqa_logits import (
+        CuteDSLPagedMQALogitsRunner,
+    )
+
+    # Keep 8 head weights per row in registers and read the rest from SMEM; all
+    # 8 x 32 would spill. [:q_offset:8] de-expands the per-row block table, no copy.
+    return CuteDSLPagedMQALogitsRunner.forward(
+        q_fp8[:q_offset].view(B, 8, q_fp8.shape[1], q_fp8.shape[2]),
+        kv_cache_fp8,
+        weights[:q_offset],
+        context_lens,
+        block_tables[:q_offset:8],
+        schedule_metadata,
+        max_seq_len,
+        num_epi_subtiles=1,
+        pipeline_flags={"max_w_in_reg": 8},
+        block_table_strided=True,
+    )

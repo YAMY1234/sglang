@@ -418,6 +418,10 @@ class DSAMetadata:
     # 2D context_lens used to build the schedule above; the indexer reuses it
     # as DG's `context_lens` arg so the broadcast doesn't rebuild per layer.
     paged_mqa_ctx_lens_2d: Optional[torch.Tensor] = None
+    # SGLANG_DSA_DECODE_CAP8_LOGITS: per-request lengths and their one-query
+    # schedule for the fixed-eight CuTe DSL kernel (DG's [B, 8] schedule is not its ABI).
+    cap8_paged_mqa_context_lens: Optional[torch.Tensor] = None
+    cap8_paged_mqa_schedule_metadata: Optional[torch.Tensor] = None
     # Precomputed once per forward batch and reused across layers: the
     # DeepSeek-V4 top-k v2 plan (cluster-threshold metadata) for the folded
     # decode top-k transform. None unless the SGL top-k v2 path is enabled.
@@ -1429,6 +1433,38 @@ class DeepseekSparseAttnBackend(
             object.__setattr__(metadata, "paged_mqa_schedule_metadata", new_schedule)
         else:
             metadata.paged_mqa_schedule_metadata.copy_(new_schedule)
+        cap8_lens, cap8_schedule = self._build_cap8_paged_mqa_metadata(seqlens_32_2d)
+        if cap8_schedule is None:
+            return
+        if metadata.cap8_paged_mqa_schedule_metadata is None:
+            object.__setattr__(metadata, "cap8_paged_mqa_context_lens", cap8_lens)
+            object.__setattr__(
+                metadata, "cap8_paged_mqa_schedule_metadata", cap8_schedule
+            )
+        else:
+            metadata.cap8_paged_mqa_context_lens.copy_(cap8_lens)
+            metadata.cap8_paged_mqa_schedule_metadata.copy_(cap8_schedule)
+
+    def _build_cap8_paged_mqa_metadata(
+        self, ctx_lens_2d: Optional[torch.Tensor]
+    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+        # Only the SM100 DG-native verify layout [B, 8] qualifies. Its rows all carry
+        # the request's full length; the top-k masks each row to its own length.
+        if (
+            not envs.SGLANG_DSA_DECODE_CAP8_LOGITS.get()
+            or not get_platform().is_sm100
+            or ctx_lens_2d is None
+            or ctx_lens_2d.shape[1] != 8
+            or self.attn_dcp_size > 1
+            or self.dsa_shards_index_k
+            or self.dsa_index_kpool != 1
+        ):
+            return None, None
+        lengths = ctx_lens_2d[:, -1].contiguous()
+        schedule = resolve_paged_mqa_logits_metadata_fn()(
+            lengths.unsqueeze(-1), 64, resolve_num_sms()
+        )
+        return lengths, schedule
 
     def _dcp_topk_length_buffer(
         self, forward_mode: ForwardMode, seqlens_expanded: torch.Tensor
@@ -1922,6 +1958,9 @@ class DeepseekSparseAttnBackend(
                 forward_batch.batch_size,
             )
 
+        cap8_lens, cap8_schedule = self._build_cap8_paged_mqa_metadata(
+            paged_mqa_ctx_lens_2d
+        )
         metadata = DSAMetadata(
             page_size=self.physical_page_size,
             cache_seqlens_int32=cache_seqlens_int32,
@@ -1947,6 +1986,8 @@ class DeepseekSparseAttnBackend(
             ),
             paged_mqa_schedule_metadata=paged_mqa_schedule_metadata,
             paged_mqa_ctx_lens_2d=paged_mqa_ctx_lens_2d,
+            cap8_paged_mqa_context_lens=cap8_lens,
+            cap8_paged_mqa_schedule_metadata=cap8_schedule,
             dsa_cache_seqlens_int32=dsa_cache_seqlens_int32,
             dsa_cu_seqlens_q=dsa_cu_seqlens_q,
             dsa_cu_seqlens_k=dsa_cu_seqlens_k,
@@ -2324,6 +2365,9 @@ class DeepseekSparseAttnBackend(
                 self, forward_mode, cache_seqlens_int32, seqlens_expanded, bs
             )
 
+        cap8_lens, cap8_schedule = self._build_cap8_paged_mqa_metadata(
+            paged_mqa_ctx_lens_2d
+        )
         metadata = DSAMetadata(
             page_size=self.physical_page_size,
             cache_seqlens_int32=cache_seqlens_int32,
@@ -2335,6 +2379,8 @@ class DeepseekSparseAttnBackend(
             flashmla_metadata=flashmla_metadata,
             paged_mqa_schedule_metadata=paged_mqa_schedule_metadata,
             paged_mqa_ctx_lens_2d=paged_mqa_ctx_lens_2d,
+            cap8_paged_mqa_context_lens=cap8_lens,
+            cap8_paged_mqa_schedule_metadata=cap8_schedule,
             dsa_cache_seqlens_int32=dsa_cache_seqlens_int32,
             dsa_cu_seqlens_q=dsa_cu_seqlens_q,
             dsa_cu_seqlens_k=dsa_cu_seqlens_k,

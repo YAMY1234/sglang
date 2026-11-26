@@ -4,7 +4,9 @@ from .paged_mqa_logits import (
     aiter_paged_mqa_logits,
     aiter_paged_mqa_logits_persistent_schedule,
     aiter_paged_mqa_logits_verify,
+    can_use_cutedsl_paged_mqa_logits_cap8,
     cutedsl_paged_mqa_logits,
+    cutedsl_paged_mqa_logits_cap8,
     deepgemm_paged_mqa_logits_native,
     deepgemm_paged_mqa_logits_split,
 )
@@ -21,7 +23,9 @@ __all__ = [
     "aiter_paged_mqa_logits",
     "aiter_paged_mqa_logits_persistent_schedule",
     "aiter_paged_mqa_logits_verify",
+    "can_use_cutedsl_paged_mqa_logits_cap8",
     "cutedsl_paged_mqa_logits",
+    "cutedsl_paged_mqa_logits_cap8",
     "deepgemm_paged_mqa_logits_native",
     "deepgemm_paged_mqa_logits_split",
 ]

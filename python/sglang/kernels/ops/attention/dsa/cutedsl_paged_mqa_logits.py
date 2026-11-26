@@ -194,6 +194,7 @@ class CuteDSLPagedMQALogitsRunner:
         acc_dtype,
         output_dtype,
         pipeline_flags=None,
+        block_table_strided=False,
     ):
         """Compile kernel using fake tensors + TVM FFI."""
         pipeline_flags = pipeline_flags or {}
@@ -210,6 +211,8 @@ class CuteDSLPagedMQALogitsRunner:
             output_dtype,
             tuple(sorted(pipeline_flags.items())),
         )
+        if block_table_strided:
+            key += ("strided_block_table",)
         if key in cls.kernel_cache:
             return
 
@@ -247,9 +250,17 @@ class CuteDSLPagedMQALogitsRunner:
             stride=(cute.sym_int64(), 1),
         )
 
-        bt_fake = cute.runtime.make_fake_compact_tensor(
-            cutlass.Int32, (sym_B, max_blocks_per_seq), stride_order=(1, 0)
-        )
+        if block_table_strided:
+            # A per-query-row table de-expanded with [::next_n], without a copy.
+            bt_fake = cute.runtime.make_fake_tensor(
+                cutlass.Int32,
+                (sym_B, max_blocks_per_seq),
+                stride=(cute.sym_int64(), 1),
+            )
+        else:
+            bt_fake = cute.runtime.make_fake_compact_tensor(
+                cutlass.Int32, (sym_B, max_blocks_per_seq), stride_order=(1, 0)
+            )
 
         cl_fake = cute.runtime.make_fake_compact_tensor(
             cutlass.Int32, (sym_B,), stride_order=(0,)
@@ -310,6 +321,8 @@ class CuteDSLPagedMQALogitsRunner:
         epi_dtype: torch.dtype = torch.float32,
         acc_dtype: torch.dtype = torch.float32,
         output_dtype: torch.dtype = torch.float32,
+        pipeline_flags: dict | None = None,
+        block_table_strided: bool = False,
     ) -> torch.Tensor:
         """Execute FP8 paged MQA logits kernel.
 
@@ -325,6 +338,8 @@ class CuteDSLPagedMQALogitsRunner:
             epi_dtype: epilogue compute dtype
             acc_dtype: MMA accumulator dtype
             output_dtype: output logits dtype
+            pipeline_flags: explicit epilogue flags (with num_epi_subtiles); None auto-tunes
+            block_table_strided: block_table rows may be strided (stride(1) must be 1)
         Returns:
             logits: [B*next_n, max_context_len] output_dtype
         """
@@ -336,15 +351,18 @@ class CuteDSLPagedMQALogitsRunner:
         num_sms = HardwareInfo().get_device_multiprocessor_count()
 
         # Auto-tune (num_epi_subtiles, pipeline flags) for the epilogue when the
-        # caller leaves num_epi_subtiles unset; an explicit value disables the
+        # caller leaves both unset; an explicit num_epi_subtiles alone disables the
         # flag auto-tuning and is honored as-is.
-        auto_nst, pipeline_flags = _propose_epi_config(
-            H, next_n, B, max_context_len, num_sms
-        )
-        if num_epi_subtiles is None:
-            num_epi_subtiles = auto_nst
+        if pipeline_flags is None:
+            auto_nst, pipeline_flags = _propose_epi_config(
+                H, next_n, B, max_context_len, num_sms
+            )
+            if num_epi_subtiles is None:
+                num_epi_subtiles = auto_nst
+            else:
+                pipeline_flags = {}
         else:
-            pipeline_flags = {}
+            assert num_epi_subtiles is not None
 
         # Reshape Q: [B, next_n, H, D] -> [B, N, D] -> [N, D, B]
         q_3d = q.reshape(B, N, D).permute(1, 2, 0)
@@ -382,6 +400,8 @@ class CuteDSLPagedMQALogitsRunner:
             output_dtype,
             tuple(sorted(pipeline_flags.items())),
         )
+        if block_table_strided:
+            key += ("strided_block_table",)
         if key not in cls.kernel_cache:
             cls._compile(
                 compute_block_kv,
@@ -395,6 +415,7 @@ class CuteDSLPagedMQALogitsRunner:
                 acc_dtype,
                 output_dtype,
                 pipeline_flags,
+                block_table_strided,
             )
         compiled = cls.kernel_cache[key]
 

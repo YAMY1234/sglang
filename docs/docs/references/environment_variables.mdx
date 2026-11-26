@@ -648,6 +648,11 @@ SGLang supports various environment variables that can be used to configure its 
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Fraction of free memory the MQA-logits step may use on the DSA path.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>0.2</code></td>
     </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_DSA_DECODE_CAP8_LOGITS</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Experimental. On SM100 with the DeepGEMM paged MQA logits backend, compute the target-verify indexer logits of batches with exactly 8 query rows per request (e.g. EAGLE with <code>--speculative-num-draft-tokens 8</code>), 32 FP8 indexer heads and at most 32 requests with a fixed-eight CuTe DSL kernel (one task per request covering all 8 rows). Other shapes keep DeepGEMM.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
+    </tr>
   </tbody>
 </table>
 

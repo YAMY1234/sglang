@@ -2390,6 +2390,10 @@ class Envs:
     SGLANG_DSA_INDEXER_BF16_LOGITS = EnvBool(False)
     SGLANG_ENABLE_PCG_DSV2_DUAL_STREAM = EnvBool(False)
     SGLANG_DSA_TOPK_BROADCAST = EnvBool(False)
+    # Opt-in (SM100, deepgemm paged MQA backend): score target-verify rows with exactly
+    # 8 queries per request, 32 FP8 indexer heads, through a fixed-eight CuTe DSL
+    # kernel; every other shape keeps DeepGEMM.
+    SGLANG_DSA_DECODE_CAP8_LOGITS = EnvBool(False)
     # DCP8 decode: the indexer's local top-k, candidate exchange, merge and
     # localization in one kernel (DcpFusedTopK, SM100, multicast).
     SGLANG_ENABLE_DSA_DCP_FUSED_TOPK = EnvBool(False)
