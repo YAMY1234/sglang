@@ -10,6 +10,7 @@ Host pages are opaque bytes to every L3 backend.
 
 from __future__ import annotations
 
+import functools
 import logging
 
 import torch
@@ -58,6 +59,9 @@ def _scratch_chunk_pages(scratch_bytes_per_page: int) -> int:
 class NVFP4RowCodec:
     """FP8 rows (uint8 storage, ``dim`` values) <-> NVFP4 rows (``nvfp4_row_bytes(dim)`` bytes)."""
 
+    # nvfp4_row_codec() hands out a fallback subclass if these kernels fail its probe.
+    backend = "triton"
+
     def __init__(self, dim: int, device: torch.device | str):
         if dim % NVFP4_BLOCK_SIZE:
             raise ValueError(f"NVFP4 rows need a multiple of 16 values, got {dim}")
@@ -88,21 +92,28 @@ class IndexKeyPageCodec:
 
     def __init__(self, page_size: int, device: torch.device | str):
         self.page_size = page_size
-        self.rows = NVFP4RowCodec(_PAGED_INDEX_KEY_HEAD_DIM, device)
+        self.rows = nvfp4_row_codec(_PAGED_INDEX_KEY_HEAD_DIM, device)
         self.key_bytes = page_size * _PAGED_INDEX_KEY_HEAD_DIM
         self.encoded_key_bytes = page_size * self.rows.row_bytes
         scale_bytes = page_size * 4
         self.device_page_bytes = self.key_bytes + scale_bytes
         self.host_page_bytes = self.encoded_key_bytes + scale_bytes
-        # Per page: the page gather and the key copy.
-        self.encode_scratch_bytes = self.device_page_bytes + self.key_bytes
-        # Per page: the stage, the key-row copy, the decoded keys and the page.
+        # Per page: the page gather and key copy, then the row codec's.
+        self.encode_scratch_bytes = (
+            self.device_page_bytes
+            + self.key_bytes
+            + page_size * self.rows.encode_scratch_bytes
+        )
+        # Per page: the stage, key-row copy and decoded keys, the row codec's
+        # temporaries, then the reassembled page.
         self.decode_scratch_bytes = (
             self.host_page_bytes
             + self.encoded_key_bytes
             + self.key_bytes
+            + page_size * self.rows.decode_scratch_bytes
             + self.device_page_bytes
         )
+        self.backend = self.rows.backend
 
     def encode_rows(self, src, rows, out, *, page_size: int) -> None:
         """Encode the device pages src[rows] into out[page, 1, host_page_bytes]."""
@@ -136,6 +147,162 @@ class IndexKeyPageCodec:
             (keys.view(n, self.key_bytes), src[:, self.encoded_key_bytes :]), dim=1
         )
         dst.index_copy_(0, rows, pages)
+
+
+def quantize_nvfp4_torch(
+    x: torch.Tensor, global_scale: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """torch twin of flashinfer.nvfp4_kv_quantize: [n, d] -> ([n, d/2], [n, d/16]) uint8."""
+    from sglang.srt.layers.quantization.kvfp4_tensor import E2M1_BOUNDS
+
+    n, dim = x.shape
+    blocks = x.float().view(n, dim // NVFP4_BLOCK_SIZE, NVFP4_BLOCK_SIZE)
+    amax = blocks.abs().amax(dim=-1, keepdim=True)
+    gs = global_scale.float().to(x.device)
+    sf = (amax / (6.0 * gs)).to(torch.float8_e4m3fn)
+    inv = torch.where(amax > 0, 1.0 / (sf.float() * gs), torch.zeros_like(amax))
+    y = blocks * inv
+    mag = y.abs().clamp(max=6.0)
+    # Nearest E2M1 magnitude; a tie goes to the even code, the upper neighbour
+    # only at 0.75, 1.75 and 3.5.
+    code = torch.bucketize(mag, mag.new_tensor(E2M1_BOUNDS))
+    code += torch.isin(mag, mag.new_tensor((0.75, 1.75, 3.5))).to(code.dtype)
+    code |= torch.signbit(y).to(code.dtype) << 3
+    code = code.to(torch.uint8).view(n, dim)
+    packed = code[:, 0::2] | (code[:, 1::2] << 4)
+    return packed, sf.view(torch.uint8).view(n, dim // NVFP4_BLOCK_SIZE)
+
+
+def dequantize_nvfp4_torch(
+    fp4: torch.Tensor, sf: torch.Tensor, global_scale: torch.Tensor
+) -> torch.Tensor:
+    """torch twin of flashinfer.nvfp4_kv_dequantize (bf16 output)."""
+    from sglang.srt.layers.quantization.kvfp4_tensor import E2M1_VALUES
+
+    n = fp4.shape[0]
+    dim = fp4.shape[1] * 2
+    codes = torch.stack((fp4 & 0xF, fp4 >> 4), dim=-1).view(n, dim)
+    lut = fp4.new_tensor(E2M1_VALUES, dtype=torch.float32)
+    vals = lut[codes.long()].view(n, dim // NVFP4_BLOCK_SIZE, NVFP4_BLOCK_SIZE)
+    scale = sf.view(torch.float8_e4m3fn).float().unsqueeze(-1)
+    out = (vals * scale) * global_scale.float().to(fp4.device)
+    return out.view(n, dim).to(torch.bfloat16)
+
+
+class _UnfusedNVFP4RowCodec(NVFP4RowCodec):
+    """NVFP4RowCodec on FlashInfer's NVFP4 KV kernels or the torch twin."""
+
+    def __init__(self, dim, device, quantize, dequantize, backend: str):
+        super().__init__(dim, device)
+        self._quantize, self._dequantize, self.backend = quantize, dequantize, backend
+        self.data_bytes = dim // 2
+        # Live at once per row: FP8 gather, bf16, NVFP4 out.
+        self.encode_scratch_bytes = 3 * dim + self.row_bytes
+        # NVFP4 stage, its split copies, bf16, FP8 out.
+        self.decode_scratch_bytes = 2 * self.row_bytes + 3 * dim
+
+    def encode_rows(self, src, rows, out, *, page_size: int) -> None:
+        x = src.index_select(0, rows).view(torch.float8_e4m3fn).view(-1, self.dim)
+        fp4, sf = self._quantize(x.to(torch.bfloat16), self.global_scale)
+        lead = out.shape[:-1]
+        out[..., : self.data_bytes].copy_(fp4.view(*lead, self.data_bytes))
+        out[..., self.data_bytes :].copy_(sf.view(*lead, -1))
+
+    def decode_rows(self, src, rows, dst) -> None:
+        fp4 = src[:, : self.data_bytes].contiguous()
+        sf = src[:, self.data_bytes :].contiguous()
+        x = self._dequantize(fp4, sf, self.global_scale)
+        fp8 = x.to(torch.float8_e4m3fn).view(torch.uint8)
+        dst.index_copy_(0, rows, fp8.view(rows.numel(), *dst.shape[1:]))
+
+
+def _probe_rows(dim: int, device: torch.device) -> torch.Tensor:
+    """FP8 rows covering every finite byte, zero and -0 blocks, subnormal-only
+    blocks, +-448, and blocks dense in E2M1 ties."""
+    finite = torch.tensor(
+        [b for b in range(256) if b not in (0x7F, 0xFF)], dtype=torch.uint8
+    )
+    rows = finite.repeat(64 * dim // finite.numel() + 1)[: 64 * dim].view(64, dim)
+    rows = rows.clone()
+    rows[0] = 0
+    rows[1] = 0x80
+    rows[2] = torch.arange(1, 8, dtype=torch.uint8).repeat(dim // 7 + 1)[:dim]
+    rows[3, ::16] = 0x7E
+    rows[4, ::16] = 0xFE
+    # amax 384 (0x7C) with 320 (0x7A) and 64 (0x60): scaled values 5.0 and 1.0
+    rows[5] = torch.tensor([0x7C, 0x7A, 0x60, 0xFA] * (dim // 4), dtype=torch.uint8)
+    return rows.to(device)
+
+
+def _triton_probe_error(dim: int, device: torch.device, global_scale) -> str | None:
+    """None if the Triton kernels match the torch twin byte for byte on the probe
+    rows, else why not."""
+    try:
+        x = _probe_rows(dim, device)
+        n = x.shape[0]
+        rows = torch.arange(n, device=device)
+        q, sf = quantize_nvfp4_torch(x.view(torch.float8_e4m3fn).float(), global_scale)
+        want = torch.cat((q, sf), dim=1)
+        got = torch.zeros(
+            (1, n, nvfp4_row_bytes(dim)), dtype=torch.uint8, device=device
+        )
+        encode_fp8_rows_to_nvfp4(x, rows, got, global_scale, dim=dim, page_size=n)
+        deq = dequantize_nvfp4_torch(q, sf, global_scale)
+        want_fp8 = deq.to(torch.float8_e4m3fn).view(torch.uint8)
+        got_fp8 = torch.zeros_like(x)
+        decode_nvfp4_rows_to_fp8(want, rows, got_fp8, global_scale, dim=dim)
+        bad = (int((got.view(n, -1) != want).sum()), int((got_fp8 != want_fp8).sum()))
+        if bad != (0, 0):
+            return f"differ from the torch twin on the probe ({bad} bytes)"
+        return None
+    except Exception as err:
+        return repr(err)
+
+
+def _unfused_kernels(device: torch.device, global_scale):
+    """(quantize, dequantize, backend, description) for the fallback path."""
+    if device.type != "cuda":
+        return quantize_nvfp4_torch, dequantize_nvfp4_torch, "torch", "torch"
+    try:
+        from flashinfer import nvfp4_kv_dequantize, nvfp4_kv_quantize
+
+        # Build the JIT modules at startup rather than on the first eviction.
+        probe = torch.zeros((1, NVFP4_BLOCK_SIZE), dtype=torch.bfloat16, device=device)
+        nvfp4_kv_dequantize(*nvfp4_kv_quantize(probe, global_scale), global_scale)
+        return (
+            nvfp4_kv_quantize,
+            nvfp4_kv_dequantize,
+            "flashinfer",
+            "flashinfer kernels",
+        )
+    except Exception as err:
+        return quantize_nvfp4_torch, dequantize_nvfp4_torch, "torch", f"torch ({err!r})"
+
+
+@functools.cache
+def _codec_fallback(dim: int, device: torch.device):
+    """None if the Triton kernels pass the probe, else (quantize, dequantize,
+    backend). Probed once per process, device and row width."""
+    global_scale = torch.tensor([_GLOBAL_SCALE], dtype=torch.float32, device=device)
+    error = _triton_probe_error(dim, device, global_scale)
+    if error is None:
+        return None
+    quantize, dequantize, backend, description = _unfused_kernels(device, global_scale)
+    logger.warning(
+        "HiCache NVFP4 host codec fallback: %s",
+        f"{description}, triton fused kernels failed: {error}",
+    )
+    return quantize, dequantize, backend
+
+
+def nvfp4_row_codec(dim: int, device: torch.device | str) -> NVFP4RowCodec:
+    """The row codec on the Triton kernels if they reproduce the torch twin on a
+    probe, else on FlashInfer's NVFP4 KV kernels, else on the twin itself."""
+    codec = NVFP4RowCodec(dim, device)
+    fallback = _codec_fallback(dim, codec.global_scale.device)
+    if fallback is None:
+        return codec
+    return _UnfusedNVFP4RowCodec(dim, device, *fallback)
 
 
 def _upload_indices(indices: torch.Tensor, device: torch.device) -> torch.Tensor:
@@ -271,7 +438,7 @@ class MLATokenToKVPoolNVFP4Host(MLATokenToKVPoolHost):
                 f"with the {NVFP4_HOST_LAYOUT} layout, without layer sharding or DCP; "
                 f"got layout={layout!r}, row={device_dim} x {buffer_info.dtype}"
             )
-        self._codec = NVFP4RowCodec(device_dim, buffer_info.device)
+        self._codec = nvfp4_row_codec(device_dim, buffer_info.device)
         # Read by the DSA indexer builder; the L3 key tag names both formats.
         self.encode_index_keys = envs.SGLANG_ENABLE_HICACHE_NVFP4_HOST_INDEXER.get()
         self.storage_format_tag = (
@@ -299,8 +466,9 @@ class MLATokenToKVPoolNVFP4Host(MLATokenToKVPoolHost):
             max(self._load_chunk_pages * self.page_size, self._backup_chunk_pages)
         )
         logger.info(
-            "HiCache host KV stored as NVFP4: %d B per token-layer instead of %d, "
-            "index keys %s.",
+            "HiCache host KV stored as NVFP4, codec: %s. %d B per token-layer "
+            "instead of %d, index keys %s.",
+            self._codec.backend,
             self.kv_cache_dim,
             device_dim,
             "NVFP4" if self.encode_index_keys else "FP8",

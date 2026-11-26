@@ -16,7 +16,7 @@ from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
 from sglang.srt.mem_cache.pool_host.nvfp4_host import (
     DSAIndexerPoolNVFP4Host,
     MLATokenToKVPoolNVFP4Host,
-    NVFP4RowCodec,
+    nvfp4_row_codec,
 )
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import is_cuda
@@ -90,7 +90,9 @@ class TestNVFP4HostTier(CustomTestCase):
             with self.subTest(dim=dim):
                 rows = _probe_rows(dim)
                 n, data = rows.shape[0], dim // 2
-                codec = NVFP4RowCodec(dim, "cuda")
+                codec = nvfp4_row_codec(dim, "cuda")
+                # The startup probe passed, so the Triton kernels are in use.
+                self.assertEqual(codec.backend, "triton")
                 idx = torch.arange(n, device="cuda")
                 enc = torch.zeros(
                     (1, n, codec.row_bytes), dtype=torch.uint8, device="cuda"
