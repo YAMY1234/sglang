@@ -676,9 +676,9 @@ class Envs:
     # MegaAttention reads fork the attention mix's side stream at the read (beside the q/kv
     # projections) instead of deferring it to the attention core. Scheduling only.
     SGLANG_OPT_DSV41_ATTN_STATS_FORK_AT_READ = EnvBool(False)
-    # mHC Sinkhorn after the DeepGEMM prenorm (HC=4): one row per thread instead of one
-    # single-warp program per row (it runs on the 2 SMs MegaMoE leaves free). Same
-    # per-element operations and sum order, so the outputs are bitwise identical.
+    # mHC Sinkhorn of target layers' ffn mix (DeepGEMM prenorm, HC=4), which runs on the SMs
+    # MegaMoE leaves free: one row per thread instead of one single-warp program per row.
+    # Same per-element operations and sum order, so the outputs are bitwise identical.
     SGLANG_OPT_MHC_FAST_SINKHORN = EnvBool(False)
     # V4.1 fp8 SWA cache: keep a second copy of every paged SWA row dequantized and rounded to
     # e4m3 (written by the SWA store kernels), which FlashMLA's fp8 decode reads instead of

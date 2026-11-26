@@ -2968,6 +2968,7 @@ def hc_mix_stats_sinkhorn_deepgemm(
     rms_eps: float,
     hc_eps: float,
     hc_mult: int = 4,
+    rows_per_thread: bool = False,
 ):
     from sglang.srt.layers.deep_gemm_wrapper.entrypoint import (
         tf32_hc_prenorm_gemm,
@@ -2997,7 +2998,9 @@ def hc_mix_stats_sinkhorn_deepgemm(
         # sq depends only on x_flat, so the second projection recomputes the same
         # values; overwriting it avoids a throwaway (slices, m) scratch, 4 MiB at m=65536.
         tf32_hc_prenorm_gemm(x_flat, low, mix_lo, sq, slices)
-    if hc_mult == 4 and envs.SGLANG_OPT_MHC_FAST_SINKHORN.get():
+    # Only where the Sinkhorn has a few SMs to itself (beside MegaMoE): on a shared GPU the
+    # stock kernel's many short CTAs interfere less with the main-stream kernels.
+    if rows_per_thread and hc_mult == 4 and envs.SGLANG_OPT_MHC_FAST_SINKHORN.get():
         global _HC_FAST_SINKHORN_LOGGED
         if not _HC_FAST_SINKHORN_LOGGED:
             _HC_FAST_SINKHORN_LOGGED = True

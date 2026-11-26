@@ -132,6 +132,8 @@ class HcConfig(NamedTuple):
     hidden: int
     pre_from_prev: bool
     cp_prefill: bool
+    # Target layers' ffn mix runs beside MegaMoE on its reserved SMs (not the draft's).
+    fast_ffn_sinkhorn: bool = False
 
 
 class HcSubLayer(NamedTuple):
@@ -146,6 +148,7 @@ class HcSubLayer(NamedTuple):
     tf32_parts: Optional[Any] = None
     bf16_parts: Optional[Any] = None
     bf16_packed: Optional[torch.Tensor] = None
+    fast_sinkhorn: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -453,6 +456,7 @@ def _mix_stats_impl(hc: HcSubLayer, x: torch.Tensor) -> HcTriplet:
                 cfg.sinkhorn_iters,
                 cfg.rms_eps,
                 cfg.eps,
+                rows_per_thread=hc.fast_sinkhorn,
             )
         else:
             pre, post, comb = hc_mix_stats_sinkhorn(

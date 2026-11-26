@@ -3760,6 +3760,7 @@ class DeepseekV4DecoderLayerBase(nn.Module):
             hidden=config.hidden_size,
             pre_from_prev=self.hc_pre_from_prev_sublayer,
             cp_prefill=self.dsa_enable_prefill_cp,
+            fast_ffn_sinkhorn=not is_nextn,
         )
         self.attn_hc: Optional[mhc.HcSubLayer] = None
         self.ffn_hc: Optional[mhc.HcSubLayer] = None
@@ -3823,6 +3824,7 @@ class DeepseekV4DecoderLayerBase(nn.Module):
             self._hc_ffn_tf32_parts,
             self._hc_ffn_bf16_parts,
             self._hc_ffn_bf16_packed,
+            fast_sinkhorn=self.hc_cfg.fast_ffn_sinkhorn,
         )
 
     def refresh_mhc_norm_weight_cache(self):

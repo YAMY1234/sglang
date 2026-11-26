@@ -437,7 +437,7 @@ def test_deepgemm_fast_sinkhorn_matches_stock(num_tokens):
     args = (x, (high, low), scale, base, 20, 1e-6, 1e-6)
     stock = mhc.hc_mix_stats_sinkhorn_deepgemm(*args)
     with envs.SGLANG_OPT_MHC_FAST_SINKHORN.override(True):
-        fast = mhc.hc_mix_stats_sinkhorn_deepgemm(*args)
+        fast = mhc.hc_mix_stats_sinkhorn_deepgemm(*args, rows_per_thread=True)
     for a, b in zip(fast, stock):
         assert torch.equal(a.view(torch.int32), b.view(torch.int32))
 
