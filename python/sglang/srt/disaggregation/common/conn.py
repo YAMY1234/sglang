@@ -963,6 +963,8 @@ class CommonKVManager(BaseKVManager):
         if self.deferred_bootstrap is None or not msg:
             return False
         if msg[0] not in (b"BOOTSTRAP", b"ABORT", b"REBIND"):
+            if msg[0].isdigit() and len(msg) >= 4:
+                return self._drop_stale_destination(msg)
             return False
         try:
             room = int(msg[1])
@@ -994,6 +996,23 @@ class CommonKVManager(BaseKVManager):
         if room in self.request_status and self.request_status[room] != KVPoll.Success:
             self.update_status(room, KVPoll.Failed)
         return False
+
+    def _drop_stale_destination(self, msg: List[bytes]) -> bool:
+        """Record a destination ([room, ip, port, session, ...]) for REBIND
+        gating; True drops one from an endpoint its room was rebound away from
+        before the backend files it."""
+        try:
+            room = int(msg[0])
+            endpoint = (msg[1].decode("ascii"), int(msg[2]))
+        except (ValueError, UnicodeDecodeError):
+            return False
+        if self.deferred_bootstrap.note_metadata(room, endpoint):
+            return False
+        logger.error(
+            f"Dropped destination of room {room} from {endpoint}, which it was "
+            "rebound away from"
+        )
+        return True
 
     def record_failure(self, bootstrap_room: int, failure_reason: str):
         with self.failure_lock:

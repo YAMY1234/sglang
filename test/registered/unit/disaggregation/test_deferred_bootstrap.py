@@ -116,6 +116,40 @@ class TestDeferredBootstrap(unittest.TestCase):
         self.assertEqual(self.table.rooms[1].endpoint, other)
         self.assertFalse(self.table.rooms[1].failed)
 
+    def test_late_bootstrap_from_rebound_endpoint_is_dropped(self):
+        new = ("decode", 5678)
+        self.table.open(1, self.owner)
+        # The REBIND reaches this stage before the old rank's BOOTSTRAP.
+        self.assertIsNone(self.table.rebind(1, new, self.endpoint))
+        self.assertIsNone(self.table.register(1, self.endpoint))
+        self.assertEqual(self.table.rooms[1].endpoint, new)
+        self.assertFalse(self.table.rooms[1].failed)
+        self.assertEqual(self.table.complete(1, self.owner), (new, False))
+
+    def test_rebind_after_destination_is_refused(self):
+        new = ("decode", 5678)
+        self.table.open(1, self.owner)
+        self.table.register(1, self.endpoint)
+        self.table.complete(1, self.owner)
+        self.assertTrue(self.table.note_metadata(1, self.endpoint))
+        self.assertEqual(self.table.rebind(1, new, self.endpoint), (new, True))
+        self.assertEqual(self.table.rooms[1].endpoint, self.endpoint)
+        self.assertEqual(self.table.rooms[1].stale_endpoints, set())
+
+    def test_destination_from_rebound_endpoint_is_dropped(self):
+        new = ("decode", 5678)
+        self.table.open(1, self.owner)
+        self.table.register(1, self.endpoint)
+        self.table.complete(1, self.owner)
+        self.table.rebind(1, new, self.endpoint)
+        self.assertFalse(self.table.note_metadata(1, self.endpoint))
+        self.assertFalse(self.table.rooms[1].has_destination)
+        self.assertTrue(self.table.note_metadata(1, new))
+        self.assertTrue(self.table.rooms[1].has_destination)
+        # A destination for a room the table does not hold creates none.
+        self.assertTrue(self.table.note_metadata(2, self.endpoint))
+        self.assertNotIn(2, self.table.rooms)
+
     def test_cancel_from_rebound_endpoint_is_ignored(self):
         new = ("decode", 5678)
         self.table.open(1, self.owner)
@@ -148,6 +182,7 @@ class TestDeferredBootstrap(unittest.TestCase):
             lambda: self.table.register(1, self.endpoint),
             lambda: self.table.complete(1, self.owner),
             lambda: self.table.rebind(1, ("decode", 5678), self.endpoint),
+            lambda: self.table.note_metadata(1, ("decode", 5678)),
             lambda: self.table.cancel(1, self.endpoint),
             lambda: self.table.fail(1),
             lambda: self.table.close(1, self.owner),

@@ -36,6 +36,7 @@ from typing import (
 
 import torch.distributed as dist
 import zmq
+from zmq.utils.monitor import recv_monitor_message
 
 from sglang.srt.managers.io_struct import AbortReq
 from sglang.srt.managers.scheduler_components.dp_attn import (
@@ -55,6 +56,10 @@ MAX_FENCED_IDS = 4096
 MAX_OUTBOX = 4096
 # A CANCEL is retried for this many ack timeouts before it is dropped.
 CANCEL_LIFETIME_FACTOR = 10
+# Startup wait for the D->D sockets' handshakes. With IMMEDIATE a send fails
+# until the ZMTP handshake ends, so first handoffs and ACKs would be lost.
+PRECONNECT_WAIT_S = 5.0
+_CONNECTED_EVENT = getattr(zmq, "EVENT_HANDSHAKE_SUCCEEDED", zmq.EVENT_CONNECTED)
 
 
 def _active_ranks(rows: Sequence[Sequence[int]]) -> List[int]:
@@ -223,6 +228,9 @@ class DecodeLateBinding:
         self.on_timeout: Optional[Callable[[LateBindingHandoff, Any], None]] = None
         self.peers: List[str] = []
         self._push: Dict[int, zmq.Socket] = {}
+        # Peers whose PUSH socket finished the handshake (socket monitors).
+        self.connected: set = set()
+        self._monitors: Dict[int, zmq.Socket] = {}
         self._ctx = context or zmq.Context()
         port, self.pull = get_zmq_socket_on_host(
             self._ctx, zmq.PULL, host=local_ip, restrict_peers=True
@@ -232,17 +240,28 @@ class DecodeLateBinding:
         self._ipv6 = address.is_ipv6
 
     # -- startup -------------------------------------------------------------
-    def connect_peers(self, group) -> None:
+    def connect_peers(self, group, wait_s: float = PRECONNECT_WAIT_S) -> None:
         """Collective over the TP CPU group (one rank per DP rank): exchange the
-        PULL addresses and connect a PUSH socket to every other rank."""
+        PULL addresses, connect a PUSH socket to every other rank and wait,
+        bounded, for the handshakes."""
         gathered: List[Optional[str]] = [None] * dist.get_world_size(group)
         dist.all_gather_object(gathered, self.address, group=group)
         if len(gathered) != self.num_dp_ranks or None in gathered:
             raise RuntimeError(f"Late binding: bad handoff addresses {gathered}")
         self.peers = gathered
-        for dp_rank in range(self.num_dp_ranks):
-            if dp_rank != self.dp_rank:
-                self._socket_to(dp_rank)
+        others = [r for r in range(self.num_dp_ranks) if r != self.dp_rank]
+        for dp_rank in others:
+            self._socket_to(dp_rank)
+        deadline = time.monotonic() + wait_s
+        while time.monotonic() < deadline:
+            self._poll_monitors()
+            if self.connected.issuperset(others):
+                return
+            time.sleep(0.01)
+        missing = sorted(set(others) - self.connected)
+        logger.warning(
+            f"Late binding: DP{self.dp_rank} not yet connected to DP ranks {missing}"
+        )
 
     # -- MLP-sync columns ----------------------------------------------------
     def local_row(self, committed: int, kv_usage: float) -> Tuple[int, int, int]:
@@ -288,9 +307,24 @@ class DecodeLateBinding:
             sock.setsockopt(zmq.SNDHWM, HANDOFF_SNDHWM)
             # Queue only to a connected peer: no peer fails the send at once.
             sock.setsockopt(zmq.IMMEDIATE, 1)
+            self._monitors[dp_rank] = sock.get_monitor_socket(
+                _CONNECTED_EVENT | zmq.EVENT_DISCONNECTED
+            )
             sock.connect(self.peers[dp_rank])
             self._push[dp_rank] = sock
         return sock
+
+    def _poll_monitors(self) -> None:
+        for dp_rank, monitor in self._monitors.items():
+            while True:
+                try:
+                    event = recv_monitor_message(monitor, zmq.NOBLOCK)
+                except zmq.Again:
+                    break
+                if event["event"] == _CONNECTED_EVENT:
+                    self.connected.add(dp_rank)
+                elif event["event"] == zmq.EVENT_DISCONNECTED:
+                    self.connected.discard(dp_rank)
 
     def _send_bytes(self, dp_rank: int, data: bytes) -> bool:
         """Never blocks: a full queue, an unconnected peer or a socket error
@@ -303,7 +337,11 @@ class DecodeLateBinding:
 
     def send_handoff(self, handoff: LateBindingHandoff, owner: Any) -> bool:
         """True only if the payload is queued; the caller detaches only then.
-        Not retried: on failure the request stays on this rank."""
+        Not retried: on failure, or to a peer whose handshake has not finished,
+        the request stays on this rank."""
+        self._poll_monitors()
+        if handoff.target_dp_rank not in self.connected:
+            return False
         data = pickle.dumps(handoff, protocol=pickle.HIGHEST_PROTOCOL)
         if not self._send_bytes(handoff.target_dp_rank, data):
             return False
@@ -375,6 +413,7 @@ class DecodeLateBinding:
                 self.on_cancel(msg)
             elif not self.is_fenced(msg):
                 self.arrivals.append(msg)
+        self._poll_monitors()
         self.flush_outbox()
         self.check_timeouts()
 

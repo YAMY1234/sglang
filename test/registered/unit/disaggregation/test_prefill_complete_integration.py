@@ -334,6 +334,14 @@ class TestAllocationIntegration(CustomTestCase):
         self.assertEqual(moved.poll(), KVPoll.WaitingForInput)
         self.assertEqual(list(self.wire), [])
 
+        # A destination from the rank the request left never reaches the
+        # backend; the current rank's passes and blocks any further REBIND.
+        stale = [b"1", b"decode", b"2", b"session", b"indices"]
+        self.assertTrue(self.prefill._handle_bootstrap_message(stale))
+        current = [b"1", b"decode", b"3", b"session", b"indices"]
+        self.assertFalse(self.prefill._handle_bootstrap_message(current))
+        self.assertTrue(self.prefill.deferred_bootstrap.rooms[1].has_destination)
+
         # An ABORT from the rank the request left is consumed, not applied.
         source.send_abort_after_handoff_timeout()
         _, abort = self.wire.popleft()

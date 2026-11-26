@@ -5,11 +5,12 @@ import time
 import unittest
 from types import SimpleNamespace
 from typing import Optional
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import msgspec
 import zmq
 
+from sglang.srt.disaggregation import late_binding as late_binding_module
 from sglang.srt.disaggregation.decode import DecodePreallocQueue
 from sglang.srt.disaggregation.late_binding import (
     DecodeLateBinding,
@@ -150,6 +151,7 @@ class TestDecodeLateBindingProtocol(CustomTestCase):
             context=self.ctx,
         )
         late_binding.sent = []
+        late_binding.connected.add(1 - dp_rank)
 
         def send_bytes(peer, data):
             late_binding.sent.append((peer, pickle.loads(data)))
@@ -270,6 +272,53 @@ class TestDecodeLateBindingProtocol(CustomTestCase):
         admitted, _, abort = self._admit(handoff)
         self.assertTrue(admitted)
         abort.assert_called_once_with(late)
+
+
+class TestDecodeLateBindingConnect(CustomTestCase):
+    def test_handoff_waits_for_peer_handshake(self):
+        ctx = zmq.Context()
+        self.addCleanup(ctx.destroy, linger=0)
+        source, target = (
+            DecodeLateBinding(
+                dp_rank=dp_rank,
+                num_dp_ranks=2,
+                threshold=2,
+                local_ip="127.0.0.1",
+                ack_timeout=10.0,
+                context=ctx,
+            )
+            for dp_rank in (0, 1)
+        )
+        handoff = LateBindingHandoff(
+            recv_req=_RecvReq(rid="r1"),
+            room=7,
+            old_endpoint=("decode", 2),
+            source_dp_rank=0,
+            target_dp_rank=1,
+            sent_at=time.time(),
+            handoff_id=source.new_handoff_id(7),
+        )
+        # No handshake with the target yet: the request stays on this rank.
+        self.assertFalse(source.send_handoff(handoff, None))
+        self.assertEqual(source.pending_acks, {})
+        self.assertEqual(source.sent_to, -1)
+
+        def all_gather_object(gathered, address, group):
+            gathered[:] = [source.address, target.address]
+
+        fake_dist = SimpleNamespace(
+            get_world_size=lambda group: 2, all_gather_object=all_gather_object
+        )
+        with patch.object(late_binding_module, "dist", fake_dist):
+            source.connect_peers(group=None)
+        self.assertEqual(source.connected, {1})
+        self.assertTrue(source.send_handoff(handoff, None))
+        deadline = time.monotonic() + 10
+        while not target.arrivals and time.monotonic() < deadline:
+            target.poll()
+            time.sleep(0.01)
+        [arrival] = target.take_arrivals()
+        self.assertEqual(arrival.handoff_id, handoff.handoff_id)
 
 
 if __name__ == "__main__":
