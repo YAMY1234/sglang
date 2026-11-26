@@ -30,7 +30,10 @@ register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 class TestMooncakeTransferBatching(unittest.TestCase):
     @staticmethod
     def _make_manager(
-        side_effect=None, enable_custom_mem_pool=False, max_batch_indices=0
+        side_effect=None,
+        enable_custom_mem_pool=False,
+        max_batch_indices=0,
+        nvlink_layer_batches=0,
     ):
         engine = MagicMock()
         if side_effect is None:
@@ -47,6 +50,7 @@ class TestMooncakeTransferBatching(unittest.TestCase):
             custom_mem_pool_type="NVLINK" if enable_custom_mem_pool else None,
             enable_deferred_decode_kv_release=False,
             max_transfer_batch_indices=max_batch_indices,
+            nvlink_layer_batches=nvlink_layer_batches,
             get_mla_kv_ptrs_with_pp=MagicMock(return_value=([0, 1], [0, 1], 2)),
         )
         attach_mooncake_transport(
@@ -157,6 +161,62 @@ class TestMooncakeTransferBatching(unittest.TestCase):
             ],
             any_order=True,
         )
+
+    def _send_nvlink_layers(self, nvlink_layer_batches, num_layers):
+        """Send two page runs of `num_layers` layers over the NVLINK pool and
+        return the (src, dst, length) rows of each batch transfer."""
+        manager = self._make_manager(
+            enable_custom_mem_pool=True, nvlink_layer_batches=nvlink_layer_batches
+        )
+        layers = list(range(num_layers))
+        manager.get_mla_kv_ptrs_with_pp = MagicMock(
+            return_value=(layers, layers, num_layers)
+        )
+        attach_mooncake_transport(
+            manager,
+            manager.engine,
+            kv=[1000 * (i + 1) for i in layers],
+            peer_kv=[10000 * (i + 1) for i in layers],
+        )
+        with concurrent.futures.ThreadPoolExecutor() as executor:
+            ret = MooncakeKVManager._send_kvcache_generic(
+                manager,
+                mooncake_session_id="session",
+                item_lens=[10 * (i + 1) for i in layers],
+                # Two contiguous runs: pages 0-2 -> 10-12 and 5-6 -> 20-21.
+                prefill_data_indices=np.array([0, 1, 2, 5, 6], dtype=np.int32),
+                dst_data_indices=np.array([10, 11, 12, 20, 21], dtype=np.int32),
+                executor=executor,
+                src_keys=manager._local_keys.kv,
+                dst_keys=manager._peers["session"].keys.kv,
+            )
+        self.assertEqual(ret, 0)
+        return [
+            list(zip(*c.args[1:4]))
+            for c in manager.engine.batch_transfer_sync.call_args_list
+        ]
+
+    def test_nvlink_layer_batches_off_keeps_one_transfer_per_layer(self):
+        expected = []
+        for i in range(5):
+            src, dst, item_len = 1000 * (i + 1), 10000 * (i + 1), 10 * (i + 1)
+            expected.append(
+                [
+                    (src, dst + 10 * item_len, 3 * item_len),
+                    (src + 5 * item_len, dst + 20 * item_len, 2 * item_len),
+                ]
+            )
+
+        self.assertCountEqual(self._send_nvlink_layers(0, num_layers=5), expected)
+
+    def test_nvlink_layer_batches_cover_the_per_layer_ranges(self):
+        per_layer = self._send_nvlink_layers(0, num_layers=5)
+        for batches in (1, 2, 3, 5, 8):
+            with self.subTest(nvlink_layer_batches=batches):
+                sent = self._send_nvlink_layers(batches, num_layers=5)
+
+                self.assertEqual(len(sent), min(batches, 5))
+                self.assertCountEqual(sum(sent, []), sum(per_layer, []))
 
 
 class TestMiniMaxStateTransfer(CustomTestCase):

@@ -411,6 +411,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         self.max_transfer_batch_indices = (
             envs.SGLANG_MOONCAKE_MAX_TRANSFER_BATCH_INDICES.get()
         )
+        self.nvlink_layer_batches = envs.SGLANG_MOONCAKE_NVLINK_LAYER_BATCHES.get()
         self.enable_trace = get_observability().enable_trace
         # Set by teardown() to make worker threads exit (P<->D role switch).
         self._stopped = False
@@ -1468,9 +1469,18 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             self.enable_custom_mem_pool
             and self.custom_mem_pool_type != "INTRA_NODE_NVLINK"
         ):
-            futures = [
-                executor.submit(process_layer, *params) for params in layers_params
-            ]
+            if self.custom_mem_pool_type == "NVLINK" and self.nvlink_layer_batches > 0:
+                # Spread the layers over a few concurrent batch transfers
+                # instead of one transfer per layer.
+                num_batches = min(self.nvlink_layer_batches, len(layers_params))
+                futures = [
+                    executor.submit(process_layers, layers_params[i::num_batches])
+                    for i in range(num_batches)
+                ]
+            else:
+                futures = [
+                    executor.submit(process_layer, *params) for params in layers_params
+                ]
             return self._await_transfer_futures(futures)
         else:
             # Combining all layers' params in one batch transfer is more efficient

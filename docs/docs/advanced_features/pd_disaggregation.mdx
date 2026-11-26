@@ -338,6 +338,11 @@ The `SGLANG_MOONCAKE_CUSTOM_MEM_POOL` environment variable enables the custom me
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>0</code> (disabled)</td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>**`SGLANG_MOONCAKE_NVLINK_LAYER_BATCHES`**</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>With <code>SGLANG_MOONCAKE_CUSTOM_MEM_POOL=NVLINK</code>, send the layers of a KV chunk in this many concurrent Mooncake batch transfers instead of one transfer per layer. Concurrency is bounded by the transfer threads per queue (<code>SGLANG_DISAGGREGATION_THREAD_POOL_SIZE</code> / <code>SGLANG_DISAGGREGATION_QUEUE_SIZE</code>).</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>0</code> (one transfer per layer)</td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>**`SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT`**</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Timeout (seconds) for receiving destination KV indices during request initialization</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`300`</td>

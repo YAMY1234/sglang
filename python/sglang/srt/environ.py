@@ -987,6 +987,10 @@ class Envs:
     # synchronous all-layer Mooncake batch. Set to a positive value to split
     # larger transfers; 0 preserves the legacy single-batch behavior.
     SGLANG_MOONCAKE_MAX_TRANSFER_BATCH_INDICES = EnvInt(0)
+    # With SGLANG_MOONCAKE_CUSTOM_MEM_POOL=NVLINK, send the layers of a KV chunk
+    # in this many concurrent batch transfers instead of one per layer; 0 keeps
+    # one transfer per layer.
+    SGLANG_MOONCAKE_NVLINK_LAYER_BATCHES = EnvInt(0)
     ENABLE_ASCEND_TRANSFER_WITH_MOONCAKE = EnvBool(False)
     ASCEND_NPU_PHY_ID = EnvInt(-1)
     SGLANG_MOONCAKE_SEND_AUX_TCP = EnvBool(False)
