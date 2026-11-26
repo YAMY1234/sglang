@@ -507,7 +507,9 @@ def corrector_history_attention(
 
 
 # Window rows per tile, whether a program serves both streams, warps per program.
-_CONTEXT_TILE, _CONTEXT_PAIR, _CONTEXT_WARPS = 256, False, 4
+# Measured on VR200 at batch 116, window 256: paired 11.6 us, one stream 13.3 us,
+# 64- or 128-row tiles and 8 warps slower; re-tune when the kernel changes.
+_CONTEXT_TILE, _CONTEXT_PAIR, _CONTEXT_WARPS = 256, True, 4
 
 
 def _context_attention(
@@ -630,11 +632,18 @@ def corrector_ring_context_attention(
     )
 
 
+# Candidates per program and warps; 32 x 4 measured 15.5 us at batch 116, pool 2048.
+_CANDIDATE_BLOCK, _CANDIDATE_WARPS = 32, 4
+
+
 def corrector_candidate_scores(
     base: torch.Tensor,
     candidate_ids: torch.Tensor,
     table: torch.Tensor,
     correction: torch.Tensor,
+    *,
+    block_pool: Optional[int] = None,
+    num_warps: Optional[int] = None,
 ) -> torch.Tensor:
     """``base + table[candidate_ids] @ correction``, [batch, K] FP32.
 
@@ -652,8 +661,7 @@ def corrector_candidate_scores(
     assert dim & (dim - 1) == 0, dim
     out = torch.empty((bs, pool), dtype=torch.float32, device=base.device)
     if bs:
-        # Arbitrary: 32 rows of 256 BF16 per program keep ~7k programs at batch 116.
-        block = min(32, triton.next_power_of_2(pool))
+        block = min(block_pool or _CANDIDATE_BLOCK, triton.next_power_of_2(pool))
         _candidate_scores_kernel[(bs, triton.cdiv(pool, block))](
             base,
             base.stride(0),
@@ -665,7 +673,7 @@ def corrector_candidate_scores(
             POOL=pool,
             DIM=dim,
             BLOCK_POOL=block,
-            num_warps=4,
+            num_warps=num_warps or _CANDIDATE_WARPS,
         )
     return out
 
