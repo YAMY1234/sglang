@@ -46,7 +46,7 @@ SGL_DEVICE T* assume_global(T* ptr) {
  * out = T(residual * w * rstd), with that kernel's two FMA chains per thread, xor-butterfly
  * warp sum, in-order cross-warp sum and rounding, so both outputs equal the unfused chain's.
  */
-template <int64_t kDim, bool kUsePDL>
+template <int64_t kDim, bool kUsePDL, bool kEarlyPDL = false>
 __global__ __launch_bounds__(kDim / 16) void megamoe_epilogue_kernel(const MegaMoeEpilogueParams __grid_constant__ params) {
   using namespace device;
   using T2 = packed_t<bf16_t>;
@@ -71,6 +71,9 @@ __global__ __launch_bounds__(kDim / 16) void megamoe_epilogue_kernel(const MegaM
   weight.load(params.weight, tid);  // never written by the producer kernels
 
   PDLWaitPrimary<kUsePDL>();
+  // Early release (TRT's TopkReduceAddRMSNorm order): a dependent reads these outputs only after its
+  // own griddepcontrol.wait, which returns once this grid has completed.
+  if constexpr (kEarlyPDL) PDLTriggerSecondary<kUsePDL>();
 
   vec_t x, shared, res;
   x.load(assume_global(pointer::offset<bf16_t>(params.routed, row * params.routed_stride)), tid);
@@ -122,10 +125,10 @@ __global__ __launch_bounds__(kDim / 16) void megamoe_epilogue_kernel(const MegaM
   }
   out.store(assume_global(pointer::offset<bf16_t>(params.out, row * params.out_stride)), tid);
 
-  PDLTriggerSecondary<kUsePDL>();
+  if constexpr (!kEarlyPDL) PDLTriggerSecondary<kUsePDL>();
 }
 
-template <int64_t kDim, bool kUsePDL>
+template <int64_t kDim, bool kUsePDL, bool kEarlyPDL = false>
 struct MegaMoeEpilogueKernel {
   static constexpr uint32_t kThreads = kDim / 16;
   static constexpr uint32_t kVecBytes = 32;
@@ -172,7 +175,7 @@ struct MegaMoeEpilogueKernel {
     if (num_tokens == 0) return;
     CHECK_HOST(num_tokens <= INT32_MAX) << "too many tokens: " << num_tokens;
     LaunchKernel(static_cast<uint32_t>(num_tokens), kThreads, device_sym.unwrap())  //
-        .enable_pdl(kUsePDL)(megamoe_epilogue_kernel<kDim, kUsePDL>, params);
+        .enable_pdl(kUsePDL)(megamoe_epilogue_kernel<kDim, kUsePDL, kEarlyPDL>, params);
   }
 };
 

@@ -535,6 +535,41 @@ def _install_sm107_kernel_options(sm107_variant: str | None) -> None:
     )
 
 
+def _install_sm107_fc1_kblock_wait(sm107_variant: str | None) -> str | None:
+    """SGLANG_OPT_FLASHINFER_MEGAMOE_SM107_FC1_KBLOCK_WAIT: FC2 waits per K tile for its FC1
+    tiles (bitwise equal); every EP rank must make the same choice. Returns the installed mode."""
+    if not envs.SGLANG_OPT_FLASHINFER_MEGAMOE_SM107_FC1_KBLOCK_WAIT.get():
+        return None
+
+    import flashinfer
+
+    from sglang.srt.utils import print_info_once, print_warning_once
+
+    if (
+        sm107_variant != "inference"
+        or flashinfer.__version__ != _SM107_KERNEL_OPTIONS_FLASHINFER_VERSION
+    ):
+        print_warning_once(
+            "SGLANG_OPT_FLASHINFER_MEGAMOE_SM107_FC1_KBLOCK_WAIT is ignored: it "
+            "patches the SM107 inference kernel of FlashInfer "
+            f"{_SM107_KERNEL_OPTIONS_FLASHINFER_VERSION}, found the "
+            f"{sm107_variant or 'default'} kernel on FlashInfer {flashinfer.__version__}."
+        )
+        return None
+
+    from sglang.srt.layers.moe.flashinfer_megamoe_sm107_opts import (
+        install_sm107_megamoe_fc1_kblock_wait,
+    )
+
+    acquire_v8 = envs.SGLANG_OPT_FLASHINFER_MEGAMOE_SM107_FC1_KBLOCK_WAIT_ACQUIRE_V8.get()
+    install_sm107_megamoe_fc1_kblock_wait(acquire_v8=acquire_v8)
+    print_info_once(
+        "FlashInfer MegaMOE SM107 kernel options: fc1_kblock_wait=True"
+        f"{', acquire_v8=True' if acquire_v8 else ''} (FlashInfer {flashinfer.__version__})."
+    )
+    return "acquire_v8" if acquire_v8 else "fence"
+
+
 # The SM107 dispatch options need one router data CTA: at most this many routes per rank.
 _SM107_DISPATCH_OPTIONS_MAX_ROUTES_PER_RANK = 16384
 
@@ -722,6 +757,9 @@ def ensure_nvfp4_moe_layer_for_flashinfer_megamoe(layer: FusedMoE) -> Any:
 
     # Before the layer's first forward, which compiles the kernel.
     _install_sm107_kernel_options(layer._flashinfer_megamoe_sm107_variant)
+    layer._flashinfer_megamoe_fc1_kblock_wait = _install_sm107_fc1_kblock_wait(
+        layer._flashinfer_megamoe_sm107_variant
+    )
     _install_sm107_dispatch_options(
         layer._flashinfer_megamoe_sm107_variant, layer.top_k
     )

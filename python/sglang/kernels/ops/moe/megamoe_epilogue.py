@@ -29,9 +29,21 @@ if TYPE_CHECKING:
 _VEC_ELEMS = 16
 
 
+def _early_pdl() -> bool:
+    """SGLANG_OPT_FLASHINFER_MEGAMOE_EPILOGUE_EARLY_PDL: release PDL dependents right after the wait."""
+    from sglang.srt.environ import envs
+
+    return bool(envs.SGLANG_OPT_FLASHINFER_MEGAMOE_EPILOGUE_EARLY_PDL.get()) and is_arch_support_pdl()
+
+
 @cache_once
 def _jit_module(hidden: int) -> Module:
-    args = make_cpp_args(hidden, is_arch_support_pdl())
+    import logging
+
+    early = _early_pdl()
+    if early:
+        logging.getLogger(__name__).info(f"MegaMoE epilogue EARLY_PDL engaged=1 hidden={hidden}")
+    args = make_cpp_args(hidden, is_arch_support_pdl(), early)
     return load_jit(
         "megamoe_epilogue",
         *args,

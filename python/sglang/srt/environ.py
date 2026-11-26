@@ -1420,6 +1420,15 @@ class Envs:
     # End the SM107 inference kernel with one NVLink barrier instead of two
     # (FlashInfer 0.7.3); outputs are unchanged. Every EP rank must set the same value.
     SGLANG_OPT_FLASHINFER_MEGAMOE_SM107_SINGLE_TAIL_BARRIER = EnvBool(False)
+    # SM107 inference kernel (FlashInfer 0.7.3), intermediate 2048: FC2 waits per K tile for the FC1
+    # tiles that write it, not for the whole token block. Bitwise equal. All EP ranks alike.
+    SGLANG_OPT_FLASHINFER_MEGAMOE_SM107_FC1_KBLOCK_WAIT = EnvBool(False)
+    # With FC1_KBLOCK_WAIT: read each slot's K-tile counters with one acquire v8 load instead of relaxed
+    # loads plus a GPU fence (D3b). Bitwise equal. All EP ranks alike.
+    SGLANG_OPT_FLASHINFER_MEGAMOE_SM107_FC1_KBLOCK_WAIT_ACQUIRE_V8 = EnvBool(False)
+    # MegaMoE epilogue: release PDL dependents right after griddepcontrol.wait (norm
+    # weight loaded before the wait) instead of after the stores. Arithmetic unchanged.
+    SGLANG_OPT_FLASHINFER_MEGAMOE_EPILOGUE_EARLY_PDL = EnvBool(False)
     # On that SM107 inference kernel (FlashInfer 0.7.3), send each route's dispatch
     # metadata as a tagged word without a trailing fence or ready counter, and pull
     # each row as its word lands. Bitwise equal; every EP rank must set the same value.
