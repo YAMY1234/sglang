@@ -1433,6 +1433,19 @@ class Envs:
     # traffic with a small accuracy tradeoff and require FC2 reduce outside the
     # kernel.
     SGLANG_FLASHINFER_MEGAMOE_COMBINE_DTYPE = EnvStr("bf16")
+    # Run the NVFP4 W4A4 MegaMOE on FlashInfer's compute capability 10.7 kernel under
+    # expert parallelism: "inference" (generic) or "genphase" (one cross-rank token
+    # exchange per layer). Needs <= 1024 tokens per rank and the BF16 combine; empty is off.
+    SGLANG_FLASHINFER_MEGAMOE_SM107_VARIANT = EnvStr("")
+    # FlashInfer knobs for that kernel as a JSON object; empty keeps FlashInfer's defaults.
+    SGLANG_FLASHINFER_MEGAMOE_SM107_KNOBS = EnvStr("")
+    # Options for that kernel's "inference" variant; outputs are bitwise equal and every
+    # EP rank must set the same values. End each launch with one NVLink barrier, not two.
+    SGLANG_OPT_FLASHINFER_MEGAMOE_SM107_SINGLE_TAIL_BARRIER = EnvBool(False)
+    # Send each route's dispatch metadata as a tagged word and pull each row as it lands.
+    SGLANG_OPT_FLASHINFER_MEGAMOE_SM107_TAGGED_DISPATCH = EnvBool(False)
+    # Let each router push warp compute its routes' destinations, not wait for a table.
+    SGLANG_OPT_FLASHINFER_MEGAMOE_SM107_PER_CTA_PUSH_LAYOUT = EnvBool(False)
     # Enable per-token FP32 activation scaling for serialized ModelOpt FP4 with
     # FlashInfer TRT-LLM or CuTe DSL v2 MoE.
     SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION = EnvBool(False)

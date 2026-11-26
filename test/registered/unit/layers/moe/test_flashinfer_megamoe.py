@@ -58,6 +58,17 @@ def _load_megamoe_module(monkeypatch):
         SGLANG_FLASHINFER_MEGAMOE_IN_KERNEL_FC2_REDUCE=types.SimpleNamespace(
             get=lambda: False
         ),
+        SGLANG_FLASHINFER_MEGAMOE_SM107_VARIANT=types.SimpleNamespace(get=lambda: ""),
+        SGLANG_FLASHINFER_MEGAMOE_SM107_KNOBS=types.SimpleNamespace(get=lambda: ""),
+        SGLANG_OPT_FLASHINFER_MEGAMOE_SM107_SINGLE_TAIL_BARRIER=types.SimpleNamespace(
+            get=lambda: False
+        ),
+        SGLANG_OPT_FLASHINFER_MEGAMOE_SM107_TAGGED_DISPATCH=types.SimpleNamespace(
+            get=lambda: False
+        ),
+        SGLANG_OPT_FLASHINFER_MEGAMOE_SM107_PER_CTA_PUSH_LAYOUT=types.SimpleNamespace(
+            get=lambda: False
+        ),
     )
     runtime_context = fake_modules["sglang.srt.runtime_context"]
     runtime_context.cutedsl_moe_max_num_tokens = lambda: 2048
@@ -848,6 +859,260 @@ def test_nvfp4_reload_preserves_layer_and_prepared_weight_storage(
         assert layer._flashinfer_megamoe_layer is mega
         assert layer._flashinfer_megamoe_forward is forward
         assert layer._flashinfer_megamoe_input_norm_const == 1.0
+
+
+def _set_envs(monkeypatch, module, **values):
+    for name, value in values.items():
+        monkeypatch.setattr(
+            getattr(module.envs, name), "get", lambda value=value: value
+        )
+
+
+def _capture_warnings_once(monkeypatch):
+    warnings = []
+    utils = types.ModuleType("sglang.srt.utils")
+    utils.print_warning_once = warnings.append
+    utils.print_info_once = lambda _message: None
+    monkeypatch.setitem(sys.modules, utils.__name__, utils)
+    return warnings
+
+
+@pytest.mark.parametrize(
+    "value,expected",
+    [("", None), ("inference", "inference"), (" GenPhase ", "genphase")],
+)
+def test_sm107_variant_parsing(monkeypatch, value, expected):
+    module = _load_megamoe_module(monkeypatch)
+    _set_envs(monkeypatch, module, SGLANG_FLASHINFER_MEGAMOE_SM107_VARIANT=value)
+    assert module._resolve_sm107_variant() == expected
+
+
+def test_sm107_variant_rejects_unknown_value(monkeypatch):
+    module = _load_megamoe_module(monkeypatch)
+    _set_envs(monkeypatch, module, SGLANG_FLASHINFER_MEGAMOE_SM107_VARIANT="decode")
+    with pytest.raises(ValueError, match="SGLANG_FLASHINFER_MEGAMOE_SM107_VARIANT"):
+        module._resolve_sm107_variant()
+
+
+def test_sm107_knobs_parse_json_object(monkeypatch):
+    module = _load_megamoe_module(monkeypatch)
+    assert module._resolve_sm107_knobs() is None
+    _set_envs(
+        monkeypatch,
+        module,
+        SGLANG_FLASHINFER_MEGAMOE_SM107_KNOBS=json.dumps(
+            {
+                "mma_tiler_mnk": [256, 128, 256],
+                "schedule_policy": ["phase_interleave", None],
+                "fc2_use_bulk": True,
+                "token_back_mode": "epi_warps",
+            }
+        ),
+    )
+    # FlashInfer compares the list-valued knobs as tuples.
+    assert module._resolve_sm107_knobs() == {
+        "mma_tiler_mnk": (256, 128, 256),
+        "schedule_policy": ("phase_interleave", None),
+        "fc2_use_bulk": True,
+        "token_back_mode": "epi_warps",
+    }
+
+
+@pytest.mark.parametrize("value", ["{not json", "[4, 1]", "null", "auto"])
+def test_sm107_knobs_reject_non_object(monkeypatch, value):
+    module = _load_megamoe_module(monkeypatch)
+    _set_envs(monkeypatch, module, SGLANG_FLASHINFER_MEGAMOE_SM107_KNOBS=value)
+    with pytest.raises(ValueError, match="must be a JSON object"):
+        module._resolve_sm107_knobs()
+
+
+@pytest.mark.parametrize(
+    "overrides,reason",
+    [
+        ({}, None),
+        ({"capability": (10, 0)}, "compute capability (10, 0)"),
+        ({"ep_size": 1}, "expert parallel size 1"),
+        (
+            {"SGLANG_FLASHINFER_MEGAMOE_MAX_TOKENS_PER_RANK": 2048},
+            "2048 tokens per rank",
+        ),
+        ({"SGLANG_FLASHINFER_MEGAMOE_COMBINE_DTYPE": "mxfp8"}, "quantized combine"),
+        ({"SGLANG_FLASHINFER_MEGAMOE_IN_KERNEL_FC2_REDUCE": True}, "FC2 reduce"),
+        ({"SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16": True}, "W4A16 activations"),
+    ],
+)
+def test_sm107_variant_falls_back_outside_its_constraints(
+    monkeypatch, overrides, reason
+):
+    module = _load_megamoe_module(monkeypatch)
+    warnings = _capture_warnings_once(monkeypatch)
+    overrides = dict(overrides)
+    capability = overrides.pop("capability", (10, 7))
+    layer = types.SimpleNamespace(moe_ep_size=overrides.pop("ep_size", 16))
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda: capability)
+    _set_envs(
+        monkeypatch,
+        module,
+        SGLANG_FLASHINFER_MEGAMOE_SM107_VARIANT="inference",
+        **{"SGLANG_FLASHINFER_MEGAMOE_MAX_TOKENS_PER_RANK": 256, **overrides},
+    )
+
+    variant = module._flashinfer_megamoe_sm107_variant(layer)
+
+    if reason is None:
+        assert variant == "inference"
+        assert warnings == []
+    else:
+        assert variant is None
+        assert len(warnings) == 1 and reason in warnings[0]
+
+
+@pytest.mark.parametrize(
+    "option,variant,version,overrides,reason",
+    [
+        ("SINGLE_TAIL_BARRIER", "inference", "0.7.4", {}, None),
+        ("TAGGED_DISPATCH", "inference", "0.7.5", {}, None),
+        ("PER_CTA_PUSH_LAYOUT", "inference", "0.7.4", {}, None),
+        ("SINGLE_TAIL_BARRIER", "genphase", "0.7.4", {}, "found the genphase"),
+        ("TAGGED_DISPATCH", None, "0.7.4", {}, "found the default"),
+        ("PER_CTA_PUSH_LAYOUT", "inference", "0.7.6", {}, "on FlashInfer 0.7.6"),
+        # 4096 tokens per rank at top-8 need more than one router data CTA.
+        (
+            "SINGLE_TAIL_BARRIER",
+            "inference",
+            "0.7.4",
+            {"SGLANG_FLASHINFER_MEGAMOE_MAX_TOKENS_PER_RANK": 4096},
+            None,
+        ),
+        (
+            "TAGGED_DISPATCH",
+            "inference",
+            "0.7.4",
+            {"SGLANG_FLASHINFER_MEGAMOE_MAX_TOKENS_PER_RANK": 4096},
+            "32768 routes",
+        ),
+        (
+            "PER_CTA_PUSH_LAYOUT",
+            "inference",
+            "0.7.4",
+            {"SGLANG_FLASHINFER_MEGAMOE_COMBINE_DTYPE": "nvfp4"},
+            "BF16 combine",
+        ),
+        (
+            "TAGGED_DISPATCH",
+            "inference",
+            "0.7.4",
+            {
+                "SGLANG_FLASHINFER_MEGAMOE_SM107_KNOBS": (
+                    '{"token_back_mode": "standalone_warps"}'
+                )
+            },
+            "token_back_mode 'epi_warps'",
+        ),
+    ],
+)
+def test_sm107_kernel_option_constraints(
+    monkeypatch, option, variant, version, overrides, reason
+):
+    module = _load_megamoe_module(monkeypatch)
+    _set_envs(
+        monkeypatch,
+        module,
+        **{"SGLANG_FLASHINFER_MEGAMOE_MAX_TOKENS_PER_RANK": 256, **overrides},
+    )
+
+    actual = module._sm107_kernel_option_unsupported_reason(option, variant, 8, version)
+
+    if reason is None:
+        assert actual is None
+    else:
+        assert reason in actual
+
+
+def test_sm107_kernel_options_are_ignored_off_the_inference_kernel(monkeypatch):
+    module = _load_megamoe_module(monkeypatch)
+    warnings = _capture_warnings_once(monkeypatch)
+    _set_envs(
+        monkeypatch,
+        module,
+        SGLANG_OPT_FLASHINFER_MEGAMOE_SM107_SINGLE_TAIL_BARRIER=True,
+        SGLANG_OPT_FLASHINFER_MEGAMOE_SM107_TAGGED_DISPATCH=True,
+    )
+    fake_flashinfer = types.ModuleType("flashinfer")
+    fake_flashinfer.__version__ = "0.7.4"
+    monkeypatch.setitem(sys.modules, "flashinfer", fake_flashinfer)
+
+    # Neither option imports the kernel patches, which need the CuTe DSL toolchain.
+    module._install_sm107_kernel_options("genphase", top_k=8)
+
+    assert [warning.split(" is ignored")[0] for warning in warnings] == [
+        "SGLANG_OPT_FLASHINFER_MEGAMOE_SM107_SINGLE_TAIL_BARRIER",
+        "SGLANG_OPT_FLASHINFER_MEGAMOE_SM107_TAGGED_DISPATCH",
+    ]
+
+
+@pytest.mark.parametrize("variant", ["inference", "genphase"])
+def test_sm107_layer_runs_fixed_knobs_without_startup_tuning(monkeypatch, variant):
+    module = _load_megamoe_module(monkeypatch)
+    _capture_warnings_once(monkeypatch)
+    _set_envs(
+        monkeypatch,
+        module,
+        SGLANG_FLASHINFER_MEGAMOE_MAX_TOKENS_PER_RANK=256,
+        SGLANG_FLASHINFER_MEGAMOE_SM107_KNOBS='{"mma_tiler_mnk": [256, 128, 256]}',
+    )
+    fake_moe_ep = types.ModuleType("flashinfer.moe_ep")
+    fake_moe_ep.Sm107_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig = types.SimpleNamespace
+    fake_moe_ep.BootstrapConfig = types.SimpleNamespace
+    fake_moe_ep.FleetParams = types.SimpleNamespace
+    fake_moe_ep.MegaConfig = types.SimpleNamespace
+    fake_moe_ep.MoEEpMegaLayer = types.SimpleNamespace
+    monkeypatch.setitem(sys.modules, "flashinfer.moe_ep", fake_moe_ep)
+    monkeypatch.setattr(
+        sys.modules["sglang.srt.runtime_context"],
+        "get_parallel",
+        lambda: types.SimpleNamespace(
+            moe_ep_group=types.SimpleNamespace(device_group=None)
+        ),
+        raising=False,
+    )
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    layer = types.SimpleNamespace(
+        layer_id=0,
+        hidden_size=128,
+        num_experts=4,
+        moe_ep_size=2,
+        moe_ep_rank=1,
+        intermediate_size_per_partition=128,
+        top_k=2,
+        moe_runner_config=types.SimpleNamespace(
+            is_gated=True, activation="silu", swiglu_limit=8.0
+        ),
+        w13_weight=torch.zeros(1),
+        w2_weight=torch.zeros(1),
+        w13_weight_scale=torch.zeros(1),
+        w2_weight_scale=torch.zeros(1),
+    )
+    # The state prepare_nvfp4_moe_weights_for_flashinfer_megamoe leaves on an
+    # eligible layer.
+    module._init_flashinfer_megamoe_layer_state(layer)
+    layer._flashinfer_megamoe_sm107_variant = variant
+    layer._flashinfer_megamoe_input_norm_const = 2.0
+
+    mega = module.ensure_nvfp4_moe_layer_for_flashinfer_megamoe(layer)
+
+    config = mega.backend.megakernel
+    assert config.kernel_variant == variant
+    assert config.knobs == {"mma_tiler_mnk": (256, 128, 256)}
+    assert config.input_norm_const == 2.0
+    assert (config.activation, config.gate_up_clamp) == ("swiglu", 8.0)
+    if variant == "genphase":
+        assert (config.cluster_shape_mn, config.fc2_use_bulk) == ((4, 1), True)
+    else:
+        assert not hasattr(config, "cluster_shape_mn")
+    assert layer._flashinfer_megamoe_forward is module.forward_megamoe
+    with pytest.raises(ValueError, match="weight reload"):
+        module._prepare_nvfp4_weights_for_sm107(layer, variant=variant)
 
 
 if __name__ == "__main__":

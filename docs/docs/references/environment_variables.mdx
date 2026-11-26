@@ -384,6 +384,31 @@ SGLang supports various environment variables that can be used to configure its 
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>"false"</code></td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_FLASHINFER_MEGAMOE_SM107_VARIANT</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Run ModelOpt NVFP4 W4A4 MegaMOE layers on FlashInfer's compute capability 10.7 kernel: <code>inference</code> (generic) or <code>genphase</code> (one cross-rank token exchange per layer). Applies only on compute capability 10.7 with expert parallel size above 1, at most 1024 tokens per rank, BF16 combine and no in-kernel FC2 reduce; otherwise it is ignored with a warning. The kernel runs fixed knobs, so MegaMoE startup autotuning and <code>SGLANG_FLASHINFER_MEGAMOE_DECODE_MAX_TOKENS_PER_RANK</code> do not apply to it, and weight reload is not supported. Empty keeps the default kernel.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>""</code></td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_FLASHINFER_MEGAMOE_SM107_KNOBS</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>FlashInfer knobs for the kernel that <code>SGLANG_FLASHINFER_MEGAMOE_SM107_VARIANT</code> selects, as a JSON object (for example <code>{'{"cluster_shape_mn": [4, 1], "fc2_use_bulk": true}'}</code>). Empty keeps FlashInfer's defaults.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>""</code></td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_OPT_FLASHINFER_MEGAMOE_SM107_SINGLE_TAIL_BARRIER</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>End each launch of the compute capability 10.7 <code>inference</code> kernel with one NVLink barrier instead of two. Outputs are bitwise equal. Applies with FlashInfer 0.7.4 or 0.7.5 and is ignored with a warning otherwise; every EP rank must set the same value.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>"false"</code></td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_OPT_FLASHINFER_MEGAMOE_SM107_TAGGED_DISPATCH</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>On the compute capability 10.7 <code>inference</code> kernel, send each route's dispatch metadata as one tagged word without a trailing fence or ready counter, and pull each row as soon as its word lands. Outputs are bitwise equal. Needs FlashInfer 0.7.4 or 0.7.5, BF16 combine, <code>token_back_mode</code> <code>epi_warps</code> and at most 16384 routes (tokens per rank times top-k) per rank; every EP rank must set the same value.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>"false"</code></td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_OPT_FLASHINFER_MEGAMOE_SM107_PER_CTA_PUSH_LAYOUT</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>On the compute capability 10.7 <code>inference</code> kernel, let each router push warp compute its routes' destination rows instead of waiting for a helper CTA's table. Outputs are bitwise equal. Same requirements as <code>SGLANG_OPT_FLASHINFER_MEGAMOE_SM107_TAGGED_DISPATCH</code>; every EP rank must set the same value.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>"false"</code></td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`SGLANG_DEEPEP_LL_COMBINE_SEND_NUM_SMS`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Number of SMs used for DeepEP combine when single batch overlap is enabled</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`"32"`</td>

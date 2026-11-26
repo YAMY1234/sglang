@@ -22,6 +22,7 @@ and combine stay pure no-ops; this module owns the layer build + forward.
 
 from __future__ import annotations
 
+import json
 import logging
 from collections.abc import Callable, Generator
 from contextlib import contextmanager
@@ -183,6 +184,75 @@ def resolve_flashinfer_megamoe_combine_dtype() -> str:
     return combine_dtype
 
 
+_SM107_VARIANTS = ("inference", "genphase")
+# FlashInfer's GenPhase variant is built for at most this many tokens per rank;
+# the compute capability 10.7 gate applies it to both variants.
+_SM107_MAX_TOKENS_PER_RANK = 1024
+
+
+def _resolve_sm107_variant() -> str | None:
+    variant = envs.SGLANG_FLASHINFER_MEGAMOE_SM107_VARIANT.get().strip().lower()
+    if not variant:
+        return None
+    if variant not in _SM107_VARIANTS:
+        raise ValueError(
+            "SGLANG_FLASHINFER_MEGAMOE_SM107_VARIANT must be empty, 'inference' "
+            f"or 'genphase', got {variant!r}."
+        )
+    return variant
+
+
+def _resolve_sm107_knobs() -> dict[str, Any] | None:
+    knobs = envs.SGLANG_FLASHINFER_MEGAMOE_SM107_KNOBS.get().strip()
+    if not knobs:
+        return None
+    try:
+        parsed = json.loads(knobs)
+    except json.JSONDecodeError:
+        parsed = None
+    if not isinstance(parsed, dict):
+        raise ValueError(
+            f"SGLANG_FLASHINFER_MEGAMOE_SM107_KNOBS must be a JSON object, got {knobs!r}."
+        )
+    # FlashInfer compares tile, cluster and schedule knobs as tuples.
+    return {k: tuple(v) if isinstance(v, list) else v for k, v in parsed.items()}
+
+
+def _sm107_unsupported_reason(layer: FusedMoE) -> str | None:
+    if envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16.get():
+        return "W4A16 activations"
+    capability = torch.cuda.get_device_capability()
+    if capability != (10, 7):
+        return f"compute capability {capability}"
+    if layer.moe_ep_size == 1:
+        return "expert parallel size 1"
+    max_tokens_per_rank = _resolve_max_tokens_per_rank()
+    if max_tokens_per_rank > _SM107_MAX_TOKENS_PER_RANK:
+        return f"{max_tokens_per_rank} tokens per rank"
+    if (
+        resolve_flashinfer_megamoe_combine_dtype() != "bf16"
+        or envs.SGLANG_FLASHINFER_MEGAMOE_IN_KERNEL_FC2_REDUCE.get()
+    ):
+        return "a quantized combine or the in-kernel FC2 reduce"
+    return None
+
+
+def _flashinfer_megamoe_sm107_variant(layer: FusedMoE) -> str | None:
+    variant = _resolve_sm107_variant()
+    if variant is None:
+        return None
+    reason = _sm107_unsupported_reason(layer)
+    if reason is not None:
+        from sglang.srt.utils import print_warning_once
+
+        print_warning_once(
+            f"SGLANG_FLASHINFER_MEGAMOE_SM107_VARIANT={variant} is ignored "
+            f"({reason}); FlashInfer MegaMOE keeps its default kernel."
+        )
+        return None
+    return variant
+
+
 def _layer_ep_world_rank(layer: FusedMoE) -> tuple[int, int]:
     world_size = int(layer.moe_ep_size)
     rank = int(layer.moe_ep_rank)
@@ -245,6 +315,7 @@ def _init_flashinfer_megamoe_layer_state(layer: FusedMoE) -> None:
     layer._flashinfer_megamoe_layer = None
     layer._flashinfer_megamoe_forward = None
     layer._flashinfer_megamoe_input_norm_const = None
+    layer._flashinfer_megamoe_sm107_variant = None
 
 
 def _get_or_init_flashinfer_megamoe_layer_state(layer: FusedMoE) -> Any:
@@ -320,7 +391,12 @@ def _ensure_flashinfer_megamoe_layer(
         backend=backend,
     )
     layer._flashinfer_megamoe_layer = mega
-    if hasattr(megakernel_config, "knobs"):
+    # The compute capability 10.7 kernels run fixed knobs: startup profiles would build
+    # workspaces past the per-rank token bound that gates them.
+    if (
+        hasattr(megakernel_config, "knobs")
+        and layer._flashinfer_megamoe_sm107_variant is None
+    ):
         layer._flashinfer_megamoe_forward = MegaMoeTunedForward(
             bootstrap,
             fleet_params,
@@ -370,11 +446,128 @@ def _nvfp4_megamoe_activation_kwargs(config: MoeRunnerConfig) -> dict[str, Any]:
     raise ValueError("FlashInfer NVFP4 MegaMOE only supports gated SiLU or SiTU.")
 
 
+def _sm107_megakernel_config(
+    layer: FusedMoE, *, variant: str, activation_kwargs: dict[str, Any]
+) -> Any:
+    from flashinfer.moe_ep import Sm107_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig
+
+    from sglang.srt.utils import print_info_once
+
+    knobs = _resolve_sm107_knobs()
+    print_info_once(
+        f"FlashInfer MegaMOE runs the compute capability 10.7 {variant} kernel "
+        f"(EP size {layer.moe_ep_size}, knobs {knobs or 'default'})."
+    )
+    # GenPhase accepts only this cluster shape and the bulk FC2 store.
+    variant_fields = (
+        {"cluster_shape_mn": (4, 1), "fc2_use_bulk": True}
+        if variant == "genphase"
+        else {}
+    )
+    return Sm107_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(
+        intermediate_size=layer.intermediate_size_per_partition,
+        top_k=layer.top_k,
+        kernel_variant=variant,
+        knobs=knobs,
+        input_norm_const=layer._flashinfer_megamoe_input_norm_const,
+        **variant_fields,
+        **activation_kwargs,
+    )
+
+
+# The kernel options replace methods of FlashInfer's vendored compute capability 10.7
+# kernel sources, which are identical in these releases.
+_SM107_KERNEL_OPTIONS_FLASHINFER_VERSIONS = ("0.7.3", "0.7.4", "0.7.5", "0.7.5.post1")
+# The dispatch options need a router with one data CTA: at most this many routes per rank.
+_SM107_DISPATCH_OPTIONS_MAX_ROUTES_PER_RANK = 16384
+
+
+def _sm107_kernel_option_unsupported_reason(
+    option: str, sm107_variant: str | None, top_k: int, flashinfer_version: str
+) -> str | None:
+    if (
+        sm107_variant != "inference"
+        or flashinfer_version not in _SM107_KERNEL_OPTIONS_FLASHINFER_VERSIONS
+    ):
+        return (
+            "it patches the compute capability 10.7 inference kernel of FlashInfer "
+            f"{'/'.join(_SM107_KERNEL_OPTIONS_FLASHINFER_VERSIONS)}, found the "
+            f"{sm107_variant or 'default'} kernel on FlashInfer {flashinfer_version}"
+        )
+    if option == "SINGLE_TAIL_BARRIER":
+        return None
+    routes = _resolve_max_tokens_per_rank() * top_k
+    if routes > _SM107_DISPATCH_OPTIONS_MAX_ROUTES_PER_RANK:
+        return (
+            f"{routes} routes per rank exceed the one-data-CTA router's "
+            f"{_SM107_DISPATCH_OPTIONS_MAX_ROUTES_PER_RANK}"
+        )
+    # The token-in warps must own no token-back work.
+    if resolve_flashinfer_megamoe_combine_dtype() != "bf16":
+        return "it needs the BF16 combine"
+    token_back_mode = (_resolve_sm107_knobs() or {}).get("token_back_mode", "epi_warps")
+    if token_back_mode != "epi_warps":
+        return f"it needs token_back_mode 'epi_warps', got {token_back_mode!r}"
+    return None
+
+
+def _install_sm107_kernel_options(sm107_variant: str | None, top_k: int) -> None:
+    options = {
+        "SINGLE_TAIL_BARRIER": envs.SGLANG_OPT_FLASHINFER_MEGAMOE_SM107_SINGLE_TAIL_BARRIER,
+        "TAGGED_DISPATCH": envs.SGLANG_OPT_FLASHINFER_MEGAMOE_SM107_TAGGED_DISPATCH,
+        "PER_CTA_PUSH_LAYOUT": envs.SGLANG_OPT_FLASHINFER_MEGAMOE_SM107_PER_CTA_PUSH_LAYOUT,
+    }
+    requested = [option for option, env in options.items() if env.get()]
+    if not requested:
+        return
+
+    import flashinfer
+
+    from sglang.srt.utils import print_info_once, print_warning_once
+
+    supported = []
+    for option in requested:
+        reason = _sm107_kernel_option_unsupported_reason(
+            option, sm107_variant, top_k, flashinfer.__version__
+        )
+        if reason is None:
+            supported.append(option)
+        else:
+            print_warning_once(
+                f"SGLANG_OPT_FLASHINFER_MEGAMOE_SM107_{option} is ignored: {reason}."
+            )
+    if not supported:
+        return
+
+    from sglang.srt.layers.moe.flashinfer_megamoe_sm107_dispatch import (
+        install_sm107_megamoe_per_cta_push_layout,
+        install_sm107_megamoe_tagged_dispatch,
+    )
+    from sglang.srt.layers.moe.flashinfer_megamoe_sm107_opts import (
+        install_sm107_megamoe_single_tail_barrier,
+    )
+
+    installers = {
+        "SINGLE_TAIL_BARRIER": install_sm107_megamoe_single_tail_barrier,
+        "TAGGED_DISPATCH": install_sm107_megamoe_tagged_dispatch,
+        "PER_CTA_PUSH_LAYOUT": install_sm107_megamoe_per_cta_push_layout,
+    }
+    # In this order: the tagged dispatch wraps whichever kernel tail is installed.
+    for option in supported:
+        installers[option]()
+    print_info_once(
+        "FlashInfer MegaMOE compute capability 10.7 kernel options: "
+        f"{', '.join(supported)} (FlashInfer {flashinfer.__version__})."
+    )
+
+
 def ensure_nvfp4_moe_layer_for_flashinfer_megamoe(layer: FusedMoE) -> Any:
     mega = _get_or_init_flashinfer_megamoe_layer_state(layer)
     if mega is not None:
         return mega
 
+    # Before the layer's first forward, which compiles the kernel.
+    _install_sm107_kernel_options(layer._flashinfer_megamoe_sm107_variant, layer.top_k)
     activation_kwargs = _nvfp4_megamoe_activation_kwargs(layer.moe_runner_config)
     if envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16.get():
         from flashinfer.moe_ep import Sm100_Bf16_Nvfp4_Bf16_Cutedsl_MegaMoeConfig
@@ -384,6 +577,12 @@ def ensure_nvfp4_moe_layer_for_flashinfer_megamoe(layer: FusedMoE) -> Any:
             top_k=layer.top_k,
             enable_in_kernel_fc2_reduce=envs.SGLANG_FLASHINFER_MEGAMOE_IN_KERNEL_FC2_REDUCE.get(),
             **activation_kwargs,
+        )
+    elif layer._flashinfer_megamoe_sm107_variant is not None:
+        megakernel_config = _sm107_megakernel_config(
+            layer,
+            variant=layer._flashinfer_megamoe_sm107_variant,
+            activation_kwargs=activation_kwargs,
         )
     else:
         from flashinfer.moe_ep import Nvfp4CutedslMegaMoeConfig
@@ -503,6 +702,37 @@ def make_nvfp4_megamoe_weight_loader(
     return load_weights
 
 
+def _prepare_nvfp4_weights_for_sm107(layer: FusedMoE, *, variant: str) -> None:
+    # The compute capability 10.7 layout interleaves gate/up rows and transposes the
+    # weights in new storage, so the checkpoint loader cannot write into it again.
+    if layer._flashinfer_megamoe_sm107_variant is not None:
+        raise ValueError(
+            "SGLANG_FLASHINFER_MEGAMOE_SM107_VARIANT does not support weight reload."
+        )
+    from flashinfer.moe_ep import MoEWeightPack, preprocess_sm107_nvfp4_mega_weights
+
+    transformed_weights = preprocess_sm107_nvfp4_mega_weights(
+        MoEWeightPack(
+            w13=layer.w13_weight.data,
+            w2=layer.w2_weight.data,
+            w13_scale=layer.w13_weight_scale.data,
+            w2_scale=layer.w2_weight_scale.data,
+        ),
+        intermediate_size=layer.intermediate_size_per_partition,
+        hidden_size=layer.hidden_size,
+    )
+    _bind_transformed_weights(
+        layer,
+        transformed_weights,
+        w13_scale_name="w13_weight_scale",
+        w2_scale_name="w2_weight_scale",
+    )
+    layer._flashinfer_megamoe_input_norm_const = _scalar_float(
+        layer.w13_input_scale_quant
+    )
+    layer._flashinfer_megamoe_sm107_variant = variant
+
+
 def prepare_nvfp4_moe_weights_for_flashinfer_megamoe(
     layer: FusedMoE,
 ) -> None:
@@ -545,6 +775,13 @@ def prepare_nvfp4_moe_weights_for_flashinfer_megamoe(
         )
 
     _validate_nvfp4_fc1_alpha(layer)
+    sm107_variant = (
+        layer._flashinfer_megamoe_sm107_variant
+        or _flashinfer_megamoe_sm107_variant(layer)
+    )
+    if sm107_variant is not None:
+        _prepare_nvfp4_weights_for_sm107(layer, variant=sm107_variant)
+        return
     weight_views = getattr(layer, "_flashinfer_megamoe_weight_views", None)
     if weight_views is None:
         load_layouts = {}
