@@ -1376,6 +1376,10 @@ class Envs:
     # Cache BF16 expansions of Hopper group32 FP8 weights for larger GEMMs.
     # Disable to save the additional weight memory or allow online updates.
     SGLANG_OPT_HOPPER_BLOCK_FP8_BF16 = EnvBool(True)
+    # SM107 with the cutedsl BF16 GEMM backend (auto's pick on SM10x): send the shapes in
+    # unquant's _BF16_SPLITK_HEURISTIC_M_RANGES (GLM-5.2 at attention TP 1) to split-K
+    # kernels; (M, N, K) in the tuned split-K tables keep their route.
+    SGLANG_ENABLE_BF16_SPLITK_GEMM_HEURISTIC = EnvBool(False)
     SGLANG_MOE_NVFP4_DISPATCH = EnvBool(False)
     SGLANG_NVFP4_CKPT_FP8_GEMM_IN_ATTN = EnvBool(False)
     SGLANG_NVFP4_CKPT_FP8_NEXTN_MOE = EnvBool(False)

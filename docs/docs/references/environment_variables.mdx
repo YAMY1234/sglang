@@ -827,6 +827,11 @@ SGLang supports various environment variables that can be used to configure its 
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_ENABLE_BF16_SPLITK_GEMM_HEURISTIC</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>On compute capability 10.7 GPUs with the CuTe DSL BF16 GEMM backend (what <code>--bf16-gemm-backend auto</code> selects on SM10x), run the GLM-5.2 attention TP 1 BF16 projections (fused qkv_a, o_proj, dense MLP, indexer wq_b) on split-K kernels for the token counts listed per shape (all M &lt;= 128): warp split-K up to M = 32, above that a TGV GEMM with K split into FP32 partials and summed in a fixed order. Shapes in the tuned split-K tables keep their tactic.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_NVFP4_CKPT_FP8_GEMM_IN_ATTN</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Quantize q_b_proj from BF16 to FP8 when launching DeepSeek NVFP4 checkpoint</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
