@@ -1,5 +1,7 @@
 """Storage backup acks settle at the rank-agreed written prefix: beliefs cover
 only what was written, the tail is left for a later write-through to cover.
+With SGLANG_HICACHE_L3_WRITE_ON_HOST_EVICT, cache mode writes storage from the
+cold end of the host LRU and holds each page until its write is acked.
 CPU only: the tree, the controller, its backup thread and the file backend are
 real; the D2H transfer engine is faked (no device streams)."""
 
@@ -19,7 +21,11 @@ import torch
 import sglang.test.kits.unified_radix_cache.fixtures as _fixtures
 from sglang.kernels.ops.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
 from sglang.srt.environ import envs
-from sglang.srt.mem_cache.base_prefix_cache import InsertParams, MatchPrefixParams
+from sglang.srt.mem_cache.base_prefix_cache import (
+    EvictParams,
+    InsertParams,
+    MatchPrefixParams,
+)
 from sglang.srt.mem_cache.hicache_storage import (
     STORAGE_BATCH_SIZE,
     HiCacheStorageConfig,
@@ -170,8 +176,8 @@ def _build_cache(
     return cache, allocator, req_to_token_pool
 
 
-def _insert_span(cache, allocator, num_tokens):
-    tokens = array("q", range(1, 1 + num_tokens))
+def _insert_span(cache, allocator, num_tokens, start=1):
+    tokens = array("q", range(start, start + num_tokens))
     value = allocator.alloc(num_tokens)
     cache.insert(InsertParams(key=RadixKey(tokens), value=value))
     return cache.match_prefix(MatchPrefixParams(key=RadixKey(tokens))).last_device_node
@@ -405,6 +411,166 @@ class TestCacheModeShortSettlement(unittest.TestCase):
         # host eviction) sends the span again.
         self.assertTrue(self.cache.tree_core.is_backuped(self.leaf))
         self.cache.sanity_check()
+
+
+class _HostTailCase(unittest.TestCase):
+    """Cache mode with three host-only spans, coldest first, and the host pool
+    otherwise full. With write-on-host-evict the reserve (0.05 of the pool by
+    default) covers the two coldest spans but not the third."""
+
+    write_on_host_evict = True
+
+    def setUp(self):
+        self._cleanup = contextlib.ExitStack()
+        self.addCleanup(self._cleanup.close)
+        storage_dir = tempfile.mkdtemp(prefix="hicache-backup-settle-")
+        self.addCleanup(shutil.rmtree, storage_dir, ignore_errors=True)
+        self._cleanup.enter_context(
+            envs.SGLANG_HICACHE_L3_WRITE_ON_HOST_EVICT.override(
+                self.write_on_host_evict
+            )
+        )
+        self.cache, self.allocator, _ = _build_cache(
+            self._cleanup, host_memory_mode="cache", storage_dir=storage_dir
+        )
+        self.cc = self.cache.cache_controller
+        self.host = self.cc.mem_pool_host
+        self.target = int(
+            envs.SGLANG_HICACHE_L3_EVICT_WRITE_RESERVE_FRACTION.get() * self.host.size
+        )
+        self.assertGreaterEqual(self.target, 8)
+        # Two spans exceed the reserve, one does not.
+        self.span = self.target * 2 // 3
+        self.cold, self.warm, self.hot = (
+            _insert_span(self.cache, self.allocator, self.span, start=start)
+            for start in (1, 100_000, 200_000)
+        )
+        self.chains = {
+            node: self.cache.tree_core.get_hash_values(node)
+            for node in (self.cold, self.warm, self.hot)
+        }
+        self.beliefs = self.cache.storage_existence_cache.pool(PoolName.KV)
+        self.writes = _spy_storage_writes(self.cc)
+
+    def _demote_all_and_fill_host(self):
+        """Back up and demote the spans, then take every free host slot."""
+        for node in (self.cold, self.warm, self.hot):
+            _backup_to_host(self.cache, node)
+        # Admission writes (switch off) hold their host pages until acked.
+        _tick_until(self.cache, lambda: not self.cache.ongoing_backup)
+        self.cache.evict(EvictParams(num_tokens=3 * self.span))
+        for node in (self.cold, self.warm, self.hot):
+            self.assertTrue(self.cache.tree_core.is_host_evictable_leaf(node))
+        return self.host.alloc(self.host.available_size())
+
+    def _written_chains(self):
+        return [c.args[2] for c in self.writes.call_args_list]
+
+
+class TestCacheModeWriteOnHostEvict(_HostTailCase):
+    def _drain_both_acks(self, timeout: float = 20.0):
+        # One drain takes both acks: a walk between two drains would see one
+        # span still locked and reach past it.
+        deadline = time.time() + timeout
+        while self.cc.ack_backup_queue.qsize() < 2:
+            self.assertLess(time.time(), deadline, "the storage writes were not acked")
+            time.sleep(0.01)
+        self.cache.check_hicache_events()
+        self.assertEqual(self.cache.ongoing_backup, {})
+
+    def test_storage_is_written_from_the_cold_end_of_the_host_lru(self):
+        self._demote_all_and_fill_host()
+        # Nothing is written at host admission.
+        self.assertEqual(self.writes.call_count, 0)
+        self.assertEqual(self.cache.ongoing_backup, {})
+
+        _tick_until(self.cache, lambda: self.writes.call_count > 0)
+        # The two coldest spans cover the reserve; the third is left alone.
+        self.assertEqual(
+            self._written_chains(), [self.chains[self.cold], self.chains[self.warm]]
+        )
+        self.assertEqual(_write_spans(self.writes), [(self.span, self.span)] * 2)
+        for node, locks in ((self.cold, 1), (self.warm, 1), (self.hot, 0)):
+            self.assertEqual(
+                node_host_lock_ref(self.cache, node, ComponentType.FULL), locks
+            )
+
+        self._drain_both_acks()
+        for node in (self.cold, self.warm):
+            self.assertEqual(
+                node_host_lock_ref(self.cache, node, ComponentType.FULL), 0
+            )
+            self.assertTrue(self.beliefs.contains_all(self.chains[node]))
+            self.assertEqual(
+                self.cc.storage_backend.batch_exists(self.chains[node]), self.span
+            )
+        self.assertEqual(self.cache._write_behind_keys, {})
+
+        # The stored tail now counts as covered: no write is issued again.
+        for _ in range(8):
+            self.cache.check_hicache_events()
+        self.assertEqual(self.writes.call_count, 2)
+        self.assertEqual(self.cache._write_behind_clean_tokens, 2 * self.span)
+
+    def test_peek_follows_the_host_eviction_order(self):
+        # A child of the coldest span: its parent becomes a host leaf only
+        # once the child is evicted.
+        child = _insert_span(self.cache, self.allocator, 2 * self.span)
+        nodes = (self.cold, self.warm, self.hot, child)
+        for node in nodes:
+            _backup_to_host(self.cache, node)
+        self.cache.evict(EvictParams(num_tokens=4 * self.span))
+        order = [
+            node_id
+            for node_id, _, _ in self.cache.tree_core.peek_host_eviction_candidates(
+                self.host.size
+            )
+        ]
+        self.assertEqual(order, [self.warm, self.hot, child, self.cold])
+        for i, node in enumerate(order):
+            self.assertEqual(self.cache.evict_host(1), self.span)
+            self.assertFalse(self.cache.tree_core.contains_node(node))
+            for later in order[i + 1 :]:
+                self.assertTrue(self.cache.tree_core.contains_node(later))
+
+    def test_a_host_page_leaves_the_host_pool_only_after_its_write_is_acked(self):
+        filler = self._demote_all_and_fill_host()
+        _tick_until(self.cache, lambda: self.writes.call_count == 2)
+
+        # Writes in flight hold their pages: only the unwritten span is evicted.
+        self.assertEqual(self.cache.evict_host(self.host.size), self.span)
+        self.assertFalse(self.cache.tree_core.contains_node(self.hot))
+        for node in (self.cold, self.warm):
+            self.assertTrue(self.cache.tree_core.is_backuped(node))
+
+        self._drain_both_acks()
+        self.assertEqual(self.cache.evict_host(self.host.size), 2 * self.span)
+        for node in (self.cold, self.warm):
+            self.assertFalse(self.cache.tree_core.contains_node(node))
+            self.assertEqual(
+                self.cc.storage_backend.batch_exists(self.chains[node]), self.span
+            )
+        self.assertEqual(self.cache._write_behind_clean_tokens, 0)
+        self.host.free(filler)
+        self.cache.sanity_check()
+
+
+class TestCacheModeWriteAtAdmission(_HostTailCase):
+    """The switch off: storage is written at host admission, as before."""
+
+    write_on_host_evict = False
+
+    def test_storage_is_written_at_host_admission(self):
+        self._demote_all_and_fill_host()
+        self.assertEqual(
+            self._written_chains(),
+            [self.chains[node] for node in (self.cold, self.warm, self.hot)],
+        )
+        _tick_until(self.cache, lambda: not self.cache.ongoing_backup)
+        for _ in range(8):
+            self.cache.check_hicache_events()
+        self.assertEqual(self.writes.call_count, 3)
+        self.assertFalse(self.beliefs.contains(self.chains[self.cold][0]))
 
 
 def _two_rank_settlement(rank, rendezvous_dir, skip_rank):

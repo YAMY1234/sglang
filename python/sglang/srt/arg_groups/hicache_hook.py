@@ -8,6 +8,7 @@ from typing import Any
 
 from sglang.srt.arg_groups.model_override_base import resolving_view, use_mla_backend
 from sglang.srt.arg_groups.overrides import declare_resolution
+from sglang.srt.environ import envs
 
 logger = logging.getLogger(__name__)
 
@@ -85,6 +86,8 @@ def handle_hicache(server_args: Any):
         return
 
     validate_hicache_host_memory_mode(server_args)
+    if cfg.enable_hierarchical_cache:
+        validate_hicache_l3_write_on_host_evict(server_args)
 
     if cfg.disaggregation_decode_host_receive_threshold < 1:
         # The shared host pool must match KV transfer's per-layer buffers.
@@ -419,4 +422,21 @@ def validate_hicache_host_memory_mode(server_args: Any):
             "bypass the buffer-mode pipeline, fetching without its prefix "
             "context and never consuming its staged holds. Prefill "
             "instances share the standard scheduler path and are supported."
+        )
+
+
+def validate_hicache_l3_write_on_host_evict(server_args: Any):
+    if not envs.SGLANG_HICACHE_L3_WRITE_ON_HOST_EVICT.get():
+        return
+    cfg = resolving_view(server_args)
+    if cfg.hicache_storage_backend is None or cfg.hicache_host_memory_mode != "cache":
+        raise ValueError(
+            "SGLANG_HICACHE_L3_WRITE_ON_HOST_EVICT requires --hicache-storage-backend "
+            "with --hicache-host-memory-mode cache."
+        )
+    fraction = envs.SGLANG_HICACHE_L3_EVICT_WRITE_RESERVE_FRACTION.get()
+    if not 0 < fraction <= 1:
+        raise ValueError(
+            "SGLANG_HICACHE_L3_EVICT_WRITE_RESERVE_FRACTION must be in (0, 1], "
+            f"got {fraction}."
         )

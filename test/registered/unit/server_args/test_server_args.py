@@ -3056,6 +3056,35 @@ class TestHiCacheArgs(CustomTestCase):
                     resolution_result(args, "hicache_write_policy"), expected
                 )
 
+    def test_l3_write_on_host_evict_requires_cache_mode_storage(self):
+        storage = {"hicache_storage_backend": "file"}
+        cases = [
+            (storage, 0.05, None),
+            (storage, 1.0, None),
+            ({}, 0.05, "requires --hicache-storage-backend"),
+            (
+                {**storage, "hicache_host_memory_mode": "buffer_only"},
+                0.05,
+                "requires --hicache-storage-backend",
+            ),
+            (storage, 0.0, r"must be in \(0, 1\]"),
+            (storage, 1.5, r"must be in \(0, 1\]"),
+        ]
+        for overrides, fraction, error in cases:
+            with self.subTest(overrides=overrides, fraction=fraction):
+                args = self._make_args(enable_hierarchical_cache=True, **overrides)
+                with (
+                    envs.SGLANG_HICACHE_L3_WRITE_ON_HOST_EVICT.override(True),
+                    envs.SGLANG_HICACHE_L3_EVICT_WRITE_RESERVE_FRACTION.override(
+                        fraction
+                    ),
+                ):
+                    if error is None:
+                        handle_hicache(args)
+                    else:
+                        with self.assertRaisesRegex(ValueError, error):
+                            handle_hicache(args)
+
     def test_optimistic_prefill_allows_only_exercised_hicache_modes(self):
         common = {
             "enable_hierarchical_cache": True,

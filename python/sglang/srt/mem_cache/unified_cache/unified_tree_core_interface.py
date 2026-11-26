@@ -616,6 +616,21 @@ class UnifiedTreeCoreInterface(ABC):
         """Evict a component's host-side resources; no-op if the component is absent."""
         ...
 
+    # Whether this core has peek_host_eviction_candidates below.
+    # UnifiedRadixCache.init_hicache rejects SGLANG_HICACHE_L3_WRITE_ON_HOST_EVICT
+    # on a core without it.
+    supports_host_eviction_peek: bool = False
+
+    def peek_host_eviction_candidates(
+        self, num_tokens: int
+    ) -> list[tuple[NodeId, int, Optional[list[str]]]]:
+        """Full host leaves in the order drive_host_eviction would take them,
+        until their host tokens reach num_tokens: (node id, host tokens, page
+        hashes). Read-only. A TreeCore without it raises."""
+        raise NotImplementedError(
+            f"{type(self).__name__} cannot peek the host eviction order"
+        )
+
     @abstractmethod
     def evict_excess_path_states(
         self,

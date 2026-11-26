@@ -660,6 +660,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
 
     supports_rotation_base = True
     supports_joint_eviction = True
+    supports_host_eviction_peek = True
 
     def rotation_base_of(self, node_id: NodeId) -> Optional[int]:
         """Logical-page KV sharding: the node's chain rotation base, or None
@@ -2250,6 +2251,14 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             )
         return result
 
+    def peek_host_eviction_candidates(
+        self, num_tokens: int
+    ) -> list[tuple[NodeId, int, Optional[list[str]]]]:
+        comp = self.components_by_type.get(BASE_COMPONENT_TYPE)
+        if comp is None:
+            return []
+        return comp.peek_host_eviction_candidates(num_tokens)
+
     def evict_excess_path_states(
         self,
         tail_node_id: NodeId,
@@ -2707,9 +2716,12 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             return not node.write_back_queued
         return self.is_write_back and self._is_evictable_after_queued_children(node)
 
-    def _is_host_leaf(self, node: UnifiedTreeNode) -> bool:
+    def _is_host_leaf(
+        self, node: UnifiedTreeNode, *, ignore_children: bool = False
+    ) -> bool:
         """H-leaf: evicted, Full host value present, no children, unlocked on
-        both tiers, not root.
+        both tiers, not root. ``ignore_children`` asks whether the node would
+        be one once its children are gone (the host eviction order peek).
 
         Only the Full (base) component host_value is required; auxiliary
         components are not mandatory for H-leaf membership. In-flight DMA
@@ -2724,7 +2736,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         # a live segment's anchor, and _evict_host_leaf would delete it.
         if any(cd.lock_ref > 0 for cd in node.component_data):
             return False
-        if len(node.children) > 0:
+        if not ignore_children and len(node.children) > 0:
             return False
         return True
 

@@ -230,6 +230,9 @@ class UnifiedRadixCache(BasePrefixCache):
     # Whether storage can hold Full KV past its last SWA window, a gap the cache
     # then heals: a buffer-mode Full + SWA cache, resolved in init_hicache.
     _heals_storage_swa_gap: bool = False
+    # Whether L3 is written from the cold end of the host LRU ahead of host
+    # eviction instead of at host admission; resolved in init_hicache.
+    _l3_write_on_host_evict: bool = False
 
     def __init__(
         self,
@@ -537,6 +540,10 @@ class UnifiedRadixCache(BasePrefixCache):
         # ongoing_backup: the ack drain settles every write at a rank-agreed
         # written prefix of this span (buffer mode reads it from its entry).
         self._backup_requested_tokens: dict[int, int] = {}
+        # Write-on-host-evict: the pool keys each storage write carries, believed
+        # stored at its ack; and the tail tokens the last walk found in storage.
+        self._write_behind_keys: dict[int, dict[PoolName, list[str]]] = {}
+        self._write_behind_clean_tokens = 0
         if self.buffer_pipeline is not None:
             self.buffer_pipeline.reset()
             # The dropped writes' content no longer reaches a storage ack.
@@ -656,6 +663,29 @@ class UnifiedRadixCache(BasePrefixCache):
             self.cache_controller is not None
             and self.cache_controller.write_policy == "write_back"
         )
+        self._l3_write_on_host_evict = (
+            envs.SGLANG_HICACHE_L3_WRITE_ON_HOST_EVICT.get()
+            and self.cache_controller is not None
+            and self.cache_controller.enable_storage
+        )
+        if self._l3_write_on_host_evict:
+            if self.host_memory_mode == "buffer_only":
+                raise ValueError(
+                    "SGLANG_HICACHE_L3_WRITE_ON_HOST_EVICT needs a host cache tier; "
+                    "it does not apply to --hicache-host-memory-mode buffer_only."
+                )
+            if not self.tree_core.supports_host_eviction_peek:
+                raise ValueError(
+                    "SGLANG_HICACHE_L3_WRITE_ON_HOST_EVICT requires a tree core "
+                    "that peeks the host eviction order; "
+                    f"SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND={self._tree_core_backend!r} "
+                    "does not (use python)."
+                )
+            self._l3_evict_write_reserve_tokens = int(
+                envs.SGLANG_HICACHE_L3_EVICT_WRITE_RESERVE_FRACTION.get()
+                * self.cache_controller.mem_pool_host.size
+            )
+            self._write_behind_step = 0
         # Pre-seed the logical dropped-tokens series.
         if self.metrics_collector is not None and self.cache_controller is not None:
             reasons = ["host_pressure"]
@@ -1995,7 +2025,13 @@ class UnifiedRadixCache(BasePrefixCache):
             return 0
         result = self.tree_core.drive_host_eviction(component_type, num_tokens)
         self._apply_eviction_result(result)
-        return result.tracker.get(component_type, 0)
+        evicted = result.tracker.get(component_type, 0)
+        if self._l3_write_on_host_evict and component_type == BASE_COMPONENT_TYPE:
+            # Host eviction takes the clean tail the last walk counted first.
+            self._write_behind_clean_tokens = max(
+                0, self._write_behind_clean_tokens - evicted
+            )
+        return evicted
 
     # ---- Decode retraction ----
 
@@ -2429,7 +2465,8 @@ class UnifiedRadixCache(BasePrefixCache):
         self.tree_core.finish_write_through(publish_node_ids, ack_id)
         if lock_params is not None:
             self.dec_lock_ref(lock_node_id, lock_params)
-        if self.enable_storage:
+        # Write-on-host-evict writes storage from the host LRU tail instead.
+        if self.enable_storage and not self._l3_write_on_host_evict:
             # Back up each fragment: after a split, lock_node only holds the
             # suffix; the prefix fragment must be persisted as well.
             for node_id in publish_node_ids:
@@ -2650,17 +2687,7 @@ class UnifiedRadixCache(BasePrefixCache):
         if spec is None:
             return
 
-        kv_xfer = PoolTransfer(
-            name=PoolName.KV,
-            host_indices=spec.host_value,
-            keys=spec.hash_value,
-        )
-        sidecar_xfers = self._build_sidecar_transfers(
-            CacheTransferPhase.BACKUP_STORAGE, kv_xfer, spec.comp_xfers
-        )
-        aux_xfers = [x for xfers in spec.comp_xfers.values() for x in xfers]
-        aux_xfers.extend(sidecar_xfers)
-
+        aux_xfers = self._storage_backup_aux_transfers(spec)
         operation_id = self.cache_controller.write_storage(
             spec.host_value,
             spec.token_ids,
@@ -2675,6 +2702,67 @@ class UnifiedRadixCache(BasePrefixCache):
         self._backup_requested_tokens[operation_id] = (
             len(spec.hash_value) * self.page_size
         )
+        if self._l3_write_on_host_evict:
+            keys_by_pool = {PoolName.KV: list(spec.hash_value)}
+            for xfer in aux_xfers:
+                if xfer.keys is not None:
+                    keys_by_pool.setdefault(xfer.name, []).extend(xfer.keys)
+            self._write_behind_keys[operation_id] = keys_by_pool
+
+    def _storage_backup_aux_transfers(self, spec) -> list[PoolTransfer]:
+        """Component and sidecar transfers of a node's storage write."""
+        kv_xfer = PoolTransfer(
+            name=PoolName.KV,
+            host_indices=spec.host_value,
+            keys=spec.hash_value,
+        )
+        sidecar_xfers = self._build_sidecar_transfers(
+            CacheTransferPhase.BACKUP_STORAGE, kv_xfer, spec.comp_xfers
+        )
+        aux_xfers = [x for xfers in spec.comp_xfers.values() for x in xfers]
+        aux_xfers.extend(sidecar_xfers)
+        return aux_xfers
+
+    def _write_behind_host_tail(self) -> None:
+        """Keep the reserve at the cold end of the host LRU free, in flight to
+        storage or already in storage, so host eviction drops only pages storage
+        holds. Every input (host pool, tree, beliefs, writes in flight) is
+        rank-replicated, so all ranks issue the same writes in the same order."""
+        self._write_behind_step += 1
+        # The walk heapifies every host leaf: run it on every 4th step at most,
+        # and only once a quarter of the reserve is uncovered.
+        if self._write_behind_step % 4:
+            return
+        host = self.cache_controller.mem_pool_host
+        target = self._l3_evict_write_reserve_tokens
+        available = host.available_size()
+        covered = (
+            available
+            + sum(self._backup_requested_tokens.values())
+            + self._write_behind_clean_tokens
+        )
+        if target - covered < max(1, target // 4):
+            return
+        beliefs = self.storage_existence_cache
+        clean = 0
+        for (
+            node_id,
+            num_tokens,
+            hash_value,
+        ) in self.tree_core.peek_host_eviction_candidates(target - available):
+            if hash_value and beliefs.pool(PoolName.KV).covered(hash_value):
+                spec = self.tree_core.build_storage_backup_spec(
+                    node_id, self.hicache_storage_pass_prefix_keys
+                )
+                # KV alone does not prove a component or sidecar page was stored.
+                if spec is not None and all(
+                    xfer.keys is not None and beliefs.pool(xfer.name).covered(xfer.keys)
+                    for xfer in self._storage_backup_aux_transfers(spec)
+                ):
+                    clean += num_tokens
+                    continue
+            self.write_backup_storage(node_id)
+        self._write_behind_clean_tokens = clean
 
     def is_backuped(self, node_id: NodeId) -> bool:
         return self.tree_core.is_backuped(node_id)
@@ -3251,6 +3339,12 @@ class UnifiedRadixCache(BasePrefixCache):
         # Apply the host-insert walk's actions before the transfer commit.
         self._apply_cache_actions(insert_result.cache_actions)
 
+        if self._l3_write_on_host_evict:
+            # The rank-agreed fetch proves L3 holds these pages: no write-behind.
+            self.storage_existence_cache.pool(PoolName.KV).add(
+                hash_value[: completed_tokens // self.page_size]
+            )
+
         if insert_result.host_insert_dropped:
             self._resolve_storage_prefetch_tokens(
                 request, insert_result.prefix_len, reason="already_cached"
@@ -3630,7 +3724,10 @@ class UnifiedRadixCache(BasePrefixCache):
         """Heal each pool's beliefs beyond its rank-agreed boundary (a
         chain-page pool also learns presence up to it); a pool without a
         verdict heals from the folded cut."""
-        if self.host_memory_mode != "buffer_only" or operation.deadline_expired:
+        # Cache mode reads the beliefs only to skip write-on-host-evict writes.
+        if (
+            self.host_memory_mode != "buffer_only" and not self._l3_write_on_host_evict
+        ) or operation.deadline_expired:
             # A cut query's agreed hit may be a MIN over skipped lookups, not a verdict.
             return
         chain = operation.all_hash_values
@@ -4210,6 +4307,12 @@ class UnifiedRadixCache(BasePrefixCache):
             if entry is not None:
                 node_id, lock_params = entry
                 self.dec_host_lock_ref(node_id, lock_params)
+            if self._l3_write_on_host_evict:
+                keys_by_pool = self._write_behind_keys.pop(operation.id, None)
+                # A short write is not believed: the next walk writes it again.
+                if keys_by_pool is not None and not short:
+                    for pool, keys in keys_by_pool.items():
+                        self.storage_existence_cache.pool(pool).add(keys)
         if short:
             logger.warning(
                 "HiCache storage backup operation %d wrote %d of %d tokens; the "
@@ -4758,6 +4861,8 @@ class UnifiedRadixCache(BasePrefixCache):
         if self.enable_storage:
             # After the drain: a prefetch it retired is not voted on.
             self._vote_prefetch_deadlines()
+            if self._l3_write_on_host_evict:
+                self._write_behind_host_tail()
         if self.buffer_pipeline is not None:
             self.buffer_pipeline.flush_pending_writes()
         if self.enable_storage_metrics and self.storage_metrics_collector is not None:

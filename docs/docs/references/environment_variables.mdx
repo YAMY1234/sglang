@@ -1309,6 +1309,16 @@ SGLang supports various environment variables that can be used to configure its 
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Storage directory for the HiCache NIXL backend.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Not set</td>
     </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_HICACHE_L3_WRITE_ON_HOST_EVICT</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>With <code>--hicache-host-memory-mode cache</code> and a <code>--hicache-storage-backend</code>: write a page to storage from the cold end of the host LRU ahead of its host eviction instead of when it enters the host pool, so the host pool and storage hold different pages. A page with a storage write in flight is not evicted from the host pool. Requires <code>SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND=python</code>. Meant for deployments whose host pool cannot hold the working set.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_HICACHE_L3_EVICT_WRITE_RESERVE_FRACTION</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>With <code>SGLANG_HICACHE_L3_WRITE_ON_HOST_EVICT</code>: the share of the host pool, in <code>(0, 1]</code>, kept free, in flight to storage or already in storage at the cold end of the host LRU. It should exceed the host tokens evicted during one storage write.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>0.05</code></td>
+    </tr>
   </tbody>
 </table>
 

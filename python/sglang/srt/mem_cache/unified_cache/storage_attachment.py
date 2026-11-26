@@ -460,6 +460,7 @@ class StorageAttachment:
             except Exception:
                 logger.exception("Failed to release host lock for backup op %s", ack_id)
         cache._backup_requested_tokens.clear()
+        cache._write_behind_keys.clear()
 
         for handle in list(cache._storage_prefetch_hit_remaining_by_reqid):
             cache.discard_storage_prefetch_accounting(handle)
