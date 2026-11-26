@@ -11,6 +11,7 @@ import triton.language as tl
 
 from sglang.kernels.arch import current_arch
 from sglang.kernels.jit.utils import is_arch_support_pdl
+from sglang.kernels.numerics import add_rn_f32
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
@@ -2520,9 +2521,15 @@ def _rows4(x0, x1, x2, x3):
 
 
 @triton.jit
+def _sum4(x0, x1, x2, x3):
+    # The single-warp kernel's butterfly (xor 2, then xor 1) sums (x0+x2)+(x1+x3), and its
+    # shuffles keep ptxas from fusing a division's multiply into the add: add.rn does the same.
+    return add_rn_f32(add_rn_f32(x0, x2), add_rn_f32(x1, x3))
+
+
+@triton.jit
 def _sk_norm4(x0, x1, x2, x3, EPS: tl.constexpr):
-    # The single-warp kernel's butterfly (xor 2, then xor 1) sums (x0+x2)+(x1+x3).
-    d = ((x0 + x2) + (x1 + x3)) + EPS
+    d = add_rn_f32(_sum4(x0, x1, x2, x3), EPS)
     return x0 / d, x1 / d, x2 / d, x3 / d
 
 
@@ -2617,7 +2624,7 @@ def _hc_mix_reduce_sinkhorn_rows_hc4_kernel(
         tl.exp(c02 - mx),
         tl.exp(c03 - mx),
     )
-    d = (c00 + c02) + (c01 + c03)
+    d = _sum4(c00, c01, c02, c03)
     c00, c01, c02, c03 = c00 / d + EPS, c01 / d + EPS, c02 / d + EPS, c03 / d + EPS
     mx = tl.maximum(tl.maximum(c10, c12), tl.maximum(c11, c13))
     c10, c11, c12, c13 = (
@@ -2626,7 +2633,7 @@ def _hc_mix_reduce_sinkhorn_rows_hc4_kernel(
         tl.exp(c12 - mx),
         tl.exp(c13 - mx),
     )
-    d = (c10 + c12) + (c11 + c13)
+    d = _sum4(c10, c11, c12, c13)
     c10, c11, c12, c13 = c10 / d + EPS, c11 / d + EPS, c12 / d + EPS, c13 / d + EPS
     mx = tl.maximum(tl.maximum(c20, c22), tl.maximum(c21, c23))
     c20, c21, c22, c23 = (
@@ -2635,7 +2642,7 @@ def _hc_mix_reduce_sinkhorn_rows_hc4_kernel(
         tl.exp(c22 - mx),
         tl.exp(c23 - mx),
     )
-    d = (c20 + c22) + (c21 + c23)
+    d = _sum4(c20, c21, c22, c23)
     c20, c21, c22, c23 = c20 / d + EPS, c21 / d + EPS, c22 / d + EPS, c23 / d + EPS
     mx = tl.maximum(tl.maximum(c30, c32), tl.maximum(c31, c33))
     c30, c31, c32, c33 = (
@@ -2644,7 +2651,7 @@ def _hc_mix_reduce_sinkhorn_rows_hc4_kernel(
         tl.exp(c32 - mx),
         tl.exp(c33 - mx),
     )
-    d = (c30 + c32) + (c31 + c33)
+    d = _sum4(c30, c31, c32, c33)
     c30, c31, c32, c33 = c30 / d + EPS, c31 / d + EPS, c32 / d + EPS, c33 / d + EPS
 
     c00, c10, c20, c30 = _sk_norm4(c00, c10, c20, c30, EPS)

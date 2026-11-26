@@ -30,6 +30,19 @@ def mul_rn_f32(x, y):
 
 
 @triton.jit
+def add_rn_f32(x, y):
+    """Opaque correctly-rounded fp32 add that blocks FMA contraction."""
+    return tl.inline_asm_elementwise(
+        asm="add.rn.f32 $0, $1, $2;",
+        constraints="=f,f,f",
+        args=[x, y],
+        dtype=tl.float32,
+        is_pure=True,
+        pack=1,
+    )
+
+
+@triton.jit
 def div_rn_f32(x, y):
     """IEEE correctly-rounded fp32 division."""
     return tl.inline_asm_elementwise(
@@ -64,6 +77,7 @@ def cuda_rsqrtf(x):
 
 
 __all__ = [
+    "add_rn_f32",
     "cuda_rsqrtf",
     "div_rn_f32",
     "mul_rn_f32",
