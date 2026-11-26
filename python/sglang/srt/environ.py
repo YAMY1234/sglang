@@ -2029,6 +2029,9 @@ class Envs:
     SGLANG_OPT_DFLASH_SWA_SKIP_LSE = EnvBool(
         SGLANG_ENABLE_NV_MEGA_RUNTIME_K31_GB_OPTIMIZATION.get
     )
+    # SWA draft without DCP: draft block rows per shared window read (0 off); a group
+    # of rows attends its common window once, rows folded into heads (<= 64).
+    SGLANG_OPT_DFLASH_SWA_SHARED_WINDOW = EnvInt(0)
     # Defer the TP gather of an unsoftcapped target-verify vocab shard; off by default.
     SGLANG_DFLASH_DEFER_PLAIN_GATHER = EnvBool(False)
     # Capture the megakernel post-verify tail as CUDA graphs; off by default.

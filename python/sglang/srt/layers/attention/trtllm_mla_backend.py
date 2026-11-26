@@ -378,6 +378,8 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         self._swa_need_lse = get_parallel().dcp_enabled or not (
             envs.SGLANG_OPT_DFLASH_SWA_SKIP_LSE.get()
         )
+        self._swa_shared_window = envs.SGLANG_OPT_DFLASH_SWA_SHARED_WINDOW.get()
+        self._shared_window_cache = None
         if model_runner.sliding_window_size is not None and (
             model_runner.sliding_window_size >= 0
         ):
@@ -1647,6 +1649,79 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         window_left = min(layer.sliding_window_size, self._compact_draft_window)
         return local.reshape(-1), window_left
 
+    def _shared_window_group(self, q: torch.Tensor, forward_batch: ForwardBatch) -> int:
+        """Rows per shared window read (SGLANG_OPT_DFLASH_SWA_SHARED_WINDOW), or 0
+        for the per-row path: needs the draft KV ring's ordinary window, no DCP."""
+        if (
+            not self._swa_shared_window
+            or self._draft_runner is None
+            or self._draft_runner.draft_kv_ring is None
+            or self._compact_draft_window is not None
+            or get_parallel().dcp_enabled
+            or not q.is_contiguous()
+        ):
+            return 0
+        from sglang.srt.layers.attention.draft_shared_window import (
+            shared_window_group,
+        )
+
+        _, q_len, heads, _ = q.shape
+        return shared_window_group(
+            rows_per_req=q_len, heads=heads, group=self._swa_shared_window
+        )
+
+    def _forward_shared_window(
+        self,
+        q: torch.Tensor,
+        kv_cache: torch.Tensor,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        metadata: TRTLLMMLADecodeMetadata,
+        group: int,
+    ) -> torch.Tensor:
+        """``_forward_sliding_window`` with each group of a request's rows reading
+        their common window once (``draft_shared_window``); rows x heads x 512."""
+        from sglang.srt.layers.attention.draft_shared_window import (
+            shared_window_indices,
+            shared_window_sparse_attention,
+        )
+
+        cache = self._shared_window_cache
+        if (
+            cache is not None
+            and cache[0] is forward_batch
+            and cache[1] == layer.layer_id - 1
+        ):
+            indices = cache[2]
+        else:
+            ring = self._draft_runner.draft_kv_ring
+            indices = shared_window_indices(
+                req_pool_indices=forward_batch.req_pool_indices,
+                positions=forward_batch.positions,
+                min_pos=ring.min_pos,
+                window_left=layer.sliding_window_size,
+                ring_rows_per_req=ring.rows_per_req,
+                group=group,
+            )
+        self._shared_window_cache = (forward_batch, layer.layer_id, indices)
+        out = shared_window_sparse_attention(
+            query=q,
+            indices=indices,
+            group=group,
+            row_indptr=self._window_row_indptr,
+            kv_cache=kv_cache,
+            workspace_buffer=self.workspace_buffer,
+            qk_nope_head_dim=self.qk_nope_head_dim,
+            kv_lora_rank=self.kv_lora_rank,
+            qk_rope_head_dim=self.qk_rope_head_dim,
+            max_seq_len=metadata.max_seq_len_k,
+            bmm1_scale=self._compute_decode_bmm1_scale(layer),
+            backend="trtllm-gen",
+            skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR.get(),
+            multi_ctas_kv_counter_buffer=self._window_counter_buffer,
+        )
+        return out.reshape(q.shape[0] * q.shape[1], -1)
+
     def _forward_sliding_window(
         self,
         q: torch.Tensor,
@@ -1674,6 +1749,11 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 q.reshape(rows, heads, head_dim), layer
             )
             return (out, lse) if get_parallel().dcp_enabled else out
+        group = self._shared_window_group(q, forward_batch)
+        if group:
+            return self._forward_shared_window(
+                q, kv_cache, layer, forward_batch, metadata, group
+            )
         indices, counts = self._window_sparse_indices(layer, forward_batch)
         # trtllm-gen MLA has no 64 < heads < 128 variant (96-head draft under DCP8).
         kernel_heads = 128 if 64 < heads < 128 else heads
