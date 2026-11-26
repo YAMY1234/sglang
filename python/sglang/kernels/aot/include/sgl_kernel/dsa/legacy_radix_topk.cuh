@@ -4,6 +4,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <type_traits>
 
 namespace sglang::device::legacy_radix_topk {
 
@@ -24,7 +25,8 @@ __device__ __forceinline__ uint32_t exact_key(float x) {
 
 // Exact radix top-k over finite scores. A threshold bin that fits the stash
 // keeps the original two-stash refinement; a larger one is refined by rescanning
-// the input. Unfilled output slots stay -1.
+// the input until the cutoff's key prefix fits the stash. Unfilled output slots
+// stay -1.
 template <int BlockSize, int OutputCapacity, int StashEntries>
 __device__ __forceinline__ void
 select(const float* __restrict__ input, int32_t* __restrict__ output, int row_start, int length, int topk) {
@@ -95,6 +97,67 @@ select(const float* __restrict__ input, int32_t* __restrict__ output, int row_st
 
   const int coarse_population = histogram[coarse_threshold] - histogram[coarse_threshold + 1];
   __syncthreads();
+  // Refines the candidates in stash slot `start_round & 1` from key byte `start_round`.
+  // The start is a compile-time constant, so each entry keeps the fully unrolled loop.
+  const auto refine_stash = [&](auto start_round) {
+#pragma unroll 4
+    for (int round = decltype(start_round)::value; round < 4; ++round) {
+      const int current = round & 1;
+      const int next = current ^ 1;
+      const int raw_num_input = num_input[current];
+      const int current_count = raw_num_input < StashEntries ? raw_num_input : StashEntries;
+
+      if (tx == 0) {
+        threshold_bin_id = -1;
+        num_input[next] = 0;
+      }
+      run_cumsum();
+      if (tx < kRadix && histogram[tx] > remaining && histogram[tx + 1] <= remaining) {
+        threshold_bin_id = tx;
+      }
+      __syncthreads();
+
+      const int threshold = threshold_bin_id;
+      if (threshold < 0) return;
+      const int above = histogram[threshold + 1];
+      const int shift = 24 - round * 8;
+
+      __syncthreads();
+      if (round < 3 && tx < kRadix + 1) histogram[tx] = 0;
+      __syncthreads();
+      for (int i = tx; i < current_count; i += BlockSize) {
+        const int idx = input_idx[current][i];
+        const float value = input[row_start + idx];
+        const int bin = static_cast<int>((exact_key(value) >> shift) & 0xFFu);
+        if (bin > threshold) {
+          const int pos = atomicAdd(&counter, 1);
+          if (pos < topk) output[pos] = idx;
+        } else if (bin == threshold && round < 3) {
+          const int pos = atomicAdd(&num_input[next], 1);
+          if (pos < StashEntries) {
+            input_idx[next][pos] = idx;
+            atomicAdd(&histogram[(exact_key(value) >> (shift - 8)) & 0xFFu], 1);
+          }
+        }
+      }
+      __syncthreads();
+
+      remaining -= above;
+      if (remaining == 0) return;
+      if (round == 3) {
+        for (int i = tx; i < current_count; i += BlockSize) {
+          const int idx = input_idx[current][i];
+          if (static_cast<int>(exact_key(input[row_start + idx]) & 0xFFu) == threshold) {
+            const int pos = atomicAdd(&counter, 1);
+            if (pos < topk) output[pos] = idx;
+          }
+        }
+        __syncthreads();
+        return;
+      }
+    }
+  };
+
   if (coarse_population >= StashEntries) {
     // Find the exact cutoff one key byte per pass. Pass L counts byte L and
     // emits what byte L-1 placed strictly above the cutoff; pass 0 emits the
@@ -153,8 +216,57 @@ select(const float* __restrict__ input, int32_t* __restrict__ output, int row_st
       remaining -= above;
       prefix |= static_cast<uint32_t>(threshold) << (24 - level * 8);
       last_threshold = threshold;
+      const int boundary_population = histogram[threshold] - histogram[threshold + 1];
       // All threads must read the histogram before the next pass clears it.
       __syncthreads();
+
+      // Once the cutoff's prefix fits the stash, gather it in one more scan and finish in
+      // shared memory instead of rescanning the row for every remaining key byte. The scan
+      // also emits this level's strictly-above values, which the next level would emit.
+      if (level < 3 && boundary_population < StashEntries) {
+        const int start_round = level + 1;
+        const int slot = start_round & 1;
+        const uint32_t gather_mask = ~0u << (32 - start_round * 8);
+        if (tx < kRadix + 1) histogram[tx] = 0;
+        if (tx == 0) {
+          // coarse_above and the older strict-prefix groups are already emitted.
+          counter = coarse_above + strict_count - above;
+          num_input[0] = 0;
+          num_input[1] = 0;
+        }
+        __syncthreads();
+        for (int idx = tx; idx < length; idx += BlockSize) {
+          const float value = input[row_start + idx];
+          if (coarse_key(value) != coarse_threshold) continue;
+          const uint32_t key = exact_key(value);
+          if ((key & mask) == (prefix & mask) && static_cast<int>((key >> (24 - level * 8)) & 0xFFu) > threshold) {
+            const int pos = atomicAdd(&counter, 1);
+            if (pos < topk) output[pos] = idx;
+          } else if ((key & gather_mask) == prefix) {
+            if (boundary_population == remaining) {
+              // Every member is selected; the stash rounds need population > remaining.
+              const int pos = atomicAdd(&counter, 1);
+              if (pos < topk) output[pos] = idx;
+            } else {
+              const int pos = atomicAdd(&num_input[slot], 1);
+              if (pos < StashEntries) {
+                input_idx[slot][pos] = idx;
+                atomicAdd(&histogram[(key >> (24 - start_round * 8)) & 0xFFu], 1);
+              }
+            }
+          }
+        }
+        __syncthreads();
+        if (boundary_population == remaining) return;
+        if (level == 0) {
+          refine_stash(std::integral_constant<int, 1>{});
+        } else if (level == 1) {
+          refine_stash(std::integral_constant<int, 2>{});
+        } else {
+          refine_stash(std::integral_constant<int, 3>{});
+        }
+        return;
+      }
     }
     return;
   }
@@ -178,62 +290,7 @@ select(const float* __restrict__ input, int32_t* __restrict__ output, int row_st
   }
   __syncthreads();
 
-#pragma unroll 4
-  for (int round = 0; round < 4; ++round) {
-    const int current = round & 1;
-    const int next = current ^ 1;
-    const int raw_num_input = num_input[current];
-    const int current_count = raw_num_input < StashEntries ? raw_num_input : StashEntries;
-
-    if (tx == 0) {
-      threshold_bin_id = -1;
-      num_input[next] = 0;
-    }
-    run_cumsum();
-    if (tx < kRadix && histogram[tx] > remaining && histogram[tx + 1] <= remaining) {
-      threshold_bin_id = tx;
-    }
-    __syncthreads();
-
-    const int threshold = threshold_bin_id;
-    if (threshold < 0) return;
-    const int above = histogram[threshold + 1];
-    const int shift = 24 - round * 8;
-
-    __syncthreads();
-    if (round < 3 && tx < kRadix + 1) histogram[tx] = 0;
-    __syncthreads();
-    for (int i = tx; i < current_count; i += BlockSize) {
-      const int idx = input_idx[current][i];
-      const float value = input[row_start + idx];
-      const int bin = static_cast<int>((exact_key(value) >> shift) & 0xFFu);
-      if (bin > threshold) {
-        const int pos = atomicAdd(&counter, 1);
-        if (pos < topk) output[pos] = idx;
-      } else if (bin == threshold && round < 3) {
-        const int pos = atomicAdd(&num_input[next], 1);
-        if (pos < StashEntries) {
-          input_idx[next][pos] = idx;
-          atomicAdd(&histogram[(exact_key(value) >> (shift - 8)) & 0xFFu], 1);
-        }
-      }
-    }
-    __syncthreads();
-
-    remaining -= above;
-    if (remaining == 0) return;
-    if (round == 3) {
-      for (int i = tx; i < current_count; i += BlockSize) {
-        const int idx = input_idx[current][i];
-        if (static_cast<int>(exact_key(input[row_start + idx]) & 0xFFu) == threshold) {
-          const int pos = atomicAdd(&counter, 1);
-          if (pos < topk) output[pos] = idx;
-        }
-      }
-      __syncthreads();
-      return;
-    }
-  }
+  refine_stash(std::integral_constant<int, 0>{});
 }
 
 }  // namespace sglang::device::legacy_radix_topk

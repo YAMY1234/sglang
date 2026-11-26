@@ -576,6 +576,115 @@ def test_topk_variants_are_exact_on_variable_windows(
     assert_exact_rows(score, mapped_raw, lengths, k)
 
 
+def _oversized_bin_rows(g: torch.Generator) -> list:
+    """Rows whose coarse threshold bin exceeds the 4096-entry stash of topk.cu.
+
+    The cutoff's exact-key prefix fits the stash after key byte 0, 1 or 2, needs
+    every member of that prefix, or never fits (cutoff ties). Two rows whose bin
+    fits the stash are controls for the unchanged path.
+    """
+
+    def to_float(bits: torch.Tensor) -> torch.Tensor:
+        return bits.to(torch.int32).view(torch.float32)
+
+    def group(n: int, byte1: int, byte2: Optional[int] = None) -> torch.Tensor:
+        # [1.0, 1.25) is one fp16 coarse bin; byte1 and byte2 are exact-key bytes.
+        if byte2 is None:
+            low = (byte1 << 16) + torch.randint(0, 1 << 16, (n,), generator=g)
+        else:
+            low = (byte1 << 16) + (byte2 << 8)
+            low = low + torch.randint(0, 1 << 8, (n,), generator=g)
+        return to_float(0x3F000000 + low)
+
+    def below(n: int) -> torch.Tensor:
+        return torch.rand(n, generator=g) * 8.5 - 8.0
+
+    def above(n: int) -> torch.Tensor:
+        return 3.0 + 3.0 * torch.rand(n, generator=g)
+
+    # The fp16 bin [2.0, 2.5) also holds the fp32 values in (2 - 2^-11, 2), whose
+    # first exact-key byte is one lower.
+    two = 0x40000000
+    straddle = to_float(
+        torch.cat(
+            [
+                two + torch.randint(0, 1 << 20, (1024,), generator=g),
+                two - torch.randint(1, 1 << 12, (3500,), generator=g),
+            ]
+        )
+    )
+    rows = [
+        torch.cat([below(3000), straddle]),
+        torch.cat(
+            [
+                below(3000),
+                above(300),
+                group(1500, 0x95),
+                group(3000, 0x90),
+                group(2000, 0x85),
+            ]
+        ),
+        torch.cat(
+            [
+                below(2000),
+                above(100),
+                group(500, 0x98),
+                group(700, 0x90, 0xA0),
+                group(2500, 0x90, 0x50),
+                group(1400, 0x90, 0x10),
+            ]
+        ),
+        torch.cat(
+            [below(1000), group(1048, 0x95), group(1000, 0x90), group(3000, 0x85)]
+        ),
+        torch.cat([below(1000), above(50), group(6000, 0x90, 0x40)]),
+        torch.cat([below(5000), group(4095, 0x90)]),
+        torch.randn(20000, generator=g),
+    ]
+    return [row[torch.randperm(row.numel(), generator=g)] for row in rows]
+
+
+@torch.inference_mode()
+def test_legacy_topk_oversized_bin_prefix_gather() -> None:
+    """Oversized bins finish in the stash once the cutoff prefix fits; all exact."""
+    rows = _oversized_bin_rows(torch.Generator().manual_seed(20261126))
+    bs, k, row_start = len(rows), 2048, 3
+    lengths = torch.tensor([row.numel() for row in rows], dtype=torch.int32)
+    width = int(lengths.max()) + row_start
+    # +inf outside each window, so a read past it would select padding.
+    score = torch.full((bs, width), float("inf"))
+    for i, row in enumerate(rows):
+        score[i, row_start : row_start + row.numel()] = row
+    score, lengths = score.cuda(), lengths.cuda()
+    row_starts = torch.full((bs,), row_start, dtype=torch.int32, device="cuda")
+
+    def check(indices, scores, starts=None):
+        assert bool((indices.sort(dim=1).values.diff(dim=1) > 0).all())
+        assert_exact_rows(scores, indices, lengths, k, starts)
+
+    check(fast_topk_v2(score, lengths, k, row_starts=row_starts), score, row_starts)
+
+    offsets = torch.arange(bs, dtype=torch.int32, device="cuda") * 100000 + 17
+    ragged = fast_topk_transform_ragged_fused(
+        score, lengths, offsets, k, row_starts=row_starts
+    )
+    check(ragged - offsets[:, None], score, row_starts)
+
+    page_table = torch.arange(width, dtype=torch.int32, device="cuda").expand(bs, -1)
+    cu_seqlens_q = torch.arange(bs + 1, dtype=torch.int32, device="cuda")
+    prefill = fast_topk_transform_fused(
+        score, lengths, page_table, cu_seqlens_q, k, row_starts=row_starts
+    )
+    check(prefill, score, row_starts)
+
+    # One query per row and no row starts selects the decode kernel.
+    decode_score = score[:, row_start:].contiguous()
+    check(
+        fast_topk_transform_fused(decode_score, lengths, page_table, cu_seqlens_q, k),
+        decode_score,
+    )
+
+
 @pytest.mark.skipif(
     torch.version.hip is None,
     reason="deepseek_v4_topk_transform_512 is only built on ROCm",
