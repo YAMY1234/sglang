@@ -187,6 +187,63 @@ __global__ void __launch_bounds__(kThreadsPerBlock) kernel(const __grid_constant
   *reinterpret_cast<uint16_t*>(rec + kRopeOff + 2 * lane) = static_cast<uint16_t>(r0 | (r1 << 8));
 }
 
+// kMode 4 ("split"): two lanes per NoPE block (64 threads per token, 128-thread blocks = 2 tokens), 8 elements per lane = one 16-byte load, amax joined with one shuffle, one 4-byte packed store per lane; the near-midpoint test
+// is an integer one: every E2M1 midpoint (and code) has its low 20 float-mantissa bits zero, so |q| is "near" when ((bits + 128) & 0xFFFFF) < 256 (+-128 ulp = 1.5e-5 relative, far above the ~3e-7 rcp error); near elements
+// recompute IEEE q = v / scale and the reference rule. Bit-identical to kMode 2 / 3.
+inline constexpr int kSplitThreads = 128;
+inline constexpr int kSplitTokensPerBlock = 2;
+
+template <typename LocT, bool kRecipScale>
+__global__ void __launch_bounds__(kSplitThreads) kernel_split(const __grid_constant__ WriterParams p) {
+  const uint32_t idx = threadIdx.x & 63;
+  const uint32_t t = blockIdx.x * kSplitTokensPerBlock + (threadIdx.x >> 6);
+  if (t >= p.num_tokens) return;
+  const int64_t slot = static_cast<int64_t>(static_cast<const LocT*>(p.loc)[t]);
+  if (slot < 0 || slot == p.skip_index) return;
+  uint8_t* __restrict__ rec = p.dst + slot * kRecBytes;
+  const uint32_t blk = idx >> 1;
+  const uint32_t half = idx & 1;
+
+  const uint4 a = *reinterpret_cast<const uint4*>(p.k_nope + static_cast<int64_t>(t) * p.k_nope_stride_t + blk * kBlock + half * 8);
+  const uint32_t w[4] = {a.x, a.y, a.z, a.w};
+  float v[8];
+  float amax = 0.0f;
+#pragma unroll
+  for (int i = 0; i < 4; ++i) {
+    v[2 * i] = bf16_lo(w[i]);
+    v[2 * i + 1] = bf16_hi(w[i]);
+    amax = fmaxf(amax, fmaxf(fabsf(v[2 * i]), fabsf(v[2 * i + 1])));
+  }
+  amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 1));
+  const __nv_fp8_storage_t s8 = __nv_cvt_float_to_fp8(kRecipScale ? amax * kInvSix : __fdiv_rn(amax, 6.0f), __NV_SATFINITE, __NV_E4M3);
+  const float sf = e4m3_to_f32(s8);
+  uint32_t packed = 0;
+  if (sf > 0.0f) {
+    const float rs = rcp_approx_ftz(sf);
+    float q[8];
+    uint32_t sg = 0, nr = 0;
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+      q[i] = fabsf(v[i] * rs);
+      sg |= (v[i] < 0.0f ? 8u : 0u) << (4 * i);
+      nr |= (((__float_as_uint(q[i]) + 128u) & 0xFFFFFu) < 256u ? 1u : 0u) << i;
+    }
+    packed = f32x8_to_e2m1(q) | sg;
+    while (nr) {
+      const int i = __ffs(nr) - 1;
+      nr &= nr - 1;
+      const uint32_t code = e2m1_code_ref(__fdiv_rn(v[i], sf));
+      const int sh = 4 * i;
+      packed = (packed & ~(0xFu << sh)) | (code << sh);
+    }
+  }
+  *reinterpret_cast<uint32_t*>(rec + 8 * blk + 4 * half) = packed;
+  if (half == 0) rec[kScaleOff + 8 * (blk & 3) + (blk >> 2)] = static_cast<uint8_t>(s8);
+
+  const float r = __uint_as_float(static_cast<uint32_t>(*reinterpret_cast<const uint16_t*>(p.k_rope + static_cast<int64_t>(t) * p.k_rope_stride_t + idx)) << 16);
+  rec[kRopeOff + idx] = static_cast<uint8_t>(__nv_cvt_float_to_fp8(r, __NV_SATFINITE, __NV_E4M3));
+}
+
 template <int kMode>
 struct WriterKernel {
   static void run(
@@ -235,9 +292,14 @@ struct WriterKernel {
         .skip_index = skip_index,
         .num_tokens = num_tokens,
     };
-    const auto kernel_ptr = loc_dtype.is_type<int32_t>() ? kernel<int32_t, kMode> : kernel<int64_t, kMode>;
-    const uint32_t num_blocks = div_ceil(num_tokens, static_cast<uint32_t>(kWarpsPerBlock));
-    LaunchKernel(num_blocks, kThreadsPerBlock, device.unwrap())(kernel_ptr, params);
+    if constexpr (kMode == 4 || kMode == 5) {
+      const auto kernel_ptr = loc_dtype.is_type<int32_t>() ? kernel_split<int32_t, kMode == 5> : kernel_split<int64_t, kMode == 5>;
+      LaunchKernel(div_ceil(num_tokens, static_cast<uint32_t>(kSplitTokensPerBlock)), kSplitThreads, device.unwrap())(kernel_ptr, params);
+    } else {
+      const auto kernel_ptr = loc_dtype.is_type<int32_t>() ? kernel<int32_t, kMode> : kernel<int64_t, kMode>;
+      const uint32_t num_blocks = div_ceil(num_tokens, static_cast<uint32_t>(kWarpsPerBlock));
+      LaunchKernel(num_blocks, kThreadsPerBlock, device.unwrap())(kernel_ptr, params);
+    }
   }
 };
 
