@@ -11,6 +11,7 @@ from sglang.srt.layers.attention.dsa.utils import (
     INDEXER_K_CACHE_PRESHUFFLE_TILE,
     aiter_can_use_preshuffle_paged_mqa,
 )
+from sglang.srt.mem_cache.utils import retraction_chunk_rows
 
 _use_aiter_preshuffle = aiter_can_use_preshuffle_paged_mqa()
 
@@ -142,7 +143,9 @@ class IndexKeyCache:
         torch.cuda.synchronize()
         index_k_cpu = []
         chunk_size = self.pool.cpu_offloading_chunk_size
-        page_chunk_size = max(1, chunk_size // self.pool.page_size)
+        page_chunk_size = retraction_chunk_rows(
+            self.buffer, max(1, chunk_size // self.pool.page_size)
+        )
         for layer_id in range(self.pool.layer_num):
             index_k_cpu.append([])
             if self.buffer[layer_id].shape[0] == 0:
@@ -160,7 +163,9 @@ class IndexKeyCache:
         page_indices = indices[:: self.pool.page_size] // self.pool.page_size
         torch.cuda.synchronize()
         chunk_size = self.pool.cpu_offloading_chunk_size
-        page_chunk_size = max(1, chunk_size // self.pool.page_size)
+        page_chunk_size = retraction_chunk_rows(
+            self.buffer, max(1, chunk_size // self.pool.page_size)
+        )
         for layer_id in range(self.pool.layer_num):
             if self.buffer[layer_id].shape[0] == 0:
                 continue

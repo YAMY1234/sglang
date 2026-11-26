@@ -14,6 +14,7 @@
 """Common utilities."""
 
 import hashlib
+import math
 from typing import Any, Callable, List, Optional, Tuple
 
 import torch
@@ -90,6 +91,17 @@ def maybe_init_custom_mem_pool(
         return init_mooncake_custom_mem_pool(device)
     else:
         return False, None, None
+
+
+def retraction_chunk_rows(buffers: List[torch.Tensor], default_rows: int) -> int:
+    """Rows per chunk when a retraction backup copies ``buffers`` (one per layer,
+    all with the same row size) to pinned host memory."""
+    if not envs.SGLANG_OPT_RETRACTION_PINNED_CHUNKS.get():
+        return default_rows
+    # The caching host allocator rounds each pinned block up to a power of two;
+    # size full chunks to fill one 8 MiB block rather than round up into one.
+    row_bytes = buffers[0].element_size() * math.prod(buffers[0].shape[1:])
+    return max(1, (8 << 20) // row_bytes)
 
 
 def get_hash_str(

@@ -84,7 +84,10 @@ from sglang.srt.mem_cache.layout.token_major import (
     build_mamba_entry_views,
     mamba_entry_bytes,
 )
-from sglang.srt.mem_cache.utils import maybe_init_custom_mem_pool
+from sglang.srt.mem_cache.utils import (
+    maybe_init_custom_mem_pool,
+    retraction_chunk_rows,
+)
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_exec, get_flags, get_parallel, get_platform
 from sglang.srt.utils import (
@@ -5291,7 +5294,9 @@ class MLATokenToKVPool(KVCache, MLAKVView):
         )
         current_platform.synchronize()
         kv_cache_cpu = []
-        chunk_size = self.cpu_offloading_chunk_size
+        chunk_size = retraction_chunk_rows(
+            self.kv_buffer, self.cpu_offloading_chunk_size
+        )
         for layer_id in range(self.layer_num):
             kv_cache_cpu.append([])
             if self.kv_buffer[layer_id].shape[0] == 0:
@@ -5312,7 +5317,9 @@ class MLATokenToKVPool(KVCache, MLAKVView):
             indices, self._write_loc_dcp_span, get_parallel().attn_dcp_rank
         )
         current_platform.synchronize()
-        chunk_size = self.cpu_offloading_chunk_size
+        chunk_size = retraction_chunk_rows(
+            self.kv_buffer, self.cpu_offloading_chunk_size
+        )
         for layer_id in range(self.layer_num):
             if self.kv_buffer[layer_id].shape[0] == 0:
                 continue

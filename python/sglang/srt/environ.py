@@ -869,6 +869,9 @@ class Envs:
     # Under overlap, publish decode KV destinations one iteration later instead of
     # reading them back inline; False restores the inline publish.
     SGLANG_ENABLE_DISAGG_DECODE_DEFERRED_PUBLISH = EnvBool(True)
+    # Decode retraction with the cpu_tensor backup: copy MLA/DSA KV in chunks that
+    # fill one 8 MiB pinned host block, and free cached pinned blocks after a restore.
+    SGLANG_OPT_RETRACTION_PINNED_CHUNKS = EnvBool(False)
 
     # ===================================================================
     # Distributed and model-parallel runtime

@@ -13,6 +13,7 @@ from sglang.srt.disaggregation.base.conn import KVPoll, KVTransferDestination
 from sglang.srt.disaggregation.decode import DecodePreallocQueue, DecodeRequest
 from sglang.srt.disaggregation.fake.conn import FakeKVManager
 from sglang.srt.disaggregation.utils import ReqToMetadataIdxAllocator, TransferBackend
+from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import Req, ReqKvInfo
 from sglang.srt.managers.scheduler_components.pool_stats_observer import (
     SchedulerPoolStatsObserver,
@@ -30,11 +31,13 @@ from sglang.srt.mem_cache.allocator import (
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.common import (
+    RetractionBackup,
     backup_kv_cache,
     release_kv_cache,
     restore_kv_cache,
 )
 from sglang.srt.mem_cache.hicache_storage import PoolName
+from sglang.srt.mem_cache.index_key_cache import IndexKeyCache
 from sglang.srt.mem_cache.kv_cache_builder import maybe_register_hicache_draft
 from sglang.srt.mem_cache.memory_pool import (
     MHATokenToKVPool,
@@ -45,6 +48,7 @@ from sglang.srt.mem_cache.static_kv_storage import StaticPoolShape, kv_storage_o
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.mem_cache.unified_cache.components import ComponentType
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+from sglang.srt.mem_cache.utils import retraction_chunk_rows
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
@@ -1011,6 +1015,92 @@ class TestDcpRetractionBackup(unittest.TestCase):
 
         for layer in range(pool.layer_num):
             torch.testing.assert_close(torch.cat(kv_cpu[layer]), pool.kv_buffer[layer])
+
+
+class TestRetractionPinnedChunks(unittest.TestCase):
+    """With SGLANG_OPT_RETRACTION_PINNED_CHUNKS a cpu_tensor backup copies chunks
+    that fill one 8 MiB pinned block and frees cached pinned blocks after restore;
+    off keeps `cpu_offloading_chunk_size` and the cache."""
+
+    def test_chunk_rows(self):
+        buffers = [torch.empty(0, 1, 576, dtype=torch.uint8)]
+        with envs.SGLANG_OPT_RETRACTION_PINNED_CHUNKS.override(False):
+            self.assertEqual(retraction_chunk_rows(buffers, 8192), 8192)
+        with envs.SGLANG_OPT_RETRACTION_PINNED_CHUNKS.override(True):
+            self.assertEqual(retraction_chunk_rows(buffers, 8192), 14563)
+            # A row larger than the block still moves one row per chunk.
+            wide = [torch.empty(0, 16 << 20, dtype=torch.uint8)]
+            self.assertEqual(retraction_chunk_rows(wide, 8192), 1)
+
+    def test_mla_backup_round_trips_in_either_chunking(self):
+        rows = torch.arange(DCP_ROWS, dtype=torch.int64)
+        for enabled, num_chunks in ((False, 3), (True, 1)):
+            with self.subTest(enabled=enabled):
+                pool = _bare_mla_pool()
+                before = [buf.clone() for buf in pool.kv_buffer]
+                with (
+                    envs.SGLANG_OPT_RETRACTION_PINNED_CHUNKS.override(enabled),
+                    get_parallel().override(
+                        dcp_enabled=False, attn_dcp_size=1, attn_dcp_rank=0
+                    ),
+                ):
+                    kv_cpu = pool.get_cpu_copy(rows)
+                    for buf in pool.kv_buffer:
+                        buf.zero_()
+                    pool.load_cpu_copy(kv_cpu, rows.flip(0))
+                for layer in range(pool.layer_num):
+                    self.assertEqual(len(kv_cpu[layer]), num_chunks)
+                    torch.testing.assert_close(
+                        pool.kv_buffer[layer][rows.flip(0)], before[layer]
+                    )
+
+    def test_index_k_backup_round_trips_in_either_chunking(self):
+        page_size, num_pages, page_bytes = 4, 6, 4 * 132
+        indices = torch.arange(page_size, num_pages * page_size)
+        for enabled, num_chunks in ((False, 3), (True, 1)):
+            with self.subTest(enabled=enabled):
+                cache = object.__new__(IndexKeyCache)
+                cache.pool = SimpleNamespace(
+                    page_size=page_size, layer_num=2, cpu_offloading_chunk_size=8
+                )
+                # The second layer reuses another layer's top-k and keeps no index-K.
+                cache.buffer = [
+                    torch.randint(0, 256, (num_pages, page_bytes), dtype=torch.uint8),
+                    torch.empty(0, page_bytes, dtype=torch.uint8),
+                ]
+                before = cache.buffer[0].clone()
+                with envs.SGLANG_OPT_RETRACTION_PINNED_CHUNKS.override(enabled):
+                    index_k_cpu = cache.cpu_copy(indices)
+                    cache.buffer[0].zero_()
+                    cache.load_cpu_copy(index_k_cpu, indices)
+                self.assertEqual(len(index_k_cpu[0]), num_chunks)
+                self.assertEqual(index_k_cpu[1], [])
+                self.assertTrue(torch.equal(cache.buffer[0][1:], before[1:]))
+
+    def test_restore_frees_cached_pinned_blocks_only_when_enabled(self):
+        for enabled in (False, True):
+            with self.subTest(enabled=enabled):
+                req = SimpleNamespace(
+                    seqlen=4,
+                    kv=SimpleNamespace(
+                        req_pool_idx=0,
+                        mamba_pool_idx=None,
+                        holds_mamba=False,
+                        retraction_backup=RetractionBackup(cpu_tensors=[]),
+                    ),
+                )
+                req_to_token_pool = SimpleNamespace(
+                    req_to_token=torch.arange(4, dtype=torch.int32).view(1, 4)
+                )
+                allocator = Mock()
+                with (
+                    envs.SGLANG_OPT_RETRACTION_PINNED_CHUNKS.override(enabled),
+                    patch.object(torch._C, "_host_emptyCache") as empty_cache,
+                ):
+                    Req.load_kv_cache(req, req_to_token_pool, allocator)
+                allocator.load_cpu_copy.assert_called_once()
+                self.assertIsNone(req.kv.retraction_backup)
+                self.assertEqual(empty_cache.call_count, int(enabled))
 
 
 if __name__ == "__main__":
