@@ -13,6 +13,8 @@ FP32 and read their BF16 weights in place. The draw takes FP32 scores over at
 most ``DRAW_MAX_POOL`` candidates.
 """
 
+from typing import Optional
+
 import torch
 import triton
 import triton.language as tl
@@ -305,6 +307,73 @@ def _pool_max_kernel(
     tl.store(OUT + request * VOCAB + column, top, mask=inside)
 
 
+# BF16 exponent and mantissa bits.
+EXP_MASK = tl.constexpr(0x7F80)
+MANT_MASK = tl.constexpr(0x007F)
+
+
+@triton.jit
+def _topk_key(bits):
+    # torch.topk's order key of a 16-bit float (TopKTypeConfig): sign-flipped bits,
+    # so -0 sorts below +0, and NaN above everything.
+    bits = bits.to(tl.int32) & 0xFFFF
+    key = tl.where((bits & 0x8000) != 0, bits ^ 0xFFFF, bits ^ 0x8000)
+    nan = ((bits & EXP_MASK) == EXP_MASK) & ((bits & MANT_MASK) != 0)
+    return tl.where(nan, 0xFFFF, key)
+
+
+@triton.jit
+def _topk_kernel(
+    BITS,
+    row_stride,
+    VALUES,
+    IDS,
+    N: tl.constexpr,
+    K: tl.constexpr,
+    CHUNK: tl.constexpr,
+):
+    row = tl.program_id(0)
+    src = BITS + row * row_stride
+    index = tl.arange(0, CHUNK)
+    # The k-th largest key, a byte at a time: its high byte, then its low byte.
+    high_bins = tl.arange(0, 256)
+    high = tl.zeros([256], tl.int32)
+    for start in range(0, N, CHUNK):
+        key = _topk_key(tl.load(src + start + index))
+        high += tl.histogram(key >> 8, 256)
+    kth_high = tl.max(tl.where(tl.cumsum(high, 0, reverse=True) >= K, high_bins, -1), 0)
+    above = tl.sum(tl.where(high_bins > kth_high, high, 0), 0)
+    low_bins = tl.arange(0, 512)
+    low = tl.zeros([512], tl.int32)
+    for start in range(0, N, CHUNK):
+        key = _topk_key(tl.load(src + start + index))
+        # Keys outside the k-th high byte go to bin 256, which is never counted.
+        low += tl.histogram(tl.where(key >> 8 == kth_high, key & 255, 256), 512)
+    low = tl.where(low_bins < 256, low, 0)
+    kth_low = tl.max(
+        tl.where(tl.cumsum(low, 0, reverse=True) >= K - above, low_bins, -1), 0
+    )
+    kth = kth_high * 256 + kth_low
+    # torch.topk(sorted=False)'s layout: the keys above the k-th in index order, then
+    # the keys equal to it in index order, up to K.
+    greater = above + tl.sum(tl.where(low_bins > kth_low, low, 0), 0)
+    next_greater = tl.zeros([], tl.int32)
+    next_equal = greater
+    for start in range(0, N, CHUNK):
+        bits = tl.load(src + start + index)
+        key = _topk_key(bits)
+        is_greater = (key > kth).to(tl.int32)
+        is_equal = (key == kth).to(tl.int32)
+        at_greater = next_greater + tl.cumsum(is_greater, 0) - is_greater
+        at_equal = next_equal + tl.cumsum(is_equal, 0) - is_equal
+        at = tl.where(is_greater != 0, at_greater, at_equal)
+        keep = (is_greater != 0) | ((is_equal != 0) & (at_equal < K))
+        tl.store(VALUES + row * K + at, bits, mask=keep)
+        tl.store(IDS + row * K + at, (start + index).to(tl.int64), mask=keep)
+        next_greater += tl.sum(is_greater, 0)
+        next_equal += tl.sum(is_equal, 0)
+
+
 @triton.jit
 def _draw_kernel(
     SCORES,
@@ -334,6 +403,41 @@ def _draw_kernel(
     tl.store(TOKENS + request, tl.load(CANDIDATES + request * POOL + choice))
     point_mass = tl.where(index == top, 1.0, 0.0)
     tl.store(Q + row, tl.where(greedy, point_mass, q), mask=inside)
+
+
+# Rows per pass of the top-k; a row's length must be a multiple of it.
+TOPK_CHUNK = 4096
+
+
+def corrector_topk(
+    scores: torch.Tensor, k: int
+) -> Optional[tuple[torch.Tensor, torch.Tensor]]:
+    """``torch.topk(scores, k, dim=-1, sorted=False)`` of [batch, N] BF16 scores with
+    contiguous rows, element for element (values, then int64 indices), or None
+    where the kernel does not apply (N not a multiple of ``TOPK_CHUNK``)."""
+    bs, n = scores.shape
+    if not (
+        scores.is_cuda
+        and scores.dtype == torch.bfloat16
+        and scores.stride(1) == 1
+        and n % TOPK_CHUNK == 0
+        and 0 < k <= n
+    ):
+        return None
+    values = scores.new_empty((bs, k))
+    ids = torch.empty((bs, k), dtype=torch.int64, device=scores.device)
+    if bs:
+        _topk_kernel[(bs,)](
+            scores.view(torch.int16),
+            scores.stride(0),
+            values.view(torch.int16),
+            ids,
+            N=n,
+            K=k,
+            CHUNK=TOPK_CHUNK,
+            num_warps=8,
+        )
+    return values, ids
 
 
 def corrector_pool_max(logits: torch.Tensor) -> torch.Tensor:

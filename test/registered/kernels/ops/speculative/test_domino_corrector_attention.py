@@ -14,6 +14,7 @@ from sglang.kernels.ops.speculative.domino_corrector import (
     corrector_output_head,
     corrector_pool_max,
     corrector_ring_context_attention,
+    corrector_topk,
 )
 from sglang.srt.speculative.domino_corrector import (
     CorrectorContext,
@@ -184,6 +185,29 @@ def test_pool_max_equals_amax(dtype, bs, steps, vocab):
     # A block's corrected steps: a strided slice of [batch, steps + 1, vocab] logits.
     logits = _randn((bs, steps + 1, vocab), dtype, gen)[:, 1:]
     assert torch.equal(corrector_pool_max(logits), logits.amax(dim=1))
+
+
+@pytest.mark.parametrize("kind", ["normal", "ties", "zeros"])
+@pytest.mark.parametrize(
+    "bs,n,k", [(116, 40960, 2048), (116, 8192, 2048), (3, 4096, 1), (2, 4096, 4096)]
+)
+def test_topk_lays_out_like_torch(kind, bs, n, k):
+    """Values and indices equal torch.topk(sorted=False)'s, position by position."""
+    gen = torch.Generator(device="cuda").manual_seed(n + k)
+    x = _randn((bs, n), torch.bfloat16, gen)
+    if kind == "ties":
+        # Few distinct values, so the k-th value is shared by many entries.
+        x = (x * 2).round() / 2
+        x[:, ::97] = -torch.inf
+    elif kind == "zeros":
+        x = torch.where(
+            torch.rand(bs, n, device="cuda", generator=gen) < 0.5, 0.0, -0.0
+        )
+        x = x.to(torch.bfloat16)
+    values, ids = corrector_topk(x, k)
+    ref = torch.topk(x, k, dim=-1, sorted=False)
+    assert torch.equal(values.view(torch.int16), ref.values.view(torch.int16))
+    assert torch.equal(ids, ref.indices)
 
 
 def _rollout_case(dtype):

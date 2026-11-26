@@ -59,6 +59,17 @@ def _domino_tp_first_ids(
     return torch.gather(gathered_ids, 0, best_rank).squeeze(0)
 
 
+def _topk_unsorted(scores: torch.Tensor, k: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """``torch.topk(scores, k, dim=-1, sorted=False)``, element for element."""
+    if scores.is_cuda:
+        from sglang.kernels.ops.speculative.domino_corrector import corrector_topk
+
+        out = corrector_topk(scores, k)
+        if out is not None:
+            return out
+    return torch.topk(scores, k=k, dim=-1, sorted=False)
+
+
 def _pool_max(logits: torch.Tensor) -> torch.Tensor:
     """[batch, steps, vocab] -> [batch, vocab]: the max over a block's steps."""
     if logits.is_cuda:
@@ -125,9 +136,7 @@ def _domino_tp_candidate_state(
     pool_scores = _pool_max(local_feedback_logits.transpose(0, 1))
     if num_org < local_vocab_size:
         pool_scores[:, num_org:].fill_(float("-inf"))
-    local_scores, local_positions = torch.topk(
-        pool_scores, k=local_k, dim=-1, sorted=False
-    )
+    local_scores, local_positions = _topk_unsorted(pool_scores, local_k)
     gathered_scores, gathered_ids = _all_gather_candidates(
         local_scores,
         local_positions,
@@ -145,12 +154,7 @@ def _domino_tp_candidate_state(
         .permute(1, 0, 2)
         .reshape(batch_size, tp_size * local_k)
     )
-    global_positions = torch.topk(
-        gathered_scores,
-        k=int(candidate_pool_size),
-        dim=-1,
-        sorted=False,
-    ).indices
+    global_positions = _topk_unsorted(gathered_scores, int(candidate_pool_size))[1]
     candidate_ids = torch.gather(gathered_ids, 1, global_positions).contiguous()
 
     owned = (candidate_ids >= int(org_vocab_start)) & (
