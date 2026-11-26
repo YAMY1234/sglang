@@ -955,6 +955,14 @@ class Envs:
     # Disable with SGLANG_HICACHE_NIXL_USE_DIRECT_IO=0 or via the
     # "use_direct_io": false key in --hicache-storage-backend-extra-config.
     SGLANG_HICACHE_NIXL_USE_DIRECT_IO = EnvBool(True)
+    # nixl_dram L3 backend: >0 bounces every transfer through a registered staging region of
+    # this many MiB instead of registering the whole host pool with NIXL.
+    SGLANG_HICACHE_NIXL_DRAM_STAGING_MIB = EnvInt(0)
+    # nixl_dram L3 backend: run NIXL's progress thread in the client's agent.
+    SGLANG_HICACHE_NIXL_DRAM_PROG_THREAD = EnvBool(True)
+    # nixl_dram L3 backend: on a transfer error, re-add the pool service's NIXL agent and
+    # retry the transfer once.
+    SGLANG_HICACHE_NIXL_DRAM_RECONNECT = EnvBool(False)
     SGLANG_HUGEPAGE_SIZE = EnvStr("")
     # off: normal pages; prefer: hugepages with normal-page fallback;
     # required: hugepages only, failing immediately when unavailable.
