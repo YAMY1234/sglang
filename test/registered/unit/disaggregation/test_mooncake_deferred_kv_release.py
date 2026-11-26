@@ -7,6 +7,7 @@ Only the transfer worker can send that ACK after its write has drained.
 import threading
 import unittest
 from collections import defaultdict
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import numpy as np
@@ -239,6 +240,42 @@ class TestMooncakeAbortNotification(
 
                 manager.send_aux.assert_called_once()
                 self.assertEqual(manager._sent, [])
+
+
+class TestMooncakeLocalResultAux(CustomTestCase):
+    """SGLANG_PP_PD_LOCAL_RESULT: an earlier PP prefill stage holds no sampled
+    token or draft state, so it leaves decode's aux to the last stage."""
+
+    _prepare_worker = TestMooncakeAbortNotification._prepare_worker
+
+    def test_earlier_stage_sends_kv_and_state_but_no_aux(self):
+        manager = _manager()
+        self._prepare_worker(manager)
+        manager.aux_from_last_pp_stage = True
+        queue = MagicMock()
+        queue.get.side_effect = [_last_chunk(), None]
+        manager.transfer_worker(queue, MagicMock())
+        manager.send_kvcache.assert_called_once()
+        manager.maybe_send_extra.assert_called_once()
+        manager.send_aux.assert_not_called()
+        self.assertEqual(manager.request_status[ROOM], KVPoll.Success)
+
+    def test_earlier_stage_rejects_a_decode_that_runs_pp(self):
+        """A decode stage pulling only this stage's layers reads its aux from
+        here; every transfer to it fails instead of reaching decode without it."""
+        manager = MooncakeKVManager.__new__(MooncakeKVManager)
+        manager.pp_rank = 0
+        manager.kv_args = SimpleNamespace(kv_layer_ids=[0, 1, 0, 1])
+        without_pp = SimpleNamespace(dst_kv_layer_ids=[0, 1, 2, 3, 0, 1, 2, 3])
+        pp_matched = SimpleNamespace(dst_kv_layer_ids=[0, 1, 0, 1])
+        positional = SimpleNamespace(dst_kv_layer_ids=[])
+        self.assertIsNone(manager._local_result_peer_mismatch(pp_matched))
+        manager.aux_from_last_pp_stage = True
+        self.assertIsNone(manager._local_result_peer_mismatch(without_pp))
+        for peer in (pp_matched, positional):
+            self.assertIn(
+                "SGLANG_PP_PD_LOCAL_RESULT", manager._local_result_peer_mismatch(peer)
+            )
 
 
 if __name__ == "__main__":

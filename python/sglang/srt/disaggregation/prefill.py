@@ -1235,13 +1235,23 @@ class SchedulerDisaggregationPrefillMixin:
         draft_hidden_states_cpu = None
         draft_dsa_topk_indices_cpu = None
         if self.spec_algorithm.is_eagle() and draft_input is not None:
-            draft_hidden_states_cpu = draft_input.hidden_states.to(
-                "cpu", non_blocking=False
-            )
-            if batch.spec_info.dsa_topk_indices is not None:
-                draft_dsa_topk_indices_cpu = batch.spec_info.dsa_topk_indices.to(
+            draft_topk_p = draft_input.topk_p
+            draft_topk_index = draft_input.topk_index
+            if result.prefill_host_draft is not None:
+                (
+                    draft_topk_p,
+                    draft_topk_index,
+                    draft_hidden_states_cpu,
+                    draft_dsa_topk_indices_cpu,
+                ) = result.prefill_host_draft
+            else:
+                draft_hidden_states_cpu = draft_input.hidden_states.to(
                     "cpu", non_blocking=False
                 )
+                if batch.spec_info.dsa_topk_indices is not None:
+                    draft_dsa_topk_indices_cpu = batch.spec_info.dsa_topk_indices.to(
+                        "cpu", non_blocking=False
+                    )
         # Transfer kv for prefill completed requests and add it into disagg_prefill_transfer_queue
         next_token_ids = result.next_token_ids.tolist()
         self.batch_result_processor.move_logprobs_to_cpu(
@@ -1333,8 +1343,8 @@ class SchedulerDisaggregationPrefillMixin:
                     self.disagg_prefill_transfer_queue,
                 )
                 if self.spec_algorithm.is_eagle() and draft_input is not None:
-                    req.output_topk_p = draft_input.topk_p[i]
-                    req.output_topk_index = draft_input.topk_index[i]
+                    req.output_topk_p = draft_topk_p[i]
+                    req.output_topk_index = draft_topk_index[i]
                     req.hidden_states_tensor = draft_hidden_states_cpu[i].clone()
                     if draft_dsa_topk_indices_cpu is not None:
                         req.output_dsa_topk_indices = draft_dsa_topk_indices_cpu[

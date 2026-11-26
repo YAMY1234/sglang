@@ -793,9 +793,21 @@ class Envs:
     # Run PP tensor communication on a dedicated stream so asynchronous sends
     # do not fence the next forward through the scheduler stream.
     SGLANG_PP_COMM_OVERLAP = EnvBool(False)
+    # With SGLANG_PP_COMM_OVERLAP: the PP communication stream also avoids every
+    # stream already held (model side streams, cache copy streams) at loop start.
+    SGLANG_PP_COMM_STREAM_AVOID_SIDE_STREAMS = EnvBool(False)
     # PP rank 0 posts its output recv only after its own forward. Enable it if PP
     # hangs or stalls on kernels that need every SM (e.g. flashinfer MLA).
     SGLANG_ENABLE_PP_OUTPUT_RECV_AFTER_FORWARD = EnvBool(False)
+    # PP PD prefill (Mooncake, decode without PP): plain extend batches skip the
+    # output ring; the last stage alone sends the first token and draft state.
+    SGLANG_PP_PD_LOCAL_RESULT = EnvBool(False)
+    # PP PD prefill: relay this iteration's requests and proxy to the next stage
+    # before waiting on an older micro-batch's result.
+    SGLANG_PP_PREFILL_RELAY_BEFORE_D2H = EnvBool(False)
+    # PP PD prefill: copy a received result (sampled tokens, logprobs, draft state)
+    # to the host on the copy stream as soon as it arrives.
+    SGLANG_PP_PREFILL_HOST_OUTPUT_COPY = EnvBool(False)
     SGLANG_NCCL_ALL_GATHER_IN_OVERLAP_SCHEDULER_SYNC_BATCH = EnvBool(False)
     # Opt-in: keep receiving prefill requests while forward results are pending.
     SGLANG_ENABLE_DISAGG_PREFILL_CONTINUOUS_INPUT_POLLING = EnvBool(False)

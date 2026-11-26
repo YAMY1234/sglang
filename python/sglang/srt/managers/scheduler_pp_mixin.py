@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gc
 import logging
 from collections import defaultdict, deque
 from contextlib import nullcontext
@@ -10,7 +11,10 @@ import torch
 import torch.distributed
 
 from sglang.srt.disaggregation.base.conn import KVPoll
-from sglang.srt.disaggregation.utils import poll_and_all_reduce_attn_cp_tp_group
+from sglang.srt.disaggregation.utils import (
+    TransferBackend,
+    poll_and_all_reduce_attn_cp_tp_group,
+)
 from sglang.srt.distributed.communication_op import attn_cp_tp_broadcast_pyobj
 from sglang.srt.distributed.parallel_state import P2PWork
 from sglang.srt.distributed.pp_sync_window import PPSyncSendWindow
@@ -111,6 +115,12 @@ def _pp_exchange_outputs_before_forward(
     return not (cur_batch.forward_mode.is_extend() or cur_batch.is_extend_in_batch)
 
 
+def _held_cuda_streams() -> Tuple[torch.cuda.Stream, ...]:
+    """Every CUDA stream object alive now. Pool streams are handed out round-robin,
+    so a new one may alias a model's or a cache's side stream."""
+    return tuple(obj for obj in gc.get_objects() if isinstance(obj, torch.cuda.Stream))
+
+
 @dataclass
 class PPBatchMetadata:
     can_run_cuda_graph: bool
@@ -131,6 +141,9 @@ class PPBatchMetadata:
     unified_forward_done: Optional[torch.cuda.Event] = None
     # Rank-local: recorded on the forward stream after this forward, any pool.
     forward_done: Optional[torch.cuda.Event] = None
+    # Decided at launch, the same on every stage: this PD prefill micro-batch
+    # skips the output ring (SGLANG_PP_PD_LOCAL_RESULT).
+    pd_local_result: bool = False
 
 
 class SchedulerPPMixin:
@@ -147,6 +160,10 @@ class SchedulerPPMixin:
     _pp_reqs_awaiting_verdict: Tuple[
         Union[ReleaseMemoryOccupationReqInput, RpcReqInput], ...
     ] = ()
+    # Set by the PP PD prefill loop (SGLANG_PP_PD_LOCAL_RESULT,
+    # SGLANG_PP_PREFILL_HOST_OUTPUT_COPY).
+    _pp_pd_local_result_enabled: bool = False
+    _pp_prefill_host_output_copy: bool = False
 
     @DynamicGradMode()
     def event_loop_pp(self: Scheduler):
@@ -297,9 +314,16 @@ class SchedulerPPMixin:
         send current stage's outputs to next stage (can be stashed and delayed to send later)
 
         the above order can be optimized and reordered to minimize communication-related CPU stall and overhead bubbles.
+
+        With SGLANG_PP_PREFILL_RELAY_BEFORE_D2H a stage sends the ith reqs and
+        proxy right after its launch, before it waits on an older result; every
+        stage still receives the same messages at the same iteration.
         ====================================================================
         """
         self.init_pp_loop_state()
+        self._pp_pd_local_result_enabled = self._pp_pd_local_result_engages()
+        self._pp_prefill_host_output_copy = self._pp_prefill_host_output_copy_engages()
+        relay_before_d2h = self._pp_prefill_relay_before_d2h_engages()
 
         while True:
             server_is_idle = True
@@ -370,6 +394,10 @@ class SchedulerPPMixin:
                             next_mb_id,
                         )
                     )
+                if relay_before_d2h:
+                    self._pp_relay_to_next_stage(
+                        recv_reqs, result if cur_batch else None
+                    )
 
                 # post-process the coming microbatch
                 if self.mbs[next_mb_id] is not None:
@@ -381,11 +409,10 @@ class SchedulerPPMixin:
                     self.last_mbs[next_mb_id] = self.mbs[next_mb_id]
 
                 self.process_disagg_prefill_transfer_queue()
-                if not self.pp_group.is_last_rank:
-                    self.send_req_work = self._pp_send_reqs_to_next_stage(recv_reqs)
-                    self._pp_send_capacity_digest()
-                    if cur_batch:
-                        self._pp_send_proxy_to_next_stage(result)
+                if not relay_before_d2h and not self.pp_group.is_last_rank:
+                    self._pp_relay_to_next_stage(
+                        recv_reqs, result if cur_batch else None
+                    )
                 self._pp_answer_verdict_requests()
 
                 self.pp_outputs = next_pp_outputs
@@ -671,9 +698,15 @@ class SchedulerPPMixin:
             and torch.cuda.is_available()
             and str(self.device).startswith("cuda")
         ):
+            avoid_streams = (
+                self.schedule_stream,
+                self.forward_stream,
+                self.copy_stream,
+            )
+            if envs.SGLANG_PP_COMM_STREAM_AVOID_SIDE_STREAMS.get():
+                avoid_streams += _held_cuda_streams()
             self.pp_comm_stream = allocate_distinct_stream(
-                self.device_module,
-                (self.schedule_stream, self.forward_stream, self.copy_stream),
+                self.device_module, avoid_streams
             )
             self.pp_comm_stream_ctx = self.device_module.stream(self.pp_comm_stream)
             logger.info(
@@ -683,6 +716,8 @@ class SchedulerPPMixin:
         self._pp_tensor_dict_inbox: Dict[
             str, deque[Tuple[Dict[str, torch.Tensor], Optional[torch.Event]]]
         ] = defaultdict(deque)
+        # Last stage, PD local result: its own outputs, held until processed.
+        self._pp_local_outputs: Dict[int, Tuple[torch.Event, PPProxyTensors]] = {}
         self._pp_capacity_send_work: List[P2PWork] = []
         self._pp_verdict_send_work: List[P2PWork] = []
         # Like the bootstrap poll forwards, the transfer-queue release decision
@@ -748,6 +783,133 @@ class SchedulerPPMixin:
 
     def process_bootstrapped_queue(self: Scheduler):
         self.disagg_prefill_bootstrap_queue.move_bootstrapped(self.waiting_queue)
+
+    def _pp_pd_local_result_engages(self: Scheduler) -> bool:
+        """SGLANG_PP_PD_LOCAL_RESULT, read once at the PP PD prefill loop's entry."""
+        if not envs.SGLANG_PP_PD_LOCAL_RESULT.get():
+            return False
+        # Only the Mooncake sender leaves the aux to the last stage, and sampling
+        # observer outputs reach the first stage only over the ring.
+        if (
+            _is_npu
+            or self.transfer_backend != TransferBackend.MOONCAKE
+            or self._pp_spec_relay
+            or self.tp_worker.model_runner.sampling_observer is not None
+        ):
+            raise ValueError(
+                "SGLANG_PP_PD_LOCAL_RESULT needs the Mooncake transfer backend on "
+                "CUDA, without SGLANG_ENABLE_PP_SPEC or a sampling observer"
+            )
+        logger.info(
+            "SGLANG_PP_PD_LOCAL_RESULT engaged: plain extend batches skip the PP "
+            "output ring; the last stage sends their first token to decode"
+        )
+        return True
+
+    def _pp_prefill_relay_before_d2h_engages(self: Scheduler) -> bool:
+        """SGLANG_PP_PREFILL_RELAY_BEFORE_D2H, read once at the PP PD prefill
+        loop's entry; True only on the stages that relay."""
+        if not envs.SGLANG_PP_PREFILL_RELAY_BEFORE_D2H.get():
+            return False
+        parallel = get_parallel()
+        if (
+            _is_npu
+            or parallel.tp_size != 1
+            or parallel.attn_dp_enabled
+            or parallel.pp_async_batch_depth != 0
+            or self._pp_spec_relay
+        ):
+            raise ValueError(
+                "SGLANG_PP_PREFILL_RELAY_BEFORE_D2H needs TP 1, "
+                "--pp-async-batch-depth 0, no attention DP and no "
+                "SGLANG_ENABLE_PP_SPEC"
+            )
+        logger.info(
+            "SGLANG_PP_PREFILL_RELAY_BEFORE_D2H engaged: a stage relays its "
+            "launch before it processes an older result"
+        )
+        return not self.pp_group.is_last_rank
+
+    def _pp_prefill_host_output_copy_engages(self: Scheduler) -> bool:
+        """SGLANG_PP_PREFILL_HOST_OUTPUT_COPY, read once at the PP PD prefill
+        loop's entry."""
+        if not envs.SGLANG_PP_PREFILL_HOST_OUTPUT_COPY.get():
+            return False
+        parallel = get_parallel()
+        if (
+            not str(self.device).startswith("cuda")
+            or parallel.tp_size != 1
+            or parallel.pp_async_batch_depth != 0
+            or self._pp_spec_relay
+        ):
+            raise ValueError(
+                "SGLANG_PP_PREFILL_HOST_OUTPUT_COPY needs CUDA, TP 1, "
+                "--pp-async-batch-depth 0 and no SGLANG_ENABLE_PP_SPEC"
+            )
+        logger.info(
+            "SGLANG_PP_PREFILL_HOST_OUTPUT_COPY engaged: a received result is "
+            "copied to the host as soon as it arrives"
+        )
+        return True
+
+    def _pp_relay_to_next_stage(
+        self: Scheduler, recv_reqs: List, result: Optional[GenerationBatchResult]
+    ) -> None:
+        """Send this iteration's reqs, capacity digest and launched proxy on."""
+        self.send_req_work = self._pp_send_reqs_to_next_stage(recv_reqs)
+        self._pp_send_capacity_digest()
+        if result is not None:
+            self._pp_send_proxy_to_next_stage(result)
+
+    def _pp_pd_local_result(self: Scheduler, batch: ScheduleBatch) -> bool:
+        """Whether this PD prefill batch skips the output ring. Batches whose
+        output feeds a consumer on the first stage (logprobs, grammar, sampling
+        mask, routed experts) keep it."""
+        return (
+            self._pp_pd_local_result_enabled
+            and batch.forward_mode == ForwardMode.EXTEND
+            and not batch.return_logprob
+            # The output message carries every batch's routed experts while
+            # they are captured.
+            and not get_exec().features.enable_return_routed_experts
+            and not any(
+                req.grammar is not None
+                or req.return_sampling_mask
+                or req.return_routed_experts
+                for req in batch.reqs
+            )
+        )
+
+    def _pp_make_local_result(
+        self: Scheduler,
+        batch: ScheduleBatch,
+        mb_metadata: PPBatchMetadata,
+        mb_id: int,
+    ) -> Tuple[None, GenerationBatchResult, torch.Event]:
+        """The last stage processes its own output. An earlier stage reads no
+        sampled value and sends no aux, so it processes a placeholder."""
+        if not self.pp_group.is_last_rank:
+            batch.spec_info = None
+            batch_result = GenerationBatchResult(
+                # On the host, so reading it back never waits on the device.
+                next_token_ids=torch.zeros(len(batch.reqs), dtype=torch.int64),
+                can_run_cuda_graph=mb_metadata.can_run_cuda_graph,
+                fpm_timing=mb_metadata.fpm_timing,
+                forward_launch=mb_metadata.forward_launch,
+                unified_forward_done=mb_metadata.unified_forward_done,
+            )
+            # The micro-batch's KV must be written before it is checkpointed or
+            # sent; a received output used to imply that.
+            assert mb_metadata.forward_done is not None
+            d2h_event = self._pp_result_done_event(mb_metadata, side_stream=True)
+            return None, batch_result, d2h_event
+        ready_event, local_outputs = self._pp_local_outputs.pop(mb_id)
+        with self.copy_stream_ctx:
+            self.copy_stream.wait_stream(self.schedule_stream)
+            self.copy_stream.wait_event(ready_event)
+            batch_result = self._pp_prep_batch_result(batch, mb_metadata, local_outputs)
+            d2h_event = self._pp_result_done_event(mb_metadata)
+        return None, batch_result, d2h_event
 
     def _pp_pd_send_consensus_bootstrapped_ids(
         self: Scheduler,
@@ -1632,7 +1794,22 @@ class SchedulerPPMixin:
             target = mbs[next_first_rank_mb_id]
             if target is not None:
                 q_event, pp_outputs_to_send = last_rank_comm_queue.popleft()
-                if (
+                target_md = (
+                    self.mb_metadata[next_first_rank_mb_id]
+                    if self._pp_pd_local_result_enabled
+                    else None
+                )
+                if target_md is not None and target_md.pd_local_result:
+                    # Processed on this stage from its own output; nothing to send.
+                    self._pp_local_outputs[next_first_rank_mb_id] = (
+                        q_event,
+                        pp_outputs_to_send,
+                    )
+                    if self.pp_comm_stream is None:
+                        # Keep the skipped send's fence: it orders a chunked
+                        # request's next KV send after this forward.
+                        self.device_module.current_stream().wait_event(q_event)
+                elif (
                     not target.forward_mode.is_prebuilt()
                     and not _pp_can_skip_output_comm(target)
                 ):
@@ -1713,6 +1890,12 @@ class SchedulerPPMixin:
             target = mbs[next_mb_id]
             if target is None or target.forward_mode.is_prebuilt():
                 return
+            target_md = mb_metadata[next_mb_id]
+            if target_md is not None and target_md.pd_local_result:
+                next_pp_outputs, batch_result, d2h_event = self._pp_make_local_result(
+                    target, target_md, next_mb_id
+                )
+                return
             if _pp_can_skip_output_comm(target):
                 next_pp_outputs, batch_result, d2h_event = (
                     self._pp_make_skip_output_result(target, mb_metadata[next_mb_id])
@@ -1742,7 +1925,14 @@ class SchedulerPPMixin:
                     target, mb_metadata[next_mb_id], next_pp_outputs
                 )
                 d2h_event = self._pp_result_done_event(mb_metadata[next_mb_id])
-                if (
+                # On odd ranks recv precedes send. Copy the old result here,
+                # before a later send queues the current forward's wait on the
+                # scheduler stream used by the CPU result processor.
+                host_output_copy = (
+                    self._pp_prefill_host_output_copy
+                    and target.forward_mode.is_extend()
+                )
+                if host_output_copy or (
                     batch_result.logits_output is not None
                     and batch_result.logits_output.sampling_mask_output is not None
                 ):
@@ -1751,6 +1941,10 @@ class SchedulerPPMixin:
                     batch_result.copy_to_cpu(
                         return_logprob=target.return_logprob,
                         return_hidden_states=False,
+                        return_pd_prefill_draft=(
+                            host_output_copy and self.spec_algorithm.is_eagle()
+                        ),
+                        fence_logprob_copy_devices=host_output_copy,
                     )
 
         if send_first:
@@ -1916,6 +2110,7 @@ class SchedulerPPMixin:
                     forward_launch=result.forward_launch,
                     unified_forward_done=result.unified_forward_done,
                     forward_done=event,
+                    pd_local_result=self._pp_pd_local_result(cur_batch),
                 )
                 if self.pp_group.is_last_rank:
                     # (last rank) buffer the outputs for async batch depth
@@ -1923,6 +2118,15 @@ class SchedulerPPMixin:
                     ready_event = event
                     if pp_output_rows_to_host(tensor_dict):
                         # The send waits for these copies, which follow the forward.
+                        ready_event = self.device_module.Event()
+                        ready_event.record(self.device_module.current_stream())
+                    if mb_metadata[mb_id].pd_local_result:
+                        # Held until processed, pp_loop_size - 1 iterations on: copy
+                        # it out of buffers a later forward (graph replay) reuses.
+                        tensor_dict = {
+                            key: value.clone() if torch.is_tensor(value) else value
+                            for key, value in tensor_dict.items()
+                        }
                         ready_event = self.device_module.Event()
                         ready_event.record(self.device_module.current_stream())
                     last_rank_comm_queue.append(

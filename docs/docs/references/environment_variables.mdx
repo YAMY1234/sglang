@@ -1502,6 +1502,26 @@ SGLang supports various environment variables that can be used to configure its 
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_PP_COMM_STREAM_AVOID_SIDE_STREAMS</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>With <code>SGLANG_PP_COMM_OVERLAP</code>, draw the pipeline-parallel communication stream so it aliases none of the CUDA streams already held when the PP loop starts (model side streams, cache copy streams), not only the scheduler's own streams.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_PP_PD_LOCAL_RESULT</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>PD prefill with pipeline parallelism and the Mooncake backend: extend batches without logprobs, grammar, sampling masks or routed experts skip the PP output ring. The last stage processes its own output and alone sends the first token and draft state to decode; the earlier stages process a placeholder after their own forward. Needs a decode server without pipeline parallelism.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_PP_PREFILL_RELAY_BEFORE_D2H</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>PD prefill with pipeline parallelism (TP 1, <code>--pp-async-batch-depth 0</code>, no attention DP): a stage sends the iteration's requests and launched proxy tensors to the next stage before it waits on and processes an older micro-batch's result.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_PP_PREFILL_HOST_OUTPUT_COPY</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>PD prefill with pipeline parallelism on CUDA (TP 1, <code>--pp-async-batch-depth 0</code>): copy a result received over the PP output ring (sampled tokens, logprobs, EAGLE draft state) to the host on the copy stream as soon as it arrives, so result processing does not read it through the scheduler stream.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_KILLPG_ON_SCHEDULER_EXCEPTION</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Kill the whole process group when the scheduler raises an exception.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>

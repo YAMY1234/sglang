@@ -376,6 +376,9 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
     supports_role_switch = True
     # Bootstrap thread defers the ABORT ack until the transfer worker drains.
     supports_deferred_decode_kv_release = True
+    # SGLANG_PP_PD_LOCAL_RESULT: an earlier PP prefill stage holds no sampled
+    # token or draft state, so it leaves decode's aux to the last stage.
+    aux_from_last_pp_stage: bool = False
 
     def __init__(
         self,
@@ -391,6 +394,11 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             enable_custom_mem_pool, custom_mem_pool_type
         )
         super().__init__(args, disaggregation_mode, server_args, is_mla_backend)
+        self.aux_from_last_pp_stage = (
+            envs.SGLANG_PP_PD_LOCAL_RESULT.get()
+            and disaggregation_mode == DisaggregationMode.PREFILL
+            and self.pp_rank < self.pp_size - 1
+        )
         self.init_engine()
         self.transport = MooncakeTransport(engine=self.engine)
         # Staging rings and DCP pack buffers by base address: they reach
@@ -1076,7 +1084,11 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         """
         kv_layout_mismatch = self._kv_layout_mismatch(decode_kv_args)
         fully_checked, state_mismatch = self._validate_peer_state_layout(decode_kv_args)
-        mismatch = kv_layout_mismatch or state_mismatch
+        mismatch = (
+            kv_layout_mismatch
+            or state_mismatch
+            or self._local_result_peer_mismatch(decode_kv_args)
+        )
         self.check_peer_aux_buffer_count(
             mooncake_session_id, len(decode_kv_args.dst_aux_ptrs)
         )
@@ -1093,6 +1105,22 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 mooncake_session_id, decode_kv_args
             )
         return mismatch
+
+    def _local_result_peer_mismatch(
+        self, decode_kv_args: KVArgsRegisterInfo
+    ) -> Optional[str]:
+        """An earlier PP stage that leaves the aux to the last one pairs only with
+        a decode that also pulls later stages' layers (a decode without PP)."""
+        if not self.aux_from_last_pp_stage:
+            return None
+        own_layer_ids = set(self.kv_args.kv_layer_ids)
+        if any(i not in own_layer_ids for i in decode_kv_args.dst_kv_layer_ids):
+            return None
+        return (
+            "SGLANG_PP_PD_LOCAL_RESULT needs a decode without pipeline parallelism: "
+            f"prefill PP stage {self.pp_rank} sends no aux, and this decode pulls "
+            "no later stage's layers"
+        )
 
     def _reject_decode_without_fan_in(
         self, mooncake_session_id: str, required_dst_info_num: int
@@ -3715,7 +3743,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                                     break
 
                             # Only the last chunk we need to send the aux data;
-                            # a non-peer sends KV pages only.
+                            # a non-peer sends KV pages only, and so does an
+                            # earlier PP stage under SGLANG_PP_PD_LOCAL_RESULT.
                             ret = (
                                 self.send_aux(
                                     req,
@@ -3723,7 +3752,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                                     target_rank_registration_info.dst_aux_ptrs,
                                     target_rank_registration_info.dst_aux_item_lens,
                                 )
-                                if is_request_peer
+                                if is_request_peer and not self.aux_from_last_pp_stage
                                 else 0
                             )
                             if ret != 0:

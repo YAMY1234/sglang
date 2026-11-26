@@ -4,7 +4,7 @@ import dataclasses
 import logging
 import re
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, List, Optional, Union
+from typing import TYPE_CHECKING, Any, Callable, List, Optional, Tuple, Union
 
 import msgspec
 import torch
@@ -56,12 +56,25 @@ logger = logging.getLogger(__name__)
 # (every row asks the same k), or one batched copy for the per-row list.
 def _async_d2h_top_logprobs(
     rows: Optional[Union[torch.Tensor, List]],
+    copy: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
 ) -> Optional[Union[torch.Tensor, List]]:
     if rows is None:
         return None
     if torch.is_tensor(rows):
-        return _async_d2h(rows)
-    return _async_d2h_rows(rows)
+        return (copy or _async_d2h)(rows)
+    return _async_d2h_rows(rows, copy)
+
+
+def _async_logprob_d2h(tensor: torch.Tensor, copy_stream) -> torch.Tensor:
+    host = _async_d2h(tensor)
+    # PP pickles nested logprob tensors as metadata, preserving their CUDA
+    # device. A copy from another device uses that device's current stream;
+    # join it into the stream on which copy_done will be recorded.
+    if tensor.device.type == "cuda" and tensor.device != copy_stream.device:
+        copied = torch.cuda.Event()
+        copied.record(torch.cuda.current_stream(tensor.device))
+        copy_stream.wait_event(copied)
+    return host
 
 
 def allocate_distinct_stream(device_module, avoid_streams):
@@ -88,15 +101,18 @@ def is_war_barrier_enabled() -> bool:
     )
 
 
-def _async_d2h_rows(rows: List[Any]) -> List[Any]:
+def _async_d2h_rows(
+    rows: List[Any], copy: Optional[Callable[[torch.Tensor], torch.Tensor]] = None
+) -> List[Any]:
     """`_async_d2h` over per-request rows with one host buffer and one copy.
 
     The rows come back as host views with their shapes, in order; entries that
     are not tensors pass through.
     """
+    copy = copy or _async_d2h
     tensors = [row for row in rows if torch.is_tensor(row)]
     if len(tensors) < 2 or len({row.dtype for row in tensors}) > 1:
-        return [_async_d2h(row) if torch.is_tensor(row) else row for row in rows]
+        return [copy(row) if torch.is_tensor(row) else row for row in rows]
     flat = torch.cat([row.reshape(-1) for row in tensors])
     device = flat.device
     if device.type != "cpu" and is_pin_memory_available(device):
@@ -104,7 +120,7 @@ def _async_d2h_rows(rows: List[Any]) -> List[Any]:
         stream = torch.get_device_module(device).current_stream()
         for row in tensors:
             row.record_stream(stream)
-    host = _async_d2h(flat)
+    host = copy(flat)
     host_rows = iter(
         chunk.view(row.shape)
         for chunk, row in zip(host.split([row.numel() for row in tensors]), tensors)
@@ -223,6 +239,12 @@ class GenerationBatchResult:
     # ForwardObserver output, copied together with the sampling observer's.
     forward_auxiliary_output: Optional[DeviceAuxiliaryOutput] = None
     auxiliary_host_output: Optional[HostAuxiliaryOutput] = None
+    # PD prefill: host snapshots of next_draft_input's topk_p, topk_index,
+    # hidden_states and dsa_topk_indices, covered by copy_done. next_draft_input
+    # stays on the device for the PP relay and the future map.
+    prefill_host_draft: Optional[
+        Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]
+    ] = None
 
     @property
     def has_sampled_token_ids(self) -> bool:
@@ -234,35 +256,58 @@ class GenerationBatchResult:
         return self.num_correct_drafts + batch_size * self.num_non_draft_tokens_per_req
 
     @torch.profiler.record_function("copy_result_to_cpu")
-    def copy_to_cpu(self, return_logprob: bool, return_hidden_states: bool = True):
+    def copy_to_cpu(
+        self,
+        return_logprob: bool,
+        return_hidden_states: bool = True,
+        return_pd_prefill_draft: bool = False,
+        fence_logprob_copy_devices: bool = False,
+    ):
         """Copy tensors to CPU in overlap scheduling.
         Only the tensors which are needed for processing results are copied,
         e.g., next_token_ids, logits outputs
         """
         if return_logprob:
+            copy = _async_d2h
+            if fence_logprob_copy_devices:
+                copy_stream = torch.cuda.current_stream()
+                copy = lambda tensor: _async_logprob_d2h(tensor, copy_stream)
             if self.logits_output.next_token_logprobs is not None:
-                self.logits_output.next_token_logprobs = _async_d2h(
+                self.logits_output.next_token_logprobs = copy(
                     self.logits_output.next_token_logprobs
                 )
             if self.logits_output.input_token_logprobs is not None:
-                self.logits_output.input_token_logprobs = _async_d2h(
+                self.logits_output.input_token_logprobs = copy(
                     self.logits_output.input_token_logprobs
                 )
             self.logits_output.next_token_top_logprobs_val = _async_d2h_top_logprobs(
-                self.logits_output.next_token_top_logprobs_val
+                self.logits_output.next_token_top_logprobs_val, copy
             )
             self.logits_output.next_token_top_logprobs_idx = _async_d2h_top_logprobs(
-                self.logits_output.next_token_top_logprobs_idx
+                self.logits_output.next_token_top_logprobs_idx, copy
             )
             if self.logits_output.next_token_token_ids_logprobs_val is not None:
                 self.logits_output.next_token_token_ids_logprobs_val = _async_d2h_rows(
-                    self.logits_output.next_token_token_ids_logprobs_val
+                    self.logits_output.next_token_token_ids_logprobs_val, copy
                 )
         if return_hidden_states and self.logits_output.hidden_states is not None:
             self.logits_output.hidden_states = _async_d2h(
                 self.logits_output.hidden_states
             )
         self.next_token_ids = _async_d2h(self.next_token_ids)
+
+        if return_pd_prefill_draft and self.next_draft_input is not None:
+            draft = self.next_draft_input
+            self.prefill_host_draft = (
+                _async_d2h(draft.topk_p),
+                _async_d2h(draft.topk_index),
+                _async_d2h(draft.hidden_states),
+                (
+                    _async_d2h(draft.dsa_topk_indices)
+                    if draft.dsa_topk_indices is not None
+                    else None
+                ),
+            )
 
         if self.accept_lens is not None:
             self.accept_lens = _async_d2h(self.accept_lens)
