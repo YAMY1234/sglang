@@ -186,7 +186,8 @@ def test_merge_shared_window_matches_softmax_merge(base2):
 @pytest.mark.skipif(
     torch.cuda.get_device_capability()[0] < 10, reason="trtllm-gen sparse MLA"
 )
-def test_shared_window_attention_matches_per_row():
+@pytest.mark.parametrize("edges_in_merge", [True, False])
+def test_shared_window_attention_matches_per_row(edges_in_merge):
     """The shared-window draft attention equals the per-row window attention up to
     the BF16 rounding of the two partial outputs it merges."""
     from sglang.srt.layers.attention.draft_shared_window import (
@@ -257,6 +258,7 @@ def test_shared_window_attention_matches_per_row():
         ),
         group=group,
         row_indptr=indptr,
+        edges_in_merge=edges_in_merge,
         **kwargs,
     )
     torch.testing.assert_close(
