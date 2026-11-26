@@ -800,6 +800,36 @@ def _mega_moe_sf_as_fp32(sf: torch.Tensor) -> torch.Tensor:
     return sf
 
 
+@contextmanager
+def mega_moe_weight_pool_scope(experts):
+    """Allocate the experts' checkpoint copies in a private pool the MegaMoE build drops.
+
+    The build replaces them; freed in the shared pool, they leave split segments that
+    later long-lived tensors keep the allocator from returning.
+    """
+    if not get_moe_a2a_backend().is_megamoe() or _use_amd_flydsl_mega_moe():
+        yield
+        return
+    experts._mega_moe_weight_pool = torch.cuda.MemPool()
+    with torch.cuda.use_mem_pool(experts._mega_moe_weight_pool):
+        yield
+
+
+_weight_mempool_logged = False
+
+
+def _log_weight_mempool_once(pool) -> None:
+    global _weight_mempool_logged
+    if _weight_mempool_logged:
+        return
+    _weight_mempool_logged = True
+    live = sum(s["allocated_size"] for s in pool.snapshot(include_traces=False))
+    logger.info(
+        "MegaMoE weights built in a private pool: %.2f GiB still live when dropped",
+        live / (1 << 30),
+    )
+
+
 def build_mega_moe_experts_weights(experts) -> None:
     if _use_amd_flydsl_mega_moe():
         from sglang.srt.layers.moe.mega_moe_flydsl import (
@@ -829,46 +859,55 @@ def build_mega_moe_experts_weights(experts) -> None:
     _, n2, packed_k2 = w2.shape
     k2 = packed_k2 * (1 if mma_type == "fp8xfp8" else 2)
 
-    w13_sf = transform_sf_into_required_layout(
-        w13_sf_fp32,
-        mn=n1,
-        k=k1,
-        recipe=(1, 32),
-        num_groups=num_groups,
-        disable_ue8m0_cast=False,
-    )
-    w2_sf = transform_sf_into_required_layout(
-        w2_sf_fp32,
-        mn=n2,
-        k=k2,
-        recipe=(1, 32),
-        num_groups=num_groups,
-        disable_ue8m0_cast=False,
-    )
+    pool = getattr(experts, "_mega_moe_weight_pool", None)
+    with torch.cuda.use_mem_pool(pool) if pool is not None else nullcontext():
+        w13_sf = transform_sf_into_required_layout(
+            w13_sf_fp32,
+            mn=n1,
+            k=k1,
+            recipe=(1, 32),
+            num_groups=num_groups,
+            disable_ue8m0_cast=False,
+        )
+        w2_sf = transform_sf_into_required_layout(
+            w2_sf_fp32,
+            mn=n2,
+            k=k2,
+            recipe=(1, 32),
+            num_groups=num_groups,
+            disable_ue8m0_cast=False,
+        )
 
-    # Build the interleaved L1 weight + scale once; share the weight buffer
-    # between `w13_weight.data` (normal deep-ep path) and `mega_l1_weights[0]`
-    # (mega moe path). Mega moe additionally needs a UTCCP-transposed scale;
-    # the deep-ep path consumes the non-transposed interleaved scale and a
-    # swizzle-aware activation kernel. L2 weight is untouched by the mega
-    # transform, so the existing `w2_weight.data` is shared directly.
-    gran = 16 if mma_type == "mxf4xmxf4" else 8
-    w13_sf_interleaved = _interleave_mega_moe_gate_up(w13_sf, gran=gran)
-    w13_sf_utccp = _transpose_mega_moe_sf_for_utccp(w13_sf_interleaved)
-    w2_sf_utccp = _transpose_mega_moe_sf_for_utccp(w2_sf)
-    w13_interleaved = _interleave_mega_moe_gate_up(w13, gran=gran)
+        # Build the interleaved L1 weight + scale once; share the weight buffer
+        # between `w13_weight.data` (normal deep-ep path) and `mega_l1_weights[0]`
+        # (mega moe path). Mega moe additionally needs a UTCCP-transposed scale;
+        # the deep-ep path consumes the non-transposed interleaved scale and a
+        # swizzle-aware activation kernel. L2 weight is untouched by the mega
+        # transform, so the existing `w2_weight.data` is shared directly.
+        gran = 16 if mma_type == "mxf4xmxf4" else 8
+        w13_sf_interleaved = _interleave_mega_moe_gate_up(w13_sf, gran=gran)
+        w13_sf_utccp = _transpose_mega_moe_sf_for_utccp(w13_sf_interleaved)
+        w2_sf_utccp = _transpose_mega_moe_sf_for_utccp(w2_sf)
+        w13_interleaved = _interleave_mega_moe_gate_up(w13, gran=gran)
 
-    localize = _is_mega_moe_localization_enabled()
-    mega_l1, mega_l2 = w13_interleaved, w2
-    if localize:
-        # The build that runs the kernel localizes: it recognizes only its own localized memory
-        deep_gemm = _mega_moe_dg(mma_type)
+        localize = _is_mega_moe_localization_enabled()
+        mega_l1, mega_l2 = w13_interleaved, w2
+        if localize:
+            # The build that runs the kernel localizes: it recognizes only its own localized memory
+            deep_gemm = _mega_moe_dg(mma_type)
 
-        # (domains, experts, N / domains, K) for the kernel; the parameters get the
-        # expert-major view of the same memory.
-        mega_l1, mega_l2 = deep_gemm.localize(mega_l1), deep_gemm.localize(mega_l2)
-        w13_interleaved, w2 = mega_l1.transpose(0, 1), mega_l2.transpose(0, 1)
-        experts._mega_moe_weights_localized = True
+            # (domains, experts, N / domains, K) for the kernel; the parameters get the
+            # expert-major view of the same memory.
+            mega_l1, mega_l2 = deep_gemm.localize(mega_l1), deep_gemm.localize(mega_l2)
+            w13_interleaved, w2 = mega_l1.transpose(0, 1), mega_l2.transpose(0, 1)
+            experts._mega_moe_weights_localized = True
+    if pool is not None:
+        # What outlives the build leaves the pool; localized weights are not torch's.
+        w13_sf_interleaved, w2_sf, w13_sf_utccp, w2_sf_utccp = (
+            t.clone() for t in (w13_sf_interleaved, w2_sf, w13_sf_utccp, w2_sf_utccp)
+        )
+        if not localize:
+            mega_l1, mega_l2 = w13_interleaved, w2 = w13_interleaved.clone(), w2.clone()
 
     experts.w13_weight.data = w13_interleaved
     experts.w2_weight.data = w2
@@ -891,8 +930,12 @@ def build_mega_moe_experts_weights(experts) -> None:
     )
 
     experts._mega_moe_weights_built = True
-    if localize:
+    if localize or pool is not None:
         del w13, w13_sf, w13_sf_fp32, w2_sf_fp32
+        if pool is not None:
+            _log_weight_mempool_once(pool)
+            del pool
+            experts._mega_moe_weight_pool = None
         torch.cuda.empty_cache()
 
 

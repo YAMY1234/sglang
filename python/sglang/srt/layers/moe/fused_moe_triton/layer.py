@@ -3,6 +3,7 @@
 # Adapted from https://github.com/vllm-project/vllm/blob/a6221a144af772fd1a68fe7e627935dc53e81738/vllm/model_executor/layers/fused_moe/layer.py
 
 import logging
+from contextlib import nullcontext
 from enum import Enum
 from functools import cached_property
 from typing import Dict, List, Optional, Tuple
@@ -613,20 +614,26 @@ class FusedMoE(torch.nn.Module):
         )
         self.supports_deferred_finalize = False
 
-        self.quant_method.create_weights(
-            layer=self,
-            num_experts=self.num_local_experts,
-            hidden_size=hidden_size,
-            intermediate_size_per_partition=self.intermediate_size_per_partition,
-            params_dtype=params_dtype,
-            weight_loader=(
-                self.weight_loader
-                if not use_weight_loader_fused
-                else self.weight_loader_fused
-            ),
-            with_bias=with_bias,
-            moe_intermediate_size=intermediate_size,
-        )
+        weight_pool_scope = nullcontext()
+        if envs.SGLANG_OPT_MEGA_MOE_WEIGHT_MEMPOOL.get():
+            from sglang.srt.layers.moe.mega_moe import mega_moe_weight_pool_scope
+
+            weight_pool_scope = mega_moe_weight_pool_scope(self)
+        with weight_pool_scope:
+            self.quant_method.create_weights(
+                layer=self,
+                num_experts=self.num_local_experts,
+                hidden_size=hidden_size,
+                intermediate_size_per_partition=self.intermediate_size_per_partition,
+                params_dtype=params_dtype,
+                weight_loader=(
+                    self.weight_loader
+                    if not use_weight_loader_fused
+                    else self.weight_loader_fused
+                ),
+                with_bias=with_bias,
+                moe_intermediate_size=intermediate_size,
+            )
 
         _validate_gluon_quant_method(self, self.quant_method)
         self.quant_method.create_moe_runner(self, self.moe_runner_config)
