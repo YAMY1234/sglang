@@ -944,9 +944,9 @@ class SchedulerPPMixin:
             self._pp_launch_events.clear()
         # An optional second field switches the CE push gate (SGLANG_PP_CE_PUSH_GATED), a third
         # SGLANG_PP_PD_EARLY_SEND_WHEN_READY.
-        if len(fields) > 1 and self._pp_ce is not None and fields[1] != self._pp_ce.gated:
-            logger.info("PP CE push gate -> %s (%s)", fields[1], self._pp_host_lead_file)
-            self._pp_ce.gated = fields[1]
+        if len(fields) > 1 and self._pp_ce is not None and bool(fields[1]) != self._pp_ce.gated:
+            logger.info("PP CE push gate -> %s (%s)", bool(fields[1]), self._pp_host_lead_file)
+            self._pp_ce.gated = bool(fields[1])
         if len(fields) > 2 and bool(fields[2]) != self._pp_early_send_when_ready:
             logger.info("PP early send when ready -> %s (%s)", bool(fields[2]), self._pp_host_lead_file)
             self._pp_early_send_when_ready = bool(fields[2])
@@ -1235,20 +1235,19 @@ class SchedulerPPMixin:
         after enqueuing its own proxy send, which may read the slot in place (an in-place residual)."""
         if self._pp_ce is None or self._pp_ce_in_use is None:
             return
-        if self.pp_group.is_last_rank or self._pp_ce.gated >= 2:
-            # Gate-every-stage: right after the forward, before any later forward's wait on its input.
+        if self.pp_group.is_last_rank:
             stream = self.forward_stream
         else:
             stream = self._pp_ce.stream
-        if nccl_send_work is not None:
-            # An NCCL fallback send reads on NCCL's stream: fence the release behind it. Its gloo
-            # sends read no device memory and are left to the send window, which waits each once:
-            # a second wait of a gloo send never returns.
-            with self.pp_comm_stream_ctx:
-                for work in nccl_send_work:
-                    if not work.payload.is_cpu:
-                        work.work.wait()
-                stream.wait_event(self._pp_record_comm_event())
+            if nccl_send_work is not None:
+                # An NCCL fallback send reads on NCCL's stream: fence the release behind it. Its gloo
+                # sends read no device memory and are left to the send window, which waits each once:
+                # a second wait of a gloo send never returns.
+                with self.pp_comm_stream_ctx:
+                    for work in nccl_send_work:
+                        if not work.payload.is_cpu:
+                            work.work.wait()
+                    stream.wait_event(self._pp_record_comm_event())
         self._pp_ce.release(stream, self._pp_ce_in_use)
         self._pp_ce_in_use = None
 

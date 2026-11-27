@@ -903,10 +903,9 @@ class Envs:
     SGLANG_PP_CE_PUSH = EnvBool(False)
     # Under SGLANG_PP_CE_PUSH: enqueue a push's copies only once the next stage freed its slot (a gate thread waits
     # on a bare stream wait). Copies parked behind a stream wait hold the GPU's peer copy path and stall every other
-    # peer copy from that GPU, such as PD KV transfers, until the slot frees. 1: the first stage (whose push waits
-    # longest, since only the relay window bounds it); 2: every stage, each releasing its input slot right after
-    # its forward with a flag-store kernel instead of a copy-engine signal.
-    SGLANG_PP_CE_PUSH_GATED = EnvInt(0)
+    # peer copy from that GPU, such as PD KV transfers, until the slot frees. Only the first stage gates (the one
+    # whose push waits longest, since only the relay window bounds it).
+    SGLANG_PP_CE_PUSH_GATED = EnvBool(False)
     # MiB per slot of a stage's CE input ring: one value for every stage, one per stage (indexed
     # by the receiving stage; PP0's entry is unused), or "auto" (each stage's previous stage's
     # largest proxy at the prefill token budget). A larger message goes over NCCL.
