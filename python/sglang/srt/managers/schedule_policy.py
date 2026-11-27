@@ -270,14 +270,16 @@ class SchedulePolicy:
                     self._promote_aged_prefill(waiting_queue, temporary_deprioritized)
                 self._shortest_prefill_calls += 1
                 if waiting_queue and self._shortest_prefill_calls % 128 == 1:
-                    # prefix_match_ms: mean prefix-match time per pass since the last line.
+                    # prefix_match_ms: mean prefix-match time per pass since the last line;
+                    # dedupe_held: requests the in-batch prefix dedupe holds back this pass.
                     logger.info(
                         "Experimental shortest-prefill-first: queue=%d shortest_uncached=%d "
-                        "prefix_match_ms=%.2f aged_promotions=%d",
+                        "prefix_match_ms=%.2f aged_promotions=%d dedupe_held=%d",
                         len(waiting_queue),
                         self._shortest_prefill_work(waiting_queue[0]),
                         1e3 * self._prefix_match_seconds / 128,
                         self._spf_aged_promotions,
+                        len(temporary_deprioritized),
                     )
                     self._prefix_match_seconds = 0.0
             else:
