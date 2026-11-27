@@ -1855,6 +1855,10 @@ def mxfp8_sm107_gemm(
     return out
 
 
+# DECODE_TABLE starts at this M. Below it the FlashInfer autotune (warp split-K) wins: 1792 x 5120 at
+# M 6 takes 4.1 us there vs 8.8 us on the table's tactic, while M 36 keeps the table (5.9 vs 6.6 us).
+DECODE_TABLE_MIN_M = 16
+
 # Decode table: (N, K) -> [(max M, tactic, split_k), ...], ascending max M; the first entry whose max M
 # covers the call's M is used, and an M above the last entry keeps FlashInfer's mm_mxfp8. Entries are
 # the shapes and M ranges where this PDL copy beat FlashInfer's autotuned SM107 tactic on VR200 in
@@ -1973,6 +1977,8 @@ def decode_linear(
         tactic = DECODE_TABLE_BUCKETS.get(tuple(weight.shape), {}).get(m)
         split_k = 1
     if tactic is None:
+        if m < DECODE_TABLE_MIN_M:
+            return None
         for max_m, tactic, split_k in DECODE_TABLE.get(tuple(weight.shape), ()):
             if m <= max_m:
                 break
