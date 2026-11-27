@@ -549,9 +549,6 @@ class Envs:
     # DSpark opt-in: apply the simulated correct_len / bonus inside the folded verify epilogue
     # (CUDA/HIP graph) instead of falling back to the eager accept + commit path.
     SGLANG_DSPARK_SIMULATE_FOLD = EnvBool(False)
-    # DSpark diagnostic opt-in: no HiCache host sidecar for a non-packed draft (a host hit then reloads no
-    # draft rows; the draft reads stale rows there). Valid only under synthetic acceptance (SIMULATE_ACC_LEN).
-    SGLANG_DSPARK_HICACHE_NO_DRAFT_SIDECAR = EnvBool(False)
     SGLANG_SIMULATE_UNIFORM_EXPERTS = EnvBool(False)
     SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS = EnvBool(False)
 

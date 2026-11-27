@@ -31,11 +31,7 @@ from sglang.srt.runtime_context import (
     mamba_track_grid,
 )
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.speculative.base_spec_worker import (
-    BaseSpecWorker,
-    HiCacheDraftMode,
-    HiCacheDraftPlan,
-)
+from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.dp_spec_prefill_coordination import (
     DPSpecPrefillCoordinationPlan,
@@ -174,15 +170,6 @@ class DSparkWorkerV2(BaseSpecWorker):
 
     def weight_update_runners(self) -> list[tuple[str, "ModelRunner"]]:
         return [("draft", self.draft_model_runner)] if self._hosts_draft else []
-
-    def _build_hicache_draft_plan(self) -> HiCacheDraftPlan:
-        plan = super()._build_hicache_draft_plan()
-        if (
-            plan.mode == HiCacheDraftMode.SIDECAR
-            and envs.SGLANG_DSPARK_HICACHE_NO_DRAFT_SIDECAR.get()
-        ):
-            return HiCacheDraftPlan()
-        return plan
 
     def __init__(
         self,
