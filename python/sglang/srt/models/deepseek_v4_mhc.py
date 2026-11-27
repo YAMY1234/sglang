@@ -58,6 +58,7 @@ from sglang.srt.models.deepseek_v2 import MoEOutput
 from sglang.srt.runtime_context import get_forward, get_parallel, get_platform
 from sglang.srt.utils import is_gfx95_supported, is_hip, is_npu, is_xpu
 from sglang.srt.utils.log_utils import print_info_once
+from sglang.srt import h331_skip
 
 _is_gfx95_supported = is_gfx95_supported()
 _is_hip = is_hip()
@@ -336,7 +337,7 @@ def make_boundary(
 
 
 def use_stats_stream(cfg: HcConfig, forward_batch: ForwardBatch, x: torch.Tensor):
-    if not cfg.pre_from_prev:
+    if not cfg.pre_from_prev or h331_skip.skip("mhc"):
         return False
     decode_like = forward_batch.forward_mode.is_decode() or (
         forward_batch.forward_mode.is_target_verify() and x.shape[0] > 0
@@ -775,6 +776,13 @@ def _compute_triplet(
     run_deferred_attn_stats_fork()
     if precomputed is not None:
         return precomputed
+    if h331_skip.skip("mhc"):
+        rows, dev = residual.shape[0], residual.device
+        return (
+            h331_skip.static("mhc_pre", (rows, hc.cfg.mult), torch.float32, dev, 0.25),
+            h331_skip.static("mhc_post", (rows, hc.cfg.mult), torch.float32, dev, 0.5),
+            h331_skip.static("mhc_comb", (rows, hc.cfg.mult, hc.cfg.mult), torch.float32, dev, 0.25),
+        )
     coefficients = mix_stats(hc, residual, stats_stream)
     if stats_stream is not None:
         torch.cuda.current_stream().wait_stream(stats_stream)
@@ -937,6 +945,9 @@ def run_attn_post(
 
         assert next is not None
         pre, post_mix, comb = _compute_triplet(hc, residual, stats_stream, precomputed)
+        if h331_skip.skip("ar1"):
+            normed = h331_skip.static("ar1", (residual.shape[0], residual.shape[-1]), residual.dtype, residual.device)
+            return HcState(residual, pre, HcNormed(normed))
         _, updated, normalized = all_reduce_mhc_post_combine_norm(
             out.partial,
             residual,
@@ -978,6 +989,8 @@ def run_moe_post(
         and can_fuse_all_reduce(out.routed.expert_weights.shape[0], hc.cfg.hidden)
     ):
         pre, post_mix, comb = _compute_triplet(hc, residual, stats_stream, precomputed)
+        if h331_skip.skip("fin"):
+            return _h331_skip_fin(residual, pre, next, out.routed.expert_weights.shape[0])
         args = (
             out.routed.gemm2_out,
             out.routed.expanded_idx_to_permuted_idx,
@@ -1033,3 +1046,15 @@ def run_moe_post(
             out += pieces.shared
     coefficients = _compute_triplet(hc, residual, stats_stream, precomputed)
     return _post_fusion(hc, out, residual, coefficients, next)
+
+
+def _h331_skip_fin(residual, pre, next, rows):
+    """H331 knockout: the MoE seam's finalize + all-reduce + post kernel does not run."""
+    rows_hidden = (residual.shape[0], residual.shape[-1])
+    if next is not None and next.accepts_mxfp8 and next.norm_fusable and rows <= 128:
+        dev = residual.device
+        normed = h331_skip.static("fin_n", rows_hidden, residual.dtype, dev)
+        q = h331_skip.static("fin_q", rows_hidden, torch.float8_e4m3fn, dev)
+        sf = h331_skip.static("fin_sf", ((rows_hidden[1] // 32) * 128,), torch.uint8, dev, 127)
+        return HcState(residual, pre, HcQuantized(normed, Mxfp8SwizzledInput(q, sf)))
+    return HcState(residual, pre)

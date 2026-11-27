@@ -4804,7 +4804,13 @@ class DeepseekV4AttnBackend(
                     from sgl_kernel import flash_mla_with_kvcache
                 else:
                     flash_mla_with_kvcache = self._flash_mla_with_kvcache
+                from sglang.srt import h331_skip
 
+                if h331_skip.skip("attn"):
+                    o = h331_skip.static(
+                        "attn", (*q.shape[:-1], self.head_dim_v), torch.bfloat16, q.device
+                    )
+                    return o.squeeze(1)
                 if self.is_dsv41 and (
                     not self._swa_interleaved
                     or _flashmla_v41_splits_kv(

@@ -1393,6 +1393,14 @@ class Fp8LinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        from sglang.srt import h331_skip
+
+        prefix = layer._h331_prefix
+        if ".layers." in "." + prefix and not prefix.endswith(".gate") and h331_skip.skip("dense"):
+            t = x.data if isinstance(x, Mxfp8SwizzledInput) else (x[0] if isinstance(x, tuple) else x)
+            return h331_skip.static(
+                ("dense", prefix), (*t.shape[:-1], layer.output_size_per_partition), torch.bfloat16, t.device
+            )
         if self.use_marlin:
             return torch.ops.sglang.apply_fp8_marlin_linear(
                 input=x,

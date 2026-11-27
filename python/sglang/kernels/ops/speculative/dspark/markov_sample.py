@@ -266,6 +266,11 @@ class MarkovSampleStep:
 
     @classmethod
     def execute(cls, **kwargs) -> torch.Tensor:
+        from sglang.srt import h331_skip
+
+        if h331_skip.skip("samp"):
+            logits = kwargs["base_logits"]
+            return h331_skip.static("samp_draft", (logits.shape[0],), torch.int64, logits.device)
         if inputs_on_cuda(**kwargs):
             if _is_npu:
                 from sgl_kernel_npu.operators.sample import markov_sample_step_triton

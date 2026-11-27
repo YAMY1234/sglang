@@ -1429,6 +1429,15 @@ def accept_draft_tokens(
     block_verification: bool = False,
     rejection_noise: Optional[RejectionNoise] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    from sglang.srt import h331_skip
+
+    if h331_skip.skip("samp"):
+        bs, dev = candidates.shape[0], candidates.device
+        return (
+            h331_skip.static("samp_len", (bs,), torch.int32, dev),
+            h331_skip.static("samp_bonus", (bs,), torch.int64, dev),
+            h331_skip.static("samp_trim", (bs,), torch.int32, dev),
+        )
     greedy_mask = draft_block.greedy_mask
     cutoff_verify_lens = None if cutoff_layout is None else cutoff_layout.verify_lens
     all_greedy = sampling_info is None or sampling_info.is_all_greedy

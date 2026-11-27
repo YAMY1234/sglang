@@ -3442,6 +3442,13 @@ class MQALayer(MqaAttentionBase):
         return self._project_wo_b(o, defer_all_reduce)
 
     def _project_wo_a(self, o, *, positions, forward_batch, inv_rope, wo_a_quant_freqs):
+        from sglang.srt import h331_skip
+
+        if h331_skip.skip("dense"):
+            rows = (o[0] if isinstance(o, tuple) else o).shape[0]
+            return h331_skip.static(
+                ("wo_a", self.layer_id), (rows, self.wo_b.input_size_per_partition), torch.bfloat16, positions.device
+            )
         if wo_a_quant_freqs is not None:
             # the decode already returned the wo_a mxfp8 (codes, scales)
             G = self.n_local_groups
