@@ -47,7 +47,7 @@ def _rms_norm(x: torch.Tensor, norm: nn.RMSNorm) -> torch.Tensor:
 
 
 def _fused_block_gemms(x: torch.Tensor) -> bool:
-    """Whether a block's norm + GEMM and activation + down GEMM run as one launch each."""
+    """Whether a block's norm + GEMM pairs run as one launch each."""
     width = x.shape[-1]
     return x.is_cuda and x.dtype == torch.bfloat16 and width & (width - 1) == 0
 
@@ -432,9 +432,13 @@ class TransformerCorrector(nn.Module):
                 gate_up = _norm_matmul(
                     streams, norms.mlp_norm, block.gate_up_t, fused=fused_gemms
                 )
-                self._mlp_down(
-                    flat, gate_up.view(bs * 2, -1), block.down_t, fused=fused_gemms
+                # The fused op picks its backend by machine, not by tensor.
+                hidden_mlp = (
+                    self.mlp_act(gate_up)
+                    if _on_kernels(gate_up)
+                    else self.mlp_act.forward_native(gate_up)
                 )
+                flat.addmm_(hidden_mlp.view(bs * 2, -1), block.down_t)
             if i < num_unary_slots:
                 previous = unary_picks[:, i]
             else:
@@ -458,30 +462,6 @@ class TransformerCorrector(nn.Module):
                         q_rows.append(q)
             picks.append(previous)
         return torch.stack(picks, dim=1), torch.stack(q_rows, dim=1) if q_rows else None
-
-    def _mlp_down(
-        self,
-        flat: torch.Tensor,
-        gate_up: torch.Tensor,
-        down_t: torch.Tensor,
-        *,
-        fused: bool,
-    ) -> None:
-        """``flat += act(gate_up) @ down_t`` in place."""
-        if fused:
-            from sglang.kernels.ops.speculative.domino_corrector import (
-                corrector_act_down_residual,
-            )
-
-            corrector_act_down_residual(gate_up, down_t, flat)
-            return
-        # The fused op picks its backend by machine, not by tensor.
-        hidden_mlp = (
-            self.mlp_act(gate_up)
-            if _on_kernels(gate_up)
-            else self.mlp_act.forward_native(gate_up)
-        )
-        flat.addmm_(hidden_mlp, down_t)
 
     def _correction(
         self,

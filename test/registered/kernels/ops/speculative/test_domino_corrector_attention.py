@@ -7,7 +7,6 @@ import torch.nn.functional as F
 from torch import nn
 
 from sglang.kernels.ops.speculative.domino_corrector import (
-    corrector_act_down_residual,
     corrector_candidate_scores,
     corrector_context_attention,
     corrector_draw,
@@ -231,21 +230,6 @@ def test_norm_matmul_matches_reference(rows, n):
     normed = wide * torch.rsqrt(wide.square().mean(-1, keepdim=True) + eps)
     normed = (normed * norm_weight.float().cpu()).bfloat16().double()
     _bf16_close(out, (normed @ weight.double().cpu()).bfloat16())
-
-
-@pytest.mark.parametrize("rows", [232, 7, 0])
-def test_act_down_residual_matches_reference(rows):
-    gen = torch.Generator(device="cuda").manual_seed(rows)
-    k, n = 1024, 256
-    gate_up = _randn((rows, 2 * k), torch.bfloat16, gen)
-    weight = _randn((k, n), torch.bfloat16, gen) * k**-0.5
-    residual = _randn((rows, n), torch.bfloat16, gen)
-    expected_in = residual.clone()
-    corrector_act_down_residual(gate_up, weight, residual)
-    gate, up = gate_up.double().cpu().chunk(2, dim=-1)
-    hidden = (F.silu(gate) * up).bfloat16().double()
-    ref = hidden @ weight.double().cpu() + expected_in.double().cpu()
-    _bf16_close(residual, ref.bfloat16())
 
 
 def _rollout_case(dtype):
