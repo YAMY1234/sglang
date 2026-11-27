@@ -11,6 +11,7 @@ import torch
 
 from sglang.kernels.ops.attention.mla_shared_window import (
     merge_shared_window,
+    merge_shared_window_edges,
     mla_shared_window_indices,
 )
 from sglang.kernels.ops.attention.mla_window_indices import (
@@ -181,6 +182,56 @@ def test_merge_shared_window_matches_softmax_merge(base2):
     ref = (c_out * w_c + edge_out.bfloat16().float() * w_e) / (w_c + w_e)
     torch.testing.assert_close(out.float(), ref, rtol=1e-2, atol=1e-2)
     torch.testing.assert_close(out[3].float(), c_out[3], rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("heads", [24, 20])
+def test_merge_shared_window_edges_matches_softmax(heads):
+    gen = torch.Generator(device="cuda").manual_seed(heads)
+    groups, group, dim, head_dim, edge_k, scale = 5, 2, 512, 576, 4, 192**-0.5
+    rows = groups * group
+    common_out = torch.randn(
+        groups, group * heads, dim, device="cuda", generator=gen
+    ).bfloat16()
+    common_lse = torch.randn(groups, group * heads, device="cuda", generator=gen) * 4
+    query = (torch.randn(rows, heads, head_dim, device="cuda", generator=gen)).to(
+        torch.float8_e4m3fn
+    )
+    kv = (torch.randn(40, head_dim, device="cuda", generator=gen)).to(
+        torch.float8_e4m3fn
+    )
+    edge_counts = torch.arange(rows, device="cuda", dtype=torch.int32) % edge_k
+    edge = torch.randint(0, 40, (rows, edge_k), device="cuda", generator=gen)
+    edge = torch.where(
+        torch.arange(edge_k, device="cuda") < edge_counts[:, None], edge, -1
+    ).int()
+    # Row 1 has an empty common window and one edge key; row 4 has no key at all.
+    common_lse[0, heads : 2 * heads] = -torch.inf
+    common_lse[2, :heads] = -torch.inf
+    out = merge_shared_window_edges(
+        common_out,
+        common_lse,
+        query,
+        kv,
+        edge,
+        edge_counts,
+        group=group,
+        softmax_scale=scale,
+    )
+    c_out = common_out.float().view(rows, heads, dim)
+    c_lse = common_lse.view(rows, heads)
+    keys = kv.float()[edge.long().clamp_min(0)]
+    scores = torch.einsum("rhd,rkd->rhk", query.float(), keys) * scale
+    scores = scores * 1.4426950408889634
+    valid = torch.arange(edge_k, device="cuda") < edge_counts[:, None]
+    scores = scores.masked_fill(~valid[:, None], -torch.inf)
+    top = torch.maximum(c_lse, scores.amax(-1))
+    w_c = torch.exp2(c_lse - top).nan_to_num(0.0)
+    w_e = torch.exp2(scores - top[..., None]).nan_to_num(0.0)
+    num = c_out * w_c[..., None] + torch.einsum("rhk,rkd->rhd", w_e, keys[..., :dim])
+    total = (w_c + w_e.sum(-1))[..., None]
+    ref = torch.where(total > 0, num / total, 0.0)
+    torch.testing.assert_close(out.float(), ref, rtol=1e-2, atol=1e-2)
+    assert (out[4] == 0).all()
 
 
 @pytest.mark.skipif(

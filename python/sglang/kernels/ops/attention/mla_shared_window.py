@@ -221,42 +221,74 @@ def _merge_edges_kernel(
     GROUP: tl.constexpr,
     DIM: tl.constexpr,
     HEAD_DIM: tl.constexpr,
-    BLOCK_HEAD_DIM: tl.constexpr,
+    BLOCK_ROPE: tl.constexpr,
+    BLOCK_H: tl.constexpr,
     EDGE_K: tl.constexpr,
+    BLOCK_EDGE: tl.constexpr,
 ):
     row = tl.program_id(0)
-    head = tl.program_id(1)
+    head = tl.program_id(1) * BLOCK_H + tl.arange(0, BLOCK_H)
+    head_mask = head < HEADS
+    edge_offs = tl.arange(0, BLOCK_EDGE)
+    count = tl.load(EDGE_COUNTS + row)
+    edge_rows = tl.load(
+        EDGE + row * EDGE_K + edge_offs, mask=edge_offs < EDGE_K, other=0
+    )
     group = row // GROUP
     common_head = (row % GROUP) * HEADS + head
-    top = tl.load(COMMON_LSE + group * common_lse_stride + common_head)
+    top = tl.load(
+        COMMON_LSE + group * common_lse_stride + common_head,
+        mask=head_mask,
+        other=float("-inf"),
+    )
     dim = tl.arange(0, DIM)
-    acc = tl.load(COMMON_OUT + group * common_row_stride + common_head * DIM + dim)
-    acc = acc.to(tl.float32)
-    total = tl.where(top == float("-inf"), 0.0, 1.0)
-    acc = acc * total
-    qdim = tl.arange(0, BLOCK_HEAD_DIM)
-    query = tl.load(
-        QUERY + (row * HEADS + head) * HEAD_DIM + qdim, mask=qdim < HEAD_DIM, other=0.0
+    acc = tl.load(
+        COMMON_OUT
+        + group * common_row_stride
+        + common_head[:, None] * DIM
+        + dim[None, :],
+        mask=head_mask[:, None],
+        other=0.0,
     ).to(tl.float32)
-    count = tl.load(EDGE_COUNTS + row)
+    total = tl.where(top == float("-inf"), 0.0, 1.0)
+    acc = acc * total[:, None]
+    rope = tl.arange(0, BLOCK_ROPE)
+    rope_mask = DIM + rope < HEAD_DIM
+    query = QUERY + (row * HEADS + head[:, None]) * HEAD_DIM
+    q_nope = tl.load(query + dim[None, :], mask=head_mask[:, None], other=0.0)
+    q_rope = tl.load(
+        query + DIM + rope[None, :],
+        mask=head_mask[:, None] & rope_mask[None, :],
+        other=0.0,
+    )
+    q_nope, q_rope = q_nope.to(tl.float32), q_rope.to(tl.float32)
     # Online softmax over the row's few edge keys, in the kernel's log2 units;
-    # a key's value is the first DIM entries of its cache row.
+    # a key's value is the first DIM entries of its cache row (its latent part).
     for e in tl.static_range(EDGE_K):
         if e < count:
-            key_row = KV + tl.load(EDGE + row * EDGE_K + e).to(tl.int64) * kv_row_stride
-            key = tl.load(key_row + qdim, mask=qdim < HEAD_DIM, other=0.0).to(
-                tl.float32
-            )
-            score = tl.sum(query * key, axis=0) * scale_log2
+            edge_row = tl.sum(tl.where(edge_offs == e, edge_rows, 0))
+            key_row = KV + edge_row.to(tl.int64) * kv_row_stride
+            latent = tl.load(key_row + dim).to(tl.float32)
+            k_rope = tl.load(key_row + DIM + rope, mask=rope_mask, other=0.0)
+            score = tl.sum(q_nope * latent[None, :], axis=1)
+            score += tl.sum(q_rope * k_rope.to(tl.float32)[None, :], axis=1)
+            score = score * scale_log2
             new_top = tl.maximum(top, score)
             carry = tl.exp2(top - new_top)
             weight = tl.exp2(score - new_top)
-            value = tl.load(key_row + dim).to(tl.float32)
-            acc = acc * carry + weight * value
+            acc = acc * carry[:, None] + weight[:, None] * latent[None, :]
             total = total * carry + weight
             top = new_top
-    out = tl.where(total > 0.0, acc / total, 0.0)
-    tl.store(OUT + (row * HEADS + head) * DIM + dim, out.to(OUT.dtype.element_ty))
+    out = tl.where(total[:, None] > 0.0, acc / total[:, None], 0.0)
+    tl.store(
+        OUT + (row * HEADS + head[:, None]) * DIM + dim[None, :],
+        out.to(OUT.dtype.element_ty),
+        mask=head_mask[:, None],
+    )
+
+
+# Heads per program; 8 divides the draft's 24 heads per attention-TP rank.
+_MERGE_EDGES_BLOCK_H = 8
 
 
 def merge_shared_window_edges(
@@ -281,7 +313,7 @@ def merge_shared_window_edges(
     assert edge.shape[0] == rows and edge_counts.shape == (rows,)
     out = torch.empty((rows, heads, dim), dtype=torch.bfloat16, device=query.device)
     if rows:
-        _merge_edges_kernel[(rows, heads)](
+        _merge_edges_kernel[(rows, triton.cdiv(heads, _MERGE_EDGES_BLOCK_H))](
             common_out,
             common_out.stride(0),
             common_lse,
@@ -297,8 +329,10 @@ def merge_shared_window_edges(
             GROUP=group,
             DIM=dim,
             HEAD_DIM=head_dim,
-            BLOCK_HEAD_DIM=triton.next_power_of_2(head_dim),
+            BLOCK_ROPE=triton.next_power_of_2(head_dim - dim),
+            BLOCK_H=_MERGE_EDGES_BLOCK_H,
             EDGE_K=edge.shape[1],
+            BLOCK_EDGE=triton.next_power_of_2(edge.shape[1]),
             num_warps=4,
         )
     return out
