@@ -188,8 +188,9 @@ def test_merge_shared_window_matches_softmax_merge(base2):
 )
 @pytest.mark.parametrize("edges_in_merge", [True, False])
 def test_shared_window_attention_matches_per_row(edges_in_merge):
-    """The shared-window draft attention equals the per-row window attention up to
-    the BF16 rounding of the two partial outputs it merges."""
+    """The shared-window draft attention is no less accurate than the per-row window
+    attention: both against an FP32 softmax over the same FP8 query and KV rows (the
+    trtllm-gen kernel quantizes P to FP8, so the two paths differ by that much)."""
     from sglang.srt.layers.attention.draft_shared_window import (
         shared_window_indices,
         shared_window_sparse_attention,
@@ -205,10 +206,10 @@ def test_shared_window_attention_matches_per_row(edges_in_merge):
     bs, rows = slots.numel(), positions.numel()
     torch.manual_seed(0)
     cache_rows = -(-(1 + int(slots.max() + 1) * ring_rows) // PAGE) * PAGE
-    kv = (torch.randn(cache_rows, 1, head_dim, device="cuda") * 0.5).to(
+    kv = (torch.randn(cache_rows, 1, head_dim, device="cuda") * 0.25).to(
         torch.float8_e4m3fn
     )
-    query = (torch.randn(bs, q_len, heads, head_dim, device="cuda") * 0.5).to(
+    query = (torch.randn(bs, q_len, heads, head_dim, device="cuda") * 0.25).to(
         torch.float8_e4m3fn
     )
     kwargs = dict(
@@ -261,8 +262,17 @@ def test_shared_window_attention_matches_per_row(edges_in_merge):
         edges_in_merge=edges_in_merge,
         **kwargs,
     )
-    torch.testing.assert_close(
-        out.float(), ref.view(rows, heads, -1).float(), rtol=2e-2, atol=2e-2
+    keys = kv.view(-1, head_dim).float()[indices.long().clamp_min(0)]
+    valid = torch.arange(indices.shape[1], device="cuda") < counts[:, None]
+    scores = torch.einsum("rhd,rkd->rhk", query.view(rows, heads, -1).float(), keys)
+    scores = (scores * kwargs["bmm1_scale"]).masked_fill(~valid[:, None], -torch.inf)
+    exact = torch.einsum("rhk,rkd->rhd", scores.softmax(-1), keys[..., :512])
+    per_row = (ref.view(rows, heads, -1).float() - exact).abs()
+    shared = (out.float() - exact).abs()
+    assert shared.max() <= 1.25 * per_row.max() + 1e-3, (shared.max(), per_row.max())
+    assert shared.mean() <= 1.25 * per_row.mean() + 1e-5, (
+        shared.mean(),
+        per_row.mean(),
     )
 
 
