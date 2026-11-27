@@ -50,6 +50,10 @@ def _jit_topk_v2_module(stable_ties: bool = False):
             extra_cuda_cflags.append(
                 f"-DSGL_TOPK_V2_MAX_C{cluster_size}_OCC{occupancy}={max_active_clusters}"
             )
+    # SM107 JIT may target sm_100f (SGL_CUDA_ARCH 1000), so detect it on the host;
+    # its paged rows take the exact streaming path.
+    if torch.cuda.get_device_capability() == (10, 7):
+        extra_cuda_cflags.append("-DSGL_TOPK_V2_PAGED_NO_CLUSTER=1")
     kernel = f"TopKKernel<{args}>"
     wrappers = [
         ("topk_transform_paged", f"{kernel}::transform_paged"),

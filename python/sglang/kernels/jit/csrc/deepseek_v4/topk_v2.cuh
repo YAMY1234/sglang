@@ -1094,6 +1094,10 @@ CLUSTER_TOPK_KERNEL void topk_candidates_cluster_kernel(const __grid_constant__ 
 
 #endif  // SUPPORT_CLUSTER
 
+#ifndef SGL_TOPK_V2_PAGED_NO_CLUSTER
+#define SGL_TOPK_V2_PAGED_NO_CLUSTER 0
+#endif
+
 #ifdef USE_ROCM
 // Split path (ROCm): no clusters/DSMEM on CDNA, so a row spans blocks over two launches with the
 // kernel boundary as the barrier: hist accumulates chunk histograms in global memory, select appends
@@ -1497,7 +1501,10 @@ struct TopKKernel {
 
   static uint32_t get_static_cluster_floor(uint32_t batch_size) {
     // NOTE: 15 is exactly 0.5 wave which saturate all cluster-8 SMs on Hopper/Blackwell
-    if constexpr (SGL_ARCH_BLACKWELL_OR_GREATER) {
+    if constexpr (SGL_TOPK_V2_PAGED_NO_CLUSTER) {
+      // The paged cluster kernels truncate a threshold bin past kMaxNumTie (no streaming redo).
+      return UINT_MAX;
+    } else if constexpr (SGL_ARCH_BLACKWELL_OR_GREATER) {
       return batch_size <= 15 ? 24576 : 30720;
     } else if constexpr (SGL_ARCH_HOPPER_OR_GREATER) {
       return batch_size <= 15 ? 32768 : 65536;
